@@ -5,7 +5,7 @@ A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so 
 
 > **Status: foundation (v0.1).** The architecture, agent interface, ontology, hardware model, CLI, MCP server
 > and both GUIs are working and tested. The codec/container set is deliberately small so far:
-> **WAV and Y4M containers; PCM and raw-video codecs; `volume`, `gray`, `hflip` filters.**
+> **WAV, FLAC and Y4M containers; PCM (8/16/24/32-bit, float), FLAC and raw-video codecs; `volume`, `gray`, `hflip` filters.**
 > H.264/HEVC/AV1/AAC/Opus, MP4/MKV/WebM etc. are modelled in the ontology as `planned`, not implemented.
 > IronAV is not yet a drop-in replacement for FFmpeg or HandBrake. No native hardware provider is linked yet (see below).
 
@@ -46,12 +46,28 @@ OpenCL across Windows, Linux, macOS, Android and iOS: capability matrix, driver 
 A backend is *usable* only if its driver is detected **and** a native provider is linked. **This build links none,** so
 `auto` falls back to software and `require` fails with `hardware-unavailable`. Providers are the next major milestone.
 
+## FLAC
+
+Lossless audio, implemented from RFC 9639 (no code from libFLAC or FFmpeg): all subframe types, every stereo mode,
+wasted bits, 4-32 bit decode, 8/12/16/20/24-bit encode, 1-8 channels, CRC-checked frames (corruption is reported,
+never decoded into garbage). Limits: the encoder does not write the STREAMINFO MD5 (zeros = "not computed", which is
+valid), the `.flac` demuxer skips metadata blocks such as tags and cover art (they are not carried over), and 32-bit
+sources are written as 24-bit FLAC.
+
+**Conformance** was checked against the reference libFLAC (through libsndfile): 26 files across 8/16/24-bit, 1/2/6
+channels, 1-100,003 samples, and three libFLAC compression levels, in both directions (IronAV→libFLAC and
+libFLAC→IronAV), all bit-exact. Small libFLAC-produced fixtures are committed so `cargo test` keeps checking this.
+On one synthetic 3-minute stereo signal the output size equals libFLAC's mid compression level (0.652 of the WAV).
+
 ## Performance
 
 Stages run on separate threads with bounded queues, packets are moved not copied, and the MCP/GUI processes stay
 resident. Measured (release build, one Windows machine, 10 min of 48 kHz stereo PCM): s16→f32 with a volume filter
-≈ 2,500× real time (≈ 450 MiB/s in); stream copy ≈ 5,100× real time. These are PCM numbers only; no claim is made
-about compressed codecs, and no comparison against FFmpeg has been run.
+≈ 2,500× real time (≈ 450 MiB/s in); stream copy ≈ 5,100× real time. These are PCM numbers.
+FLAC, same machine (heavily loaded, so treat as rough): decode ≈ 270-400× real time; **encode ≈ 55-90× real time,
+which is several times slower than libFLAC at a comparable setting** (about 0.4 s vs 2 s for the same 3-minute file).
+Per-block multithreading was tried and reverted because it was not reliably faster. No comparison against FFmpeg
+has been run.
 
 ## Security notes (browser GUI)
 

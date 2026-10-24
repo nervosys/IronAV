@@ -1619,6 +1619,7 @@ dependencies = [
 name = "ironav-formats"
 version = "0.1.0"
 dependencies = [
+ "ironav-codec",
  "ironav-core",
  "serde",
  "serde_json",

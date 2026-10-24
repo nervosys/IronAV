@@ -202,3 +202,91 @@ fn ontology_answers_conversion_questions() {
     let e = call_tool("ontology_describe", &json!({ "id": "h265x" })).unwrap_err();
     assert_eq!(e.code, ErrorCode::NotFound);
 }
+
+// ---- FLAC ------------------------------------------------------------------------------
+
+fn fixture(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)
+}
+
+/// Raw bytes of the `data` chunk of a canonical WAV file.
+fn wav_data(path: &std::path::Path) -> Vec<u8> {
+    let b = std::fs::read(path).unwrap();
+    let mut p = 12;
+    while p + 8 <= b.len() {
+        let len = u32::from_le_bytes([b[p + 4], b[p + 5], b[p + 6], b[p + 7]]) as usize;
+        if &b[p..p + 4] == b"data" {
+            return b[p + 8..p + 8 + len].to_vec();
+        }
+        p += 8 + len + (len & 1);
+    }
+    panic!("no data chunk");
+}
+
+/// Files in `tests/fixtures` were written by the reference libFLAC (via libsndfile), so these
+/// check the decoder against an independent implementation rather than against ourselves.
+#[test]
+fn decodes_reference_libflac_files_bit_exactly() {
+    let d = scratch("flacref");
+    for (flac, wav, codec) in [("ref_stereo16.flac", "ref_stereo16.wav", "pcm_s16le"), ("ref_mono24.flac", "ref_mono24.wav", "pcm_s24le")] {
+        let out = d.join(wav);
+        let mut j = job(&fixture(flac), &out);
+        j.audio.codec = Some(codec.into());
+        run(&j, &mut |_| {}).unwrap();
+        assert_eq!(wav_data(&out), wav_data(&fixture(wav)), "{flac} decoded differently from libFLAC");
+    }
+}
+
+#[test]
+fn wav_to_flac_to_wav_is_lossless_at_16_and_24_bits() {
+    let d = scratch("flacrt");
+    let a = d.join("a.wav");
+    // 16-bit: from the libFLAC reference WAV
+    for (src, codec) in [(fixture("ref_stereo16.wav"), "pcm_s16le"), (fixture("ref_mono24.wav"), "pcm_s24le")] {
+        let (f, back) = (d.join("x.flac"), d.join("back.wav"));
+        let _ = std::fs::remove_file(&f);
+        let _ = std::fs::remove_file(&back);
+        let mut j = job(&src, &f);
+        j.audio.codec = Some("flac".into());
+        let r = run(&j, &mut |_| {}).unwrap();
+        assert!(r.bytes_out < r.bytes_in, "FLAC should compress this signal");
+        let mut j = job(&f, &back);
+        j.audio.codec = Some(codec.into());
+        run(&j, &mut |_| {}).unwrap();
+        assert_eq!(wav_data(&back), wav_data(&src));
+    }
+    let _ = a;
+}
+
+#[test]
+fn flac_plan_picks_bit_depth_and_explains_wav_mismatch() {
+    let d = scratch("flacplan");
+    let p = plan(&{
+        let mut j = job(&fixture("ref_mono24.wav"), &d.join("o.flac"));
+        j.audio.codec = Some("flac".into());
+        j
+    })
+    .unwrap();
+    assert_eq!(p.output.streams[0].bits, Some(24));
+
+    // FLAC cannot be written into WAV: the error must say which codecs would work.
+    let e = plan(&job(&fixture("ref_stereo16.flac"), &d.join("o.wav"))).unwrap_err();
+    assert_eq!(e.code, ErrorCode::UnsupportedCodec);
+    assert!(e.alternatives.contains(&"pcm_s16le".to_string()));
+}
+
+#[test]
+fn corrupt_flac_fails_cleanly_without_output() {
+    let d = scratch("flaccorrupt");
+    let bad = d.join("bad.flac");
+    let mut bytes = std::fs::read(fixture("ref_stereo16.flac")).unwrap();
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 0x55;
+    std::fs::write(&bad, bytes).unwrap();
+    let out = d.join("out.wav");
+    let mut j = job(&bad, &out);
+    j.audio.codec = Some("pcm_s16le".into());
+    let e = run(&j, &mut |_| {}).unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidInput);
+    assert!(!out.exists() && !d.join("out.wav.partial").exists());
+}

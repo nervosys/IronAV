@@ -48,6 +48,7 @@ impl<R: BufRead + Send> Y4mDemuxer<R> {
             codec: CodecId::RawVideo,
             time_base: fps.invert(),
             duration: None,
+            bits: None,
             params: StreamParams::Video { width: w, height: h, pix_fmt: pix, frame_rate: fps },
         };
         Ok(Self { r, streams: vec![stream], frame_bytes: pix.frame_bytes(w as usize, h as usize), index: 0 })

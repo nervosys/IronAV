@@ -50,6 +50,24 @@ pub struct Plan {
     pub warnings: Vec<String>,
 }
 
+/// Bit depth of the coded output. FLAC keeps the source depth when it has one; from PCM it
+/// uses 8/16 bits for 8/16-bit sources and 24 bits for wider ones (32-bit and float).
+fn output_bits(to: CodecId, src: &StreamInfo) -> Option<u8> {
+    use ironav_core::SampleFormat;
+    if let Some(f) = to.sample_format() {
+        return Some(f.bytes() as u8 * 8);
+    }
+    if to == CodecId::Flac {
+        return Some(match (src.codec, src.codec.sample_format()) {
+            (CodecId::Flac, _) => src.bits.unwrap_or(16),
+            (_, Some(SampleFormat::U8)) => 8,
+            (_, Some(SampleFormat::S16)) => 16,
+            _ => 24,
+        });
+    }
+    None
+}
+
 pub fn plan(job: &Job) -> Result<Plan> {
     let in_path = Path::new(&job.input);
     let out_path = Path::new(&job.output);
@@ -127,10 +145,11 @@ pub fn plan(job: &Job) -> Result<Plan> {
         }
 
         let action = if to == s.codec && chain.is_empty() { Action::Copy } else { Action::Transcode };
+        let bits = if action == Action::Copy { s.bits } else { output_bits(to, s) };
         let mut hardware = Vec::new();
         if action == Action::Transcode {
-            new_decoder(s.codec, &s.params)?;
-            new_encoder(to, &params)?;
+            new_decoder(s.codec, &s.params, s.bits)?;
+            new_encoder(to, &params, bits)?;
             if media == MediaType::Video || matches!(policy, HwPolicy::RequireAny | HwPolicy::Require(_)) {
                 hardware.push(select(s.codec, Direction::Decode, policy, &probes)?);
                 hardware.push(select(to, Direction::Encode, policy, &probes)?);
@@ -142,6 +161,7 @@ pub fn plan(job: &Job) -> Result<Plan> {
             codec: to,
             time_base: s.time_base,
             duration: s.duration,
+            bits,
             params,
         });
         steps.push(Step { input_stream: s.index, output_stream: steps.len(), action, from_codec: s.codec, to_codec: to, filters: chain, hardware });

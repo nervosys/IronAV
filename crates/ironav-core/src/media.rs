@@ -13,17 +13,19 @@ pub enum MediaType {
 pub enum SampleFormat {
     U8,
     S16,
+    S24,
     S32,
     F32,
     F64,
 }
 
 impl SampleFormat {
-    pub const ALL: [SampleFormat; 5] = [Self::U8, Self::S16, Self::S32, Self::F32, Self::F64];
+    pub const ALL: [SampleFormat; 6] = [Self::U8, Self::S16, Self::S24, Self::S32, Self::F32, Self::F64];
     pub fn name(self) -> &'static str {
         match self {
             Self::U8 => "u8",
             Self::S16 => "s16",
+            Self::S24 => "s24",
             Self::S32 => "s32",
             Self::F32 => "f32",
             Self::F64 => "f64",
@@ -33,6 +35,7 @@ impl SampleFormat {
         match self {
             Self::U8 => 1,
             Self::S16 => 2,
+            Self::S24 => 3,
             Self::S32 | Self::F32 => 4,
             Self::F64 => 8,
         }
@@ -93,6 +96,7 @@ macro_rules! codecs {
 codecs! {
     PcmU8 => "pcm_u8", Audio;
     PcmS16Le => "pcm_s16le", Audio;
+    PcmS24Le => "pcm_s24le", Audio;
     PcmS32Le => "pcm_s32le", Audio;
     PcmF32Le => "pcm_f32le", Audio;
     PcmF64Le => "pcm_f64le", Audio;
@@ -133,6 +137,7 @@ impl CodecId {
         Some(match self {
             Self::PcmU8 => SampleFormat::U8,
             Self::PcmS16Le => SampleFormat::S16,
+            Self::PcmS24Le => SampleFormat::S24,
             Self::PcmS32Le => SampleFormat::S32,
             Self::PcmF32Le => SampleFormat::F32,
             Self::PcmF64Le => SampleFormat::F64,
@@ -143,6 +148,7 @@ impl CodecId {
         match fmt {
             SampleFormat::U8 => Self::PcmU8,
             SampleFormat::S16 => Self::PcmS16Le,
+            SampleFormat::S24 => Self::PcmS24Le,
             SampleFormat::S32 => Self::PcmS32Le,
             SampleFormat::F32 => Self::PcmF32Le,
             SampleFormat::F64 => Self::PcmF64Le,
@@ -186,6 +192,9 @@ pub struct StreamInfo {
     /// Duration in `time_base` units, when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration: Option<i64>,
+    /// Bits per sample of the coded audio, when meaningful (PCM, FLAC).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bits: Option<u8>,
     #[serde(flatten)]
     pub params: StreamParams,
 }

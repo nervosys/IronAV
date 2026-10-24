@@ -1,5 +1,6 @@
 //! Container demuxers and muxers, and the format registry.
 
+mod flac;
 mod wav;
 mod y4m;
 
@@ -28,7 +29,7 @@ pub static FORMATS: &[FormatSpec] = &[
         media: MediaType::Audio,
         demux: true,
         mux: true,
-        codecs: &[CodecId::PcmU8, CodecId::PcmS16Le, CodecId::PcmS32Le, CodecId::PcmF32Le, CodecId::PcmF64Le],
+        codecs: &[CodecId::PcmU8, CodecId::PcmS16Le, CodecId::PcmS24Le, CodecId::PcmS32Le, CodecId::PcmF32Le, CodecId::PcmF64Le],
     },
     FormatSpec {
         name: "y4m",
@@ -38,6 +39,15 @@ pub static FORMATS: &[FormatSpec] = &[
         demux: true,
         mux: true,
         codecs: &[CodecId::RawVideo],
+    },
+    FormatSpec {
+        name: "flac",
+        extensions: &["flac"],
+        description: "Native FLAC lossless audio",
+        media: MediaType::Audio,
+        demux: true,
+        mux: true,
+        codecs: &[CodecId::Flac],
     },
 ];
 
@@ -67,6 +77,8 @@ pub fn open_demuxer(path: &Path) -> Result<Box<dyn Demuxer>> {
     let magic = &magic[..n];
     if magic.len() >= 12 && &magic[..4] == b"RIFF" && &magic[8..12] == b"WAVE" {
         Ok(Box::new(wav::WavDemuxer::open(f)?))
+    } else if flac::looks_like_flac(magic) {
+        Ok(Box::new(flac::FlacDemuxer::open(f)?))
     } else if magic.starts_with(b"YUV4MPEG2") {
         Ok(Box::new(y4m::Y4mDemuxer::open(f)?))
     } else {
@@ -86,6 +98,7 @@ pub fn create_muxer(path: &Path, format: &str) -> Result<Box<dyn Muxer>> {
     match spec.name {
         "wav" => Ok(Box::new(wav::WavMuxer::new(out))),
         "y4m" => Ok(Box::new(y4m::Y4mMuxer::new(out))),
+        "flac" => Ok(Box::new(flac::FlacMuxer::new(out))),
         _ => Err(Error::new(ErrorCode::UnsupportedFormat, format!("format '{format}' cannot be written"))),
     }
 }

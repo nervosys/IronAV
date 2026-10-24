@@ -134,7 +134,7 @@ fn execute(
             for fc in &st.filters {
                 fs.push(build_filter(&fc.name, &fc.args)?);
             }
-            (Some(new_decoder(src.codec, &src.params)?), Some(new_encoder(dst.codec, &dst.params)?), fs)
+            (Some(new_decoder(src.codec, &src.params, src.bits)?), Some(new_encoder(dst.codec, &dst.params, dst.bits)?), fs)
         } else {
             (None, None, Vec::new())
         };

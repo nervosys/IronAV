@@ -87,7 +87,8 @@ impl Settings {
         let Ok(f) = find_format(name) else { return };
         self.format = f.name;
         let ok = encodable_codecs(f);
-        let fallback = || ok.first().copied().unwrap_or("copy").to_string();
+        // Prefer a common lossless-friendly default over whatever happens to be listed first (pcm_u8).
+        let fallback = || ["pcm_s16le", "flac", "rawvideo"].into_iter().find(|c| ok.contains(c)).or(ok.first().copied()).unwrap_or("copy").to_string();
         let pick = match src.and_then(|s| s.streams.iter().find(|st| st.params.media_type() == f.media)) {
             Some(st) if ok.contains(&st.codec.name()) => "copy".to_string(),
             _ => fallback(),
@@ -185,6 +186,7 @@ mod tests {
                 codec: CodecId::PcmS16Le,
                 time_base: Rational::new(1, 48000),
                 duration: Some(48000),
+                bits: Some(16),
                 params: StreamParams::Audio { sample_rate: 48000, channels: 2 },
             }],
         }
@@ -192,8 +194,24 @@ mod tests {
 
     #[test]
     fn audio_source_only_offers_audio_containers() {
-        let names: Vec<_> = writable_formats(Some(&wav_source())).iter().map(|f| f.name).collect();
-        assert_eq!(names, vec!["wav"]);
+        let fmts = writable_formats(Some(&wav_source()));
+        let names: Vec<_> = fmts.iter().map(|f| f.name).collect();
+        assert!(names.contains(&"wav") && names.contains(&"flac"), "{names:?}");
+        assert!(fmts.iter().all(|f| f.media == MediaType::Audio), "video containers must not be offered for audio");
+    }
+
+    #[test]
+    fn switching_to_flac_picks_flac_and_back_to_wav_avoids_pcm_u8() {
+        let src = wav_source();
+        let mut s = Settings::for_source(&src).unwrap();
+        s.set_format(Some(&src), "flac");
+        assert_eq!(s.acodec, "flac");
+        assert!(s.output.ends_with(".flac"), "{}", s.output);
+        // A FLAC source going to WAV must not default to the lossy-feeling first-listed pcm_u8.
+        let mut flac_src = src.clone();
+        flac_src.streams[0].codec = ironav_core::CodecId::Flac;
+        s.set_format(Some(&flac_src), "wav");
+        assert_eq!(s.acodec, "pcm_s16le");
     }
 
     #[test]

@@ -8,6 +8,7 @@ fn codec_meta(c: CodecId) -> (&'static str, &'static str) {
     match c {
         PcmU8 => ("PCM unsigned 8-bit", "Uncompressed audio, 8-bit unsigned samples."),
         PcmS16Le => ("PCM signed 16-bit LE", "Uncompressed audio, 16-bit signed little-endian samples (CD quality)."),
+        PcmS24Le => ("PCM signed 24-bit LE", "Uncompressed audio, 24-bit signed little-endian samples (studio / hi-res)."),
         PcmS32Le => ("PCM signed 32-bit LE", "Uncompressed audio, 32-bit signed little-endian samples."),
         PcmF32Le => ("PCM float 32-bit LE", "Uncompressed audio, 32-bit IEEE float samples."),
         PcmF64Le => ("PCM float 64-bit LE", "Uncompressed audio, 64-bit IEEE float samples."),

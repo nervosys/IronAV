@@ -53,6 +53,7 @@ impl<R: Read + Seek + Send> WavDemuxer<R> {
                     let codec = match (tag, bits) {
                         (1, 8) => CodecId::PcmU8,
                         (1, 16) => CodecId::PcmS16Le,
+                        (1, 24) => CodecId::PcmS24Le,
                         (1, 32) => CodecId::PcmS32Le,
                         (3, 32) => CodecId::PcmF32Le,
                         (3, 64) => CodecId::PcmF64Le,
@@ -61,7 +62,7 @@ impl<R: Read + Seek + Send> WavDemuxer<R> {
                                 ErrorCode::UnsupportedCodec,
                                 format!("WAV format tag {tag} with {bits} bits per sample is not supported"),
                             )
-                            .hint("supported: 8/16/32-bit integer PCM and 32/64-bit float PCM"))
+                            .hint("supported: 8/16/24/32-bit integer PCM and 32/64-bit float PCM"))
                         }
                     };
                     if channels == 0 || rate == 0 || align == 0 {
@@ -77,6 +78,7 @@ impl<R: Read + Seek + Send> WavDemuxer<R> {
                         codec,
                         time_base: Rational::new(1, rate as i64),
                         duration: Some(frames),
+                        bits: Some(bits as u8),
                         params: StreamParams::Audio { sample_rate: rate, channels },
                     };
                     return Ok(Self {
