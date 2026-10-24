@@ -127,6 +127,27 @@ pub(crate) struct VideoQueue {
     pub last: Option<Arc<TimedFrame>>,
 }
 
+impl VideoQueue {
+    /// Remove the front picture, keeping the byte count right.
+    fn pop(&mut self) {
+        if let Some(f) = self.frames.pop_front() {
+            self.bytes = self.bytes.saturating_sub(f.frame.planes.iter().map(Vec::len).sum::<usize>());
+        }
+        self.front_shown = false;
+    }
+
+    /// Drop pictures whose successor is already due at `pos`. Pictures nobody looked at count
+    /// as skipped.
+    pub fn discard_stale(&mut self, pos: f64) {
+        while self.frames.len() >= 2 && self.frames[1].time <= pos + 1e-4 {
+            if !self.front_shown {
+                self.skipped += 1;
+            }
+            self.pop();
+        }
+    }
+}
+
 pub(crate) struct Clock {
     /// Intent: the user wants it playing.
     pub playing: bool,
@@ -509,13 +530,7 @@ impl Player {
         if !q.ready {
             return None;
         }
-        while q.frames.len() >= 2 && q.frames[1].time <= pos + 1e-4 {
-            if !q.front_shown {
-                q.skipped += 1;
-            }
-            q.frames.pop_front();
-            q.front_shown = false;
-        }
+        q.discard_stale(pos);
         let front = q.frames.front().cloned();
         match front {
             Some(f) if f.time <= pos + 1e-4 || q.last.is_none() => {

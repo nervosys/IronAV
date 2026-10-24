@@ -135,6 +135,12 @@ fn video_loop(inner: &Inner, path: &str, stream: &StreamInfo, mut dec: Box<dyn D
             Wake::Nothing => {}
         }
         if idle {
+            // Keep the queue moving even when nobody is displaying it (headless playback).
+            if !draining {
+                if let Some(pos) = inner.update() {
+                    inner.video.lock().unwrap().discard_stale(pos);
+                }
+            }
             continue;
         }
         if need_seek {

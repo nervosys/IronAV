@@ -43,7 +43,7 @@ fn write_y4m(path: &PathBuf, frames: usize) {
     let mut f = format!("YUV4MPEG2 W{w} H{h} F10:1 Ip A1:1 C420jpeg\n").into_bytes();
     for i in 0..frames {
         f.extend(b"FRAME\n");
-        f.extend(vec![16 + 8 * i as u8; w * h]);
+        f.extend(vec![(16 + 8 * (i % 30)) as u8; w * h]);
         f.extend(vec![128u8; w * h / 2]);
     }
     std::fs::write(path, f).unwrap();
@@ -174,4 +174,13 @@ fn missing_and_unplayable_files_fail_with_a_usable_error() {
     write_wav(&p, 8000, 1);
     let e = Player::open(p.to_str().unwrap(), &OpenOptions { audio: AudioMode::Off, ..Default::default() }).err().unwrap();
     assert_eq!(e.code, ironav_core::ErrorCode::UnsupportedCodec, "audio-only file with audio off has nothing to play");
+}
+
+#[test]
+fn headless_playback_reaches_the_end_without_anyone_drawing_frames() {
+    let p = dir("headless").join("v.y4m");
+    write_y4m(&p, 40); // more pictures than the queue holds, four seconds
+    let pl = Player::open(p.to_str().unwrap(), &silent()).unwrap();
+    until("the end", 8.0, || pl.state() == State::Ended);
+    assert!((pl.position() - 4.0).abs() < 0.2, "ended at {}", pl.position());
 }

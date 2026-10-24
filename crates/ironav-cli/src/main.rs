@@ -3,18 +3,19 @@
 //! and exits non-zero on error (see `ErrorCode::exit_code`).
 
 mod mcp;
+mod play;
 
 use ironav_core::{Error, Result};
 use ironav_engine::{call_tool, ontology, tools, FilterCall, Job};
 use serde_json::{json, Value};
 use std::io::{IsTerminal, Read};
 
-struct Args {
-    rest: Vec<String>,
+pub(crate) struct Args {
+    pub(crate) rest: Vec<String>,
 }
 
 impl Args {
-    fn flag(&mut self, names: &[&str]) -> Result<Option<String>> {
+    pub(crate) fn flag(&mut self, names: &[&str]) -> Result<Option<String>> {
         let Some(i) = self.rest.iter().position(|a| names.contains(&a.as_str())) else { return Ok(None) };
         self.rest.remove(i);
         if i >= self.rest.len() {
@@ -22,14 +23,14 @@ impl Args {
         }
         Ok(Some(self.rest.remove(i)))
     }
-    fn flags(&mut self, names: &[&str]) -> Result<Vec<String>> {
+    pub(crate) fn flags(&mut self, names: &[&str]) -> Result<Vec<String>> {
         let mut v = Vec::new();
         while let Some(x) = self.flag(names)? {
             v.push(x);
         }
         Ok(v)
     }
-    fn switch(&mut self, names: &[&str]) -> bool {
+    pub(crate) fn switch(&mut self, names: &[&str]) -> bool {
         match self.rest.iter().position(|a| names.contains(&a.as_str())) {
             Some(i) => {
                 self.rest.remove(i);
@@ -38,7 +39,7 @@ impl Args {
             None => false,
         }
     }
-    fn positional(&mut self, what: &str) -> Result<String> {
+    pub(crate) fn positional(&mut self, what: &str) -> Result<String> {
         if self.rest.is_empty() {
             return Err(Error::invalid_arg(format!("missing {what}")).hint("run `ironav help` for usage"));
         }
@@ -61,6 +62,7 @@ fn help() -> Value {
             "ontology summary | search [text] [--kind K] [--limit N] | describe ID | convert FROM TO | jsonld": "knowledge graph",
             "tools": "tool definitions with JSON Schemas (function-calling compatible)",
             "mcp": "serve all tools over the Model Context Protocol on stdio",
+            "play FILE [--audio auto|silent|off] [--start S] [--volume V] [--loop] [--paused] [--hwaccel P] [--tui|--json] [--until-end]": "play audio/video: a full-screen terminal player on a TTY, otherwise JSON lines on stdin/stdout ({\"cmd\":\"seek\",\"to\":30}); send {\"cmd\":\"help\"} for the commands",
             "gui [FILE] | gui --web [--port N] [--no-open]": "native desktop window (default), or the browser-based UI"
         },
         "tools": tools().iter().map(|t| t.name).collect::<Vec<_>>(),
@@ -151,7 +153,7 @@ fn dispatch(mut a: Args, progress: bool) -> Result<Value> {
             .collect::<Vec<_>>())),
         other => Err(Error::invalid_arg(format!("unknown command '{other}'"))
             .hint("run `ironav help`")
-            .alternatives(["capabilities", "probe", "convert", "plan", "run", "hw", "ontology", "tools", "mcp", "gui"])),
+            .alternatives(["capabilities", "probe", "convert", "plan", "run", "hw", "ontology", "tools", "mcp", "play", "gui"])),
     }
 }
 
@@ -191,6 +193,14 @@ fn main() {
         Some("mcp") => {
             if let Err(e) = mcp::serve() {
                 eprintln!("{}", serde_json::to_string(&e).unwrap_or_default());
+                std::process::exit(e.code.exit_code());
+            }
+            return;
+        }
+        Some("play") => {
+            let mut a = Args { rest: rest.split_off(1) };
+            if let Err(e) = play::parse(&mut a).and_then(play::run) {
+                println!("{}", serde_json::to_string(&json!({ "ok": false, "error": e })).unwrap_or_default());
                 std::process::exit(e.code.exit_code());
             }
             return;

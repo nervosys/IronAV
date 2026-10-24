@@ -14,6 +14,8 @@ ironav-engine.workspace = true
 ironav-webui.workspace = true
 ironav-gui = { workspace = true, optional = true }
 ironav-ontology.workspace = true
+ironav-player.workspace = true
+ratatui = "0.29"
 
 [features]
 default = ["native-gui"]
