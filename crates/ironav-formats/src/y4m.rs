@@ -1,15 +1,18 @@
 use crate::WriteSeek;
 use ironav_core::{CodecId, Demuxer, Error, ErrorCode, Muxer, Packet, PixelFormat, Rational, Result, StreamInfo, StreamParams};
-use std::io::BufRead;
+use std::io::{BufRead, Seek, SeekFrom};
 
-pub struct Y4mDemuxer<R: BufRead + Send> {
+pub struct Y4mDemuxer<R: BufRead + Seek + Send> {
     r: R,
     streams: Vec<StreamInfo>,
     frame_bytes: usize,
     index: i64,
+    data_start: u64,
+    /// Bytes from one frame to the next: the "FRAME" line plus the pixels.
+    stride: u64,
 }
 
-impl<R: BufRead + Send> Y4mDemuxer<R> {
+impl<R: BufRead + Seek + Send> Y4mDemuxer<R> {
     pub fn open(mut r: R) -> Result<Self> {
         let mut line = Vec::new();
         r.read_until(b'\n', &mut line)?;
@@ -43,19 +46,32 @@ impl<R: BufRead + Send> Y4mDemuxer<R> {
         if w == 0 || h == 0 || fps.num <= 0 || fps.den <= 0 {
             return Err(Error::invalid_input("Y4M header must give positive W, H and frame rate"));
         }
+        let data_start = r.stream_position()?;
+        let frame_bytes = pix.frame_bytes(w as usize, h as usize);
+        // Frames are "FRAME\n" plus pixels unless a file adds per-frame parameters (rare);
+        // the first frame line corrects the guess below.
+        let mut stride = 6 + frame_bytes as u64;
+        let mut peek = Vec::new();
+        r.read_until(b'\n', &mut peek)?;
+        if peek.starts_with(b"FRAME") {
+            stride = peek.len() as u64 + frame_bytes as u64;
+        }
+        let total = r.seek(SeekFrom::End(0))?;
+        r.seek(SeekFrom::Start(data_start))?;
+        let frames = total.saturating_sub(data_start) / stride;
         let stream = StreamInfo {
             index: 0,
             codec: CodecId::RawVideo,
             time_base: fps.invert(),
-            duration: None,
+            duration: Some(frames as i64),
             bits: None,
             params: StreamParams::Video { width: w, height: h, pix_fmt: pix, frame_rate: fps },
         };
-        Ok(Self { r, streams: vec![stream], frame_bytes: pix.frame_bytes(w as usize, h as usize), index: 0 })
+        Ok(Self { r, streams: vec![stream], frame_bytes, index: 0, data_start, stride })
     }
 }
 
-impl<R: BufRead + Send> Demuxer for Y4mDemuxer<R> {
+impl<R: BufRead + Seek + Send> Demuxer for Y4mDemuxer<R> {
     fn format_name(&self) -> &'static str {
         "y4m"
     }
@@ -75,6 +91,15 @@ impl<R: BufRead + Send> Demuxer for Y4mDemuxer<R> {
         let pts = self.index;
         self.index += 1;
         Ok(Some(Packet { stream: 0, pts, duration: 1, data }))
+    }
+
+    fn seek(&mut self, seconds: f64) -> Result<f64> {
+        let fps = self.streams[0].time_base.invert().as_f64();
+        let last = self.streams[0].duration.unwrap_or(0).max(1) - 1;
+        let frame = ((seconds.max(0.0) * fps).floor() as i64).min(last);
+        self.r.seek(SeekFrom::Start(self.data_start + frame as u64 * self.stride))?;
+        self.index = frame;
+        Ok(frame as f64 / fps)
     }
 }
 

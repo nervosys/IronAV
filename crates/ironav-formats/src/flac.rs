@@ -27,6 +27,9 @@ pub struct FlacDemuxer<R: Read + Seek + Send> {
     start: usize,
     eof: bool,
     pts: i64,
+    frames_start: u64,
+    /// A packet read while seeking that belongs to the new position.
+    held: Option<Packet>,
 }
 
 impl<R: Read + Seek + Send> FlacDemuxer<R> {
@@ -79,7 +82,8 @@ impl<R: Read + Seek + Send> FlacDemuxer<R> {
             bits: Some(bits),
             params: StreamParams::Audio { sample_rate: rate, channels },
         };
-        Ok(Self { r, streams: vec![stream], buf: Vec::new(), start: 0, eof: false, pts: 0 })
+        let frames_start = r.stream_position()?;
+        Ok(Self { r, streams: vec![stream], buf: Vec::new(), start: 0, eof: false, pts: 0, frames_start, held: None })
     }
 
     /// Drop consumed bytes. Only called between packets: during a frame scan the buffer may
@@ -115,6 +119,36 @@ impl<R: Read + Seek + Send> Demuxer for FlacDemuxer<R> {
     /// position that both starts a valid frame header and makes the CRC-16 of everything
     /// before it come out to zero (the CRC is appended to each frame).
     fn read_packet(&mut self) -> Result<Option<Packet>> {
+        if let Some(p) = self.held.take() {
+            return Ok(Some(p));
+        }
+        self.read_frame()
+    }
+
+    /// FLAC frames carry no index, so seeking restarts at the first frame and walks forward
+    /// (reading frame boundaries only, no decoding) to the one containing the wanted time.
+    fn seek(&mut self, seconds: f64) -> Result<f64> {
+        let rate = self.streams[0].time_base.invert().as_f64();
+        let want = (seconds.max(0.0) * rate) as i64;
+        self.r.seek(SeekFrom::Start(self.frames_start))?;
+        self.buf.clear();
+        (self.start, self.eof, self.pts, self.held) = (0, false, 0, None);
+        loop {
+            match self.read_frame()? {
+                Some(p) if p.pts + p.duration <= want => continue,
+                Some(p) => {
+                    let at = p.pts as f64 / rate;
+                    self.held = Some(p);
+                    return Ok(at);
+                }
+                None => return Ok(self.pts as f64 / rate),
+            }
+        }
+    }
+}
+
+impl<R: Read + Seek + Send> FlacDemuxer<R> {
+    fn read_frame(&mut self) -> Result<Option<Packet>> {
         self.compact();
         while self.buf.len() - self.start < 2 * MAX_HEADER_LEN && !self.eof {
             self.fill()?;

@@ -469,6 +469,26 @@ impl<R: Read + Seek + Send> Demuxer for Mp4Demuxer<R> {
         }
     }
 
+    /// Lands on the last video keyframe at or before `seconds` (or the packet containing it when
+    /// there is no video), so the decoder starts on a picture it can decode alone.
+    fn seek(&mut self, seconds: f64) -> Result<f64> {
+        let t = seconds.max(0.0);
+        let at = |s: &Sample| s.dts as f64 * self.tracks[s.stream as usize].stream.time_base.as_f64();
+        let video = |s: &Sample| {
+            matches!(self.tracks[s.stream as usize].stream.params, StreamParams::Video { .. }) && !self.discarded[s.stream as usize]
+        };
+        let landing = if self.samples.iter().any(|s| video(s)) {
+            self.samples.iter().filter(|s| video(s) && s.sync && at(s) <= t + 1e-9).last().map_or(0.0, at)
+        } else {
+            // No video: start on the packet that contains the requested time.
+            self.samples.iter().filter(|s| !self.discarded[s.stream as usize] && at(s) <= t + 1e-9).last().map_or(t, at)
+        };
+        self.next = self.samples.partition_point(|s| at(s) < landing - 1e-9);
+        self.seen.fill(0); // the first video packet after a seek needs its parameter sets again
+        self.pos = u64::MAX;
+        Ok(landing)
+    }
+
     fn read_packet(&mut self) -> Result<Option<Packet>> {
         while let Some(&s) = self.samples.get(self.next) {
             self.next += 1;
@@ -644,5 +664,22 @@ mod tests {
         let junk = [&[0u8, 0, 0, 16, b'f', b't', b'y', b'p'][..], b"isom    ", &[0, 0, 0, 8, b'f', b'r', b'e', b'e']].concat();
         let e = Mp4Demuxer::open(Cursor::new(junk)).err().unwrap();
         assert_eq!(e.code, ErrorCode::UnsupportedFormat);
+    }
+
+    #[test]
+    fn seeking_lands_on_a_keyframe_and_replays_from_there() {
+        let (_, mut d) = round_trip();
+        // Only the first video frame is a keyframe, so any seek lands on it and restarts cleanly.
+        let landed = d.seek(0.07).unwrap();
+        assert_eq!(landed, 0.0);
+        let first = d.read_packet().unwrap().unwrap();
+        assert_eq!(first.stream, 0);
+        assert!(first.data.starts_with(&[0, 0, 0, 1, 0x67]), "parameter sets are repeated after a seek");
+        // With video discarded the audio is positioned exactly.
+        let (_, mut a) = round_trip();
+        a.discard(0);
+        let landed = a.seek(0.09).unwrap();
+        assert!((landed - 4096.0 / 48000.0).abs() < 1e-9, "audio frame 2 starts at {landed}");
+        assert_eq!(a.read_packet().unwrap().unwrap().pts, 4096);
     }
 }

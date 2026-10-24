@@ -1,4 +1,4 @@
-use crate::{Frame, Packet, Result, StreamInfo, StreamParams};
+use crate::{Error, ErrorCode, Frame, Packet, Result, StreamInfo, StreamParams};
 
 // All stage traits are `Send` so the engine can run each stage on its own thread and
 // move packets/frames between stages without copying.
@@ -11,6 +11,12 @@ pub trait Demuxer: Send {
     /// Tell the demuxer this stream's packets will not be used, so it need not read them.
     /// Optional: a demuxer that ignores this still works, the engine drops the packets itself.
     fn discard(&mut self, _stream: usize) {}
+    /// Reposition so the next packets start at `seconds`. Returns the time actually landed on:
+    /// formats with keyframes land on the last keyframe at or before the request, so a decoder
+    /// can start cleanly and the caller drops frames until the wanted time.
+    fn seek(&mut self, _seconds: f64) -> Result<f64> {
+        Err(Error::new(ErrorCode::UnsupportedFormat, format!("{} files cannot seek", self.format_name())))
+    }
 }
 
 pub trait Muxer: Send {

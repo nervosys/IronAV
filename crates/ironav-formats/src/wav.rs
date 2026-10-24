@@ -12,6 +12,8 @@ pub struct WavDemuxer<R: Read + Seek + Send> {
     block_align: usize,
     remaining: u64,
     pos_frames: i64,
+    data_start: u64,
+    total_frames: u64,
 }
 
 impl<R: Read + Seek + Send> WavDemuxer<R> {
@@ -87,6 +89,8 @@ impl<R: Read + Seek + Send> WavDemuxer<R> {
                         block_align: align as usize,
                         remaining: frames as u64 * align as u64,
                         pos_frames: 0,
+                        data_start: start,
+                        total_frames: frames as u64,
                     });
                 }
                 _ => {
@@ -116,6 +120,15 @@ impl<R: Read + Seek + Send> Demuxer for WavDemuxer<R> {
         let pts = self.pos_frames;
         self.pos_frames += frames;
         Ok(Some(Packet { stream: 0, pts, duration: frames, data }))
+    }
+
+    fn seek(&mut self, seconds: f64) -> Result<f64> {
+        let rate = self.streams[0].time_base.invert().as_f64();
+        let frame = ((seconds.max(0.0) * rate).round() as u64).min(self.total_frames);
+        self.r.seek(SeekFrom::Start(self.data_start + frame * self.block_align as u64))?;
+        self.remaining = (self.total_frames - frame) * self.block_align as u64;
+        self.pos_frames = frame as i64;
+        Ok(frame as f64 / rate)
     }
 }
 
