@@ -35,6 +35,13 @@ pub struct StreamOpts {
     /// Target codec name, or `copy` to pass packets through untouched (the default).
     #[serde(default)]
     pub codec: Option<String>,
+    /// Video only: target average bitrate in kbit/s. Mutually exclusive with `qp`.
+    #[serde(default)]
+    pub bitrate_kbps: Option<u32>,
+    /// Video only: constant quantizer, 0 (best) to 51 (smallest). Used when no bitrate is set;
+    /// defaults to 23.
+    #[serde(default)]
+    pub qp: Option<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

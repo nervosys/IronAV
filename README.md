@@ -6,8 +6,9 @@ A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so 
 > **Status: foundation (v0.1).** The architecture, agent interface, ontology, hardware model, CLI, MCP server
 > and both GUIs are working and tested. The codec/container set is deliberately small so far:
 > **WAV, FLAC and Y4M containers; PCM (8/16/24/32-bit, float), FLAC and raw-video codecs; `volume`, `gray`, `hflip` filters.**
-> H.264/HEVC/AV1/AAC/Opus, MP4/MKV/WebM etc. are modelled in the ontology as `planned`, not implemented.
-> IronAV is not yet a drop-in replacement for FFmpeg or HandBrake. No native hardware provider is linked yet (see below).
+> **H.264 and HEVC can be encoded on NVIDIA GPUs (NVENC)** into raw `.h264`/`.hevc` files; there is no software H.264
+> encoder, no H.264 decoder, and no MP4/MKV yet. AV1/AAC/Opus, MP4/MKV/WebM etc. are modelled in the ontology as `planned`.
+> IronAV is not yet a drop-in replacement for FFmpeg or HandBrake.
 
 ## Interfaces
 
@@ -43,8 +44,26 @@ Export: `ironav ontology jsonld` (also an MCP resource).
 `ironav-hwaccel` models CUDA/NVENC, VA-API, Quick Sync, VideoToolbox, D3D11VA, AMF, Vulkan Video, MediaCodec and
 OpenCL across Windows, Linux, macOS, Android and iOS: capability matrix, driver detection, and policy-based selection
 (`auto`, `off`, `require`, or a named backend) that explains every rejected candidate.
-A backend is *usable* only if its driver is detected **and** a native provider is linked. **This build links none,** so
-`auto` falls back to software and `require` fails with `hardware-unavailable`. Providers are the next major milestone.
+A backend is *usable* only if its driver is detected **and** a native provider implements the codec and direction.
+Today there is exactly one provider: **NVIDIA NVENC encode of H.264 and HEVC** (Windows and Linux). Every other
+backend is detected and reported but not driven, and `select` says so per candidate. Where no provider applies,
+`auto` falls back to software and `require` fails with `hardware-unavailable`.
+
+NVENC is loaded from the driver at run time (`nvEncodeAPI64.dll` / `libnvidia-encode.so.1`), so the same binary runs on
+machines without NVIDIA hardware. It needs a driver that supports NVENC API 13.1 or newer and refuses older ones with a
+clear error rather than guessing struct layouts. Input must be 8-bit `yuv420p` with even dimensions; there are no
+B-frames and no look-ahead, so output order equals input order and each frame yields a packet immediately.
+
+```
+ironav convert -i in.y4m -o out.h264 --vcodec h264 --qp 24        # quality-targeted (0-51, default 23)
+ironav convert -i in.y4m -o out.hevc --vcodec hevc --vbitrate 4000   # ~4 Mbit/s
+```
+
+Validated by decoding the output with FFmpeg's decoders (via PyAV) and comparing every frame to the source: 240/240
+frames, correct order, High/Main profile, PSNR rising monotonically as QP falls, chroma bit-exact at QP 0. The struct
+layouts were generated from NVIDIA's `nvEncodeAPI.h` (SDK 13.1) with clang, and the tests pin their sizes. Tests that
+need a GPU skip themselves when none is usable. Not done: NVDEC decode, hardware scaling, 10-bit, AV1 encode, rate-control
+tuning beyond QP/average bitrate, and the other vendors' providers.
 
 ## FLAC
 
@@ -66,8 +85,10 @@ resident. Measured (release build, one Windows machine, 10 min of 48 kHz stereo 
 ≈ 2,500× real time (≈ 450 MiB/s in); stream copy ≈ 5,100× real time. These are PCM numbers.
 FLAC, same machine (heavily loaded, so treat as rough): decode ≈ 270-400× real time; **encode ≈ 55-90× real time,
 which is several times slower than libFLAC at a comparable setting** (about 0.4 s vs 2 s for the same 3-minute file).
-Per-block multithreading was tried and reverted because it was not reliably faster. No comparison against FFmpeg
-has been run.
+Per-block multithreading was tried and reverted because it was not reliably faster.
+NVENC on an RTX 3090 Ti: 240 frames of 1280x720 (332 MB Y4M) convert to H.264 in about 0.8 s wall including process
+start, roughly 300 fps; reading the uncompressed Y4M is likely the limit, not the encoder, and this was not
+profiled further. No comparison against FFmpeg has been run.
 
 ## Security notes (browser GUI)
 

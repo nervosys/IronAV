@@ -8,3 +8,6 @@ repository.workspace = true
 [dependencies]
 serde.workspace = true
 ironav-core.workspace = true
+
+[target.'cfg(any(windows, target_os = "linux"))'.dependencies]
+libloading = "0.8"

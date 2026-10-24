@@ -1,6 +1,6 @@
 use crate::model::{entity, Kind, Ontology, Predicate, Status};
 use ironav_core::{CodecId, MediaType, PixelFormat, SampleFormat};
-use ironav_hwaccel::{linked_backends, Platform, BACKENDS};
+use ironav_hwaccel::{linked_backends, providers_for, Direction, Platform, BACKENDS};
 use serde_json::json;
 
 fn codec_meta(c: CodecId) -> (&'static str, &'static str) {
@@ -75,11 +75,15 @@ pub fn build() -> Ontology {
         let (label, desc) = codec_meta(c);
         let imp = implemented.iter().find(|i| i.codec == c);
         let media = if c.media_type() == MediaType::Audio { "audio" } else { "video" };
+        // A codec with no software implementation is still usable if a hardware provider encodes it.
+        let hw_encoders: Vec<&str> = providers_for(c, Direction::Encode).iter().map(|b| b.name()).collect();
+        let usable = imp.is_some() || !hw_encoders.is_empty();
         o.add_entity(
-            entity(Kind::Codec, c.name(), label, desc, if imp.is_some() { Status::Implemented } else { Status::Planned })
+            entity(Kind::Codec, c.name(), label, desc, if usable { Status::Implemented } else { Status::Planned })
                 .with_prop("media", media)
                 .with_prop("software_decode", imp.is_some_and(|i| i.decode))
                 .with_prop("software_encode", imp.is_some_and(|i| i.encode))
+                .with_prop("hardware_encode_providers", json!(hw_encoders))
                 .with_prop("cli_name", c.name()),
         );
         if let Some(sf) = c.sample_format() {

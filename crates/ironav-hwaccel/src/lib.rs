@@ -11,6 +11,9 @@
 //! Selection ([`select`]) reports every candidate with the reason it was or was not chosen,
 //! so an agent can explain or repair a failed hardware request.
 
+#[cfg(any(windows, target_os = "linux"))]
+pub mod nvenc;
+
 use ironav_core::{CodecId, Error, ErrorCode, Result};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -231,11 +234,80 @@ pub struct ProbeResult {
     pub linked: bool,
 }
 
-/// Backends with a native provider compiled in. Native bindings are added behind cargo
-/// features; this build links none, so every hardware request falls back to software
-/// (or fails, when hardware is required).
+/// What a compiled-in native provider can actually do. This is narrower than [`BACKENDS`]:
+/// the matrix says what the hardware family supports, this says what IronAV has implemented.
+pub struct Provider {
+    pub backend: Backend,
+    pub direction: Direction,
+    pub codecs: &'static [CodecId],
+}
+
+/// Providers compiled into this build. NVENC is loaded at run time from the NVIDIA driver, so
+/// it is present on Windows and Linux whether or not the machine has an NVIDIA GPU; the probe
+/// says whether it can be used here.
+#[cfg(any(windows, target_os = "linux"))]
+pub static PROVIDERS: &[Provider] = &[Provider { backend: Backend::Cuda, direction: Direction::Encode, codecs: nvenc::ENCODE_CODECS }];
+#[cfg(not(any(windows, target_os = "linux")))]
+pub static PROVIDERS: &[Provider] = &[];
+
+/// Backends with at least one native provider compiled in.
 pub fn linked_backends() -> &'static [Backend] {
-    &[]
+    if PROVIDERS.is_empty() {
+        &[]
+    } else {
+        &[Backend::Cuda]
+    }
+}
+
+/// Rate control for hardware video encoders.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RateControl {
+    /// Constant quantizer 0 (best) to 51 (worst); quality-targeted, size varies.
+    ConstQp(u8),
+    /// Average bitrate in bits per second.
+    Bitrate(u32),
+}
+
+/// Quantizer used when a job sets neither `qp` nor `bitrate_kbps`.
+pub const DEFAULT_QP: u8 = 23;
+
+/// Codecs some compiled-in provider can handle in `direction`.
+pub fn provider_codecs(direction: Direction) -> Vec<CodecId> {
+    let mut v: Vec<CodecId> = PROVIDERS.iter().filter(|p| p.direction == direction).flat_map(|p| p.codecs.iter().copied()).collect();
+    v.dedup();
+    v
+}
+
+/// Backends whose provider can encode `codec`.
+pub fn providers_for(codec: CodecId, direction: Direction) -> Vec<Backend> {
+    PROVIDERS.iter().filter(|p| p.direction == direction && p.codecs.contains(&codec)).map(|p| p.backend).collect()
+}
+
+/// Open a hardware video encoder on `backend`.
+pub fn new_video_encoder(
+    backend: Backend,
+    codec: CodecId,
+    params: &ironav_core::StreamParams,
+    rate: RateControl,
+) -> Result<Box<dyn ironav_core::Encoder>> {
+    #[cfg(any(windows, target_os = "linux"))]
+    if backend == Backend::Cuda {
+        let ironav_core::StreamParams::Video { width, height, frame_rate, .. } = params else {
+            return Err(Error::invalid_arg("hardware video encoder needs a video stream"));
+        };
+        return Ok(Box::new(nvenc::NvencEncoder::new(codec, *width, *height, *frame_rate, rate)?));
+    }
+    let _ = (params, rate);
+    Err(Error::new(
+        ErrorCode::HardwareUnavailable,
+        format!("no hardware encoder provider for {} on {}", codec.name(), backend.name()),
+    ))
+}
+
+/// True if this build can drive `codec` in `direction` on `backend`.
+pub fn provider_supports(backend: Backend, codec: CodecId, direction: Direction) -> bool {
+    PROVIDERS.iter().any(|p| p.backend == backend && p.direction == direction && p.codecs.contains(&codec))
 }
 
 fn lib_dirs() -> Vec<PathBuf> {
@@ -404,6 +476,8 @@ pub fn select(codec: CodecId, direction: Direction, policy: HwPolicy, probes: &[
             (false, "driver stack not detected on this machine".to_string())
         } else if !probe.is_some_and(|p| p.linked) {
             (false, "driver detected, but this IronAV build links no native provider for it".to_string())
+        } else if !provider_supports(backend, codec, direction) {
+            (false, format!("driver detected, but IronAV's {} provider does not implement {:?} of {} yet", info.name, direction, codec.name()).to_lowercase())
         } else {
             (true, "driver detected and provider linked".to_string())
         };

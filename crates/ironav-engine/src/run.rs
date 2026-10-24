@@ -1,7 +1,8 @@
 use crate::job::Job;
-use crate::plan::{plan, Action, Plan};
+use crate::plan::{plan, rate_control, Action, Plan};
 use ironav_codec::{build_filter, new_decoder, new_encoder};
-use ironav_core::{Decoder, Encoder, Error, ErrorCode, Filter, Frame, Packet, Result};
+use ironav_core::{Decoder, Encoder, Error, ErrorCode, Filter, Frame, MediaType, Packet, Result};
+use ironav_hwaccel::{new_video_encoder, Direction, RateControl};
 use ironav_formats::{create_muxer, open_demuxer};
 use serde::Serialize;
 use std::path::Path;
@@ -29,6 +30,8 @@ pub struct StepReport {
     pub packets_out: u64,
     pub frames: u64,
     pub bytes_out: u64,
+    /// Hardware backend that encoded this stream, or `None` for software / stream copy.
+    pub hardware_encoder: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -85,12 +88,22 @@ pub fn run(job: &Job, on_progress: &mut dyn FnMut(&Progress)) -> Result<Report> 
     let partial = format!("{}.partial", job.output);
     let mux = create_muxer(Path::new(&partial), plan.output.format)?;
 
-    match execute(&plan, demux, mux, t0, on_progress) {
+    let rate = rate_control(&job.video)?;
+    match execute(&plan, rate, demux, mux, t0, on_progress) {
         Ok((steps, bytes_in, bytes_out)) => {
             std::fs::rename(&partial, &job.output)?;
             let wall = t0.elapsed();
             let secs = wall.as_secs_f64().max(1e-9);
-            let media_seconds = plan.output.streams.first().and_then(|s| s.duration_secs());
+            // Y4M and raw streams carry no duration; derive it from the frames actually encoded.
+            let media_seconds = plan.output.streams.first().and_then(|s| s.duration_secs()).or_else(|| {
+                let (st, step) = (plan.output.streams.first()?, steps.first()?);
+                match st.params {
+                    ironav_core::StreamParams::Video { frame_rate, .. } if frame_rate.num > 0 => {
+                        Some(step.frames.max(step.packets_in) as f64 * frame_rate.den as f64 / frame_rate.num as f64)
+                    }
+                    _ => None,
+                }
+            });
             Ok(Report {
                 output: job.output.clone(),
                 format: plan.output.format,
@@ -115,6 +128,7 @@ type Outcome = (Vec<StepReport>, u64, u64);
 
 fn execute(
     plan: &Plan,
+    rate: RateControl,
     mut demux: Box<dyn ironav_core::Demuxer>,
     mut mux: Box<dyn ironav_core::Muxer>,
     t0: Instant,
@@ -129,12 +143,21 @@ fn execute(
     for st in &plan.steps {
         let src = &plan.input.streams[st.input_stream];
         let dst = &plan.output.streams[st.output_stream];
+        let mut hw_name = None;
         let (decoder, encoder, filters) = if st.action == Action::Transcode {
             let mut fs = Vec::new();
             for fc in &st.filters {
                 fs.push(build_filter(&fc.name, &fc.args)?);
             }
-            (Some(new_decoder(src.codec, &src.params, src.bits)?), Some(new_encoder(dst.codec, &dst.params, dst.bits)?), fs)
+            let hw = st.hardware.iter().find(|h| h.direction == Direction::Encode).and_then(|h| h.chosen);
+            let encoder = match hw {
+                Some(backend) if dst.params.media_type() == MediaType::Video => {
+                    hw_name = Some(backend.name());
+                    new_video_encoder(backend, dst.codec, &dst.params, rate)?
+                }
+                _ => new_encoder(dst.codec, &dst.params, dst.bits)?,
+            };
+            (Some(new_decoder(src.codec, &src.params, src.bits)?), Some(encoder), fs)
         } else {
             (None, None, Vec::new())
         };
@@ -145,7 +168,7 @@ fn execute(
             decoder,
             filters,
             encoder,
-            rep: StepReport { input_stream: st.input_stream, ..Default::default() },
+            rep: StepReport { input_stream: st.input_stream, hardware_encoder: hw_name, ..Default::default() },
         });
     }
 

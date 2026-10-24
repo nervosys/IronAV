@@ -290,3 +290,70 @@ fn corrupt_flac_fails_cleanly_without_output() {
     assert_eq!(e.code, ErrorCode::InvalidInput);
     assert!(!out.exists() && !d.join("out.wav.partial").exists());
 }
+
+fn write_y4m(path: &std::path::Path, w: usize, h: usize, frames: usize) {
+    let mut f = format!("YUV4MPEG2 W{w} H{h} F30:1 Ip A1:1 C420jpeg
+").into_bytes();
+    for t in 0..frames {
+        f.extend_from_slice(b"FRAME
+");
+        f.extend((0..w * h).map(|i| ((i % w) * 3 + (i / w) + t * 5) as u8));
+        f.extend(std::iter::repeat(128u8).take(w * h / 2));
+    }
+    std::fs::write(path, f).unwrap();
+}
+
+/// H.264 has no software encoder, so the result depends on the machine: with a usable NVENC
+/// GPU it must produce a real Annex B stream; without one it must fail with a precise,
+/// recoverable error and leave nothing behind.
+#[test]
+fn h264_uses_the_gpu_or_fails_precisely() {
+    let d = scratch("h264");
+    let (src, out) = (d.join("in.y4m"), d.join("out.h264"));
+    write_y4m(&src, 256, 144, 30);
+
+    let mut off = job(&src, &out);
+    off.video.codec = Some("h264".into());
+    off.hwaccel = "off".into();
+    let e = plan(&off).unwrap_err();
+    assert_eq!(e.code, ErrorCode::HardwareUnavailable);
+    assert!(e.hint.as_deref().unwrap_or("").contains("auto"), "hint should say how to recover: {:?}", e.hint);
+
+    let mut bad = job(&src, &out);
+    bad.video.codec = Some("h264".into());
+    bad.video.qp = Some(20);
+    bad.video.bitrate_kbps = Some(1000);
+    assert_eq!(plan(&bad).unwrap_err().code, ErrorCode::InvalidArgument);
+    let wav = d.join("in.wav");
+    write_wav(&wav, &[0i16; 200], 1, 8000);
+    let mut audio_opt = job(&wav, &d.join("o.wav"));
+    audio_opt.audio.qp = Some(20);
+    assert_eq!(plan(&audio_opt).unwrap_err().code, ErrorCode::InvalidArgument);
+
+    let mut j = job(&src, &out);
+    j.video.codec = Some("h264".into());
+    j.video.qp = Some(28);
+    match run(&j, &mut |_| {}) {
+        Ok(report) => {
+            assert_eq!(report.steps[0].hardware_encoder, Some("cuda"));
+            assert_eq!(report.steps[0].packets_out, 30);
+            let bytes = std::fs::read(&out).unwrap();
+            assert!(bytes.starts_with(&[0, 0, 0, 1]), "Annex B start code");
+            assert!(bytes.len() > 100 && bytes.len() < 256 * 144 * 3 * 30 / 4, "plausible compressed size, got {}", bytes.len());
+        }
+        Err(e) => {
+            assert_eq!(e.code, ErrorCode::HardwareUnavailable, "{e:?}");
+            assert!(!out.exists() && !d.join("out.h264.partial").exists(), "failure must leave no output");
+        }
+    }
+}
+
+#[test]
+fn schema_and_ontology_know_hardware_codecs() {
+    let schema = ironav_engine::tools::job_schema().to_string();
+    assert!(schema.contains("bitrate_kbps") && schema.contains("\"h264\""));
+    let o = ontology();
+    let h264 = o.get("codec/h264").expect("h264 entity");
+    assert_eq!(h264.status, ironav_ontology::Status::Implemented);
+    assert!(o.get("codec/av1").is_some_and(|e| e.status == ironav_ontology::Status::Planned));
+}

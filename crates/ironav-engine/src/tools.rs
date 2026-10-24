@@ -2,10 +2,10 @@
 //! MCP tools and ontology `Operation` entities.
 
 use crate::job::Job;
-use ironav_codec::{implemented, FILTERS};
+use ironav_codec::{implemented, is_implemented, FILTERS};
 use ironav_core::{CodecId, Error, ErrorCode, MediaType, Result};
 use ironav_formats::{open_demuxer, FORMATS};
-use ironav_hwaccel::{linked_backends, probe_all, select, Backend, Direction, HwPolicy, Platform, BACKENDS};
+use ironav_hwaccel::{linked_backends, probe_all, provider_codecs, select, Backend, Direction, HwPolicy, Platform, BACKENDS, PROVIDERS};
 use ironav_ontology::{entity, Kind, Ontology, Status};
 use serde_json::{json, Value};
 use std::path::Path;
@@ -41,9 +41,12 @@ fn object(props: Value, required: &[&str]) -> Value {
 
 /// JSON Schema for [`Job`], with enums filled in from the live registries.
 pub fn job_schema() -> Value {
+    // Software encoders plus anything a hardware provider can encode.
     let codec_names = |m: MediaType| -> Vec<&'static str> {
+        let hw = provider_codecs(Direction::Encode);
         std::iter::once("copy")
             .chain(implemented().into_iter().filter(|i| i.encode && i.codec.media_type() == m).map(|i| i.codec.name()))
+            .chain(hw.into_iter().filter(|c| c.media_type() == m && !is_implemented(*c, true)).map(|c| c.name()))
             .collect()
     };
     let policies: Vec<&str> = ["auto", "off", "require"].into_iter().chain(Backend::ALL.iter().map(|b| b.name())).collect();
@@ -56,7 +59,9 @@ pub fn job_schema() -> Value {
             "audio": object(json!({ "codec": { "type": "string", "enum": codec_names(MediaType::Audio),
                         "description": "Target audio codec; 'copy' (default) forwards packets untouched." } }), &[]),
             "video": object(json!({ "codec": { "type": "string", "enum": codec_names(MediaType::Video),
-                        "description": "Target video codec; 'copy' (default) forwards packets untouched." } }), &[]),
+                        "description": "Target video codec; 'copy' (default) forwards packets untouched. h264 and hevc are encoded on the GPU (NVENC) and need hwaccel auto or cuda." },
+                        "bitrate_kbps": { "type": "integer", "minimum": 1, "description": "Target average bitrate in kbit/s. Mutually exclusive with qp." },
+                        "qp": { "type": "integer", "minimum": 0, "maximum": 51, "description": "Constant quantizer: lower is better quality and larger. Default 23 when no bitrate is set." } }), &[]),
             "filters": { "type": "array", "description": "Applied in order to every stream of the matching media type.",
                          "items": object(json!({
                              "name": { "type": "string", "enum": FILTERS.iter().map(|f| f.name).collect::<Vec<_>>() },
@@ -108,12 +113,13 @@ fn h_capabilities(_: &Value) -> Result<Value> {
         "hardware": {
             "probes": probes,
             "linked_backends": linked_backends().iter().map(|b| b.name()).collect::<Vec<_>>(),
+            "providers": PROVIDERS.iter().map(|p| json!({ "backend": p.backend.name(), "direction": p.direction, "codecs": p.codecs.iter().map(|c| c.name()).collect::<Vec<_>>() })).collect::<Vec<_>>(),
             "note": "A backend is usable only if its driver is detected AND a native provider is linked into this build."
         },
         "tools": tools().iter().map(|t| json!({ "name": t.name, "description": t.description, "cli": t.cli, "read_only": t.read_only })).collect::<Vec<_>>(),
         "error_codes": ErrorCode::ALL,
         "ontology": ontology().summary(),
-        "not_implemented": "Compressed codecs (H.264, HEVC, AV1, AAC, Opus, ...) and containers (MP4, MKV, WebM, ...) appear in the ontology with status 'planned'."
+        "not_implemented": "AV1, AAC, Opus, MP3 and other codecs, and containers such as MP4, MKV and WebM, appear in the ontology with status 'planned'. H.264/HEVC can be encoded (not decoded) in hardware only, into raw .h264/.hevc Annex B files."
     }))
 }
 

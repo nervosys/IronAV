@@ -1645,6 +1645,7 @@ name = "ironav-hwaccel"
 version = "0.1.0"
 dependencies = [
  "ironav-core",
+ "libloading",
  "serde",
 ]
 

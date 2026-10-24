@@ -1,5 +1,6 @@
 //! Container demuxers and muxers, and the format registry.
 
+mod annexb;
 mod flac;
 mod wav;
 mod y4m;
@@ -48,6 +49,24 @@ pub static FORMATS: &[FormatSpec] = &[
         demux: true,
         mux: true,
         codecs: &[CodecId::Flac],
+    },
+    FormatSpec {
+        name: "h264",
+        extensions: &["h264", "264"],
+        description: "Raw H.264 Annex B elementary stream (write-only)",
+        media: MediaType::Video,
+        demux: false,
+        mux: true,
+        codecs: &[CodecId::H264],
+    },
+    FormatSpec {
+        name: "hevc",
+        extensions: &["hevc", "h265", "265"],
+        description: "Raw H.265/HEVC Annex B elementary stream (write-only)",
+        media: MediaType::Video,
+        demux: false,
+        mux: true,
+        codecs: &[CodecId::Hevc],
     },
 ];
 
@@ -99,6 +118,8 @@ pub fn create_muxer(path: &Path, format: &str) -> Result<Box<dyn Muxer>> {
         "wav" => Ok(Box::new(wav::WavMuxer::new(out))),
         "y4m" => Ok(Box::new(y4m::Y4mMuxer::new(out))),
         "flac" => Ok(Box::new(flac::FlacMuxer::new(out))),
+        "h264" => Ok(Box::new(annexb::AnnexBMuxer::new(out, CodecId::H264))),
+        "hevc" => Ok(Box::new(annexb::AnnexBMuxer::new(out, CodecId::Hevc))),
         _ => Err(Error::new(ErrorCode::UnsupportedFormat, format!("format '{format}' cannot be written"))),
     }
 }

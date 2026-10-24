@@ -511,7 +511,10 @@ impl App {
         }
         if linked_backends().is_empty() {
             ui.add_space(4.0);
-            ui.colored_label(WARN, "This build links no native hardware providers yet, so every job runs in software even where drivers are detected.");
+            ui.colored_label(WARN, "This build links no native hardware providers, so every job runs in software even where drivers are detected.");
+        } else {
+            ui.add_space(4.0);
+            ui.weak("Providers implemented: NVIDIA NVENC encode of H.264 and HEVC (written to raw .h264/.hevc). Other detected backends are not used yet.");
         }
         ui.add_space(6.0);
         if ui.button("Re-scan").clicked() {

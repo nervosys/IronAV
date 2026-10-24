@@ -2,7 +2,8 @@ use crate::job::{FilterCall, Job};
 use ironav_codec::{build_filter, new_decoder, new_encoder, FILTERS};
 use ironav_core::{CodecId, Error, ErrorCode, MediaType, Result, StreamInfo, StreamParams};
 use ironav_formats::{find_format, format_for_path, open_demuxer};
-use ironav_hwaccel::{probe_all, select, Direction, HwPolicy, Selection};
+use crate::job::StreamOpts;
+use ironav_hwaccel::{probe_all, provider_codecs, select, Direction, HwPolicy, RateControl, Selection, DEFAULT_QP};
 use serde::Serialize;
 use std::path::Path;
 
@@ -66,6 +67,22 @@ fn output_bits(to: CodecId, src: &StreamInfo) -> Option<u8> {
         });
     }
     None
+}
+
+/// Rate control requested by a video stream's options, validated.
+pub(crate) fn rate_control(opts: &StreamOpts) -> Result<RateControl> {
+    match (opts.bitrate_kbps, opts.qp) {
+        (Some(_), Some(_)) => Err(Error::invalid_arg("set either bitrate_kbps or qp, not both").hint("bitrate_kbps targets a size; qp targets a quality")),
+        (Some(0), None) => Err(Error::invalid_arg("bitrate_kbps must be greater than zero")),
+        (Some(k), None) => Ok(RateControl::Bitrate(k.saturating_mul(1000))),
+        (None, Some(q)) if q > 51 => Err(Error::invalid_arg(format!("qp must be 0-51, got {q}")).hint("lower is better quality; 18-28 is the usual range")),
+        (None, Some(q)) => Ok(RateControl::ConstQp(q)),
+        (None, None) => Ok(RateControl::ConstQp(DEFAULT_QP)),
+    }
+}
+
+fn is_software_encodable(c: CodecId) -> bool {
+    ironav_codec::is_implemented(c, true)
 }
 
 pub fn plan(job: &Job) -> Result<Plan> {
@@ -145,14 +162,44 @@ pub fn plan(job: &Job) -> Result<Plan> {
         }
 
         let action = if to == s.codec && chain.is_empty() { Action::Copy } else { Action::Transcode };
+        if media == MediaType::Audio && (opts.bitrate_kbps.is_some() || opts.qp.is_some()) {
+            return Err(Error::invalid_arg("bitrate_kbps and qp apply to video streams only"));
+        }
+        if media == MediaType::Video && action == Action::Transcode {
+            rate_control(opts)?;
+        } else if media == MediaType::Video && (opts.bitrate_kbps.is_some() || opts.qp.is_some()) {
+            return Err(Error::invalid_arg("bitrate_kbps and qp have no effect when the stream is copied")
+                .hint("set a video codec (for example h264) to re-encode"));
+        }
         let bits = if action == Action::Copy { s.bits } else { output_bits(to, s) };
         let mut hardware = Vec::new();
         if action == Action::Transcode {
+            // Every source codec IronAV can read has a software decoder, so hardware decode is
+            // never needed; asking for it would make `require` fail for no reason.
             new_decoder(s.codec, &s.params, s.bits)?;
-            new_encoder(to, &params, bits)?;
-            if media == MediaType::Video || matches!(policy, HwPolicy::RequireAny | HwPolicy::Require(_)) {
-                hardware.push(select(s.codec, Direction::Decode, policy, &probes)?);
+            let hw_encodable = provider_codecs(Direction::Encode).contains(&to);
+            if media == MediaType::Video || hw_encodable || matches!(policy, HwPolicy::RequireAny | HwPolicy::Require(_)) {
                 hardware.push(select(to, Direction::Encode, policy, &probes)?);
+            }
+            let hw_chosen = hardware.iter().any(|h| h.direction == Direction::Encode && h.chosen.is_some());
+            if hw_chosen {
+                #[cfg(any(windows, target_os = "linux"))]
+                ironav_hwaccel::nvenc::accepts(&params).map_err(|m| {
+                    Error::invalid_arg(m).hint("convert the input to 8-bit yuv420p with even dimensions, or set hwaccel to \"off\" if a software encoder exists")
+                })?;
+            } else if hw_encodable && !is_software_encodable(to) {
+                let why = hardware.last().map(|h| h.considered.iter().map(|c| format!("{}: {}", c.backend.name(), c.reason)).collect::<Vec<_>>().join("; ")).unwrap_or_default();
+                return Err(Error::new(
+                    ErrorCode::HardwareUnavailable,
+                    format!("{} has no software encoder in this build and no hardware backend is usable here ({why})", to.name()),
+                )
+                .hint(if matches!(policy, HwPolicy::Off) {
+                    "hwaccel is \"off\"; set it to \"auto\" so the GPU encoder can be used"
+                } else {
+                    "run `ironav hw probe`; NVENC needs an NVIDIA GPU with a driver that supports NVENC API 13.1"
+                }));
+            } else {
+                new_encoder(to, &params, bits)?;
             }
         }
 
