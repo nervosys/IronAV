@@ -1,0 +1,456 @@
+//! MP4 (ISO BMFF) writer for H.264 and HEVC video.
+//!
+//! Input packets are Annex B access units from the encoder. They are rewritten as
+//! length-prefixed samples, parameter sets are lifted out into the `avcC` / `hvcC` box, and the
+//! `moov` index is written after the media data (so the file is not "fast start"). Timing is
+//! constant frame rate with no frame reordering, which is exactly what the NVENC provider
+//! produces; a stream with B-frames would need `ctts` and is not supported here.
+//!
+//! Layout: `ftyp`, `mdat` (64-bit size, patched at the end), `moov`.
+
+use crate::WriteSeek;
+use ironav_core::{CodecId, Error, ErrorCode, Muxer, Packet, Result, StreamInfo, StreamParams};
+use std::io::{Seek, SeekFrom};
+
+/// Split an Annex B buffer into NAL units (start codes removed, trailing zero padding trimmed).
+pub(crate) fn split_nals(data: &[u8]) -> Vec<&[u8]> {
+    let mut starts = Vec::new(); // (start of payload, start of the start-code)
+    let mut i = 0;
+    while i + 3 <= data.len() {
+        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            starts.push((i + 3, i));
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    let mut out = Vec::with_capacity(starts.len());
+    for (k, &(s, _)) in starts.iter().enumerate() {
+        let mut e = starts.get(k + 1).map_or(data.len(), |n| n.1);
+        while e > s && data[e - 1] == 0 {
+            e -= 1;
+        }
+        if e > s {
+            out.push(&data[s..e]);
+        }
+    }
+    out
+}
+
+/// Remove emulation-prevention bytes (`00 00 03` -> `00 00`).
+fn unescape(nal: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(nal.len());
+    let mut zeros = 0;
+    for &b in nal {
+        if zeros >= 2 && b == 3 {
+            zeros = 0;
+            continue;
+        }
+        zeros = if b == 0 { zeros + 1 } else { 0 };
+        out.push(b);
+    }
+    out
+}
+
+fn bx(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(8 + body.len());
+    v.extend_from_slice(&(8 + body.len() as u32).to_be_bytes());
+    v.extend_from_slice(kind);
+    v.extend_from_slice(body);
+    v
+}
+
+fn full(kind: &[u8; 4], version: u8, flags: u32, body: &[u8]) -> Vec<u8> {
+    let mut b = vec![version];
+    b.extend_from_slice(&flags.to_be_bytes()[1..]);
+    b.extend_from_slice(body);
+    bx(kind, &b)
+}
+
+fn u32s(vals: &[u32]) -> Vec<u8> {
+    vals.iter().flat_map(|v| v.to_be_bytes()).collect()
+}
+
+const MATRIX: [u32; 9] = [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000];
+
+#[derive(Default)]
+struct ParamSets {
+    vps: Option<Vec<u8>>,
+    sps: Option<Vec<u8>>,
+    pps: Option<Vec<u8>>,
+}
+
+pub struct Mp4Muxer {
+    out: Box<dyn WriteSeek>,
+    codec: CodecId,
+    width: u32,
+    height: u32,
+    timescale: u32,
+    sample_delta: u32,
+    sizes: Vec<u32>,
+    sync: Vec<u32>,
+    params: ParamSets,
+    mdat_start: u64,
+    data_len: u64,
+}
+
+impl Mp4Muxer {
+    pub fn new(out: Box<dyn WriteSeek>) -> Self {
+        Self {
+            out,
+            codec: CodecId::H264,
+            width: 0,
+            height: 0,
+            timescale: 30,
+            sample_delta: 1,
+            sizes: Vec::new(),
+            sync: Vec::new(),
+            params: ParamSets::default(),
+            mdat_start: 0,
+            data_len: 0,
+        }
+    }
+
+    fn is_hevc(&self) -> bool {
+        self.codec == CodecId::Hevc
+    }
+
+    fn sample_entry(&self) -> Result<Vec<u8>> {
+        let missing = |what: &str| Error::new(ErrorCode::Internal, format!("stream has no {what}; the encoder must emit parameter sets with its first frame"));
+        let (kind, config) = if self.is_hevc() {
+            (b"hvc1", self.hvcc(&missing)?)
+        } else {
+            (b"avc1", self.avcc(&missing)?)
+        };
+        let mut e = vec![0u8; 6];
+        e.extend_from_slice(&1u16.to_be_bytes()); // data reference index
+        e.extend_from_slice(&[0u8; 16]);
+        e.extend_from_slice(&(self.width as u16).to_be_bytes());
+        e.extend_from_slice(&(self.height as u16).to_be_bytes());
+        e.extend_from_slice(&0x0048_0000u32.to_be_bytes()); // 72 dpi
+        e.extend_from_slice(&0x0048_0000u32.to_be_bytes());
+        e.extend_from_slice(&0u32.to_be_bytes());
+        e.extend_from_slice(&1u16.to_be_bytes()); // frames per sample
+        e.extend_from_slice(&[0u8; 32]); // compressor name
+        e.extend_from_slice(&0x0018u16.to_be_bytes()); // depth
+        e.extend_from_slice(&0xFFFFu16.to_be_bytes());
+        e.extend_from_slice(&config);
+        Ok(bx(kind, &e))
+    }
+
+    fn avcc(&self, missing: &dyn Fn(&str) -> Error) -> Result<Vec<u8>> {
+        let sps = self.params.sps.as_ref().ok_or_else(|| missing("SPS"))?;
+        let pps = self.params.pps.as_ref().ok_or_else(|| missing("PPS"))?;
+        if sps.len() < 4 {
+            return Err(Error::new(ErrorCode::Internal, "H.264 SPS is too short"));
+        }
+        let mut c = vec![1, sps[1], sps[2], sps[3], 0xFC | 3, 0xE0 | 1];
+        c.extend_from_slice(&(sps.len() as u16).to_be_bytes());
+        c.extend_from_slice(sps);
+        c.push(1);
+        c.extend_from_slice(&(pps.len() as u16).to_be_bytes());
+        c.extend_from_slice(pps);
+        // High-family profiles must also state chroma format and bit depth (4:2:0, 8-bit here).
+        if matches!(sps[1], 100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134) {
+            c.extend_from_slice(&[0xFC | 1, 0xF8, 0xF8, 0]);
+        }
+        Ok(bx(b"avcC", &c))
+    }
+
+    fn hvcc(&self, missing: &dyn Fn(&str) -> Error) -> Result<Vec<u8>> {
+        let sps = self.params.sps.as_ref().ok_or_else(|| missing("SPS"))?;
+        let pps = self.params.pps.as_ref().ok_or_else(|| missing("PPS"))?;
+        let vps = self.params.vps.as_ref().ok_or_else(|| missing("VPS"))?;
+        let p = unescape(sps);
+        // 2-byte NAL header, 1 byte (vps id, max sub layers, temporal-id nesting), then
+        // profile_tier_level: profile byte, 4 compat bytes, 6 constraint bytes, level.
+        if p.len() < 15 {
+            return Err(Error::new(ErrorCode::Internal, "HEVC SPS is too short"));
+        }
+        let nesting = p[2] & 1;
+        let mut c = vec![1];
+        c.extend_from_slice(&p[3..14]); // profile byte, 4 compatibility bytes, 6 constraint bytes
+        c.push(p[14]); // general_level_idc
+        c.extend_from_slice(&0xF000u16.to_be_bytes()); // min spatial segmentation
+        c.push(0xFC); // parallelism type
+        c.push(0xFC | 1); // chroma 4:2:0
+        c.push(0xF8); // luma bit depth 8
+        c.push(0xF8); // chroma bit depth 8
+        c.extend_from_slice(&0u16.to_be_bytes()); // average frame rate: unspecified
+        c.push((1 << 3) | (nesting << 2) | 3); // 1 temporal layer, 4-byte lengths
+        c.push(3);
+        for (ty, nal) in [(32u8, vps), (33, sps), (34, pps)] {
+            c.push(0x80 | ty);
+            c.extend_from_slice(&1u16.to_be_bytes());
+            c.extend_from_slice(&(nal.len() as u16).to_be_bytes());
+            c.extend_from_slice(nal);
+        }
+        Ok(bx(b"hvcC", &c))
+    }
+
+    fn moov(&self) -> Result<Vec<u8>> {
+        let n = self.sizes.len() as u32;
+        let media_dur = n as u64 * self.sample_delta as u64; // in `timescale` units
+        let ms = (media_dur * 1000 / self.timescale as u64) as u32;
+
+        let mut mvhd = u32s(&[0, 0, 1000, ms]);
+        mvhd.extend_from_slice(&0x0001_0000u32.to_be_bytes()); // rate 1.0
+        mvhd.extend_from_slice(&0x0100u16.to_be_bytes()); // volume
+        mvhd.extend_from_slice(&[0u8; 10]);
+        mvhd.extend_from_slice(&u32s(&MATRIX));
+        mvhd.extend_from_slice(&[0u8; 24]);
+        mvhd.extend_from_slice(&2u32.to_be_bytes()); // next track id
+        let mvhd = full(b"mvhd", 0, 0, &mvhd);
+
+        let mut tkhd = u32s(&[0, 0, 1, 0, ms]); // created, modified, track 1, reserved, duration
+        tkhd.extend_from_slice(&[0u8; 8]);
+        tkhd.extend_from_slice(&[0u8; 8]); // layer, alternate group, volume, reserved
+        tkhd.extend_from_slice(&u32s(&MATRIX));
+        tkhd.extend_from_slice(&(self.width << 16).to_be_bytes());
+        tkhd.extend_from_slice(&(self.height << 16).to_be_bytes());
+        let tkhd = full(b"tkhd", 0, 3, &tkhd);
+
+        let mut mdhd = u32s(&[0, 0, self.timescale, media_dur as u32]);
+        mdhd.extend_from_slice(&0x55C4u16.to_be_bytes()); // language "und"
+        mdhd.extend_from_slice(&0u16.to_be_bytes());
+        let mdhd = full(b"mdhd", 0, 0, &mdhd);
+
+        let mut hdlr = u32s(&[0]);
+        hdlr.extend_from_slice(b"vide");
+        hdlr.extend_from_slice(&[0u8; 12]);
+        hdlr.extend_from_slice(b"IronAV\0");
+        let hdlr = full(b"hdlr", 0, 0, &hdlr);
+
+        let vmhd = full(b"vmhd", 0, 1, &[0u8; 8]);
+        let url = full(b"url ", 0, 1, &[]);
+        let mut dref = u32s(&[1]);
+        dref.extend_from_slice(&url);
+        let dinf = bx(b"dinf", &full(b"dref", 0, 0, &dref));
+
+        let mut stsd = u32s(&[1]);
+        stsd.extend_from_slice(&self.sample_entry()?);
+        let stsd = full(b"stsd", 0, 0, &stsd);
+        let stts = full(b"stts", 0, 0, &u32s(&[1, n, self.sample_delta]));
+        let mut stss = u32s(&[self.sync.len() as u32]);
+        stss.extend_from_slice(&u32s(&self.sync));
+        let stss = full(b"stss", 0, 0, &stss);
+        let stsc = full(b"stsc", 0, 0, &u32s(&[1, 1, n, 1])); // every sample in one chunk
+        let mut stsz = u32s(&[0, n]);
+        stsz.extend_from_slice(&u32s(&self.sizes));
+        let stsz = full(b"stsz", 0, 0, &stsz);
+        let mut co64 = u32s(&[1]);
+        co64.extend_from_slice(&(self.mdat_start + 16).to_be_bytes());
+        let co64 = full(b"co64", 0, 0, &co64);
+
+        let stbl = bx(b"stbl", &[stsd, stts, stss, stsc, stsz, co64].concat());
+        let minf = bx(b"minf", &[vmhd, dinf, stbl].concat());
+        let mdia = bx(b"mdia", &[mdhd, hdlr, minf].concat());
+        let trak = bx(b"trak", &[tkhd, mdia].concat());
+        Ok(bx(b"moov", &[mvhd, trak].concat()))
+    }
+}
+
+impl Muxer for Mp4Muxer {
+    fn write_header(&mut self, streams: &[StreamInfo]) -> Result<()> {
+        let [s] = streams else {
+            return Err(Error::invalid_arg("this MP4 writer holds exactly one video stream"));
+        };
+        let StreamParams::Video { width, height, frame_rate, .. } = s.params else {
+            return Err(Error::invalid_arg("this MP4 writer only holds video"));
+        };
+        if !matches!(s.codec, CodecId::H264 | CodecId::Hevc) {
+            return Err(Error::new(ErrorCode::UnsupportedCodec, format!("this MP4 writer holds h264 or hevc, not {}", s.codec.name()))
+                .alternatives(["h264", "hevc"]));
+        }
+        if frame_rate.num <= 0 || frame_rate.den <= 0 || frame_rate.num > u32::MAX as i64 || frame_rate.den > u32::MAX as i64 {
+            return Err(Error::invalid_arg("MP4 needs a known, constant frame rate"));
+        }
+        if width > 65535 || height > 65535 {
+            return Err(Error::invalid_arg("MP4 sample entries limit dimensions to 65535"));
+        }
+        self.codec = s.codec;
+        (self.width, self.height) = (width, height);
+        (self.timescale, self.sample_delta) = (frame_rate.num as u32, frame_rate.den as u32);
+
+        let brands: &[&[u8; 4]] = if self.is_hevc() { &[b"isom", b"iso2", b"hvc1", b"mp41"] } else { &[b"isom", b"iso2", b"avc1", b"mp41"] };
+        let mut ftyp = b"isom".to_vec();
+        ftyp.extend_from_slice(&512u32.to_be_bytes());
+        for b in brands {
+            ftyp.extend_from_slice(*b);
+        }
+        let ftyp = bx(b"ftyp", &ftyp);
+        self.out.write_all(&ftyp)?;
+        self.mdat_start = ftyp.len() as u64;
+        // 64-bit mdat header: size field 1, then the real size, patched in finish().
+        self.out.write_all(&1u32.to_be_bytes())?;
+        self.out.write_all(b"mdat")?;
+        self.out.write_all(&0u64.to_be_bytes())?;
+        Ok(())
+    }
+
+    fn write_packet(&mut self, p: &Packet) -> Result<()> {
+        let hevc = self.is_hevc();
+        let mut sample = Vec::with_capacity(p.data.len() + 16);
+        let mut key = false;
+        for nal in split_nals(&p.data) {
+            let ty = if hevc { (nal[0] >> 1) & 0x3F } else { nal[0] & 0x1F };
+            match (hevc, ty) {
+                (false, 7) => self.params.sps = Some(nal.to_vec()),
+                (false, 8) => self.params.pps = Some(nal.to_vec()),
+                (true, 32) => self.params.vps = Some(nal.to_vec()),
+                (true, 33) => self.params.sps = Some(nal.to_vec()),
+                (true, 34) => self.params.pps = Some(nal.to_vec()),
+                (false, 9) | (true, 35) => {} // access unit delimiters carry nothing MP4 needs
+                _ => {
+                    key |= if hevc { (16..=21).contains(&ty) } else { ty == 5 };
+                    sample.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+                    sample.extend_from_slice(nal);
+                }
+            }
+        }
+        if sample.is_empty() {
+            return Ok(());
+        }
+        if sample.len() > u32::MAX as usize {
+            return Err(Error::invalid_input("a single video frame exceeds 4 GiB"));
+        }
+        self.sizes.push(sample.len() as u32);
+        if key {
+            self.sync.push(self.sizes.len() as u32); // sample numbers are 1-based
+        }
+        self.data_len += sample.len() as u64;
+        self.out.write_all(&sample)?;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        if self.sizes.is_empty() {
+            return Err(Error::invalid_input("no video frames were written, so there is nothing to put in the MP4"));
+        }
+        let moov = self.moov()?;
+        self.out.write_all(&moov)?;
+        self.out.seek(SeekFrom::Start(self.mdat_start + 8))?;
+        self.out.write_all(&(16 + self.data_len).to_be_bytes())?;
+        self.out.flush()?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ironav_core::{PixelFormat, Rational};
+    use std::io::Cursor;
+    use std::sync::{Arc, Mutex};
+
+    /// A seekable sink the test can read back after the muxer is dropped.
+    struct Shared(Arc<Mutex<Cursor<Vec<u8>>>>);
+    impl std::io::Write for Shared {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().write(b)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl Seek for Shared {
+        fn seek(&mut self, p: SeekFrom) -> std::io::Result<u64> {
+            self.0.lock().unwrap().seek(p)
+        }
+    }
+
+    #[test]
+    fn splits_nals_with_three_and_four_byte_start_codes() {
+        let d = [0, 0, 0, 1, 0x67, 1, 2, 0, 0, 1, 0x68, 3, 0, 0, 0, 1, 0x65, 9];
+        let n = split_nals(&d);
+        assert_eq!(n, vec![&[0x67u8, 1, 2][..], &[0x68, 3][..], &[0x65, 9][..]]);
+    }
+
+    #[test]
+    fn unescape_drops_only_emulation_prevention_bytes() {
+        assert_eq!(unescape(&[1, 0, 0, 3, 1, 0, 0, 3, 3]), vec![1, 0, 0, 1, 0, 0, 3]);
+    }
+
+    fn mux(codec: CodecId, frames: &[Vec<u8>]) -> Vec<u8> {
+        let sink = Arc::new(Mutex::new(Cursor::new(Vec::new())));
+        let mut m = Mp4Muxer::new(Box::new(Shared(sink.clone())));
+        let info = StreamInfo {
+            index: 0,
+            codec,
+            time_base: Rational::new(1, 30),
+            duration: None,
+            bits: None,
+            params: StreamParams::Video { width: 64, height: 48, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational::new(30000, 1001) },
+        };
+        m.write_header(&[info]).unwrap();
+        for (i, f) in frames.iter().enumerate() {
+            m.write_packet(&Packet { stream: 0, pts: i as i64, duration: 1, data: f.clone() }).unwrap();
+        }
+        m.finish().unwrap();
+        let v = sink.lock().unwrap().get_ref().clone();
+        v
+    }
+
+    /// Find a box by walking nested containers; returns its body.
+    fn find<'a>(mut data: &'a [u8], path: &[&[u8; 4]]) -> Option<&'a [u8]> {
+        let (head, rest) = path.split_first()?;
+        while data.len() >= 8 {
+            let size = u32::from_be_bytes(data[..4].try_into().unwrap()) as usize;
+            let (hdr, size) = if size == 1 { (16, u64::from_be_bytes(data[8..16].try_into().unwrap()) as usize) } else { (8, size) };
+            if size < hdr || size > data.len() {
+                return None;
+            }
+            if &data[4..8] == *head {
+                let body = &data[hdr..size];
+                return if rest.is_empty() { Some(body) } else { find(body, rest) };
+            }
+            data = &data[size..];
+        }
+        None
+    }
+
+    #[test]
+    fn h264_file_has_consistent_index() {
+        let sps = vec![0, 0, 0, 1, 0x67, 100, 0, 40, 0xAC];
+        let pps = vec![0, 0, 0, 1, 0x68, 0xEE, 0x3C];
+        let idr = [&[0u8, 0, 0, 1, 0x65][..], &[7; 20]].concat();
+        let p = [&[0u8, 0, 0, 1, 0x41][..], &[5; 6]].concat();
+        let file = mux(CodecId::H264, &[[sps, pps, idr].concat(), p.clone(), p]);
+
+        assert_eq!(&file[4..8], b"ftyp");
+        let mdat_at = u32::from_be_bytes(file[0..4].try_into().unwrap()) as usize;
+        assert_eq!(&file[mdat_at + 4..mdat_at + 8], b"mdat");
+        let mdat_size = u64::from_be_bytes(file[mdat_at + 8..mdat_at + 16].try_into().unwrap()) as usize;
+        let moov = find(&file[mdat_at + mdat_size..], &[b"moov"]).expect("moov follows mdat");
+        let stbl = find(moov, &[b"trak", b"mdia", b"minf", b"stbl"]).unwrap();
+        let sizes = find(stbl, &[b"stsz"]).unwrap();
+        assert_eq!(u32::from_be_bytes(sizes[8..12].try_into().unwrap()), 3, "three samples");
+        // Samples are length-prefixed and exclude the parameter sets: 4+21, 4+7, 4+7.
+        assert_eq!(&sizes[12..24], &[0, 0, 0, 25, 0, 0, 0, 11, 0, 0, 0, 11]);
+        let stss = find(stbl, &[b"stss"]).unwrap();
+        assert_eq!(&stss[4..12], &[0, 0, 0, 1, 0, 0, 0, 1], "only sample 1 is a sync sample");
+        let avcc = find(stbl, &[b"stsd"]).unwrap();
+        let pos = avcc.windows(4).position(|w| w == b"avcC").unwrap();
+        assert_eq!(&avcc[pos + 4..pos + 8], &[1, 100, 0, 40], "profile/compat/level come from the SPS");
+        // The chunk offset must point at the first sample's length prefix.
+        let co = find(stbl, &[b"co64"]).unwrap();
+        let off = u64::from_be_bytes(co[8..16].try_into().unwrap()) as usize;
+        assert_eq!(&file[off..off + 5], &[0, 0, 0, 21, 0x65]);
+    }
+
+    #[test]
+    fn finishing_with_no_frames_is_an_error() {
+        let sink = Arc::new(Mutex::new(Cursor::new(Vec::new())));
+        let mut m = Mp4Muxer::new(Box::new(Shared(sink)));
+        let info = StreamInfo {
+            index: 0,
+            codec: CodecId::H264,
+            time_base: Rational::new(1, 30),
+            duration: None,
+            bits: None,
+            params: StreamParams::Video { width: 64, height: 48, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational::new(30, 1) },
+        };
+        m.write_header(&[info]).unwrap();
+        assert!(m.finish().is_err());
+    }
+}

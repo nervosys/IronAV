@@ -2,6 +2,7 @@
 
 mod annexb;
 mod flac;
+mod mp4;
 mod wav;
 mod y4m;
 
@@ -49,6 +50,15 @@ pub static FORMATS: &[FormatSpec] = &[
         demux: true,
         mux: true,
         codecs: &[CodecId::Flac],
+    },
+    FormatSpec {
+        name: "mp4",
+        extensions: &["mp4", "m4v"],
+        description: "MP4 (ISO BMFF) with H.264 or HEVC video (write-only; index at the end, not fast-start)",
+        media: MediaType::Video,
+        demux: false,
+        mux: true,
+        codecs: &[CodecId::H264, CodecId::Hevc],
     },
     FormatSpec {
         name: "h264",
@@ -118,6 +128,7 @@ pub fn create_muxer(path: &Path, format: &str) -> Result<Box<dyn Muxer>> {
         "wav" => Ok(Box::new(wav::WavMuxer::new(out))),
         "y4m" => Ok(Box::new(y4m::Y4mMuxer::new(out))),
         "flac" => Ok(Box::new(flac::FlacMuxer::new(out))),
+        "mp4" => Ok(Box::new(mp4::Mp4Muxer::new(out))),
         "h264" => Ok(Box::new(annexb::AnnexBMuxer::new(out, CodecId::H264))),
         "hevc" => Ok(Box::new(annexb::AnnexBMuxer::new(out, CodecId::Hevc))),
         _ => Err(Error::new(ErrorCode::UnsupportedFormat, format!("format '{format}' cannot be written"))),

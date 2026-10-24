@@ -6,8 +6,9 @@ A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so 
 > **Status: foundation (v0.1).** The architecture, agent interface, ontology, hardware model, CLI, MCP server
 > and both GUIs are working and tested. The codec/container set is deliberately small so far:
 > **WAV, FLAC and Y4M containers; PCM (8/16/24/32-bit, float), FLAC and raw-video codecs; `volume`, `gray`, `hflip` filters.**
-> **H.264 and HEVC can be encoded on NVIDIA GPUs (NVENC)** into raw `.h264`/`.hevc` files; there is no software H.264
-> encoder, no H.264 decoder, and no MP4/MKV yet. AV1/AAC/Opus, MP4/MKV/WebM etc. are modelled in the ontology as `planned`.
+> **H.264 and HEVC can be encoded on NVIDIA GPUs (NVENC)** into `.mp4` or raw `.h264`/`.hevc` files; there is no software
+> H.264 encoder, no H.264 decoder, and no MP4 reading or audio-in-MP4 yet. AV1/AAC/Opus, MKV/WebM etc. are modelled in the
+> ontology as `planned`.
 > IronAV is not yet a drop-in replacement for FFmpeg or HandBrake.
 
 ## Interfaces
@@ -56,8 +57,12 @@ B-frames and no look-ahead, so output order equals input order and each frame yi
 
 ```
 ironav convert -i in.y4m -o out.h264 --vcodec h264 --qp 24        # quality-targeted (0-51, default 23)
-ironav convert -i in.y4m -o out.hevc --vcodec hevc --vbitrate 4000   # ~4 Mbit/s
+ironav convert -i in.y4m -o out.mp4  --vcodec hevc --vbitrate 4000   # ~4 Mbit/s, in an MP4
 ```
+
+The MP4 writer is video-only and constant-frame-rate, with the index at the end of the file (not fast-start, so it is
+not ideal for progressive web playback). Verified by opening the files with FFmpeg's MP4 demuxer: correct codec,
+dimensions, 30 fps, exact 8.000 s duration, all frames decoded, and seeking lands on the right keyframe.
 
 Validated by decoding the output with FFmpeg's decoders (via PyAV) and comparing every frame to the source: 240/240
 frames, correct order, High/Main profile, PSNR rising monotonically as QP falls, chroma bit-exact at QP 0. The struct
@@ -86,9 +91,10 @@ resident. Measured (release build, one Windows machine, 10 min of 48 kHz stereo 
 FLAC, same machine (heavily loaded, so treat as rough): decode ≈ 270-400× real time; **encode ≈ 55-90× real time,
 which is several times slower than libFLAC at a comparable setting** (about 0.4 s vs 2 s for the same 3-minute file).
 Per-block multithreading was tried and reverted because it was not reliably faster.
-NVENC on an RTX 3090 Ti: 240 frames of 1280x720 (332 MB Y4M) convert to H.264 in about 0.8 s wall including process
-start, roughly 300 fps; reading the uncompressed Y4M is likely the limit, not the encoder, and this was not
-profiled further. No comparison against FFmpeg has been run.
+NVENC on an RTX 3090 Ti: 240 frames of 1280x720 (a 332 MB Y4M) convert to H.264 in 1.3-3.8 s wall (median about 2 s,
+roughly 120 fps) over nine runs on a busy machine, including process start. Copying the same Y4M with no encoding takes
+0.75-1.3 s, so uncompressed disk I/O is a large share of that time; the encoder itself was not profiled in isolation.
+(An earlier quieter run took 0.8 s, so expect wide variance.) No comparison against FFmpeg has been run.
 
 ## Security notes (browser GUI)
 

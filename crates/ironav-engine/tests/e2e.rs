@@ -330,6 +330,22 @@ fn h264_uses_the_gpu_or_fails_precisely() {
     audio_opt.audio.qp = Some(20);
     assert_eq!(plan(&audio_opt).unwrap_err().code, ErrorCode::InvalidArgument);
 
+    // MP4 only holds codecs it can carry; the same GPU requirement applies.
+    let mp4 = d.join("out.mp4");
+    let mut m = job(&src, &mp4);
+    m.video.codec = Some("h264".into());
+    m.video.qp = Some(28);
+    if run(&m, &mut |_| {}).is_ok() {
+        let b = std::fs::read(&mp4).unwrap();
+        assert_eq!(&b[4..8], b"ftyp");
+        assert!(b.windows(4).any(|w| w == b"moov") && b.windows(4).any(|w| w == b"avcC"));
+    } else {
+        assert!(!mp4.exists());
+    }
+    let mut keep = job(&src, &d.join("copy.mp4"));
+    keep.video.codec = Some("copy".into());
+    assert_eq!(plan(&keep).unwrap_err().code, ErrorCode::UnsupportedCodec, "rawvideo cannot go in an mp4");
+
     let mut j = job(&src, &out);
     j.video.codec = Some("h264".into());
     j.video.qp = Some(28);

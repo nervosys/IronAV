@@ -32,8 +32,6 @@ fn codec_meta(c: CodecId) -> (&'static str, &'static str) {
 
 /// Containers IronAV does not implement yet, with the codecs they hold.
 const PLANNED_CONTAINERS: &[(&str, &str, &str, &[CodecId])] = &[
-    ("mp4", "MP4 (ISO BMFF)", "MPEG-4 Part 14; the standard delivery container.",
-        &[CodecId::H264, CodecId::Hevc, CodecId::Av1, CodecId::Vp9, CodecId::Aac, CodecId::Mp3, CodecId::Opus, CodecId::Flac, CodecId::Alac]),
     ("mov", "QuickTime MOV", "Apple QuickTime container; common for ProRes editing masters.",
         &[CodecId::H264, CodecId::Hevc, CodecId::ProRes, CodecId::Mjpeg, CodecId::Aac, CodecId::Alac, CodecId::PcmS16Le, CodecId::PcmS32Le]),
     ("mkv", "Matroska", "Flexible open container that can hold nearly any codec.",
