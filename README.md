@@ -63,8 +63,8 @@ ironav convert -i in.y4m -o out.h264 --vcodec h264 --qp 24        # quality-targ
 ironav convert -i in.y4m -o out.mp4  --vcodec hevc --vbitrate 4000   # ~4 Mbit/s, in an MP4
 ```
 
-The MP4 writer is constant-frame-rate, with the index at the end of the file (not fast-start, so it is not ideal for
-progressive web playback). Verified by opening the files with FFmpeg's MP4 demuxer: correct codec, dimensions, 30 fps,
+The MP4 writer is constant-frame-rate, and puts the index in front of the media data (fast-start) by copying the finished file once,
+so writing costs one extra pass over the output. Verified by opening the files with FFmpeg's MP4 demuxer: correct codec, dimensions, 30 fps,
 exact 8.000 s duration, all frames decoded, and seeking lands on the right keyframe.
 
 ### Reading MP4 and decoding on the GPU (NVDEC)

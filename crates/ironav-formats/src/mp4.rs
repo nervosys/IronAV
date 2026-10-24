@@ -2,12 +2,13 @@
 //!
 //! Input packets are Annex B access units from the encoder. They are rewritten as
 //! length-prefixed samples, parameter sets are lifted out into the `avcC` / `hvcC` box, and the
-//! `moov` index is written after the media data (so the file is not "fast start"). Timing is
+//! `moov` index is first written after the media data; when the muxer is given its file path it then
+//! copies the file once with the index moved in front ("fast start"). Timing is
 //! constant frame rate with no frame reordering, which is exactly what the NVENC provider
 //! produces; a stream with B-frames would need `ctts` and is not supported here. FLAC frames are
 //! stored as they come, one per sample, with the STREAMINFO block in a `dfLa` box.
 //!
-//! Layout: `ftyp`, `mdat` (64-bit size, patched at the end), `moov`. Each track's samples are
+//! Layout while writing: `ftyp`, `mdat` (64-bit size, patched at the end), `moov`. Each track's samples are
 //! gathered into chunks of about half a second, so a player reading both tracks finds the
 //! video and audio for the same moment close together in the file.
 
@@ -222,7 +223,8 @@ impl Track {
         self.duration * 1000 / self.timescale as u64
     }
 
-    fn trak(&self, id: u32) -> Result<Vec<u8>> {
+    /// `shift` is added to every chunk offset (used when the movie box is moved in front of the data).
+    fn trak(&self, id: u32, shift: u64) -> Result<Vec<u8>> {
         let ms = self.movie_ms() as u32;
         let mut tkhd = u32s(&[0, 0, id, 0, ms]); // created, modified, track id, reserved, duration
         tkhd.extend_from_slice(&[0u8; 8]); // reserved
@@ -281,7 +283,7 @@ impl Track {
         let stsz = full(b"stsz", 0, 0, &stsz);
         let mut co64 = u32s(&[self.chunks.len() as u32]);
         for &(offset, _) in &self.chunks {
-            co64.extend_from_slice(&offset.to_be_bytes());
+            co64.extend_from_slice(&(offset + shift).to_be_bytes());
         }
         let co64 = full(b"co64", 0, 0, &co64);
 
@@ -329,11 +331,64 @@ pub struct Mp4Muxer {
     tracks: Vec<Track>,
     mdat_start: u64,
     data_len: u64,
+    /// When set, `finish` rewrites this file with the movie box in front of the media data.
+    faststart: Option<std::path::PathBuf>,
 }
 
 impl Mp4Muxer {
     pub fn new(out: Box<dyn WriteSeek>) -> Self {
-        Self { out, tracks: Vec::new(), mdat_start: 0, data_len: 0 }
+        Self { out, tracks: Vec::new(), mdat_start: 0, data_len: 0, faststart: None }
+    }
+
+    /// Like `new`, but once the file is complete it is rewritten so that the index comes first and
+    /// playback can begin before the download ends. `path` must be the file `out` writes to.
+    pub fn with_faststart(out: Box<dyn WriteSeek>, path: &std::path::Path) -> Self {
+        Self { faststart: Some(path.to_path_buf()), ..Self::new(out) }
+    }
+
+    fn moov(&self, shift: u64) -> Result<Vec<u8>> {
+        let ms = self.tracks.iter().map(Track::movie_ms).max().unwrap_or(0) as u32;
+        let mut mvhd = u32s(&[0, 0, 1000, ms]);
+        mvhd.extend_from_slice(&0x0001_0000u32.to_be_bytes()); // rate 1.0
+        mvhd.extend_from_slice(&0x0100u16.to_be_bytes()); // volume
+        mvhd.extend_from_slice(&[0u8; 10]);
+        mvhd.extend_from_slice(&u32s(&MATRIX));
+        mvhd.extend_from_slice(&[0u8; 24]);
+        mvhd.extend_from_slice(&(self.tracks.len() as u32 + 1).to_be_bytes()); // next track id
+        let mut moov = full(b"mvhd", 0, 0, &mvhd);
+        for (i, t) in self.tracks.iter().enumerate() {
+            moov.extend_from_slice(&t.trak(i as u32 + 1, shift)?);
+        }
+        Ok(bx(b"moov", &moov))
+    }
+
+    /// Copy the finished file to a new one in the order ftyp, moov, mdat, then replace it.
+    fn move_index_first(&mut self, path: &std::path::Path) -> Result<()> {
+        use std::io::{Read, Write};
+        // The index has the same size wherever it sits, because offsets are fixed-width.
+        let size = self.moov(0)?.len() as u64;
+        let moov = self.moov(size)?;
+        // Close our handle first: Windows cannot replace a file that is still open.
+        self.out = Box::new(std::io::Cursor::new(Vec::new()));
+        let mut src = std::fs::File::open(path)?;
+        let tmp = path.with_extension("faststart.tmp");
+        let result = (|| -> Result<()> {
+            let mut dst = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&tmp)?);
+            let mut head = vec![0u8; self.mdat_start as usize];
+            src.read_exact(&mut head)?;
+            dst.write_all(&head)?;
+            dst.write_all(&moov)?;
+            std::io::copy(&mut Read::by_ref(&mut src).take(16 + self.data_len), &mut dst)?;
+            dst.flush()?;
+            Ok(())
+        })();
+        drop(src);
+        if let Err(e) = result {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        std::fs::rename(&tmp, path)?;
+        Ok(())
     }
 
     /// Write a track's gathered samples to the file as one chunk.
@@ -471,24 +526,15 @@ impl Muxer for Mp4Muxer {
         for t in 0..self.tracks.len() {
             self.flush_chunk(t)?;
         }
-        let ms = self.tracks.iter().map(Track::movie_ms).max().unwrap_or(0) as u32;
-        let mut mvhd = u32s(&[0, 0, 1000, ms]);
-        mvhd.extend_from_slice(&0x0001_0000u32.to_be_bytes()); // rate 1.0
-        mvhd.extend_from_slice(&0x0100u16.to_be_bytes()); // volume
-        mvhd.extend_from_slice(&[0u8; 10]);
-        mvhd.extend_from_slice(&u32s(&MATRIX));
-        mvhd.extend_from_slice(&[0u8; 24]);
-        mvhd.extend_from_slice(&(self.tracks.len() as u32 + 1).to_be_bytes()); // next track id
-        let mut moov = full(b"mvhd", 0, 0, &mvhd);
-        for (i, t) in self.tracks.iter().enumerate() {
-            moov.extend_from_slice(&t.trak(i as u32 + 1)?);
-        }
-        let moov = bx(b"moov", &moov);
+        let moov = self.moov(0)?;
         self.out.write_all(&moov)?;
         self.out.seek(SeekFrom::Start(self.mdat_start + 8))?;
         self.out.write_all(&(16 + self.data_len).to_be_bytes())?;
         self.out.flush()?;
-        Ok(())
+        match self.faststart.take() {
+            Some(path) => self.move_index_first(&path),
+            None => Ok(()),
+        }
     }
 }
 
@@ -592,6 +638,45 @@ mod tests {
         let co = find(stbl, &[b"co64"]).unwrap();
         let off = u64::from_be_bytes(co[8..16].try_into().unwrap()) as usize;
         assert_eq!(&file[off..off + 5], &[0, 0, 0, 21, 0x65]);
+    }
+
+    #[test]
+    fn faststart_puts_the_index_first_and_keeps_every_offset_right() {
+        let path = std::env::temp_dir().join(format!("ironav-faststart-{}.mp4", std::process::id()));
+        let sps = vec![0, 0, 0, 1, 0x67, 100, 0, 40, 0xAC];
+        let pps = vec![0, 0, 0, 1, 0x68, 0xEE, 0x3C];
+        let idr = [&[0u8, 0, 0, 1, 0x65][..], &[7; 20]].concat();
+        let p = [&[0u8, 0, 0, 1, 0x41][..], &[5; 6]].concat();
+        let file = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+        let mut m = Mp4Muxer::with_faststart(Box::new(file), &path);
+        let info = StreamInfo {
+            index: 0,
+            codec: CodecId::H264,
+            time_base: Rational::new(1, 30),
+            duration: None,
+            bits: None,
+            params: StreamParams::Video { width: 64, height: 48, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational::new(30, 1) },
+        };
+        m.write_header(&[info]).unwrap();
+        for (i, f) in [[sps, pps, idr].concat(), p.clone(), p].iter().enumerate() {
+            m.write_packet(&Packet { stream: 0, pts: i as i64, duration: 1, data: f.clone() }).unwrap();
+        }
+        m.finish().unwrap();
+        let file = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(!path.with_extension("faststart.tmp").exists());
+
+        assert_eq!(&file[4..8], b"ftyp");
+        let moov_at = u32::from_be_bytes(file[0..4].try_into().unwrap()) as usize;
+        assert_eq!(&file[moov_at + 4..moov_at + 8], b"moov", "the index comes right after ftyp");
+        let moov_len = u32::from_be_bytes(file[moov_at..moov_at + 4].try_into().unwrap()) as usize;
+        assert_eq!(&file[moov_at + moov_len + 4..moov_at + moov_len + 8], b"mdat", "the data follows it");
+        let stbl = find(&file[moov_at..], &[b"moov", b"trak", b"mdia", b"minf", b"stbl"]).unwrap();
+        let co = find(stbl, &[b"co64"]).unwrap();
+        let off = u64::from_be_bytes(co[8..16].try_into().unwrap()) as usize;
+        assert_eq!(&file[off..off + 5], &[0, 0, 0, 21, 0x65], "the chunk offset points at the first sample");
+        let total = moov_at + moov_len + 16 + (25 + 11 + 11);
+        assert_eq!(file.len(), total, "nothing was lost or duplicated");
     }
 
     #[test]

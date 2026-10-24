@@ -62,7 +62,7 @@ pub static FORMATS: &[FormatSpec] = &[
     FormatSpec {
         name: "mp4",
         extensions: &["mp4", "m4v"],
-        description: "MP4 (ISO BMFF) with H.264 or HEVC video and optionally FLAC audio. Read as well as written; written with the index at the end (not fast-start); fragmented files are not read",
+        description: "MP4 (ISO BMFF) with H.264 or HEVC video and optionally FLAC audio. Read as well as written; written with the index first (fast-start); fragmented files are not read",
         media: MediaType::Video,
         demux: true,
         mux: true,
@@ -138,7 +138,7 @@ pub fn create_muxer(path: &Path, format: &str) -> Result<Box<dyn Muxer>> {
         "wav" => Ok(Box::new(wav::WavMuxer::new(out))),
         "y4m" => Ok(Box::new(y4m::Y4mMuxer::new(out))),
         "flac" => Ok(Box::new(flac::FlacMuxer::new(out))),
-        "mp4" => Ok(Box::new(mp4::Mp4Muxer::new(out))),
+        "mp4" => Ok(Box::new(mp4::Mp4Muxer::with_faststart(out, path))),
         "h264" => Ok(Box::new(annexb::AnnexBMuxer::new(out, CodecId::H264))),
         "hevc" => Ok(Box::new(annexb::AnnexBMuxer::new(out, CodecId::Hevc))),
         _ => Err(Error::new(ErrorCode::UnsupportedFormat, format!("format '{format}' cannot be written"))),
