@@ -61,7 +61,7 @@ fn help() -> Value {
             "ontology summary | search [text] [--kind K] [--limit N] | describe ID | convert FROM TO | jsonld": "knowledge graph",
             "tools": "tool definitions with JSON Schemas (function-calling compatible)",
             "mcp": "serve all tools over the Model Context Protocol on stdio",
-            "gui [--port N] [--no-open]": "open the graphical interface in your browser"
+            "gui [FILE] | gui --web [--port N] [--no-open]": "native desktop window (default), or the browser-based UI"
         },
         "tools": tools().iter().map(|t| t.name).collect::<Vec<_>>(),
     })
@@ -157,6 +157,17 @@ fn run_job(v: Value, progress: bool) -> Result<Value> {
     Ok(serde_json::to_value(report)?)
 }
 
+#[cfg(feature = "native-gui")]
+fn native_gui(file: Option<String>) -> Result<()> {
+    ironav_gui::run(file)
+}
+
+#[cfg(not(feature = "native-gui"))]
+fn native_gui(_file: Option<String>) -> Result<()> {
+    Err(Error::new(ironav_core::ErrorCode::UnsupportedFormat, "this build was compiled without the native GUI")
+        .hint("rebuild with default features, or use `ironav gui --web`"))
+}
+
 fn main() {
     let mut rest: Vec<String> = std::env::args().skip(1).collect();
     let mut take = |name: &str| match rest.iter().position(|a| a == name) {
@@ -180,8 +191,11 @@ fn main() {
         Some("gui") => {
             let mut a = Args { rest: rest.split_off(1) };
             let result = (|| -> Result<()> {
-                let port = a.flag(&["--port"])?.map(|p| p.parse::<u16>()).transpose().map_err(|_| Error::invalid_arg("--port must be 0-65535"))?;
-                ironav_gui::serve(ironav_gui::Options { port: port.unwrap_or(0), open_browser: !a.switch(&["--no-open"]) })
+                if a.switch(&["--web"]) {
+                    let port = a.flag(&["--port"])?.map(|p| p.parse::<u16>()).transpose().map_err(|_| Error::invalid_arg("--port must be 0-65535"))?;
+                    return ironav_webui::serve(ironav_webui::Options { port: port.unwrap_or(0), open_browser: !a.switch(&["--no-open"]) });
+                }
+                native_gui(a.rest.first().cloned())
             })();
             if let Err(e) = result {
                 println!("{}", serde_json::to_string(&json!({ "ok": false, "error": e })).unwrap_or_default());

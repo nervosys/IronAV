@@ -1,0 +1,11 @@
+[package]
+name = "ironav-webui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+ironav-core.workspace = true
+ironav-engine.workspace = true

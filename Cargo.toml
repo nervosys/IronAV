@@ -7,6 +7,7 @@ members = [
     "crates/ironav-formats",
     "crates/ironav-ontology",
     "crates/ironav-engine",
+    "crates/ironav-webui",
     "crates/ironav-gui",
     "crates/ironav-cli",
 ]
@@ -14,7 +15,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "LGPL-2.1-or-later"
+license = "AGPL-3.0-or-later"
 rust-version = "1.80"
 repository = "https://github.com/nervosys/IronAV"
 
@@ -27,6 +28,7 @@ ironav-codec = { path = "crates/ironav-codec" }
 ironav-formats = { path = "crates/ironav-formats" }
 ironav-ontology = { path = "crates/ironav-ontology" }
 ironav-engine = { path = "crates/ironav-engine" }
+ironav-webui = { path = "crates/ironav-webui" }
 ironav-gui = { path = "crates/ironav-gui" }
 
 [profile.release]

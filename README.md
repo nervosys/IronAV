@@ -4,7 +4,7 @@ Audio and video conversion in Rust, built to be driven by AI agents as well as p
 A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so they cannot drift apart.
 
 > **Status: foundation (v0.1).** The architecture, agent interface, ontology, hardware model, CLI, MCP server
-> and GUI are working and tested. The codec/container set is deliberately small so far:
+> and both GUIs are working and tested. The codec/container set is deliberately small so far:
 > **WAV and Y4M containers; PCM and raw-video codecs; `volume`, `gray`, `hflip` filters.**
 > H.264/HEVC/AV1/AAC/Opus, MP4/MKV/WebM etc. are modelled in the ontology as `planned`, not implemented.
 > IronAV is not yet a drop-in replacement for FFmpeg or HandBrake. No native hardware provider is linked yet (see below).
@@ -14,7 +14,8 @@ A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so 
 | Surface | Command | Use |
 |---|---|---|
 | CLI | `ironav convert -i in.wav -o out.wav --acodec pcm_f32le --filter volume:gain=0.5` | humans and scripts |
-| GUI | `ironav gui` | HandBrake-style: source, tabs, queue (local web app on loopback) |
+| GUI (native) | `ironav gui [file]` | HandBrake-style desktop window (egui): source, tabs, queue, drag-and-drop |
+| GUI (browser) | `ironav gui --web` | same layout as a loopback-only web app, for machines without a display stack |
 | MCP | `ironav mcp` | agents; resident process, no per-call startup |
 | Tool schemas | `ironav tools` | JSON Schema for function-calling APIs |
 
@@ -52,14 +53,23 @@ resident. Measured (release build, one Windows machine, 10 min of 48 kHz stereo 
 ≈ 2,500× real time (≈ 450 MiB/s in); stream copy ≈ 5,100× real time. These are PCM numbers only; no claim is made
 about compressed codecs, and no comparison against FFmpeg has been run.
 
-## Security notes (GUI)
+## Security notes (browser GUI)
 
-Loopback only; every request needs a per-launch random token and a loopback `Host` header. The file browser can list
+The native GUI runs in-process and opens no sockets. The `--web` variant is loopback only; every request needs a per-launch random token and a loopback `Host` header. The file browser can list
 any directory the process can read, so treat the launch URL like a credential.
 
 ## Layout
 
 `ironav-core` types/traits · `ironav-hwaccel` · `ironav-codec` · `ironav-formats` · `ironav-ontology` ·
-`ironav-engine` (jobs, planner, pipeline, tool registry) · `ironav-gui` · `ironav-cli`
+`ironav-engine` (jobs, planner, pipeline, tool registry) · `ironav-gui` (native, egui) · `ironav-webui` (browser) ·
+`ironav-cli`
 
 Build: `cargo build --release` · Test: `cargo test`
+Lean build for servers/agents without the graphics stack: `cargo build --release --no-default-features -p ironav-cli`
+
+## License
+
+Dual-licensed: **[AGPL-3.0-or-later](LICENSE)** for open use, or a **commercial license** from Nervosys if you
+cannot comply with the AGPL (e.g. closed-source embedding or proprietary hosted services). See
+[COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md). Contributions are accepted under the terms in
+[CONTRIBUTING.md](CONTRIBUTING.md), which let Nervosys offer the commercial license.
