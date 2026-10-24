@@ -63,7 +63,7 @@ fn help() -> Value {
             "tools": "tool definitions with JSON Schemas (function-calling compatible)",
             "mcp": "serve all tools over the Model Context Protocol on stdio",
             "play FILE [--audio auto|silent|off] [--start S] [--volume V] [--loop] [--paused] [--hwaccel P] [--tui|--json] [--until-end]": "play audio/video: a full-screen terminal player on a TTY, otherwise JSON lines on stdin/stdout ({\"cmd\":\"seek\",\"to\":30}); send {\"cmd\":\"help\"} for the commands",
-            "gui [FILE] | gui --web [--port N] [--no-open]": "native desktop window (default), or the browser-based UI"
+            "gui [FILE] | gui --play [FILE] | gui --web [--port N] [--no-open]": "native desktop window (default), the player window (--play), or the browser-based UI"
         },
         "tools": tools().iter().map(|t| t.name).collect::<Vec<_>>(),
     })
@@ -167,12 +167,12 @@ fn run_job(v: Value, progress: bool) -> Result<Value> {
 }
 
 #[cfg(feature = "native-gui")]
-fn native_gui(file: Option<String>) -> Result<()> {
-    ironav_gui::run(file)
+fn native_gui(file: Option<String>, player: bool) -> Result<()> {
+    if player { ironav_gui::run_player(file) } else { ironav_gui::run(file) }
 }
 
 #[cfg(not(feature = "native-gui"))]
-fn native_gui(_file: Option<String>) -> Result<()> {
+fn native_gui(_file: Option<String>, _player: bool) -> Result<()> {
     Err(Error::new(ironav_core::ErrorCode::UnsupportedFormat, "this build was compiled without the native GUI")
         .hint("rebuild with default features, or use `ironav gui --web`"))
 }
@@ -212,7 +212,8 @@ fn main() {
                     let port = a.flag(&["--port"])?.map(|p| p.parse::<u16>()).transpose().map_err(|_| Error::invalid_arg("--port must be 0-65535"))?;
                     return ironav_webui::serve(ironav_webui::Options { port: port.unwrap_or(0), open_browser: !a.switch(&["--no-open"]) });
                 }
-                native_gui(a.rest.first().cloned())
+                let player = a.switch(&["--play", "--player"]);
+                native_gui(a.rest.first().cloned(), player)
             })();
             if let Err(e) = result {
                 println!("{}", serde_json::to_string(&json!({ "ok": false, "error": e })).unwrap_or_default());

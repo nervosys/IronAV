@@ -13,5 +13,6 @@ ironav-codec.workspace = true
 ironav-formats.workspace = true
 ironav-ontology.workspace = true
 ironav-engine.workspace = true
+ironav-player.workspace = true
 eframe = "0.37.0"
 rfd = "0.17.2"

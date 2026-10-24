@@ -1893,6 +1893,7 @@ dependencies = [
  "ironav-formats",
  "ironav-hwaccel",
  "ironav-ontology",
+ "ironav-player",
  "rfd",
  "serde_json",
 ]
