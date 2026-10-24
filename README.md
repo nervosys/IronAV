@@ -6,9 +6,10 @@ A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so 
 > **Status: foundation (v0.1).** The architecture, agent interface, ontology, hardware model, CLI, MCP server
 > and both GUIs are working and tested. The codec/container set is deliberately small so far:
 > **WAV, FLAC and Y4M containers; PCM (8/16/24/32-bit, float), FLAC and raw-video codecs; `volume`, `gray`, `hflip` filters.**
-> **H.264 and HEVC can be encoded on NVIDIA GPUs (NVENC)** into `.mp4` or raw `.h264`/`.hevc` files; there is no software
-> H.264 encoder, no H.264 decoder, and no MP4 reading yet. MP4 can carry FLAC audio next to the video, but not AAC or Opus (none exist here
-> yet). AV1/AAC/Opus, MKV/WebM etc. are modelled in the ontology as `planned`.
+> **H.264 and HEVC can be encoded and decoded on NVIDIA GPUs (NVENC/NVDEC)**, and MP4 files can be read and written.
+> There is no software H.264/HEVC codec, so those need an NVIDIA GPU. MP4 can carry FLAC audio next to the video, but not
+> AAC or Opus (no encoder or decoder exists here yet); an MP4's AAC track is listed by `probe` and must be left out with
+> `--acodec none`. AV1/AAC/Opus, MKV/WebM etc. are modelled in the ontology as `planned`.
 > IronAV is not yet a drop-in replacement for FFmpeg or HandBrake.
 
 ## Interfaces
@@ -64,6 +65,28 @@ The MP4 writer is constant-frame-rate, with the index at the end of the file (no
 progressive web playback). Verified by opening the files with FFmpeg's MP4 demuxer: correct codec, dimensions, 30 fps,
 exact 8.000 s duration, all frames decoded, and seeking lands on the right keyframe.
 
+### Reading MP4 and decoding on the GPU (NVDEC)
+
+`ironav probe`, `convert` and the other tools read MP4 (regular files with the index anywhere; **fragmented MP4 is not
+supported**). H.264/HEVC video is decoded by NVDEC through the driver's `nvcuvid` library, loaded at run time like NVENC;
+the output is cropped to the display size and returned as planar `yuv420p` in display order, so B-frame streams work.
+Only 8-bit 4:2:0 is accepted (10-bit and 4:2:2/4:4:4 are refused with a clear error).
+
+```
+ironav convert -i in.mp4 -o out.y4m --vcodec rawvideo                    # decode to raw frames
+ironav convert -i in.mp4 -o out.mp4 --vcodec hevc --qp 24 --acodec none  # GPU decode -> GPU encode
+ironav convert -i in.mp4 -o out.mp4                                      # stream copy (remux), no GPU needed
+```
+
+`--acodec none` / `--vcodec none` leave a stream out. Copying H.264/HEVC into an MP4 is refused for streams with
+B-frames, because the MP4 writer does not write composition offsets yet; re-encode them instead.
+
+Checked against FFmpeg's software decoders (via PyAV), frame by frame: NVDEC output is **identical** for 240/240 frames of
+720p H.264 and of HEVC (made by IronAV), and for 50/50 frames of 1080p H.264 with B-frames made by x264 (a different
+encoder, which also exercises cropping and reordering). A 1080p x264 → HEVC GPU transcode gave 49 dB PSNR at QP 20.
+Timing on the RTX 3090 Ti is noisy: decoding the 8 s 720p clip to a raw Y4M took 0.9-1.7 s over several runs, much of it
+spent writing 332 MB. No comparison with FFmpeg has been made.
+
 ### Video and audio together
 
 A job can read from more than one file, as with repeated `-i` in ffmpeg: `extra_inputs` in a job, or a second `-i` on
@@ -84,7 +107,7 @@ apart in file order.
 Validated by decoding the output with FFmpeg's decoders (via PyAV) and comparing every frame to the source: 240/240
 frames, correct order, High/Main profile, PSNR rising monotonically as QP falls, chroma bit-exact at QP 0. The struct
 layouts were generated from NVIDIA's `nvEncodeAPI.h` (SDK 13.1) with clang, and the tests pin their sizes. Tests that
-need a GPU skip themselves when none is usable. Not done: NVDEC decode, hardware scaling, 10-bit, AV1 encode, rate-control
+need a GPU skip themselves when none is usable. Not done: hardware scaling, 10-bit decode or encode, AV1, rate-control
 tuning beyond QP/average bitrate, and the other vendors' providers.
 
 ## FLAC

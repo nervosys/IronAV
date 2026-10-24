@@ -137,6 +137,10 @@ pub fn plan(job: &Job) -> Result<Plan> {
             continue;
         }
         taken.push(media);
+        if (if media == MediaType::Audio { &job.audio } else { &job.video }).codec.as_deref() == Some("none") {
+            warnings.push(format!("{at} ({media:?}) dropped: its codec is \"none\""));
+            continue;
+        }
 
         let mut chain: Vec<FilterCall> = Vec::new();
         let mut params = s.params.clone();
@@ -188,9 +192,30 @@ pub fn plan(job: &Job) -> Result<Plan> {
         let bits = if action == Action::Copy { s.bits } else { output_bits(to, s) };
         let mut hardware = Vec::new();
         if action == Action::Transcode {
-            // Every source codec IronAV can read has a software decoder, so hardware decode is
-            // never needed; asking for it would make `require` fail for no reason.
-            new_decoder(s.codec, &s.params, s.bits)?;
+            // Hardware decode is used only for codecs with no software decoder (H.264, HEVC);
+            // asking for it otherwise would make `require` fail for no reason.
+            if ironav_codec::is_implemented(s.codec, false) || !provider_codecs(Direction::Decode).contains(&s.codec) {
+                new_decoder(s.codec, &s.params, s.bits)?;
+            } else {
+                let sel = select(s.codec, Direction::Decode, policy, &probes)?;
+                if sel.chosen.is_none() {
+                    let why = sel.considered.iter().map(|c| format!("{}: {}", c.backend.name(), c.reason)).collect::<Vec<_>>().join("; ");
+                    return Err(Error::new(
+                        ErrorCode::HardwareUnavailable,
+                        format!("{} has no software decoder in this build and no hardware backend is usable here ({why})", s.codec.name()),
+                    )
+                    .hint(if matches!(policy, HwPolicy::Off) {
+                        "hwaccel is \"off\"; set it to \"auto\" so the GPU decoder can be used"
+                    } else {
+                        "run `ironav hw probe`; NVDEC needs an NVIDIA GPU with a driver that supports it"
+                    }));
+                }
+                #[cfg(any(windows, target_os = "linux"))]
+                ironav_hwaccel::nvdec::accepts(&s.params).map_err(|m| {
+                    Error::new(ErrorCode::UnsupportedCodec, m).hint("only 8-bit yuv420p H.264/HEVC can be decoded so far")
+                })?;
+                hardware.push(sel);
+            }
             let hw_encodable = provider_codecs(Direction::Encode).contains(&to);
             if media == MediaType::Video || hw_encodable || matches!(policy, HwPolicy::RequireAny | HwPolicy::Require(_)) {
                 hardware.push(select(to, Direction::Encode, policy, &probes)?);

@@ -12,6 +12,8 @@
 //! so an agent can explain or repair a failed hardware request.
 
 #[cfg(any(windows, target_os = "linux"))]
+pub mod nvdec;
+#[cfg(any(windows, target_os = "linux"))]
 pub mod nvenc;
 
 use ironav_core::{CodecId, Error, ErrorCode, Result};
@@ -242,11 +244,14 @@ pub struct Provider {
     pub codecs: &'static [CodecId],
 }
 
-/// Providers compiled into this build. NVENC is loaded at run time from the NVIDIA driver, so
-/// it is present on Windows and Linux whether or not the machine has an NVIDIA GPU; the probe
-/// says whether it can be used here.
+/// Providers compiled into this build. NVENC and NVDEC are loaded at run time from the NVIDIA
+/// driver, so they are present on Windows and Linux whether or not the machine has an NVIDIA
+/// GPU; the probe says whether they can be used here.
 #[cfg(any(windows, target_os = "linux"))]
-pub static PROVIDERS: &[Provider] = &[Provider { backend: Backend::Cuda, direction: Direction::Encode, codecs: nvenc::ENCODE_CODECS }];
+pub static PROVIDERS: &[Provider] = &[
+    Provider { backend: Backend::Cuda, direction: Direction::Encode, codecs: nvenc::ENCODE_CODECS },
+    Provider { backend: Backend::Cuda, direction: Direction::Decode, codecs: nvdec::DECODE_CODECS },
+];
 #[cfg(not(any(windows, target_os = "linux")))]
 pub static PROVIDERS: &[Provider] = &[];
 
@@ -302,6 +307,22 @@ pub fn new_video_encoder(
     Err(Error::new(
         ErrorCode::HardwareUnavailable,
         format!("no hardware encoder provider for {} on {}", codec.name(), backend.name()),
+    ))
+}
+
+/// Open a hardware video decoder on `backend`.
+pub fn new_video_decoder(backend: Backend, codec: CodecId, params: &ironav_core::StreamParams) -> Result<Box<dyn ironav_core::Decoder>> {
+    #[cfg(any(windows, target_os = "linux"))]
+    if backend == Backend::Cuda {
+        let ironav_core::StreamParams::Video { width, height, .. } = params else {
+            return Err(Error::invalid_arg("hardware video decoder needs a video stream"));
+        };
+        return Ok(Box::new(nvdec::NvdecDecoder::new(codec, *width, *height)?));
+    }
+    let _ = params;
+    Err(Error::new(
+        ErrorCode::HardwareUnavailable,
+        format!("no hardware decoder provider for {} on {}", codec.name(), backend.name()),
     ))
 }
 

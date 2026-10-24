@@ -2,7 +2,7 @@ use crate::job::Job;
 use crate::plan::{plan, rate_control, Action, Plan};
 use ironav_codec::{build_filter, new_decoder, new_encoder};
 use ironav_core::{Decoder, Encoder, Error, ErrorCode, Filter, Frame, MediaType, Packet, Rational, Result};
-use ironav_hwaccel::{new_video_encoder, Direction, RateControl};
+use ironav_hwaccel::{new_video_decoder, new_video_encoder, Direction, RateControl};
 use ironav_formats::{create_muxer, open_demuxer};
 use serde::Serialize;
 use std::path::Path;
@@ -32,6 +32,8 @@ pub struct StepReport {
     pub bytes_out: u64,
     /// Hardware backend that encoded this stream, or `None` for software / stream copy.
     pub hardware_encoder: Option<&'static str>,
+    /// Hardware backend that decoded this stream, or `None` for software / stream copy.
+    pub hardware_decoder: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -135,7 +137,7 @@ type Outcome = (Vec<StepReport>, u64, u64);
 fn execute(
     plan: &Plan,
     rate: RateControl,
-    demuxes: Vec<Box<dyn ironav_core::Demuxer>>,
+    mut demuxes: Vec<Box<dyn ironav_core::Demuxer>>,
     mut mux: Box<dyn ironav_core::Muxer>,
     t0: Instant,
     on_progress: &mut dyn FnMut(&Progress),
@@ -148,7 +150,7 @@ fn execute(
     for st in &plan.steps {
         let src = &plan.input_at(st.input_file).streams[st.input_stream];
         let dst = &plan.output.streams[st.output_stream];
-        let mut hw_name = None;
+        let (mut hw_name, mut hw_dec_name) = (None, None);
         let (decoder, encoder, filters) = if st.action == Action::Transcode {
             let mut fs = Vec::new();
             for fc in &st.filters {
@@ -162,7 +164,15 @@ fn execute(
                 }
                 _ => new_encoder(dst.codec, &dst.params, dst.bits)?,
             };
-            (Some(new_decoder(src.codec, &src.params, src.bits)?), Some(encoder), fs)
+            let hw_dec = st.hardware.iter().find(|h| h.direction == Direction::Decode).and_then(|h| h.chosen);
+            let decoder = match hw_dec {
+                Some(backend) => {
+                    hw_dec_name = Some(backend.name());
+                    new_video_decoder(backend, src.codec, &src.params)?
+                }
+                None => new_decoder(src.codec, &src.params, src.bits)?,
+            };
+            (Some(decoder), Some(encoder), fs)
         } else {
             (None, None, Vec::new())
         };
@@ -173,8 +183,17 @@ fn execute(
             decoder,
             filters,
             encoder,
-            rep: StepReport { input_stream: st.input_stream, hardware_encoder: hw_name, ..Default::default() },
+            rep: StepReport { input_stream: st.input_stream, hardware_encoder: hw_name, hardware_decoder: hw_dec_name, ..Default::default() },
         });
+    }
+
+    // Streams the plan does not use need not be read from disk.
+    for (file, d) in demuxes.iter_mut().enumerate() {
+        for (stream, used) in by_input[file].iter().enumerate() {
+            if used.is_none() {
+                d.discard(stream);
+            }
+        }
     }
 
     thread::scope(|s| {

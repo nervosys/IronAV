@@ -3,6 +3,7 @@
 mod annexb;
 pub(crate) mod flac;
 mod mp4;
+mod mp4demux;
 mod wav;
 mod y4m;
 
@@ -61,9 +62,9 @@ pub static FORMATS: &[FormatSpec] = &[
     FormatSpec {
         name: "mp4",
         extensions: &["mp4", "m4v"],
-        description: "MP4 (ISO BMFF) with H.264 or HEVC video and optionally FLAC audio (write-only; index at the end, not fast-start)",
+        description: "MP4 (ISO BMFF) with H.264 or HEVC video and optionally FLAC audio. Read as well as written; written with the index at the end (not fast-start); fragmented files are not read",
         media: MediaType::Video,
-        demux: false,
+        demux: true,
         mux: true,
         codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Flac],
     },
@@ -115,6 +116,8 @@ pub fn open_demuxer(path: &Path) -> Result<Box<dyn Demuxer>> {
         Ok(Box::new(wav::WavDemuxer::open(f)?))
     } else if flac::looks_like_flac(magic) {
         Ok(Box::new(flac::FlacDemuxer::open(f)?))
+    } else if mp4demux::looks_like_mp4(magic) {
+        Ok(Box::new(mp4demux::Mp4Demuxer::open(f)?))
     } else if magic.starts_with(b"YUV4MPEG2") {
         Ok(Box::new(y4m::Y4mDemuxer::open(f)?))
     } else {

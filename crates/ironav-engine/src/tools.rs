@@ -44,7 +44,8 @@ pub fn job_schema() -> Value {
     // Software encoders plus anything a hardware provider can encode.
     let codec_names = |m: MediaType| -> Vec<&'static str> {
         let hw = provider_codecs(Direction::Encode);
-        std::iter::once("copy")
+        ["copy", "none"]
+            .into_iter()
             .chain(implemented().into_iter().filter(|i| i.encode && i.codec.media_type() == m).map(|i| i.codec.name()))
             .chain(hw.into_iter().filter(|c| c.media_type() == m && !is_implemented(*c, true)).map(|c| c.name()))
             .collect()
@@ -59,9 +60,9 @@ pub fn job_schema() -> Value {
             "format": { "type": "string", "enum": FORMATS.iter().filter(|f| f.mux).map(|f| f.name).collect::<Vec<_>>(),
                         "description": "Output container. Inferred from the output extension when omitted." },
             "audio": object(json!({ "codec": { "type": "string", "enum": codec_names(MediaType::Audio),
-                        "description": "Target audio codec; 'copy' (default) forwards packets untouched." } }), &[]),
+                        "description": "Target audio codec; 'copy' (default) forwards packets untouched; 'none' leaves the audio out." } }), &[]),
             "video": object(json!({ "codec": { "type": "string", "enum": codec_names(MediaType::Video),
-                        "description": "Target video codec; 'copy' (default) forwards packets untouched. h264 and hevc are encoded on the GPU (NVENC) and need hwaccel auto or cuda." },
+                        "description": "Target video codec; 'copy' (default) forwards packets untouched; 'none' leaves the video out. h264 and hevc are encoded on the GPU (NVENC) and need hwaccel auto or cuda." },
                         "bitrate_kbps": { "type": "integer", "minimum": 1, "description": "Target average bitrate in kbit/s. Mutually exclusive with qp." },
                         "qp": { "type": "integer", "minimum": 0, "maximum": 51, "description": "Constant quantizer: lower is better quality and larger. Default 23 when no bitrate is set." } }), &[]),
             "filters": { "type": "array", "description": "Applied in order to every stream of the matching media type.",
@@ -121,7 +122,7 @@ fn h_capabilities(_: &Value) -> Result<Value> {
         "tools": tools().iter().map(|t| json!({ "name": t.name, "description": t.description, "cli": t.cli, "read_only": t.read_only })).collect::<Vec<_>>(),
         "error_codes": ErrorCode::ALL,
         "ontology": ontology().summary(),
-        "not_implemented": "AV1, AAC, Opus, MP3 and other codecs, and containers such as MKV and WebM, appear in the ontology with status 'planned'. H.264/HEVC can be encoded (not decoded) in hardware only, into .mp4 or raw .h264/.hevc Annex B files. MP4 is write-only: it takes FLAC for audio, and a video plus an audio file are combined with extra_inputs."
+        "not_implemented": "AV1, AAC, Opus, MP3 and other codecs, and containers such as MKV and WebM, appear in the ontology with status 'planned'. H.264/HEVC are encoded and decoded in hardware only (NVIDIA NVENC/NVDEC; no software codec exists), and only as 8-bit 4:2:0. MP4 can be read and written (not fragmented, not fast-start) and holds FLAC audio; AAC audio in an MP4 is listed by probe but cannot be decoded or copied into an MP4 yet. A video plus an audio file are combined with extra_inputs."
     }))
 }
 

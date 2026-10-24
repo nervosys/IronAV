@@ -8,6 +8,9 @@ pub trait Demuxer: Send {
     fn streams(&self) -> &[StreamInfo];
     /// `Ok(None)` signals end of input.
     fn read_packet(&mut self) -> Result<Option<Packet>>;
+    /// Tell the demuxer this stream's packets will not be used, so it need not read them.
+    /// Optional: a demuxer that ignores this still works, the engine drops the packets itself.
+    fn discard(&mut self, _stream: usize) {}
 }
 
 pub trait Muxer: Send {

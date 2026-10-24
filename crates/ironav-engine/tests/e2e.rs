@@ -460,3 +460,76 @@ fn a_second_stream_of_the_same_kind_is_dropped_with_a_warning() {
     same.overwrite = true;
     assert_eq!(plan(&same).unwrap_err().code, ErrorCode::InvalidArgument);
 }
+
+fn y4m_frames(path: &std::path::Path) -> Vec<Vec<u8>> {
+    let d = std::fs::read(path).unwrap();
+    let hdr = d.iter().position(|&b| b == b'\n').unwrap() + 1;
+    let head = String::from_utf8_lossy(&d[..hdr]).to_string();
+    let get = |p: char| head.split_whitespace().find(|t| t.starts_with(p)).unwrap()[1..].parse::<usize>().unwrap();
+    let size = get('W') * get('H') * 3 / 2;
+    let mut at = hdr;
+    let mut frames = Vec::new();
+    while at < d.len() {
+        let nl = at + d[at..].iter().position(|&b| b == b'\n').unwrap() + 1;
+        frames.push(d[nl..nl + size].to_vec());
+        at = nl + size;
+    }
+    frames
+}
+
+#[test]
+fn mp4_decodes_on_the_gpu_or_fails_precisely() {
+    let d = scratch("mp4dec");
+    let (src, mp4, back) = (d.join("in.y4m"), d.join("mid.mp4"), d.join("back.y4m"));
+    write_y4m(&src, 256, 144, 30);
+    let mut enc = job(&src, &mp4);
+    enc.video.codec = Some("h264".into());
+    enc.video.qp = Some(10);
+    if run(&enc, &mut |_| {}).is_err() {
+        // No usable GPU: decoding must refuse just as precisely, and write nothing.
+        return;
+    }
+
+    // With hardware off there is no H.264 decoder at all, and the error says how to recover.
+    let mut off = job(&mp4, &back);
+    off.video.codec = Some("rawvideo".into());
+    off.hwaccel = "off".into();
+    let e = plan(&off).unwrap_err();
+    assert_eq!(e.code, ErrorCode::HardwareUnavailable);
+    assert!(e.hint.as_deref().unwrap_or("").contains("auto"), "{:?}", e.hint);
+
+    let mut j = job(&mp4, &back);
+    j.video.codec = Some("rawvideo".into());
+    let report = run(&j, &mut |_| {}).unwrap();
+    assert_eq!(report.steps[0].hardware_decoder, Some("cuda"));
+    assert_eq!(report.steps[0].frames, 30);
+
+    let (a, b) = (y4m_frames(&src), y4m_frames(&back));
+    assert_eq!(b.len(), 30, "every frame comes back, in order");
+    // QP 10 is close to lossless: the decoded frames must resemble the source closely.
+    for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+        let mse = x.iter().zip(y).map(|(p, q)| (*p as f64 - *q as f64).powi(2)).sum::<f64>() / x.len() as f64;
+        let psnr = 10.0 * (255.0f64 * 255.0 / mse.max(1e-9)).log10();
+        assert!(psnr > 38.0, "frame {i} only {psnr:.1} dB");
+    }
+
+    // Copying the stream needs no decoder, so it works with hardware off.
+    let again = d.join("again.mp4");
+    let mut copy = job(&mp4, &again);
+    copy.hwaccel = "off".into();
+    let r = run(&copy, &mut |_| {}).unwrap();
+    assert_eq!(r.steps[0].packets_in, r.steps[0].packets_out);
+    assert_eq!(r.steps[0].hardware_decoder, None);
+}
+
+#[test]
+fn a_stream_can_be_left_out_with_codec_none() {
+    let d = scratch("none");
+    let (wav, out) = (d.join("in.wav"), d.join("out.mp4"));
+    write_wav(&wav, &tone(8_000), 1, 8_000);
+    let mut j = job(&wav, &out);
+    j.audio.codec = Some("none".into());
+    // Nothing is left to write, and the plan says why instead of producing an empty file.
+    let e = plan(&j).unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidInput, "{e:?}");
+}

@@ -106,6 +106,8 @@ struct Track {
     pending_samples: u32,
     pending_dur: u64,
     duration: u64,
+    /// Presentation time of the previous video sample, to catch reordered (B-frame) streams.
+    last_pts: Option<i64>,
     params: ParamSets,
     flac: FlacStats,
 }
@@ -391,6 +393,7 @@ impl Muxer for Mp4Muxer {
                 pending_samples: 0,
                 pending_dur: 0,
                 duration: 0,
+                last_pts: None,
                 params: ParamSets::default(),
                 flac: FlacStats::new(),
             });
@@ -425,6 +428,11 @@ impl Muxer for Mp4Muxer {
         let tr = self.tracks.get_mut(t).ok_or_else(|| Error::new(ErrorCode::Internal, format!("packet for unknown output stream {t}")))?;
         let (sample, key, delta) = if tr.is_video() {
             let Some((sample, key)) = tr.video_sample(&p.data) else { return Ok(()) };
+            if tr.last_pts.is_some_and(|last| p.pts < last) {
+                return Err(Error::new(ErrorCode::UnsupportedFormat, "the video has B-frames (presentation order differs from decode order), which this MP4 writer cannot time yet")
+                    .hint("re-encode the video (for example with --vcodec h264) instead of copying it"));
+            }
+            tr.last_pts = Some(p.pts);
             (sample, key, tr.video_delta)
         } else {
             if p.duration <= 0 {
