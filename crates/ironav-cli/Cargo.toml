@@ -18,7 +18,10 @@ ironav-player.workspace = true
 ratatui = "0.29"
 
 [features]
-default = ["native-gui"]
+default = ["native-gui", "audio"]
+# Sound output through the operating system (needs the ALSA development files on Linux).
+# Without it `ironav play` still works against a silent clock.
+audio = ["ironav-player/audio"]
 # Native desktop GUI (egui). Disable for lean agent/server builds: --no-default-features
 native-gui = ["dep:ironav-gui"]
 

@@ -18,6 +18,8 @@ A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so 
 |---|---|---|
 | CLI | `ironav convert -i in.wav -o out.wav --acodec pcm_f32le --filter volume:gain=0.5` | humans and scripts |
 | GUI (native) | `ironav gui [file]` | HandBrake-style desktop window (egui): source, tabs, queue, drag-and-drop |
+| Player (terminal) | `ironav play file` | full-screen TUI on a terminal; JSON lines on stdin/stdout otherwise, for agents |
+| Player (window) | `ironav gui --play [file]` | native player window: seek bar, volume, snapshot, drag and drop |
 | GUI (browser) | `ironav gui --web` | same layout as a loopback-only web app, for machines without a display stack |
 | MCP | `ironav mcp` | agents; resident process, no per-call startup |
 | Tool schemas | `ironav tools` | JSON Schema for function-calling APIs |
@@ -126,6 +128,38 @@ layouts were generated from NVIDIA's `nvEncodeAPI.h` (SDK 13.1) with clang, and 
 need a GPU skip themselves when none is usable. Not done: hardware scaling, 10-bit decode or encode, AV1, rate-control
 tuning beyond QP/average bitrate, and the other vendors' providers.
 
+## Playing media
+
+`ironav play FILE` opens a player. On a terminal it is a full-screen TUI (truecolor half-block video, or a level meter for
+audio; space, arrows, `j`/`l`, `+`/`-`, `m`, `r`, `0`-`9`, `s` for a PNG, mouse click on the bar to seek). Anywhere else it
+reads one JSON command per line on stdin and answers with one envelope per line:
+
+```
+$ printf '%s\n' '{"cmd":"seek","to":5}' '{"cmd":"wait","position":6}' '{"cmd":"snapshot","path":"a.png"}' | ironav play movie.mp4 --audio silent
+```
+
+Commands: `status play pause toggle seek{to|by|fraction} volume mute loop snapshot wait help`. Every reply is the full status
+(state, position, duration, streams, decoder, frames shown and skipped, the audio `level`), so one call both acts and
+shows the effect. Over MCP the same player is `play_open`, `play_control`, `play_status` and `play_close`; snapshots come
+back as image blocks. `ironav gui --play` is the same player in a window, with an "Agent view" panel showing its live JSON.
+
+How it works: audio and video are decoded on separate threads, each with its own demuxer; the master clock is the number
+of audio frames the output device has taken (so a stalled device stalls the clock and video follows), with the wall clock
+used for video-only files or once the audio runs out. Seeking is exact: audio is trimmed to the target and video decodes
+forward from the previous keyframe and shows the last picture at or before it. Late pictures are dropped, not queued.
+
+What was and was not checked, on one machine (Windows, RTX 3090 Ti):
+- Real-time pacing, pause, exact seeks, ordering, looping, end detection and the JSON commands are covered by tests on
+  generated WAV and Y4M files, against the silent clock (`--audio silent`).
+- A 720p H.264 MP4 with FLAC audio plays through NVDEC at 1.0x with no dropped pictures, seeks, and gives snapshots over
+  MCP and in the window; snapshot colours match FFmpeg's BT.709 conversion to within 3 levels (mean 0.7).
+- **Sound through a real device was not heard or measured**: no one was listening and the sound card path is untested
+  beyond building. The `level` meter reports what was handed to the device, not what came out of the speakers.
+  Audio/video sync was not measured against a reference.
+- The TUI is tested by rendering to a test buffer; it has not been exercised in a real terminal emulator.
+- Players keep their position only in memory; MP4 AAC audio is skipped with a warning (no decoder); there is no subtitle,
+  playlist or network-stream support, and no GPU rendering (pictures are converted to RGB on the CPU).
+
 ## FLAC
 
 Lossless audio, implemented from RFC 9639 (no code from libFLAC or FFmpeg): all subframe types, every stereo mode,
@@ -160,11 +194,11 @@ any directory the process can read, so treat the launch URL like a credential.
 ## Layout
 
 `ironav-core` types/traits · `ironav-hwaccel` · `ironav-codec` · `ironav-formats` · `ironav-ontology` ·
-`ironav-engine` (jobs, planner, pipeline, tool registry) · `ironav-gui` (native, egui) · `ironav-webui` (browser) ·
+`ironav-player` (playback engine) · `ironav-engine` (jobs, planner, pipeline, tool registry) · `ironav-gui` (native, egui) · `ironav-webui` (browser) ·
 `ironav-cli`
 
 Build: `cargo build --release` · Test: `cargo test`
-Lean build for servers/agents without the graphics stack: `cargo build --release --no-default-features -p ironav-cli`
+Lean build for servers/agents without the graphics or sound stack: `cargo build --release --no-default-features -p ironav-cli`
 
 ## License
 

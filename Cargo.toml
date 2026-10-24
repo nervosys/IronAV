@@ -28,7 +28,7 @@ ironav-hwaccel = { path = "crates/ironav-hwaccel" }
 ironav-codec = { path = "crates/ironav-codec" }
 ironav-formats = { path = "crates/ironav-formats" }
 ironav-ontology = { path = "crates/ironav-ontology" }
-ironav-player = { path = "crates/ironav-player" }
+ironav-player = { path = "crates/ironav-player", default-features = false }
 ironav-engine = { path = "crates/ironav-engine" }
 ironav-webui = { path = "crates/ironav-webui" }
 ironav-gui = { path = "crates/ironav-gui" }

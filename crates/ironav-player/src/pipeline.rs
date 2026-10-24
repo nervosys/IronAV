@@ -46,6 +46,10 @@ pub fn open_output(mode: AudioMode, rate: u32, channels: u16, warnings: &mut Vec
             Err(e) => warnings.push(format!("no sound output ({}); playing silently", e.message)),
         }
     }
+    #[cfg(not(feature = "audio"))]
+    if mode == AudioMode::Auto {
+        warnings.push("this build has no sound output; playing silently".into());
+    }
     let _ = (&warnings, mode);
     Arc::new(NullOutput::new(rate, channels.clamp(1, 8)))
 }
