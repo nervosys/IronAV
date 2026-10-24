@@ -41,6 +41,17 @@ pub static FILTERS: &[FilterSpec] = &[
         output_pix_fmt: Some(PixelFormat::Gray8),
     },
     FilterSpec {
+        name: "format",
+        media: MediaType::Video,
+        description: "Convert the pixel format (gray8, yuv420p, yuv422p, yuv444p, rgb24), for example to yuv420p for the GPU encoder. RGB uses limited-range BT.601 unless matrix=709.",
+        params: &[
+            ParamSpec { name: "pix_fmt", ty: "string", default: None, description: "target pixel format name" },
+            ParamSpec { name: "matrix", ty: "integer", default: Some(601.0), description: "colour matrix for RGB conversions: 601 or 709" },
+        ],
+        input_pix_fmts: &[],
+        output_pix_fmt: None,
+    },
+    FilterSpec {
         name: "scale",
         media: MediaType::Video,
         description: "Resize video. Give width, height, or both; a missing side keeps the aspect ratio (rounded to an even number). Shrinking averages the pixels it covers.",
@@ -86,6 +97,23 @@ pub fn build_filter(name: &str, args: &Map<String, Value>) -> Result<Box<dyn Fil
                 return Err(Error::invalid_arg("volume.gain must be a finite number >= 0"));
             }
             Box::new(Volume { gain })
+        }
+        "format" => {
+            let name = match args.get("pix_fmt") {
+                Some(Value::String(s)) => s.as_str(),
+                Some(_) => return Err(Error::invalid_arg("format.pix_fmt must be a pixel format name")),
+                None => return Err(Error::invalid_arg("format needs pix_fmt").hint("for example format:pix_fmt=yuv420p").alternatives(PixelFormat::ALL.iter().map(|p| p.name()))),
+            };
+            let to = PixelFormat::ALL.iter().copied().find(|p| p.name() == name).ok_or_else(|| {
+                Error::invalid_arg(format!("unknown pixel format '{name}'")).alternatives(PixelFormat::ALL.iter().map(|p| p.name()))
+            })?;
+            let matrix = match num("matrix")? {
+                None => crate::pixconv::Matrix::Bt601,
+                Some(m) if m == 601.0 => crate::pixconv::Matrix::Bt601,
+                Some(m) if m == 709.0 => crate::pixconv::Matrix::Bt709,
+                Some(m) => return Err(Error::invalid_arg(format!("format.matrix must be 601 or 709, got {m}")).alternatives(["601", "709"])),
+            };
+            Box::new(crate::pixconv::Format { to, matrix })
         }
         "scale" => {
             let dim = |key: &str| -> Result<Option<u32>> {

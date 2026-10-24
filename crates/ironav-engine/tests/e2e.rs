@@ -559,3 +559,26 @@ fn scale_changes_the_output_size_and_the_plan_says_so() {
         assert_eq!(plan(&j).unwrap_err().code, ErrorCode::InvalidArgument, "{bad}");
     }
 }
+
+#[test]
+fn format_filter_converts_pixel_formats_and_explains_mistakes() {
+    let d = scratch("format");
+    let (src, out) = (d.join("in.y4m"), d.join("out.y4m"));
+    write_y4m(&src, 64, 48, 3);
+    let mut j = job(&src, &out);
+    j.filters.push(FilterCall::parse_shorthand("format:pix_fmt=yuv444p").unwrap());
+    run(&j, &mut |_| {}).unwrap();
+    let bytes = std::fs::read(&out).unwrap();
+    assert!(String::from_utf8_lossy(&bytes[..60]).contains("C444"));
+    let first_frame_at = bytes.iter().position(|&b| b == b'\n').unwrap() + 1;
+    assert!(bytes.len() - first_frame_at >= 3 * (64 * 48 * 3 + 6), "three 4:4:4 frames");
+
+    let mut bad = job(&src, &d.join("bad.y4m"));
+    bad.filters.push(FilterCall::parse_shorthand("format:pix_fmt=yuv999").unwrap());
+    let e = plan(&bad).unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidArgument);
+    assert!(e.alternatives.iter().any(|a| a == "yuv420p"));
+    let mut missing = job(&src, &d.join("bad.y4m"));
+    missing.filters.push(FilterCall::parse_shorthand("format").unwrap());
+    assert_eq!(plan(&missing).unwrap_err().code, ErrorCode::InvalidArgument);
+}

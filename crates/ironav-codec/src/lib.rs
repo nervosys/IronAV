@@ -6,6 +6,7 @@
 pub mod flac;
 mod filters;
 mod pcm;
+mod pixconv;
 mod rawvideo;
 mod scale;
 

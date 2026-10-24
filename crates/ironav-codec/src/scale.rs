@@ -102,7 +102,7 @@ fn taps(src: usize, dst: usize) -> Taps {
 }
 
 /// Resize one plane of `bpp`-byte pixels (interleaved channels are treated independently).
-fn resize_plane(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize, bpp: usize) -> Vec<u8> {
+pub(crate) fn resize_plane(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize, bpp: usize) -> Vec<u8> {
     let (hx, vy) = (taps(sw, dw), taps(sh, dh));
     let src_stride = sw * bpp;
     // Horizontal pass into a plane that is dw wide and still sh tall.

@@ -120,7 +120,7 @@ impl Settings {
             MediaType::Video => j.video.codec = Some(self.vcodec.clone()),
             MediaType::Audio => j.audio.codec = Some(self.acodec.clone()),
         }
-        for f in FILTERS.iter().filter(|f| f.media == spec.media) {
+        for f in FILTERS.iter().filter(|f| f.media == spec.media && f.params.iter().all(|p| p.ty != "string")) {
             let Some(st) = self.filters.get(f.name).filter(|s| s.enabled) else { continue };
             let mut args = Map::new();
             for p in f.params {

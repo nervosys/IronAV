@@ -96,6 +96,13 @@ to 540p downscale, luma PSNR was 54 dB versus its bilinear mode and 48 dB (41 dB
 behaves like a bilinear scaler rather than a bicubic or Lanczos one. A 50-frame 1080p to 720p GPU transcode with scaling
 took 1.5-2.0 s on the RTX 3090 Ti; I have not measured how much of that is the scaler.
 
+### Pixel formats
+
+`--filter format:pix_fmt=yuv420p` converts between gray8, yuv420p, yuv422p, yuv444p and rgb24, so sources the GPU encoder
+cannot take directly (4:4:4, 4:2:2, grey) can be fed to it. RGB uses limited-range BT.601 (`matrix=709` for BT.709);
+chroma is resampled with the same triangle filter as `scale`. Tested for known colour values, round trips and plane
+layouts; not compared against FFmpeg's converter. 10-bit formats do not exist yet.
+
 ### Video and audio together
 
 A job can read from more than one file, as with repeated `-i` in ffmpeg: `extra_inputs` in a job, or a second `-i` on

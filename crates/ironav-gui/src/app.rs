@@ -476,7 +476,7 @@ impl App {
     fn filters_ui(&mut self, ui: &mut egui::Ui) {
         let Some(s) = self.s.as_mut() else { return };
         let media = s.spec().media;
-        for f in FILTERS.iter().filter(|f| f.media == media) {
+        for f in FILTERS.iter().filter(|f| f.media == media && f.params.iter().all(|p| p.ty != "string")) {
             let st = s.filters.entry(f.name.to_string()).or_insert_with(FilterState::default);
             ui.checkbox(&mut st.enabled, RichText::new(f.name).strong());
             ui.weak(f.description);
@@ -484,7 +484,11 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.label(p.name);
                     let v = st.params.entry(p.name.to_string()).or_insert(p.default.unwrap_or(0.0));
-                    ui.add(egui::DragValue::new(v).speed(0.01).range(0.0..=100.0));
+                    if p.ty == "integer" {
+                        ui.add(egui::DragValue::new(v).speed(1.0).range(0.0..=16384.0));
+                    } else {
+                        ui.add(egui::DragValue::new(v).speed(0.01).range(0.0..=100.0));
+                    }
                     ui.weak(p.description);
                 });
             }
