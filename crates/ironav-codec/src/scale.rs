@@ -56,16 +56,21 @@ impl Filter for Scale {
         if (w, h) == (v.width, v.height) {
             return Ok(vec![Frame::Video(v)]);
         }
-        let src_layout = v.pix_fmt.planes(v.width as usize, v.height as usize);
-        let dst_layout = v.pix_fmt.planes(w as usize, h as usize);
-        let planes = v
-            .planes
-            .iter()
-            .zip(src_layout.iter().zip(&dst_layout))
-            .map(|(p, (&(sw, sh, bpp), &(dw, dh, _)))| resize_plane(p, sw, sh, dw, dh, bpp))
-            .collect();
-        Ok(vec![Frame::Video(VideoFrame { width: w, height: h, pix_fmt: v.pix_fmt, pts: v.pts, planes })])
+        Ok(vec![Frame::Video(resize_frame(&v, w, h))])
     }
+}
+
+/// Resize a whole frame to `w` x `h` (both non-zero), keeping its pixel format and timestamp.
+pub fn resize_frame(v: &VideoFrame, w: u32, h: u32) -> VideoFrame {
+    let src_layout = v.pix_fmt.planes(v.width as usize, v.height as usize);
+    let dst_layout = v.pix_fmt.planes(w as usize, h as usize);
+    let planes = v
+        .planes
+        .iter()
+        .zip(src_layout.iter().zip(&dst_layout))
+        .map(|(p, (&(sw, sh, bpp), &(dw, dh, _)))| resize_plane(p, sw, sh, dw, dh, bpp))
+        .collect();
+    VideoFrame { width: w, height: h, pix_fmt: v.pix_fmt, pts: v.pts, planes }
 }
 
 /// For each output coordinate: the first source index and the fixed-point weights of the taps.

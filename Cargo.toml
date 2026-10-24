@@ -6,6 +6,7 @@ members = [
     "crates/ironav-codec",
     "crates/ironav-formats",
     "crates/ironav-ontology",
+    "crates/ironav-player",
     "crates/ironav-engine",
     "crates/ironav-webui",
     "crates/ironav-gui",
@@ -27,6 +28,7 @@ ironav-hwaccel = { path = "crates/ironav-hwaccel" }
 ironav-codec = { path = "crates/ironav-codec" }
 ironav-formats = { path = "crates/ironav-formats" }
 ironav-ontology = { path = "crates/ironav-ontology" }
+ironav-player = { path = "crates/ironav-player" }
 ironav-engine = { path = "crates/ironav-engine" }
 ironav-webui = { path = "crates/ironav-webui" }
 ironav-gui = { path = "crates/ironav-gui" }

@@ -11,6 +11,8 @@ mod rawvideo;
 mod scale;
 
 pub use filters::{build_filter, FilterSpec, ParamSpec, FILTERS};
+pub use pixconv::{convert as convert_pixel_format, Matrix};
+pub use scale::resize_frame;
 
 use ironav_core::{CodecId, Decoder, Encoder, Error, ErrorCode, MediaType, Result, StreamParams};
 use serde::Serialize;

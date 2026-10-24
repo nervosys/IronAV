@@ -1,0 +1,23 @@
+[package]
+name = "ironav-player"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Audio and video playback engine for IronAV: pipelined decoding, an audio-driven clock, and a JSON command interface."
+
+[features]
+default = ["audio"]
+# Real sound output through the operating system (WASAPI, CoreAudio, ALSA...). Without it,
+# or when no device exists, playback runs against a silent clock.
+audio = ["dep:cpal"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+ironav-core.workspace = true
+ironav-codec.workspace = true
+ironav-formats.workspace = true
+ironav-hwaccel.workspace = true
+png = "0.17"
+cpal = { version = "0.15", optional = true }
