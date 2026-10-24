@@ -533,3 +533,29 @@ fn a_stream_can_be_left_out_with_codec_none() {
     let e = plan(&j).unwrap_err();
     assert_eq!(e.code, ErrorCode::InvalidInput, "{e:?}");
 }
+
+#[test]
+fn scale_changes_the_output_size_and_the_plan_says_so() {
+    let d = scratch("scale");
+    let (src, out) = (d.join("in.y4m"), d.join("out.y4m"));
+    write_y4m(&src, 256, 144, 5);
+
+    let mut j = job(&src, &out);
+    j.filters.push(FilterCall::parse_shorthand("scale:width=128").unwrap());
+    let p = plan(&j).unwrap();
+    let dims = |p: &ironav_engine::Plan| match &p.output.streams[0].params {
+        ironav_core::StreamParams::Video { width, height, .. } => (*width, *height),
+        _ => panic!("video expected"),
+    };
+    assert_eq!(dims(&p), (128, 72), "height follows the aspect ratio");
+    run(&j, &mut |_| {}).unwrap();
+    let head = String::from_utf8_lossy(&std::fs::read(&out).unwrap()[..40]).to_string();
+    assert!(head.contains("W128") && head.contains("H72"), "{head}");
+    assert_eq!(y4m_frames(&out).len(), 5);
+
+    for bad in ["scale", "scale:width=0", "scale:width=12.5", "scale:depth=3"] {
+        let mut j = job(&src, &d.join("bad.y4m"));
+        j.filters.push(FilterCall::parse_shorthand(bad).unwrap());
+        assert_eq!(plan(&j).unwrap_err().code, ErrorCode::InvalidArgument, "{bad}");
+    }
+}

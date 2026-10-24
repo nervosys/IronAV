@@ -41,6 +41,17 @@ pub static FILTERS: &[FilterSpec] = &[
         output_pix_fmt: Some(PixelFormat::Gray8),
     },
     FilterSpec {
+        name: "scale",
+        media: MediaType::Video,
+        description: "Resize video. Give width, height, or both; a missing side keeps the aspect ratio (rounded to an even number). Shrinking averages the pixels it covers.",
+        params: &[
+            ParamSpec { name: "width", ty: "integer", default: None, description: "output width in pixels (0 or omitted = derive from height)" },
+            ParamSpec { name: "height", ty: "integer", default: None, description: "output height in pixels (0 or omitted = derive from width)" },
+        ],
+        input_pix_fmts: &[],
+        output_pix_fmt: None,
+    },
+    FilterSpec {
         name: "hflip",
         media: MediaType::Video,
         description: "Mirror each video frame horizontally.",
@@ -75,6 +86,19 @@ pub fn build_filter(name: &str, args: &Map<String, Value>) -> Result<Box<dyn Fil
                 return Err(Error::invalid_arg("volume.gain must be a finite number >= 0"));
             }
             Box::new(Volume { gain })
+        }
+        "scale" => {
+            let dim = |key: &str| -> Result<Option<u32>> {
+                match num(key)? {
+                    None => Ok(None),
+                    Some(v) if v == 0.0 => Ok(None),
+                    Some(v) if v.fract() == 0.0 && v > 0.0 && v <= u32::MAX as f64 => Ok(Some(v as u32)),
+                    Some(v) => Err(Error::invalid_arg(format!("scale.{key} must be a whole number of pixels, got {v}"))),
+                }
+            };
+            let (width, height) = (dim("width")?, dim("height")?);
+            crate::scale::validate(width, height)?;
+            Box::new(crate::scale::Scale { width, height })
         }
         "gray" => Box::new(Gray),
         "hflip" => Box::new(HFlip),

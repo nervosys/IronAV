@@ -7,6 +7,7 @@ pub mod flac;
 mod filters;
 mod pcm;
 mod rawvideo;
+mod scale;
 
 pub use filters::{build_filter, FilterSpec, ParamSpec, FILTERS};
 

@@ -87,6 +87,15 @@ encoder, which also exercises cropping and reordering). A 1080p x264 → HEVC GP
 Timing on the RTX 3090 Ti is noisy: decoding the 8 s 720p clip to a raw Y4M took 0.9-1.7 s over several runs, much of it
 spent writing 332 MB. No comparison with FFmpeg has been made.
 
+### Resizing
+
+`--filter scale:width=1280` (or `height=`, or both) resizes with a separable triangle filter that widens when shrinking,
+so downscaling averages the pixels it covers. A missing side keeps the aspect ratio, rounded to an even number so the
+result still suits the GPU encoder. It runs on the CPU, on every pixel format. Against FFmpeg's own scaler on a 1080p
+to 540p downscale, luma PSNR was 54 dB versus its bilinear mode and 48 dB (41 dB worst frame) versus its area mode, so it
+behaves like a bilinear scaler rather than a bicubic or Lanczos one. A 50-frame 1080p to 720p GPU transcode with scaling
+took 1.5-2.0 s on the RTX 3090 Ti; I have not measured how much of that is the scaler.
+
 ### Video and audio together
 
 A job can read from more than one file, as with repeated `-i` in ffmpeg: `extra_inputs` in a job, or a second `-i` on
