@@ -62,7 +62,15 @@ fn handle(msg: &Value) -> Option<Value> {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
             Ok(match call_tool(name, &args) {
-                Ok(v) => json!({ "content": [{ "type": "text", "text": v.to_string() }], "structuredContent": v, "isError": false }),
+                Ok(mut v) => {
+                    // A snapshot goes out as a real image block, not as base64 text in JSON.
+                    let image = v.get_mut("snapshot").and_then(|s| s.as_object_mut()).and_then(|s| s.remove("png_base64"));
+                    let mut content = vec![json!({ "type": "text", "text": v.to_string() })];
+                    if let Some(data) = image {
+                        content.push(json!({ "type": "image", "data": data, "mimeType": "image/png" }));
+                    }
+                    json!({ "content": content, "structuredContent": v, "isError": false })
+                }
                 // Tool failures are results, not protocol errors: the model must see the hint.
                 Err(e) => json!({ "content": [{ "type": "text", "text": error_text(&e) }], "isError": true }),
             })

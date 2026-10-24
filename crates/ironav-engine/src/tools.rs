@@ -276,6 +276,66 @@ pub fn tools() -> &'static [Tool] {
                 read_only: true,
                 handler: h_hw_select,
             },
+            Tool {
+                name: "play_open",
+                description: "Open a media file for playback and return a session id and the player status. Plays from the start unless autoplay is false. Sessions last until play_close or the end of the process. h264/hevc video needs the GPU decoder; audio is silent when there is no sound device.",
+                cli: "ironav play <file> --json   (JSON lines on stdin/stdout)",
+                input_schema: object(
+                    json!({
+                        "path": { "type": "string" },
+                        "audio": { "type": "string", "enum": ["auto", "silent", "off"], "default": "auto", "description": "auto = the default sound device; silent = keep time with the audio but make no sound; off = ignore audio tracks." },
+                        "hwaccel": { "type": "string", "default": "auto" },
+                        "start": { "type": "number", "minimum": 0, "description": "Start position in seconds." },
+                        "autoplay": { "type": "boolean", "default": true },
+                        "loop": { "type": "boolean", "default": false },
+                        "volume": { "type": "number", "minimum": 0, "maximum": 2, "default": 1 }
+                    }),
+                    &["path"],
+                ),
+                read_only: true,
+                handler: crate::sessions::open,
+            },
+            Tool {
+                name: "play_control",
+                description: "Send one command to a playback session and get the status back. Commands: play, pause, toggle, seek (to | by | fraction), volume (value), mute (on), loop (on), snapshot (the current picture as PNG; inline base64 unless path is given), wait (until position or state=ended), status, help. The status reports state, position, stream info, frames shown and skipped, and the audio level, which is above zero while sound is actually being played.",
+                cli: "ironav play <file> --json  then {\"cmd\":\"seek\",\"to\":30}",
+                input_schema: object(
+                    json!({
+                        "session": { "type": "string" },
+                        "cmd": { "type": "string", "enum": ["status", "play", "pause", "toggle", "seek", "volume", "mute", "loop", "snapshot", "wait", "help"] },
+                        "to": { "type": "number", "description": "seek: absolute position in seconds" },
+                        "by": { "type": "number", "description": "seek: relative offset in seconds, may be negative" },
+                        "fraction": { "type": "number", "minimum": 0, "maximum": 1, "description": "seek: position as a fraction of the duration" },
+                        "value": { "type": "number", "minimum": 0, "maximum": 2, "description": "volume: linear gain" },
+                        "on": { "type": "boolean", "description": "mute / loop: the new setting; toggles when omitted" },
+                        "max_width": { "type": "integer", "description": "snapshot: shrink to fit this width" },
+                        "max_height": { "type": "integer", "description": "snapshot: shrink to fit this height" },
+                        "path": { "type": "string", "description": "snapshot: write the PNG here instead of returning it inline" },
+                        "position": { "type": "number", "description": "wait: seconds into the media to wait for" },
+                        "state": { "type": "string", "enum": ["ended"], "description": "wait: state to wait for" },
+                        "timeout": { "type": "number", "default": 30, "description": "wait: give up after this many seconds" }
+                    }),
+                    &["session", "cmd"],
+                ),
+                read_only: false,
+                handler: crate::sessions::control,
+            },
+            Tool {
+                name: "play_status",
+                description: "The current status of a playback session, without changing anything.",
+                cli: "ironav play <file> --json  then {\"cmd\":\"status\"}",
+                input_schema: object(json!({ "session": { "type": "string" } }), &["session"]),
+                read_only: true,
+                handler: crate::sessions::status,
+            },
+            Tool {
+                name: "play_close",
+                description: "Stop a playback session and release its decoder and sound device.",
+                cli: "(quit the ironav play process)",
+                input_schema: object(json!({ "session": { "type": "string" } }), &["session"]),
+                read_only: false,
+                handler: crate::sessions::close,
+            },
         ]
     })
 }

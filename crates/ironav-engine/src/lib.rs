@@ -6,6 +6,7 @@
 pub mod job;
 pub mod plan;
 pub mod run;
+mod sessions;
 pub mod tools;
 
 pub use job::{FilterCall, Job, StreamOpts};
