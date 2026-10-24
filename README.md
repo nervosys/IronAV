@@ -178,13 +178,27 @@ On one synthetic 3-minute stereo signal the output size equals libFLAC's mid com
 Stages run on separate threads with bounded queues, packets are moved not copied, and the MCP/GUI processes stay
 resident. Measured (release build, one Windows machine, 10 min of 48 kHz stereo PCM): s16→f32 with a volume filter
 ≈ 2,500× real time (≈ 450 MiB/s in); stream copy ≈ 5,100× real time. These are PCM numbers.
-FLAC, same machine (heavily loaded, so treat as rough): decode ≈ 270-400× real time; **encode ≈ 55-90× real time,
-which is several times slower than libFLAC at a comparable setting** (about 0.4 s vs 2 s for the same 3-minute file).
-Per-block multithreading was tried and reverted because it was not reliably faster.
-NVENC on an RTX 3090 Ti: 240 frames of 1280x720 (a 332 MB Y4M) convert to H.264 in 1.3-3.8 s wall (median about 2 s,
-roughly 120 fps) over nine runs on a busy machine, including process start. Copying the same Y4M with no encoding takes
-0.75-1.3 s, so uncompressed disk I/O is a large share of that time; the encoder itself was not profiled in isolation.
-(An earlier quieter run took 0.8 s, so expect wide variance.) No comparison against FFmpeg has been run.
+
+**Against FFmpeg** (`bench/vs_ffmpeg.py`; one Windows machine, RTX 3090 Ti, 24 threads; FFmpeg 8.x libraries through PyAV;
+median of 5). The FFmpeg side runs in-process and pays no process start; the IronAV side is a new process each time
+(about 100 ms of start-up on this machine, which `python -c pass` also pays), so the table leans against IronAV:
+
+| Job | IronAV | FFmpeg | |
+|---|---|---|---|
+| WAV to FLAC, 180 s stereo | 0.38-0.45 s | 0.21-0.22 s | FFmpeg about 2x faster; IronAV output 0.1 % smaller |
+| FLAC to WAV, 180 s | 0.33 s | 0.12 s (decode only) | FFmpeg about 2.5x faster |
+| NVENC H.264, 240 frames 720p from Y4M | 0.79 s | 0.38 s (`h264_nvenc`) | FFmpeg about 2x faster; sizes differ because rate control differs |
+| NVDEC H.264 to a Y4M file, 240 frames 720p | 0.84 s | 0.42 s (`cuda` hwaccel, no file written) | not like for like; FFmpeg's figure writes nothing |
+
+**So IronAV is currently slower than FFmpeg on every job measured here.** The "lower latency, higher throughput"
+goal is a goal, not a result. The FLAC encoder alone (no file, no process) takes 0.18 s for the 3-minute file on this
+machine (`cargo test --release -p ironav-codec --test flac_perf -- --ignored --nocapture`); it was 1.1 s before it was
+tuned (cheaper Rice-parameter search, one residual per predictor family instead of eight, a cached window, batched
+four-byte bit writes, and blocks encoded in parallel). FFmpeg decodes its output bit-exactly (checked on the 3-minute file), and the committed libFLAC fixtures still pass.
+Not yet looked at: FLAC decoding, the NVENC and NVDEC paths (where the time goes between upload, encode and Y4M I/O),
+and process start-up. Timings on this machine vary by a factor of two from run to run when other work is going on.
+NVENC in earlier runs: 240 frames of 1280x720 (a 332 MB Y4M) in 0.6-3.8 s wall depending on load.
+
 
 ## Security notes (browser GUI)
 

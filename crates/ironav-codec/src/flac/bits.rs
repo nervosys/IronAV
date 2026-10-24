@@ -108,11 +108,12 @@ impl BitWriter {
         }
         self.acc = (self.acc << n) | (v & ((1u64 << n) - 1));
         self.nbits += n;
-        while self.nbits >= 8 {
-            self.nbits -= 8;
-            self.bytes.push((self.acc >> self.nbits) as u8);
+        // Hand finished bytes over four at a time; at most 7 bits stay behind.
+        if self.nbits >= 32 {
+            self.nbits -= 32;
+            self.bytes.extend_from_slice(&((self.acc >> self.nbits) as u32).to_be_bytes());
+            self.acc &= (1u64 << self.nbits) - 1;
         }
-        self.acc &= (1u64 << self.nbits) - 1;
     }
 
     pub fn write_signed(&mut self, v: i64, n: u32) {
@@ -131,8 +132,11 @@ impl BitWriter {
 
     /// Pad with zero bits to a byte boundary.
     pub fn align(&mut self) {
-        if self.nbits > 0 {
-            self.write(0, 8 - self.nbits);
+        self.write(0, (8 - self.nbits % 8) % 8);
+        while self.nbits > 0 {
+            self.nbits -= 8;
+            self.bytes.push((self.acc >> self.nbits) as u8);
+            self.acc &= (1u64 << self.nbits) - 1;
         }
     }
 }
