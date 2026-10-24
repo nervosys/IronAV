@@ -7,8 +7,8 @@ A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so 
 > and both GUIs are working and tested. The codec/container set is deliberately small so far:
 > **WAV, FLAC and Y4M containers; PCM (8/16/24/32-bit, float), FLAC and raw-video codecs; `volume`, `gray`, `hflip` filters.**
 > **H.264 and HEVC can be encoded on NVIDIA GPUs (NVENC)** into `.mp4` or raw `.h264`/`.hevc` files; there is no software
-> H.264 encoder, no H.264 decoder, and no MP4 reading or audio-in-MP4 yet. AV1/AAC/Opus, MKV/WebM etc. are modelled in the
-> ontology as `planned`.
+> H.264 encoder, no H.264 decoder, and no MP4 reading yet. MP4 can carry FLAC audio next to the video, but not AAC or Opus (none exist here
+> yet). AV1/AAC/Opus, MKV/WebM etc. are modelled in the ontology as `planned`.
 > IronAV is not yet a drop-in replacement for FFmpeg or HandBrake.
 
 ## Interfaces
@@ -60,9 +60,26 @@ ironav convert -i in.y4m -o out.h264 --vcodec h264 --qp 24        # quality-targ
 ironav convert -i in.y4m -o out.mp4  --vcodec hevc --vbitrate 4000   # ~4 Mbit/s, in an MP4
 ```
 
-The MP4 writer is video-only and constant-frame-rate, with the index at the end of the file (not fast-start, so it is
-not ideal for progressive web playback). Verified by opening the files with FFmpeg's MP4 demuxer: correct codec,
-dimensions, 30 fps, exact 8.000 s duration, all frames decoded, and seeking lands on the right keyframe.
+The MP4 writer is constant-frame-rate, with the index at the end of the file (not fast-start, so it is not ideal for
+progressive web playback). Verified by opening the files with FFmpeg's MP4 demuxer: correct codec, dimensions, 30 fps,
+exact 8.000 s duration, all frames decoded, and seeking lands on the right keyframe.
+
+### Video and audio together
+
+A job can read from more than one file, as with repeated `-i` in ffmpeg: `extra_inputs` in a job, or a second `-i` on
+the command line. The first stream of each media type that the output format can hold is used and later ones are
+dropped with a warning in the plan. Inputs are merged by timestamp, and the MP4 writer groups each track into
+half-second chunks, so audio and video for the same moment sit close together in the file.
+
+```
+ironav convert -i in.y4m -i in.wav -o out.mp4 --vcodec h264 --acodec flac
+```
+
+The only audio codec MP4 can hold here is FLAC (the standard "FLAC in ISO BMFF" mapping). It plays in FFmpeg-based
+players, VLC, Chrome and Firefox, but **not in QuickTime or most hardware players**; AAC is the codec those expect and
+it is not implemented. Checked with FFmpeg's decoders: a Y4M + WAV conversion gives an 8.000 s file whose 240 video
+frames decode and whose 352,800 audio samples are identical to the WAV, with the two tracks never more than 0.46 s
+apart in file order.
 
 Validated by decoding the output with FFmpeg's decoders (via PyAV) and comparing every frame to the source: 240/240
 frames, correct order, High/Main profile, PSNR rising monotonically as QP falls, chroma bit-exact at QP 0. The struct

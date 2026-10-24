@@ -53,6 +53,8 @@ pub fn job_schema() -> Value {
     object(
         json!({
             "input": { "type": "string", "description": "Path of the file to read. The format is detected from content, not extension." },
+            "extra_inputs": { "type": "array", "items": { "type": "string" },
+                        "description": "More files to take streams from, for example a separate audio file for a video. The first stream of each media type wins, so an mp4 can take video from `input` and audio from here." },
             "output": { "type": "string", "description": "Path to write. Written atomically via <output>.partial." },
             "format": { "type": "string", "enum": FORMATS.iter().filter(|f| f.mux).map(|f| f.name).collect::<Vec<_>>(),
                         "description": "Output container. Inferred from the output extension when omitted." },
@@ -119,7 +121,7 @@ fn h_capabilities(_: &Value) -> Result<Value> {
         "tools": tools().iter().map(|t| json!({ "name": t.name, "description": t.description, "cli": t.cli, "read_only": t.read_only })).collect::<Vec<_>>(),
         "error_codes": ErrorCode::ALL,
         "ontology": ontology().summary(),
-        "not_implemented": "AV1, AAC, Opus, MP3 and other codecs, and containers such as MP4, MKV and WebM, appear in the ontology with status 'planned'. H.264/HEVC can be encoded (not decoded) in hardware only, into raw .h264/.hevc Annex B files."
+        "not_implemented": "AV1, AAC, Opus, MP3 and other codecs, and containers such as MKV and WebM, appear in the ontology with status 'planned'. H.264/HEVC can be encoded (not decoded) in hardware only, into .mp4 or raw .h264/.hevc Annex B files. MP4 is write-only: it takes FLAC for audio, and a video plus an audio file are combined with extra_inputs."
     }))
 }
 

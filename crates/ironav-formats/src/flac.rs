@@ -160,50 +160,29 @@ impl<R: Read + Seek + Send> Demuxer for FlacDemuxer<R> {
     }
 }
 
-pub struct FlacMuxer {
-    out: Box<dyn WriteSeek>,
-    info: Option<(u32, u16, u8)>,
+/// Running totals over the FLAC frames written to a container, enough to fill STREAMINFO.
+#[derive(Default)]
+pub(crate) struct FlacStats {
     min_frame: u32,
     max_frame: u32,
     block_sizes: Vec<i64>,
     total: u64,
 }
 
-impl FlacMuxer {
-    pub fn new(out: Box<dyn WriteSeek>) -> Self {
-        Self { out, info: None, min_frame: u32::MAX, max_frame: 0, block_sizes: Vec::new(), total: 0 }
-    }
-}
-
-impl Muxer for FlacMuxer {
-    fn write_header(&mut self, streams: &[StreamInfo]) -> Result<()> {
-        let [s] = streams else {
-            return Err(Error::invalid_arg("flac holds exactly one audio stream"));
-        };
-        let (StreamParams::Audio { sample_rate, channels }, CodecId::Flac) = (&s.params, s.codec) else {
-            return Err(Error::new(ErrorCode::UnsupportedCodec, format!("flac can only hold FLAC audio, not {}", s.codec.name())).alternatives(["flac"]));
-        };
-        if *sample_rate > 1_048_575 {
-            return Err(Error::invalid_arg("FLAC STREAMINFO limits the sample rate to 1048575 Hz"));
-        }
-        self.info = Some((*sample_rate, *channels, s.bits.unwrap_or(16)));
-        self.out.write_all(b"fLaC")?;
-        self.out.write_all(&[0x80, 0, 0, 34])?; // last metadata block, STREAMINFO, 34 bytes
-        self.out.write_all(&[0u8; 34])?; // patched in finish()
-        Ok(())
+impl FlacStats {
+    pub(crate) fn new() -> Self {
+        Self { min_frame: u32::MAX, ..Self::default() }
     }
 
-    fn write_packet(&mut self, p: &Packet) -> Result<()> {
-        self.out.write_all(&p.data)?;
+    pub(crate) fn record(&mut self, p: &Packet) {
         self.min_frame = self.min_frame.min(p.data.len() as u32);
         self.max_frame = self.max_frame.max(p.data.len() as u32);
         self.block_sizes.push(p.duration);
         self.total += p.duration as u64;
-        Ok(())
     }
 
-    fn finish(&mut self) -> Result<()> {
-        let (rate, channels, bits) = self.info.ok_or_else(|| Error::new(ErrorCode::Internal, "muxer finished before write_header"))?;
+    /// The 34-byte STREAMINFO body. The MD5 of the audio is left zero, which means "not computed".
+    pub(crate) fn streaminfo(&self, rate: u32, channels: u16, bits: u8) -> [u8; 34] {
         // The last block may be shorter; STREAMINFO's minimum excludes it.
         let body = if self.block_sizes.len() > 1 { &self.block_sizes[..self.block_sizes.len() - 1] } else { &self.block_sizes[..] };
         let min_block = body.iter().copied().min().unwrap_or(0).max(16) as u16;
@@ -216,7 +195,57 @@ impl Muxer for FlacMuxer {
         info[7..10].copy_from_slice(&maxf.to_be_bytes()[1..]);
         let packed: u64 = ((rate as u64) << 44) | (((channels - 1) as u64) << 41) | (((bits - 1) as u64) << 36) | (self.total & 0xF_FFFF_FFFF);
         info[10..18].copy_from_slice(&packed.to_be_bytes());
-        // bytes 18..34: MD5 of the unencoded audio; all zeros means "not computed", which is valid.
+        info
+    }
+}
+
+/// Sample rate, channels and bit depth of a FLAC stream, with the checks FLAC itself imposes.
+pub(crate) fn flac_audio_params(s: &StreamInfo) -> Result<(u32, u16, u8)> {
+    let (StreamParams::Audio { sample_rate, channels }, CodecId::Flac) = (&s.params, s.codec) else {
+        return Err(Error::new(ErrorCode::UnsupportedCodec, format!("expected FLAC audio, got {}", s.codec.name())).alternatives(["flac"]));
+    };
+    if *sample_rate > 1_048_575 {
+        return Err(Error::invalid_arg("FLAC STREAMINFO limits the sample rate to 1048575 Hz"));
+    }
+    Ok((*sample_rate, *channels, s.bits.unwrap_or(16)))
+}
+
+pub struct FlacMuxer {
+    out: Box<dyn WriteSeek>,
+    info: Option<(u32, u16, u8)>,
+    stats: FlacStats,
+}
+
+impl FlacMuxer {
+    pub fn new(out: Box<dyn WriteSeek>) -> Self {
+        Self { out, info: None, stats: FlacStats::new() }
+    }
+}
+
+impl Muxer for FlacMuxer {
+    fn write_header(&mut self, streams: &[StreamInfo]) -> Result<()> {
+        let [s] = streams else {
+            return Err(Error::invalid_arg("flac holds exactly one audio stream"));
+        };
+        if s.codec != CodecId::Flac {
+            return Err(Error::new(ErrorCode::UnsupportedCodec, format!("flac can only hold FLAC audio, not {}", s.codec.name())).alternatives(["flac"]));
+        }
+        self.info = Some(flac_audio_params(s)?);
+        self.out.write_all(b"fLaC")?;
+        self.out.write_all(&[0x80, 0, 0, 34])?; // last metadata block, STREAMINFO, 34 bytes
+        self.out.write_all(&[0u8; 34])?; // patched in finish()
+        Ok(())
+    }
+
+    fn write_packet(&mut self, p: &Packet) -> Result<()> {
+        self.out.write_all(&p.data)?;
+        self.stats.record(p);
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        let (rate, channels, bits) = self.info.ok_or_else(|| Error::new(ErrorCode::Internal, "muxer finished before write_header"))?;
+        let info = self.stats.streaminfo(rate, channels, bits);
         self.out.seek(SeekFrom::Start(8))?;
         self.out.write_all(&info)?;
         self.out.flush()?;

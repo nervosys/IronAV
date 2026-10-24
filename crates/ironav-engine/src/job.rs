@@ -8,6 +8,11 @@ use serde_json::{Map, Value};
 pub struct Job {
     pub input: String,
     pub output: String,
+    /// More files to read streams from, as with repeated `-i` in ffmpeg: for example a video
+    /// file plus a separate audio file. Streams are taken in input order, first of each media
+    /// type wins, and the output format decides how many it can hold.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_inputs: Vec<String>,
     /// Output container (`wav`, `y4m`, ...). Inferred from the output extension when omitted.
     #[serde(default)]
     pub format: Option<String>,

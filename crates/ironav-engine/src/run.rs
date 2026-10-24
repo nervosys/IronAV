@@ -1,12 +1,12 @@
 use crate::job::Job;
 use crate::plan::{plan, rate_control, Action, Plan};
 use ironav_codec::{build_filter, new_decoder, new_encoder};
-use ironav_core::{Decoder, Encoder, Error, ErrorCode, Filter, Frame, MediaType, Packet, Result};
+use ironav_core::{Decoder, Encoder, Error, ErrorCode, Filter, Frame, MediaType, Packet, Rational, Result};
 use ironav_hwaccel::{new_video_encoder, Direction, RateControl};
 use ironav_formats::{create_muxer, open_demuxer};
 use serde::Serialize;
 use std::path::Path;
-use std::sync::mpsc::sync_channel;
+use std::sync::mpsc::{sync_channel, Receiver};
 use std::thread;
 use std::time::Instant;
 
@@ -84,26 +84,32 @@ impl Runtime {
 pub fn run(job: &Job, on_progress: &mut dyn FnMut(&Progress)) -> Result<Report> {
     let t0 = Instant::now();
     let plan = plan(job)?;
-    let demux = open_demuxer(Path::new(&job.input))?;
+    let demuxes = std::iter::once(&job.input).chain(&job.extra_inputs).map(|p| open_demuxer(Path::new(p))).collect::<Result<Vec<_>>>()?;
     let partial = format!("{}.partial", job.output);
     let mux = create_muxer(Path::new(&partial), plan.output.format)?;
 
     let rate = rate_control(&job.video)?;
-    match execute(&plan, rate, demux, mux, t0, on_progress) {
+    match execute(&plan, rate, demuxes, mux, t0, on_progress) {
         Ok((steps, bytes_in, bytes_out)) => {
             std::fs::rename(&partial, &job.output)?;
             let wall = t0.elapsed();
             let secs = wall.as_secs_f64().max(1e-9);
             // Y4M and raw streams carry no duration; derive it from the frames actually encoded.
-            let media_seconds = plan.output.streams.first().and_then(|s| s.duration_secs()).or_else(|| {
-                let (st, step) = (plan.output.streams.first()?, steps.first()?);
-                match st.params {
-                    ironav_core::StreamParams::Video { frame_rate, .. } if frame_rate.num > 0 => {
-                        Some(step.frames.max(step.packets_in) as f64 * frame_rate.den as f64 / frame_rate.num as f64)
-                    }
-                    _ => None,
-                }
-            });
+            // With several streams the media lasts as long as the longest.
+            let media_seconds = plan
+                .output
+                .streams
+                .iter()
+                .zip(&steps)
+                .filter_map(|(st, step)| {
+                    st.duration_secs().or_else(|| match st.params {
+                        ironav_core::StreamParams::Video { frame_rate, .. } if frame_rate.num > 0 => {
+                            Some(step.frames.max(step.packets_in) as f64 * frame_rate.den as f64 / frame_rate.num as f64)
+                        }
+                        _ => None,
+                    })
+                })
+                .max_by(f64::total_cmp);
             Ok(Report {
                 output: job.output.clone(),
                 format: plan.output.format,
@@ -129,19 +135,18 @@ type Outcome = (Vec<StepReport>, u64, u64);
 fn execute(
     plan: &Plan,
     rate: RateControl,
-    mut demux: Box<dyn ironav_core::Demuxer>,
+    demuxes: Vec<Box<dyn ironav_core::Demuxer>>,
     mut mux: Box<dyn ironav_core::Muxer>,
     t0: Instant,
     on_progress: &mut dyn FnMut(&Progress),
 ) -> Result<Outcome> {
-    let (tx_in, rx_in) = sync_channel::<Packet>(QUEUE_DEPTH);
     let (tx_out, rx_out) = sync_channel::<Packet>(QUEUE_DEPTH);
     let out_streams = &plan.output.streams;
 
     let mut runtimes: Vec<Runtime> = Vec::new();
-    let mut by_input: Vec<Option<usize>> = vec![None; plan.input.streams.len()];
+    let mut by_input: Vec<Vec<Option<usize>>> = (0..demuxes.len()).map(|f| vec![None; plan.input_at(f).streams.len()]).collect();
     for st in &plan.steps {
-        let src = &plan.input.streams[st.input_stream];
+        let src = &plan.input_at(st.input_file).streams[st.input_stream];
         let dst = &plan.output.streams[st.output_stream];
         let mut hw_name = None;
         let (decoder, encoder, filters) = if st.action == Action::Transcode {
@@ -161,7 +166,7 @@ fn execute(
         } else {
             (None, None, Vec::new())
         };
-        by_input[st.input_stream] = Some(runtimes.len());
+        by_input[st.input_file][st.input_stream] = Some(runtimes.len());
         runtimes.push(Runtime {
             action: st.action,
             out_stream: st.output_stream,
@@ -173,14 +178,23 @@ fn execute(
     }
 
     thread::scope(|s| {
-        let reader = s.spawn(move || -> Result<()> {
-            while let Some(p) = demux.read_packet()? {
-                if tx_in.send(p).is_err() {
-                    break; // downstream failed; its error is reported instead
+        // One reader thread per input file, each feeding its own bounded queue; `process`
+        // merges the queues by timestamp so the muxer sees the streams interleaved.
+        let mut rx_in = Vec::new();
+        let mut readers = Vec::new();
+        for mut demux in demuxes {
+            let (tx, rx) = sync_channel::<Packet>(QUEUE_DEPTH);
+            rx_in.push(rx);
+            readers.push(s.spawn(move || -> Result<()> {
+                while let Some(p) = demux.read_packet()? {
+                    if tx.send(p).is_err() {
+                        break; // downstream failed; its error is reported instead
+                    }
                 }
-            }
-            Ok(())
-        });
+                Ok(())
+            }));
+        }
+        let bases: Vec<Vec<Rational>> = (0..rx_in.len()).map(|f| plan.input_at(f).streams.iter().map(|s| s.time_base).collect()).collect();
         let writer = s.spawn(move || -> Result<()> {
             mux.write_header(out_streams)?;
             for p in rx_out {
@@ -189,22 +203,58 @@ fn execute(
             mux.finish()
         });
 
-        let processed = process(rx_in, tx_out, &mut runtimes, &by_input, t0, on_progress);
+        let processed = process(Merge::new(rx_in, bases), tx_out, &mut runtimes, &by_input, t0, on_progress);
 
         let writer = writer.join().map_err(|_| Error::new(ErrorCode::Internal, "writer thread panicked"));
-        let reader = reader.join().map_err(|_| Error::new(ErrorCode::Internal, "reader thread panicked"));
+        let readers: Vec<_> = readers.into_iter().map(|r| r.join().map_err(|_| Error::new(ErrorCode::Internal, "reader thread panicked"))).collect();
         let (bytes_in, bytes_out) = processed?;
         writer??;
-        reader??;
+        for r in readers {
+            r??;
+        }
         Ok((runtimes.into_iter().map(|r| r.rep).collect(), bytes_in, bytes_out))
     })
 }
 
+/// Takes packets from several inputs in timestamp order. Each input is already ordered, so it
+/// is enough to hold one packet per input and always release the earliest; ties go to the
+/// earlier input. A single input passes straight through.
+struct Merge {
+    rxs: Vec<Receiver<Packet>>,
+    heads: Vec<Option<Packet>>,
+    done: Vec<bool>,
+    bases: Vec<Vec<Rational>>,
+}
+
+impl Merge {
+    fn new(rxs: Vec<Receiver<Packet>>, bases: Vec<Vec<Rational>>) -> Self {
+        let n = rxs.len();
+        Self { rxs, heads: (0..n).map(|_| None).collect(), done: vec![false; n], bases }
+    }
+
+    fn next(&mut self) -> Option<(usize, Packet)> {
+        for i in 0..self.rxs.len() {
+            if self.heads[i].is_none() && !self.done[i] {
+                match self.rxs[i].recv() {
+                    Ok(p) => self.heads[i] = Some(p),
+                    Err(_) => self.done[i] = true, // reader finished (or failed; join reports it)
+                }
+            }
+        }
+        let seconds = |i: usize, p: &Packet| p.pts as f64 * self.bases[i].get(p.stream).map_or(0.0, |b| b.as_f64());
+        let pick = (0..self.heads.len())
+            .filter_map(|i| self.heads[i].as_ref().map(|p| (i, seconds(i, p))))
+            .min_by(|a, b| a.1.total_cmp(&b.1))?
+            .0;
+        self.heads[pick].take().map(|p| (pick, p))
+    }
+}
+
 fn process(
-    rx: std::sync::mpsc::Receiver<Packet>,
+    mut merge: Merge,
     tx: std::sync::mpsc::SyncSender<Packet>,
     runtimes: &mut [Runtime],
-    by_input: &[Option<usize>],
+    by_input: &[Vec<Option<usize>>],
     t0: Instant,
     on_progress: &mut dyn FnMut(&Progress),
 ) -> Result<(u64, u64)> {
@@ -224,9 +274,9 @@ fn process(
         };
     }
 
-    for p in rx {
+    while let Some((file, p)) = merge.next() {
         bytes_in += p.data.len() as u64;
-        let Some(&Some(ri)) = by_input.get(p.stream) else { continue };
+        let Some(&Some(ri)) = by_input[file].get(p.stream) else { continue };
         let rt = &mut runtimes[ri];
         rt.rep.packets_in += 1;
         let out = match rt.action {

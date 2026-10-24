@@ -18,6 +18,8 @@ pub enum Action {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Step {
+    /// Which input file the stream comes from: 0 is `input`, then `extra_inputs` in order.
+    pub input_file: usize,
     pub input_stream: usize,
     pub output_stream: usize,
     pub action: Action,
@@ -46,6 +48,8 @@ pub struct OutputSummary {
 #[derive(Debug, Clone, Serialize)]
 pub struct Plan {
     pub input: InputSummary,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub extra_inputs: Vec<InputSummary>,
     pub output: OutputSummary,
     pub steps: Vec<Step>,
     pub warnings: Vec<String>,
@@ -85,10 +89,17 @@ fn is_software_encodable(c: CodecId) -> bool {
     ironav_codec::is_implemented(c, true)
 }
 
+impl Plan {
+    /// The input file with index `file` (0 is the primary input, then the extras in order).
+    pub fn input_at(&self, file: usize) -> &InputSummary {
+        if file == 0 { &self.input } else { &self.extra_inputs[file - 1] }
+    }
+}
+
 pub fn plan(job: &Job) -> Result<Plan> {
-    let in_path = Path::new(&job.input);
     let out_path = Path::new(&job.output);
-    let demux = open_demuxer(in_path)?;
+    let in_paths: Vec<&Path> = std::iter::once(job.input.as_str()).chain(job.extra_inputs.iter().map(String::as_str)).map(Path::new).collect();
+    let demuxes = in_paths.iter().map(|p| open_demuxer(p)).collect::<Result<Vec<_>>>()?;
     let spec = match &job.format {
         Some(f) => find_format(f)?,
         None => format_for_path(out_path)?,
@@ -97,8 +108,8 @@ pub fn plan(job: &Job) -> Result<Plan> {
         return Err(Error::new(ErrorCode::UnsupportedFormat, format!("format '{}' cannot be written", spec.name)));
     }
     if out_path.exists() {
-        if matches!((in_path.canonicalize(), out_path.canonicalize()), (Ok(a), Ok(b)) if a == b) {
-            return Err(Error::invalid_arg("input and output are the same file").hint("choose a different output path"));
+        if in_paths.iter().any(|p| matches!((p.canonicalize(), out_path.canonicalize()), (Ok(a), Ok(b)) if a == b)) {
+            return Err(Error::invalid_arg("an input and the output are the same file").hint("choose a different output path"));
         }
         if !job.overwrite {
             return Err(Error::new(ErrorCode::OutputExists, format!("output '{}' already exists", job.output))
@@ -113,16 +124,19 @@ pub fn plan(job: &Job) -> Result<Plan> {
     let mut out_streams: Vec<StreamInfo> = Vec::new();
     let mut used = vec![false; job.filters.len()];
 
-    for s in demux.streams() {
+    let mut taken: Vec<MediaType> = Vec::new();
+    for (file, s) in demuxes.iter().enumerate().flat_map(|(f, d)| d.streams().iter().map(move |s| (f, s))) {
         let media = s.params.media_type();
-        if media != spec.media {
-            warnings.push(format!("input stream {} ({:?}) dropped: '{}' only holds {:?}", s.index, media, spec.name, spec.media));
+        let at = if demuxes.len() > 1 { format!("input {file} stream {}", s.index) } else { format!("input stream {}", s.index) };
+        if !spec.holds(media) {
+            warnings.push(format!("{at} ({media:?}) dropped: '{}' cannot hold {media:?}", spec.name));
             continue;
         }
-        if !steps.is_empty() {
-            warnings.push(format!("input stream {} dropped: '{}' holds a single stream", s.index, spec.name));
+        if taken.contains(&media) {
+            warnings.push(format!("{at} ({media:?}) dropped: '{}' holds one {media:?} stream here and an earlier one was used", spec.name));
             continue;
         }
+        taken.push(media);
 
         let mut chain: Vec<FilterCall> = Vec::new();
         let mut params = s.params.clone();
@@ -211,7 +225,7 @@ pub fn plan(job: &Job) -> Result<Plan> {
             bits,
             params,
         });
-        steps.push(Step { input_stream: s.index, output_stream: steps.len(), action, from_codec: s.codec, to_codec: to, filters: chain, hardware });
+        steps.push(Step { input_file: file, input_stream: s.index, output_stream: steps.len(), action, from_codec: s.codec, to_codec: to, filters: chain, hardware });
     }
 
     if let Some(i) = used.iter().position(|u| !u) {
@@ -222,12 +236,14 @@ pub fn plan(job: &Job) -> Result<Plan> {
         .hint("audio filters need an audio output format such as wav; video filters need a video format such as y4m"));
     }
     if steps.is_empty() {
-        return Err(Error::invalid_input(format!("input has no {:?} stream that '{}' can hold", spec.media, spec.name))
+        return Err(Error::invalid_input(format!("no input stream is one that '{}' can hold", spec.name))
             .hint("choose an output format that matches the input's media type"));
     }
 
+    let summary = |path: &str, d: &dyn ironav_core::Demuxer| InputSummary { path: path.to_string(), format: d.format_name(), streams: d.streams().to_vec() };
     Ok(Plan {
-        input: InputSummary { path: job.input.clone(), format: demux.format_name(), streams: demux.streams().to_vec() },
+        input: summary(&job.input, demuxes[0].as_ref()),
+        extra_inputs: job.extra_inputs.iter().zip(&demuxes[1..]).map(|(p, d)| summary(p, d.as_ref())).collect(),
         output: OutputSummary { path: job.output.clone(), format: spec.name, streams: out_streams },
         steps,
         warnings,

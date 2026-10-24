@@ -373,3 +373,90 @@ fn schema_and_ontology_know_hardware_codecs() {
     assert_eq!(h264.status, ironav_ontology::Status::Implemented);
     assert!(o.get("codec/av1").is_some_and(|e| e.status == ironav_ontology::Status::Planned));
 }
+
+fn tone(n: usize) -> Vec<i16> {
+    (0..n).map(|i| (((i as f64) * 0.05).sin() * 12000.0) as i16).collect()
+}
+
+fn has(bytes: &[u8], needle: &[u8]) -> bool {
+    bytes.windows(needle.len()).any(|w| w == needle)
+}
+
+#[test]
+fn audio_only_mp4_holds_flac_and_nothing_else() {
+    let d = scratch("mp4audio");
+    let (wav, out) = (d.join("in.wav"), d.join("out.mp4"));
+    write_wav(&wav, &tone(44_100), 1, 44_100);
+
+    // PCM is not an MP4 codec; the error must say what is.
+    let e = plan(&job(&wav, &out)).unwrap_err();
+    assert_eq!(e.code, ErrorCode::UnsupportedCodec);
+    assert!(e.alternatives.iter().any(|a| a == "flac"), "{:?}", e.alternatives);
+
+    let mut j = job(&wav, &out);
+    j.audio.codec = Some("flac".into());
+    let report = run(&j, &mut |_| {}).unwrap();
+    assert_eq!(report.format, "mp4");
+    let b = std::fs::read(&out).unwrap();
+    assert_eq!(&b[4..8], b"ftyp");
+    assert!(has(&b, b"fLaC") && has(&b, b"dfLa") && has(&b, b"soun") && has(&b, b"moov"));
+    assert!(!has(&b, b"vide"), "no video track");
+}
+
+#[test]
+fn video_and_audio_files_combine_into_one_mp4() {
+    let d = scratch("mp4av");
+    let (src, wav, out) = (d.join("in.y4m"), d.join("in.wav"), d.join("out.mp4"));
+    write_y4m(&src, 256, 144, 30);
+    write_wav(&wav, &tone(44_100), 2, 44_100);
+    let mut j = job(&src, &out);
+    j.extra_inputs = vec![wav.display().to_string()];
+    j.video.codec = Some("h264".into());
+    j.video.qp = Some(28);
+    j.audio.codec = Some("flac".into());
+
+    match run(&j, &mut |_| {}) {
+        Ok(report) => {
+            assert_eq!(report.steps.len(), 2);
+            assert_eq!(report.plan.output.streams.len(), 2);
+            assert_eq!((report.steps[0].input_stream, report.steps[1].input_stream), (0, 0));
+            assert_eq!(report.plan.extra_inputs.len(), 1);
+            let b = std::fs::read(&out).unwrap();
+            assert!(has(&b, b"avcC") && has(&b, b"fLaC") && has(&b, b"vide") && has(&b, b"soun"));
+            let secs = report.media_seconds.unwrap();
+            assert!((secs - 1.0).abs() < 0.05, "one second of media, got {secs}");
+        }
+        Err(e) => {
+            // Without a usable GPU the video stream cannot be encoded; nothing may be left behind.
+            assert_eq!(e.code, ErrorCode::HardwareUnavailable, "{e:?}");
+            assert!(!out.exists() && !d.join("out.mp4.partial").exists());
+        }
+    }
+}
+
+#[test]
+fn a_second_stream_of_the_same_kind_is_dropped_with_a_warning() {
+    let d = scratch("mp4two");
+    let (a, b, out) = (d.join("a.wav"), d.join("b.wav"), d.join("out.mp4"));
+    write_wav(&a, &tone(22_050), 1, 22_050);
+    write_wav(&b, &tone(8_000), 1, 8_000);
+    let mut j = job(&a, &out);
+    j.extra_inputs = vec![b.display().to_string()];
+    j.audio.codec = Some("flac".into());
+    let p = plan(&j).unwrap();
+    assert_eq!(p.steps.len(), 1);
+    assert_eq!(p.steps[0].input_file, 0);
+    assert!(p.warnings.iter().any(|w| w.contains("input 1 stream 0") && w.contains("dropped")), "{:?}", p.warnings);
+    run(&j, &mut |_| {}).unwrap();
+    // Only the first file's audio is in the output: its rate, not the second's.
+    let bytes = std::fs::read(&out).unwrap();
+    let at = bytes.windows(4).position(|w| w == b"dfLa").unwrap();
+    let packed = u64::from_be_bytes(bytes[at + 12 + 10..at + 12 + 18].try_into().unwrap());
+    assert_eq!((packed >> 44, packed & 0xF_FFFF_FFFF), (22_050, 22_050));
+
+    // An extra input that is also the output is refused before anything is written.
+    let mut same = job(&a, &b);
+    same.extra_inputs = vec![b.display().to_string()];
+    same.overwrite = true;
+    assert_eq!(plan(&same).unwrap_err().code, ErrorCode::InvalidArgument);
+}

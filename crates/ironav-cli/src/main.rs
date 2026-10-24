@@ -54,7 +54,7 @@ fn help() -> Value {
         "commands": {
             "capabilities": "what this build can do (start here)",
             "probe <path>": "inspect a media file",
-            "convert -i IN -o OUT [-f FMT] [--acodec C] [--vcodec C] [--vbitrate KBPS | --qp N] [--filter name[:k=v,..]]... [--hwaccel P] [-y] [--dry-run] [--progress]": "convert, handbrake/ffmpeg style",
+            "convert -i IN [-i MORE]... -o OUT [-f FMT] [--acodec C] [--vcodec C] [--vbitrate KBPS | --qp N] [--filter name[:k=v,..]]... [--hwaccel P] [-y] [--dry-run] [--progress]": "convert, handbrake/ffmpeg style",
             "plan <job.json|->": "validate a JSON job without writing",
             "run <job.json|->": "execute a JSON job",
             "hw probe | hw select --codec C --direction decode|encode [--policy P]": "hardware acceleration",
@@ -91,8 +91,13 @@ fn dispatch(mut a: Args, progress: bool) -> Result<Value> {
         "convert" => {
             let dry = a.switch(&["--dry-run", "-n"]);
             let overwrite = a.switch(&["-y", "--overwrite"]);
+            let mut inputs = a.flags(&["-i", "--input"])?;
+            if inputs.is_empty() {
+                return Err(Error::invalid_arg("missing -i <input>"));
+            }
             let mut job = Job {
-                input: a.flag(&["-i", "--input"])?.ok_or_else(|| Error::invalid_arg("missing -i <input>"))?,
+                input: inputs.remove(0),
+                extra_inputs: inputs,
                 output: a.flag(&["-o", "--output"])?.ok_or_else(|| Error::invalid_arg("missing -o <output>"))?,
                 format: a.flag(&["-f", "--format"])?,
                 hwaccel: a.flag(&["--hwaccel"])?.unwrap_or_else(|| "auto".into()),

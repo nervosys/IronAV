@@ -1,7 +1,7 @@
 //! Container demuxers and muxers, and the format registry.
 
 mod annexb;
-mod flac;
+pub(crate) mod flac;
 mod mp4;
 mod wav;
 mod y4m;
@@ -21,6 +21,13 @@ pub struct FormatSpec {
     pub demux: bool,
     pub mux: bool,
     pub codecs: &'static [CodecId],
+}
+
+impl FormatSpec {
+    /// True if the format can hold a stream of this media type (it holds at least one codec of it).
+    pub fn holds(&self, media: MediaType) -> bool {
+        self.codecs.iter().any(|c| c.media_type() == media)
+    }
 }
 
 pub static FORMATS: &[FormatSpec] = &[
@@ -54,11 +61,11 @@ pub static FORMATS: &[FormatSpec] = &[
     FormatSpec {
         name: "mp4",
         extensions: &["mp4", "m4v"],
-        description: "MP4 (ISO BMFF) with H.264 or HEVC video (write-only; index at the end, not fast-start)",
+        description: "MP4 (ISO BMFF) with H.264 or HEVC video and optionally FLAC audio (write-only; index at the end, not fast-start)",
         media: MediaType::Video,
         demux: false,
         mux: true,
-        codecs: &[CodecId::H264, CodecId::Hevc],
+        codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Flac],
     },
     FormatSpec {
         name: "h264",
