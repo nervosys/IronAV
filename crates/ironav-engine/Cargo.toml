@@ -1,0 +1,15 @@
+[package]
+name = "ironav-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+ironav-core.workspace = true
+ironav-hwaccel.workspace = true
+ironav-codec.workspace = true
+ironav-formats.workspace = true
+ironav-ontology.workspace = true

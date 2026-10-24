@@ -1,0 +1,168 @@
+use crate::job::{FilterCall, Job};
+use ironav_codec::{build_filter, new_decoder, new_encoder, FILTERS};
+use ironav_core::{CodecId, Error, ErrorCode, MediaType, Result, StreamInfo, StreamParams};
+use ironav_formats::{find_format, format_for_path, open_demuxer};
+use ironav_hwaccel::{probe_all, select, Direction, HwPolicy, Selection};
+use serde::Serialize;
+use std::path::Path;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Action {
+    /// Packets are forwarded untouched: no decode, no re-encode, no quality loss.
+    Copy,
+    /// Decode → filters → encode.
+    Transcode,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Step {
+    pub input_stream: usize,
+    pub output_stream: usize,
+    pub action: Action,
+    pub from_codec: CodecId,
+    pub to_codec: CodecId,
+    pub filters: Vec<FilterCall>,
+    /// Hardware decisions for each codec stage, with the reason for each candidate.
+    pub hardware: Vec<Selection>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InputSummary {
+    pub path: String,
+    pub format: &'static str,
+    pub streams: Vec<StreamInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OutputSummary {
+    pub path: String,
+    pub format: &'static str,
+    pub streams: Vec<StreamInfo>,
+}
+
+/// A validated, fully resolved execution plan. Producing one never touches the output path.
+#[derive(Debug, Clone, Serialize)]
+pub struct Plan {
+    pub input: InputSummary,
+    pub output: OutputSummary,
+    pub steps: Vec<Step>,
+    pub warnings: Vec<String>,
+}
+
+pub fn plan(job: &Job) -> Result<Plan> {
+    let in_path = Path::new(&job.input);
+    let out_path = Path::new(&job.output);
+    let demux = open_demuxer(in_path)?;
+    let spec = match &job.format {
+        Some(f) => find_format(f)?,
+        None => format_for_path(out_path)?,
+    };
+    if !spec.mux {
+        return Err(Error::new(ErrorCode::UnsupportedFormat, format!("format '{}' cannot be written", spec.name)));
+    }
+    if out_path.exists() {
+        if matches!((in_path.canonicalize(), out_path.canonicalize()), (Ok(a), Ok(b)) if a == b) {
+            return Err(Error::invalid_arg("input and output are the same file").hint("choose a different output path"));
+        }
+        if !job.overwrite {
+            return Err(Error::new(ErrorCode::OutputExists, format!("output '{}' already exists", job.output))
+                .hint("set \"overwrite\": true to replace it, or choose a new output path"));
+        }
+    }
+    let policy = HwPolicy::parse(&job.hwaccel)?;
+    let probes = probe_all();
+
+    let mut warnings = Vec::new();
+    let mut steps: Vec<Step> = Vec::new();
+    let mut out_streams: Vec<StreamInfo> = Vec::new();
+    let mut used = vec![false; job.filters.len()];
+
+    for s in demux.streams() {
+        let media = s.params.media_type();
+        if media != spec.media {
+            warnings.push(format!("input stream {} ({:?}) dropped: '{}' only holds {:?}", s.index, media, spec.name, spec.media));
+            continue;
+        }
+        if !steps.is_empty() {
+            warnings.push(format!("input stream {} dropped: '{}' holds a single stream", s.index, spec.name));
+            continue;
+        }
+
+        let mut chain: Vec<FilterCall> = Vec::new();
+        let mut params = s.params.clone();
+        for (i, fc) in job.filters.iter().enumerate() {
+            let f = build_filter(&fc.name, &fc.args)?;
+            let fspec = FILTERS.iter().find(|x| x.name == fc.name).expect("build_filter succeeded");
+            if fspec.media != media {
+                continue;
+            }
+            if let StreamParams::Video { pix_fmt, .. } = &params {
+                if !fspec.input_pix_fmts.is_empty() && !fspec.input_pix_fmts.contains(pix_fmt) {
+                    return Err(Error::invalid_arg(format!("filter '{}' cannot take {} input", fc.name, pix_fmt.name()))
+                        .alternatives(fspec.input_pix_fmts.iter().map(|p| p.name())));
+                }
+            }
+            used[i] = true;
+            params = f.output_params(&params);
+            chain.push(fc.clone());
+        }
+
+        let opts = if media == MediaType::Audio { &job.audio } else { &job.video };
+        let to = match opts.codec.as_deref() {
+            None | Some("copy") => s.codec,
+            Some(name) => CodecId::parse(name)?,
+        };
+        if to.media_type() != media {
+            return Err(Error::invalid_arg(format!("codec {} cannot be used for a {:?} stream", to.name(), media)));
+        }
+        if !spec.codecs.contains(&to) {
+            return Err(Error::new(ErrorCode::UnsupportedCodec, format!("format '{}' cannot hold {}", spec.name, to.name()))
+                .hint(if opts.codec.is_none() {
+                    "the input codec does not fit the output format; set the stream's \"codec\" to one of the alternatives"
+                } else {
+                    "pick a codec the output format can hold"
+                })
+                .alternatives(spec.codecs.iter().map(|c| c.name())));
+        }
+
+        let action = if to == s.codec && chain.is_empty() { Action::Copy } else { Action::Transcode };
+        let mut hardware = Vec::new();
+        if action == Action::Transcode {
+            new_decoder(s.codec, &s.params)?;
+            new_encoder(to, &params)?;
+            if media == MediaType::Video || matches!(policy, HwPolicy::RequireAny | HwPolicy::Require(_)) {
+                hardware.push(select(s.codec, Direction::Decode, policy, &probes)?);
+                hardware.push(select(to, Direction::Encode, policy, &probes)?);
+            }
+        }
+
+        out_streams.push(StreamInfo {
+            index: steps.len(),
+            codec: to,
+            time_base: s.time_base,
+            duration: s.duration,
+            params,
+        });
+        steps.push(Step { input_stream: s.index, output_stream: steps.len(), action, from_codec: s.codec, to_codec: to, filters: chain, hardware });
+    }
+
+    if let Some(i) = used.iter().position(|u| !u) {
+        return Err(Error::invalid_arg(format!(
+            "filter '{}' matched no stream that is being written to '{}'",
+            job.filters[i].name, spec.name
+        ))
+        .hint("audio filters need an audio output format such as wav; video filters need a video format such as y4m"));
+    }
+    if steps.is_empty() {
+        return Err(Error::invalid_input(format!("input has no {:?} stream that '{}' can hold", spec.media, spec.name))
+            .hint("choose an output format that matches the input's media type"));
+    }
+
+    Ok(Plan {
+        input: InputSummary { path: job.input.clone(), format: demux.format_name(), streams: demux.streams().to_vec() },
+        output: OutputSummary { path: job.output.clone(), format: spec.name, streams: out_streams },
+        steps,
+        warnings,
+    })
+}

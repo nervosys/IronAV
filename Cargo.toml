@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ironav-core",
+    "crates/ironav-hwaccel",
+    "crates/ironav-codec",
+    "crates/ironav-formats",
+    "crates/ironav-ontology",
+    "crates/ironav-engine",
+    "crates/ironav-gui",
+    "crates/ironav-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "LGPL-2.1-or-later"
+rust-version = "1.80"
+repository = "https://github.com/nervosys/IronAV"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ironav-core = { path = "crates/ironav-core" }
+ironav-hwaccel = { path = "crates/ironav-hwaccel" }
+ironav-codec = { path = "crates/ironav-codec" }
+ironav-formats = { path = "crates/ironav-formats" }
+ironav-ontology = { path = "crates/ironav-ontology" }
+ironav-engine = { path = "crates/ironav-engine" }
+ironav-gui = { path = "crates/ironav-gui" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"

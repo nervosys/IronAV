@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IronAV</title>
+<style>
+:root{--bg:#f4f5f7;--panel:#fff;--ink:#1c2128;--mute:#6a737d;--line:#d8dce1;--accent:#c2410c;--accent-ink:#fff;--ok:#1a7f37;--bad:#cf222e;--warn:#9a6700;--code:#f0f2f5}
+@media (prefers-color-scheme:dark){:root{--bg:#14171c;--panel:#1d2128;--ink:#e6e9ee;--mute:#8d96a0;--line:#30363d;--accent:#f97316;--accent-ink:#14171c;--ok:#3fb950;--bad:#f85149;--warn:#d29922;--code:#262c34}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 system-ui,-apple-system,Segoe UI,sans-serif;display:flex;flex-direction:column;min-height:100vh}
+header{display:flex;align-items:center;gap:8px;padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--line);flex-wrap:wrap}
+header h1{font-size:16px;margin:0 12px 0 0;letter-spacing:.02em}header h1 b{color:var(--accent)}
+button{font:inherit;color:var(--ink);background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:6px 12px;cursor:pointer}
+button:hover{border-color:var(--mute)}button.primary{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);font-weight:600}
+button:disabled{opacity:.45;cursor:not-allowed}
+main{flex:1;display:grid;grid-template-columns:minmax(0,1fr);gap:12px;padding:12px 16px;max-width:1100px;width:100%;margin:0 auto}
+section{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px 14px}
+h2{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--mute);margin:0 0 8px}
+.row{display:grid;grid-template-columns:150px minmax(0,1fr);gap:8px 12px;align-items:center;margin:8px 0}
+label{color:var(--mute)}
+input[type=text],input[type=number],select{font:inherit;color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:6px 8px;width:100%;min-width:0}
+.tabs{display:flex;gap:2px;border-bottom:1px solid var(--line);margin:-4px 0 10px;flex-wrap:wrap}
+.tabs button{border:0;border-bottom:2px solid transparent;border-radius:0;background:none;color:var(--mute)}
+.tabs button.on{color:var(--ink);border-bottom-color:var(--accent)}
+table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:4px 8px;border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--mute);font-weight:500}
+code,pre{font:12px/1.5 ui-monospace,Consolas,monospace;background:var(--code);border-radius:6px}code{padding:1px 5px}
+pre{padding:10px;overflow:auto;max-height:340px;margin:6px 0;white-space:pre-wrap;word-break:break-word}
+.pill{display:inline-block;padding:0 8px;border-radius:99px;font-size:12px;border:1px solid var(--line);color:var(--mute)}
+.ok{color:var(--ok);border-color:var(--ok)}.bad{color:var(--bad);border-color:var(--bad)}.warn{color:var(--warn);border-color:var(--warn)}
+.note{color:var(--mute);font-size:13px;margin:6px 0}
+.err{border:1px solid var(--bad);background:color-mix(in srgb,var(--bad) 10%,transparent);border-radius:6px;padding:8px 10px;margin:8px 0}
+.err b{color:var(--bad)}
+.bar{height:8px;background:var(--bg);border-radius:4px;overflow:hidden;border:1px solid var(--line)}.bar i{display:block;height:100%;background:var(--accent)}
+.modal{position:fixed;inset:0;background:#0008;display:flex;align-items:center;justify-content:center;padding:16px;z-index:9}
+.modal>div{background:var(--panel);border:1px solid var(--line);border-radius:10px;width:min(640px,100%);max-height:85vh;display:flex;flex-direction:column;padding:14px}
+.list{overflow:auto;border:1px solid var(--line);border-radius:6px;margin:8px 0;flex:1;min-height:200px}
+.list div{padding:5px 10px;cursor:pointer;display:flex;justify-content:space-between;gap:8px}.list div:hover{background:var(--bg)}
+footer{padding:8px 16px;color:var(--mute);font-size:12px;text-align:center}
+@media (max-width:560px){.row{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header>
+  <h1>Iron<b>AV</b></h1>
+  <button id="open">Open Source…</button>
+  <button id="plan" disabled>Preview Plan</button>
+  <button id="addq" disabled>Add to Queue</button>
+  <button id="start" class="primary" disabled>Start Queue</button>
+  <span id="hdr" class="note" style="margin-left:auto"></span>
+</header>
+<main>
+  <section id="source"><h2>Source</h2><div class="note">No source selected. Choose a media file to begin.</div></section>
+  <section>
+    <div class="tabs" id="tabs"></div>
+    <div id="pane"></div>
+  </section>
+  <section id="queue"><h2>Queue</h2><div class="note">Empty.</div></section>
+</main>
+<footer>IronAV runs locally; this page talks only to the process that served it.</footer>
+<script>
+const TOKEN='__IRONAV_TOKEN__';
+const api=async(p,b)=>(await fetch(p,{method:b===undefined?'GET':'POST',headers:{'X-IronAV-Token':TOKEN,'Content-Type':'application/json'},body:b===undefined?undefined:JSON.stringify(b)})).json();
+const tool=(n,a)=>api('/api/tool/'+n,a||{});
+const h=(t,p,...k)=>{const e=document.createElement(t);for(const[x,v]of Object.entries(p||{})){if(x==='class')e.className=v;else if(x.startsWith('on'))e.addEventListener(x.slice(2),v);else if(v!==false&&v!=null)e.setAttribute(x,v===true?'':v)}for(const c of k.flat())e.append(c instanceof Node?c:String(c??''));return e};
+const $=id=>document.getElementById(id);
+const fmtBytes=n=>n==null?'?':n>1048576?(n/1048576).toFixed(1)+' MiB':n>1024?(n/1024).toFixed(1)+' KiB':n+' B';
+const fmtTime=s=>s==null?'unknown':s>=60?Math.floor(s/60)+'m '+(s%60).toFixed(1)+'s':s.toFixed(2)+'s';
+const sep=()=>window.__sep||(window.__sep=(caps&&caps.platform==='windows')?'\\':'/');
+
+let caps=null,src=null,tab='summary',planOut=null,queue=[],running=false,onto=null;
+const S={format:'',vcodec:'copy',acodec:'copy',filters:{},hwaccel:'auto',output:'',overwrite:false};
+
+const errBox=e=>h('div',{class:'err'},h('b',{},e.code+': '),e.message,
+  e.hint?h('div',{class:'note'},'Hint: '+e.hint):'',
+  e.alternatives&&e.alternatives.length?h('div',{class:'note'},'Try: '+e.alternatives.join(', ')):'');
+
+const srcMedia=()=>src?[...new Set(src.streams.map(s=>s.type))]:[];
+const fmts=()=>caps.formats.filter(f=>f.mux&&(!src||srcMedia().includes(f.media)));
+const curFmt=()=>caps.formats.find(f=>f.name===S.format);
+const encodable=(f,media)=>f.codecs.filter(c=>caps.codecs.some(i=>i.codec===c&&i.encode));
+const dirOf=p=>{const i=Math.max(p.lastIndexOf('/'),p.lastIndexOf('\\'));return i<0?'':p.slice(0,i+1)};
+const stemOf=p=>{const b=p.slice(dirOf(p).length);const i=b.lastIndexOf('.');return i<0?b:b.slice(0,i)};
+
+function defaultOutput(){
+  const f=curFmt();if(!src||!f)return;
+  const ext='.'+f.extensions[0];let out=dirOf(src.path)+stemOf(src.path)+ext;
+  if(out.toLowerCase()===src.path.toLowerCase())out=dirOf(src.path)+stemOf(src.path)+'-converted'+ext;
+  S.output=out;
+}
+
+function buildJob(){
+  const f=curFmt();const j={input:src.path,output:S.output,format:S.format,hwaccel:S.hwaccel,overwrite:S.overwrite};
+  if(f.media==='video')j.video={codec:S.vcodec};else j.audio={codec:S.acodec};
+  const fl=caps.filters.filter(x=>x.media===f.media&&S.filters[x.name]&&S.filters[x.name].on).map(x=>({name:x.name,args:S.filters[x.name].args||{}}));
+  if(fl.length)j.filters=fl;return j;
+}
+const cliOf=j=>{
+  const q=s=>/[\s"]/.test(s)?'"'+s.replace(/"/g,'\\"')+'"':s;
+  let c='ironav convert -i '+q(j.input)+' -o '+q(j.output)+' -f '+j.format;
+  if(j.audio)c+=' --acodec '+j.audio.codec;if(j.video)c+=' --vcodec '+j.video.codec;
+  for(const f of j.filters||[]){const a=Object.entries(f.args).map(([k,v])=>k+'='+v).join(',');c+=' --filter '+f.name+(a?':'+a:'')}
+  if(j.hwaccel!=='auto')c+=' --hwaccel '+j.hwaccel;if(j.overwrite)c+=' -y';return c;
+};
+
+/* ---------- file picker ---------- */
+function pick({mode,start,title}){
+  return new Promise(res=>{
+    let cur=start||'';const m=h('div',{class:'modal'});
+    const done=v=>{m.remove();res(v)};
+    const path=h('input',{type:'text'});const list=h('div',{class:'list'});
+    const up=h('button',{},'Up');const sel=h('button',{class:'primary'},'Select this folder');
+    async function load(p){
+      const r=await api('/api/fs?path='+encodeURIComponent(p||''));list.replaceChildren();
+      if(!r.ok){list.append(errBox(r.error));return}
+      const d=r.result;cur=d.path;path.value=cur;up.onclick=()=>d.parent&&load(d.parent);
+      for(const r2 of d.roots.length>1?d.roots:[])list.append(h('div',{onclick:()=>load(r2)},'💽 '+r2));
+      for(const e of d.entries){
+        if(!e.dir&&mode==='dir')continue;
+        const full=d.path.replace(/[\\/]$/,'')+(d.path.includes('\\')?'\\':'/')+e.name;
+        list.append(h('div',{onclick:()=>e.dir?load(full):done(full)},h('span',{},(e.dir?'📁 ':'📄 ')+e.name),h('span',{class:'note'},e.dir?'':fmtBytes(e.size))));
+      }
+    }
+    path.addEventListener('change',()=>load(path.value));
+    sel.onclick=()=>done(cur);
+    m.append(h('div',{},h('h2',{},title),path,list,h('div',{style:'display:flex;gap:8px;justify-content:flex-end'},up,mode==='dir'?sel:'',h('button',{onclick:()=>done(null)},'Cancel'))));
+    document.body.append(m);load(cur);
+  });
+}
+
+/* ---------- panes ---------- */
+function renderSource(){
+  const el=$('source');el.replaceChildren(h('h2',{},'Source'));
+  if(!src){el.append(h('div',{class:'note'},'No source selected. Choose a media file to begin.'));return}
+  el.append(h('div',{},h('b',{},src.path),' ',h('span',{class:'pill'},src.format),' ',h('span',{class:'note'},fmtBytes(src.size_bytes)+' · '+fmtTime(src.duration_seconds))));
+  el.append(h('table',{},h('tr',{},['#','Type','Codec','Details'].map(x=>h('th',{},x))),
+    src.streams.map(s=>h('tr',{},h('td',{},s.index),h('td',{},s.type),h('td',{},s.codec),
+      h('td',{},s.type==='audio'?s.sample_rate+' Hz · '+s.channels+' ch':s.width+'×'+s.height+' · '+s.pix_fmt+' · '+(s.frame_rate.num/s.frame_rate.den).toFixed(3)+' fps')))));
+}
+
+const row=(l,c)=>h('div',{class:'row'},h('label',{},l),c);
+const sel=(opts,val,on)=>{const s=h('select',{},opts.map(o=>h('option',{value:o,selected:o===val},o)));s.addEventListener('change',()=>on(s.value));return s};
+
+function pSummary(){
+  const f=curFmt();
+  const fmtSel=sel(fmts().map(x=>x.name),S.format,v=>{S.format=v;const f2=curFmt();S.vcodec=S.acodec='copy';
+    const keep=f2.codecs.filter(c=>encodable(f2).includes(c));
+    if(src){const sc=src.streams.find(s=>s.type===f2.media);S[f2.media==='video'?'vcodec':'acodec']=sc&&keep.includes(sc.codec)?'copy':keep[0]||'copy'}
+    defaultOutput();render()});
+  const out=h('input',{type:'text',value:S.output});out.addEventListener('change',()=>{S.output=out.value;renderHdr()});
+  const browse=h('button',{onclick:async()=>{const d=await pick({mode:'dir',start:dirOf(S.output),title:'Save into folder'});if(d){S.output=d.replace(/[\\/]$/,'')+(d.includes('\\')?'\\':'/')+S.output.slice(dirOf(S.output).length);render()}}},'Browse…');
+  const ow=h('input',{type:'checkbox',checked:S.overwrite});ow.addEventListener('change',()=>S.overwrite=ow.checked);
+  return h('div',{},
+    row('Container',fmtSel),f?h('div',{class:'note'},f.description+' · holds '+f.media+' only'):'',
+    row('Save as',h('div',{style:'display:flex;gap:6px'},out,browse)),
+    row('Overwrite existing',ow),
+    h('div',{id:'planOut'},planOut?renderPlan(planOut):''));
+}
+function renderPlan(p){
+  if(!p.ok)return errBox(p.error);
+  const pl=p.result;
+  return h('div',{},h('h2',{},'Plan (nothing written yet)'),
+    pl.steps.map(s=>h('div',{},h('span',{class:'pill '+(s.action==='copy'?'ok':'warn')},s.action),' '+s.from_codec+' → '+s.to_codec+
+      (s.filters.length?' · filters: '+s.filters.map(f=>f.name).join(', '):'')+(s.hardware.length?' · hw: '+s.hardware.map(x=>x.summary).join('; '):''))),
+    pl.warnings.map(w=>h('div',{class:'note'},'⚠ '+w)));
+}
+function codecPane(media,key,label){
+  const f=curFmt();if(f.media!==media)return h('div',{class:'note'},'The '+f.name+' container holds '+f.media+' only. Pick a '+media+' container on the Summary tab to configure this.');
+  const opts=['copy',...encodable(f).filter(c=>true)];
+  return h('div',{},row(label+' codec',sel(opts,S[key],v=>{S[key]=v;render()})),
+    h('div',{class:'note'},S[key]==='copy'?'Packets pass through untouched: fastest, no quality loss.':'Re-encoded in software.'),
+    h('div',{class:'note'},'Compressed codecs (H.264, HEVC, AV1, AAC, Opus…) are listed in the ontology as planned and appear here once implemented.'));
+}
+function pFilters(){
+  const f=curFmt();const list=caps.filters.filter(x=>x.media===f.media);
+  if(!list.length)return h('div',{class:'note'},'No filters for '+f.media+'.');
+  return h('div',{},list.map(fl=>{
+    const st=S.filters[fl.name]||(S.filters[fl.name]={on:false,args:{}});
+    const cb=h('input',{type:'checkbox',checked:st.on});cb.addEventListener('change',()=>{st.on=cb.checked});
+    return h('div',{style:'margin:10px 0'},h('label',{style:'color:var(--ink)'},cb,' ',h('b',{},fl.name)),h('div',{class:'note'},fl.description),
+      fl.params.map(p=>{const i=h('input',{type:'number',step:'any',value:st.args[p.name]??p.default??'',style:'max-width:160px'});
+        i.addEventListener('change',()=>{st.args[p.name]=parseFloat(i.value)});return row(p.name,h('div',{},i,' ',h('span',{class:'note'},p.description)))}));
+  }));
+}
+function pHardware(){
+  const hw=caps.hardware;const names=['auto','off','require',...hw.probes.filter(p=>p.state!=='not-applicable').map(p=>p.backend)];
+  return h('div',{},row('Policy',sel(names,S.hwaccel,v=>{S.hwaccel=v})),
+    h('div',{class:'note'},'auto = use hardware when usable, else software. require = fail if no hardware is usable.'),
+    hw.linked_backends.length?'':h('div',{class:'err'},'This build links no native hardware providers yet, so every job runs in software even where drivers are detected below.'),
+    h('table',{},h('tr',{},['Backend','Driver','Provider linked','Evidence'].map(x=>h('th',{},x))),
+      hw.probes.map(p=>h('tr',{},h('td',{},p.backend),
+        h('td',{},h('span',{class:'pill '+(p.state==='detected'?'ok':p.state==='not-applicable'?'':'warn')},p.state)),
+        h('td',{},p.linked?'yes':'no'),h('td',{class:'note'},p.evidence)))));
+}
+function pAgent(){
+  let j;try{j=buildJob()}catch{return h('div',{class:'note'},'Open a source first.')}
+  return h('div',{},h('div',{class:'note'},'Exactly what this form will run. Agents can use the same job through the CLI or the MCP server.'),
+    h('h2',{},'Command line'),h('pre',{},cliOf(j)),h('h2',{},'Job (JSON) — ironav run job.json / MCP tool "run"'),h('pre',{},JSON.stringify(j,null,2)),
+    h('h2',{},'MCP server'),h('pre',{},'ironav mcp   # stdio; tools: '+caps.tools.map(t=>t.name).join(', ')));
+}
+function pOntology(){
+  const q=h('input',{type:'text',placeholder:'search codecs, containers, filters, hardware…',value:onto?.q||''});
+  const kind=sel(['(all)','codec','container','filter','hw','pixfmt','samplefmt','platform','op'],onto?.kind||'(all)',()=>go());
+  const out=h('div',{});
+  async function go(){const r=await tool('ontology_search',{query:q.value,kind:kind.value==='(all)'?undefined:kind.value,limit:40});onto={q:q.value,kind:kind.value};out.replaceChildren();
+    if(!r.ok){out.append(errBox(r.error));return}
+    out.append(h('table',{},r.result.results.map(e=>h('tr',{style:'cursor:pointer',onclick:async()=>{const d=await tool('ontology_describe',{id:e.id});det.textContent=JSON.stringify(d.ok?d.result:d.error,null,2)}},
+      h('td',{},e.id),h('td',{},e.label),h('td',{},h('span',{class:'pill '+(e.status==='implemented'?'ok':'warn')},e.status))))))}
+  q.addEventListener('keydown',e=>{if(e.key==='Enter')go()});
+  const det=h('pre',{},'Click a row for its full description and relations.');
+  setTimeout(go,0);
+  return h('div',{},h('div',{style:'display:flex;gap:6px'},q,kind,h('button',{onclick:go},'Search')),out,det);
+}
+
+const TABS=[['summary','Summary'],['video','Video'],['audio','Audio'],['filters','Filters'],['hardware','Hardware'],['agent','Agent'],['ontology','Ontology']];
+function renderTabs(){
+  const t=$('tabs');t.replaceChildren(...TABS.map(([k,l])=>h('button',{class:tab===k?'on':'',onclick:()=>{tab=k;render()}},l)));
+  const pane=$('pane');pane.replaceChildren();
+  if(!src&&!['hardware','ontology'].includes(tab)){pane.append(h('div',{class:'note'},'Open a source to configure the conversion. Hardware and Ontology are available any time.'));return}
+  pane.append({summary:pSummary,video:()=>codecPane('video','vcodec','Video'),audio:()=>codecPane('audio','acodec','Audio'),filters:pFilters,hardware:pHardware,agent:pAgent,ontology:pOntology}[tab]());
+}
+
+/* ---------- queue ---------- */
+function renderQueue(){
+  const el=$('queue');el.replaceChildren(h('h2',{},'Queue'));
+  if(!queue.length){el.append(h('div',{class:'note'},'Empty. Configure a conversion and choose “Add to Queue”.'));return}
+  for(const q of queue){
+    const pct=q.state==='done'?100:q.progress&&q.size?Math.min(99,100*q.progress.bytes_in/q.size):0;
+    el.append(h('div',{style:'margin:8px 0'},h('div',{style:'display:flex;justify-content:space-between;gap:8px'},h('span',{},q.label),
+      h('span',{class:'pill '+({done:'ok',failed:'bad',running:'warn'}[q.state]||'')},q.state)),
+      h('div',{class:'bar'},h('i',{style:'width:'+pct+'%'})),
+      q.state==='done'?h('div',{class:'note'},fmtTime(q.report.wall_ms/1000)+' · '+(q.report.realtime_factor?q.report.realtime_factor.toFixed(0)+'× real time · ':'')+q.report.throughput_mib_s.toFixed(0)+' MiB/s · '+fmtBytes(q.report.bytes_out)+' written'):'',
+      q.state==='failed'?errBox(q.error):''));
+  }
+}
+async function runQueue(){
+  if(running)return;running=true;renderHdr();
+  for(const q of queue.filter(x=>x.state==='queued')){
+    q.state='running';renderQueue();
+    const r=await api('/api/jobs',q.job);
+    if(!r.ok){q.state='failed';q.error=r.error;renderQueue();continue}
+    for(;;){await new Promise(z=>setTimeout(z,150));const s=(await api('/api/jobs/'+r.result.id)).result;
+      q.progress=s.progress;if(s.state==='done'){q.state='done';q.report=s.report}else if(s.state==='failed'){q.state='failed';q.error=s.error}
+      renderQueue();if(s.state!=='running')break}
+  }
+  running=false;renderHdr();
+}
+
+function renderHdr(){
+  $('plan').disabled=$('addq').disabled=!src||!S.output;
+  $('start').disabled=running||!queue.some(q=>q.state==='queued');
+  $('hdr').textContent=caps?'IronAV '+caps.version+' · '+caps.platform:'';
+}
+function render(){renderSource();renderTabs();renderQueue();renderHdr()}
+
+$('open').onclick=async()=>{
+  const p=await pick({mode:'file',start:src?dirOf(src.path):'',title:'Open source'});if(!p)return;
+  const r=await tool('probe',{path:p});
+  if(!r.ok){src=null;planOut={ok:false,error:r.error};tab='summary';render();return}
+  src=r.result;planOut=null;
+  const f=fmts().find(x=>x.name===src.format)||fmts()[0];
+  if(!f){src=null;alert('No writable format matches this source.');return}
+  S.format=f.name;S.vcodec=S.acodec='copy';defaultOutput();tab='summary';render();
+};
+$('plan').onclick=async()=>{planOut=await tool('plan',buildJob());tab='summary';render()};
+$('addq').onclick=()=>{queue.push({job:buildJob(),label:src.path.slice(dirOf(src.path).length)+' → '+S.output.slice(dirOf(S.output).length),size:src.size_bytes,state:'queued'});render()};
+$('start').onclick=runQueue;
+
+(async()=>{const r=await tool('capabilities');if(!r.ok){document.body.prepend(errBox(r.error));return}caps=r.result;
+  S.format=(caps.formats.find(f=>f.mux)||{}).name||'';render()})();
+</script>
+</body>
+</html>
