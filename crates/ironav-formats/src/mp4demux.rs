@@ -1,9 +1,9 @@
 //! MP4 / QuickTime (ISO BMFF) reader.
 //!
-//! The `moov` index is read into memory and turned into a flat list of samples; the media data
-//! is never read until a packet is asked for. Packets come out in decode-time order across all
-//! tracks, which is the order the engine's input merge expects. Fragmented files (`moof`) are
-//! not supported.
+//! The `moov` index (and the `moof` boxes of a fragmented file) is read into memory and turned into a
+//! flat list of samples; the media data is never read until a packet is asked for. Packets come out
+//! in decode-time order across all tracks, which is the order the engine's input merge expects. The
+//! Matroska reader builds the same list of samples and reuses everything below it.
 //!
 //! H.264 and HEVC samples are length-prefixed in the file; they are rewritten as Annex B here
 //! (start codes, with the parameter sets from `avcC` / `hvcC` put in front of every sync
@@ -16,7 +16,7 @@ use std::io::{Read, Seek, SeekFrom};
 /// Sanity cap on the size of the index we are willing to hold in memory.
 const MAX_MOOV: u64 = 1 << 30;
 
-fn corrupt(msg: impl std::fmt::Display) -> Error {
+pub(crate) fn corrupt(msg: impl std::fmt::Display) -> Error {
     Error::invalid_input(format!("MP4: {msg}"))
 }
 
@@ -98,36 +98,38 @@ fn table(d: &[u8], entry: usize) -> Result<(usize, &[u8])> {
 }
 
 #[derive(Debug)]
-struct Config {
+pub(crate) struct Config {
     /// Annex B parameter sets to put before sync samples (empty for other codecs).
-    prefix: Vec<u8>,
-    nal_length: usize,
+    pub prefix: Vec<u8>,
+    pub nal_length: usize,
     /// Bits per sample of the video: 8, or 10 for 4:2:0 high-bit-depth profiles.
-    bits: u8,
+    pub bits: u8,
 }
 
-struct TrackInfo {
-    stream: StreamInfo,
-    config: Config,
-    convert: bool,
+pub(crate) struct TrackInfo {
+    pub stream: StreamInfo,
+    pub config: Config,
+    /// Whether samples are length-prefixed NAL units to be rewritten as Annex B (H.264 and HEVC).
+    pub convert: bool,
 }
 
 #[derive(Clone, Copy)]
-struct Sample {
-    stream: u16,
-    sync: bool,
-    offset: u64,
-    size: u32,
-    dts: i64,
-    cts_offset: i32,
-    duration: u32,
+pub(crate) struct Sample {
+    pub stream: u16,
+    pub sync: bool,
+    pub offset: u64,
+    pub size: u32,
+    pub dts: i64,
+    pub cts_offset: i32,
+    pub duration: u32,
 }
 
-fn gcd(a: i64, b: i64) -> i64 {
+pub(crate) fn gcd(a: i64, b: i64) -> i64 {
     if b == 0 { a.abs().max(1) } else { gcd(b, a % b) }
 }
 
 pub struct Mp4Demuxer<R: Read + Seek + Send> {
+    name: &'static str,
     r: R,
     pos: u64,
     streams: Vec<StreamInfo>,
@@ -238,12 +240,18 @@ impl<R: Read + Seek + Send> Mp4Demuxer<R> {
         if tracks.is_empty() {
             return Err(Error::new(ErrorCode::UnsupportedCodec, "the MP4 has no audio or video track IronAV recognises"));
         }
+        Ok(Self::from_parts(r, "mp4", tracks, samples))
+    }
+
+    /// A demuxer over samples some other container reader has found: `samples` index into `tracks`
+    /// and `offset` is a position in `r`. Puts them in decode-time order across tracks.
+    pub(crate) fn from_parts(r: R, name: &'static str, tracks: Vec<TrackInfo>, mut samples: Vec<Sample>) -> Self {
         // Decode-time order across tracks; stable, so ties keep track order.
         let scale: Vec<f64> = tracks.iter().map(|t| t.stream.time_base.as_f64()).collect();
         samples.sort_by(|a, b| (a.dts as f64 * scale[a.stream as usize]).total_cmp(&(b.dts as f64 * scale[b.stream as usize])));
         let n = tracks.len();
         let streams = tracks.iter().map(|t| t.stream.clone()).collect();
-        Ok(Self { r, pos: u64::MAX, streams, tracks, samples, next: 0, discarded: vec![false; n], seen: vec![0; n] })
+        Self { name, r, pos: u64::MAX, streams, tracks, samples, next: 0, discarded: vec![false; n], seen: vec![0; n] }
     }
 }
 
@@ -590,7 +598,7 @@ fn push_start_coded(out: &mut Vec<u8>, nal: &[u8]) {
     out.extend_from_slice(nal);
 }
 
-fn parse_avcc(c: &[u8]) -> Result<Config> {
+pub(crate) fn parse_avcc(c: &[u8]) -> Result<Config> {
     if c.len() < 7 || c[0] != 1 {
         return Err(corrupt("avcC is malformed"));
     }
@@ -622,7 +630,7 @@ fn parse_avcc(c: &[u8]) -> Result<Config> {
     Ok(Config { prefix, nal_length: (c[4] & 3) as usize + 1, bits })
 }
 
-fn parse_hvcc(c: &[u8]) -> Result<Config> {
+pub(crate) fn parse_hvcc(c: &[u8]) -> Result<Config> {
     if c.len() < 23 || c[0] != 1 {
         return Err(corrupt("hvcC is malformed"));
     }
@@ -659,7 +667,7 @@ fn unsupported_format(chroma: u8, bits: u8) -> Error {
 
 impl<R: Read + Seek + Send> Demuxer for Mp4Demuxer<R> {
     fn format_name(&self) -> &'static str {
-        "mp4"
+        self.name
     }
 
     fn streams(&self) -> &[StreamInfo] {

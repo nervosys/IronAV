@@ -34,10 +34,6 @@ fn codec_meta(c: CodecId) -> (&'static str, &'static str) {
 const PLANNED_CONTAINERS: &[(&str, &str, &str, &[CodecId])] = &[
     ("mov", "QuickTime MOV", "Apple QuickTime container; common for ProRes editing masters.",
         &[CodecId::H264, CodecId::Hevc, CodecId::ProRes, CodecId::Mjpeg, CodecId::Aac, CodecId::Alac, CodecId::PcmS16Le, CodecId::PcmS32Le]),
-    ("mkv", "Matroska", "Flexible open container that can hold nearly any codec.",
-        &[CodecId::H264, CodecId::Hevc, CodecId::Av1, CodecId::Vp8, CodecId::Vp9, CodecId::Aac, CodecId::Mp3, CodecId::Opus, CodecId::Vorbis, CodecId::Flac]),
-    ("webm", "WebM", "Matroska subset for the web.",
-        &[CodecId::Vp8, CodecId::Vp9, CodecId::Av1, CodecId::Opus, CodecId::Vorbis]),
     ("mpegts", "MPEG transport stream", "Broadcast and HLS segment container.",
         &[CodecId::H264, CodecId::Hevc, CodecId::Mpeg4, CodecId::Aac, CodecId::Mp3]),
     ("ogg", "Ogg", "Open container for Vorbis, Opus and FLAC.", &[CodecId::Opus, CodecId::Vorbis, CodecId::Flac]),

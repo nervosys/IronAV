@@ -6,10 +6,11 @@ A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so 
 > **Status: foundation (v0.1).** The architecture, agent interface, ontology, hardware model, CLI, MCP server
 > and both GUIs are working and tested. The codec/container set is deliberately small so far:
 > **WAV, FLAC and Y4M containers; PCM (8/16/24/32-bit, float), FLAC and raw-video codecs, and an AAC-LC decoder; `volume`, `gray`, `hflip` filters.**
-> **H.264 and HEVC can be encoded and decoded on NVIDIA GPUs (NVENC/NVDEC)**, and MP4 files can be read and written.
+> **H.264 and HEVC can be encoded and decoded on NVIDIA GPUs (NVENC/NVDEC)**, MP4 files can be read and written, and
+> Matroska/WebM files can be read.
 > There is no software H.264/HEVC codec, so those need an NVIDIA GPU. MP4 can carry FLAC audio next to the video, and AAC
-> audio copied from another MP4/M4A (AAC can be decoded but not encoded). Opus, AV1, MKV/WebM etc. are modelled in the
-> ontology as `planned`.
+> audio copied from another MP4/M4A (AAC can be decoded but not encoded). Opus, AV1, writing Matroska etc. are modelled in
+> the ontology as `planned`.
 > IronAV is not yet a drop-in replacement for FFmpeg or HandBrake.
 
 ## Interfaces
@@ -99,6 +100,23 @@ to the identical 50 frames and 88,064 audio samples as the original.
 Fragmented MP4 (`moof`/`traf`/`trun`, as made by streaming tools and `-movflags frag_keyframe`) is read too, with or without
 `default-base-is-moof`; checked on two fragmented files made by FFmpeg, which copy to the same frames, times and audio samples.
 Fragmented MP4 is not written.
+
+### Matroska and WebM (read only)
+
+`.mkv`, `.webm` and `.mka` files are read: the elements are walked once to find every frame (simple blocks, block groups,
+Xiph/EBML/fixed lacing, clusters of unknown size, a file cut short mid-cluster), and the frames then go through the same
+reader as MP4, so probing, hardware decoding, seeking, playing and copying H.264/HEVC/AAC into an MP4 all work on them.
+Matroska keeps presentation times only, so for B-frame video the decode times are taken to be the sorted presentation
+times. Audio whose frame length is known (AAC, MP3, anything with a `DefaultDuration`) gets a sample-rate time base, so its
+times are exact despite the file's millisecond ticks.
+Checked on files remuxed by FFmpeg: an x264 file with B-frames and AAC and an HEVC file copy into MP4 with the same frames
+(identical pixels when decoded by FFmpeg) and audio samples; the 1080p H.264 file decodes on the GPU to the same 50 frames
+as FFmpeg's decoder; AAC in a `.mka` decodes to within 1 LSB of FFmpeg's. A VP9/Opus WebM is listed by `probe` but cannot
+be decoded (there are no VP9 or Opus decoders yet).
+Not handled: tracks with a content encoding (header stripping, compression, encryption) are refused; chapters, tags, cues
+and attachments are ignored; subtitle tracks are skipped; Matroska is never written. A copied track starts at its own first
+timestamp rounded to the output's frame grid, so a video that starts a fraction of a frame after the audio in the source
+(23 ms in one test file) ends up up to half a frame (20 ms at 25 fps) away from where it was.
 
 Checked against FFmpeg's software decoders (via PyAV), frame by frame: NVDEC output is **identical** for 240/240 frames of
 720p H.264 and of HEVC (made by IronAV), and for 50/50 frames of 1080p H.264 with B-frames made by x264 (a different

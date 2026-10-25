@@ -2,6 +2,7 @@
 
 mod annexb;
 pub(crate) mod flac;
+mod mkv;
 mod mp4;
 mod mp4demux;
 mod wav;
@@ -69,6 +70,15 @@ pub static FORMATS: &[FormatSpec] = &[
         codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Aac, CodecId::Flac],
     },
     FormatSpec {
+        name: "mkv",
+        extensions: &["mkv", "webm", "mka"],
+        description: "Matroska and WebM (read-only): video and audio are listed and H.264/HEVC/AAC can be copied to MP4, but nothing writes Matroska yet",
+        media: MediaType::Video,
+        demux: true,
+        mux: false,
+        codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Av1, CodecId::Vp8, CodecId::Vp9, CodecId::Aac, CodecId::Mp3, CodecId::Opus, CodecId::Vorbis, CodecId::Flac],
+    },
+    FormatSpec {
         name: "h264",
         extensions: &["h264", "264"],
         description: "Raw H.264 Annex B elementary stream (write-only)",
@@ -118,6 +128,9 @@ pub fn open_demuxer(path: &Path) -> Result<Box<dyn Demuxer>> {
         Ok(Box::new(flac::FlacDemuxer::open(f)?))
     } else if mp4demux::looks_like_mp4(magic) {
         Ok(Box::new(mp4demux::Mp4Demuxer::open(f)?))
+    } else if mkv::looks_like_mkv(magic) {
+        // Matroska does its own buffering: it seeks over every frame while indexing.
+        Ok(Box::new(mkv::open(f.into_inner())?))
     } else if magic.starts_with(b"YUV4MPEG2") {
         Ok(Box::new(y4m::Y4mDemuxer::open(f)?))
     } else {

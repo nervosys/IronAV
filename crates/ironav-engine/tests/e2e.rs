@@ -631,9 +631,19 @@ fn format_filter_converts_pixel_formats_and_explains_mistakes() {
 /// stereo all in use; the reference is what FFmpeg's decoder produces from the same file.
 #[test]
 fn aac_decodes_to_what_ffmpeg_decodes() {
-    let dir = scratch("aac");
+    aac_matches_ffmpeg("aac", "aac_stereo_tools.m4a");
+}
+
+/// The same audio remuxed into Matroska (by FFmpeg) decodes to the same samples.
+#[test]
+fn aac_in_matroska_decodes_to_what_ffmpeg_decodes() {
+    aac_matches_ffmpeg("aac-mka", "aac_stereo_tools.mka");
+}
+
+fn aac_matches_ffmpeg(scratch_name: &str, file: &str) {
+    let dir = scratch(scratch_name);
     let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
-    let input = data.join("aac_stereo_tools.m4a");
+    let input = data.join(file);
     let out = dir.join("out.wav");
     let mut j = job(&input, &out);
     j.audio.codec = Some("pcm_s16le".into());
@@ -643,4 +653,42 @@ fn aac_decodes_to_what_ffmpeg_decodes() {
     assert_eq!(got.len(), want.len());
     let worst = got.iter().zip(&want).map(|(a, b)| (*a as i32 - *b as i32).abs()).max().unwrap();
     assert!(worst <= 2, "largest difference from FFmpeg's decode is {worst} LSB");
+}
+
+/// 20 frames of H.264 with B-frames and the AAC clip, muxed into Matroska by FFmpeg. Copying it into an
+/// MP4 must keep every packet and its time, so reading the copy gives back what the Matroska reader gave.
+#[test]
+fn matroska_with_b_frames_copies_into_mp4_unchanged() {
+    let dir = scratch("mkv-copy");
+    let input = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/bframes_aac.mkv");
+    let out = dir.join("out.mp4");
+    run(&job(&input, &out), &mut |_| {}).unwrap();
+    let read = |p: &std::path::Path| {
+        let mut d = ironav_formats::open_demuxer(p).unwrap();
+        let streams = d.streams().to_vec();
+        let mut packets = Vec::new();
+        while let Some(pk) = d.read_packet().unwrap() {
+            // The edit list of an MP4 skips `lead_in` at the start; what is shown starts after it.
+            let secs = (pk.pts - streams[pk.stream].lead_in) as f64 * streams[pk.stream].time_base.as_f64();
+            packets.push((pk.stream, secs, pk.data));
+        }
+        (d.format_name(), streams, packets)
+    };
+    let (from_name, from_streams, from) = read(&input);
+    let (to_name, to_streams, to) = read(&out);
+    assert_eq!((from_name, to_name), ("matroska", "mp4"));
+    assert_eq!(from_streams.len(), 2);
+    assert_eq!(to_streams.iter().map(|s| s.codec).collect::<Vec<_>>(), from_streams.iter().map(|s| s.codec).collect::<Vec<_>>());
+    assert_eq!(from.len(), 20 + 17, "20 video frames and 17 AAC packets");
+    for stream in 0..2 {
+        let a: Vec<_> = from.iter().filter(|p| p.0 == stream).collect();
+        let b: Vec<_> = to.iter().filter(|p| p.0 == stream).collect();
+        assert_eq!(a.len(), b.len(), "stream {stream}");
+        for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+            assert_eq!(x.2, y.2, "stream {stream} packet {i}: payload");
+            assert!((x.1 - y.1).abs() < 1e-3, "stream {stream} packet {i}: shown at {} s in the Matroska, {} s in the copy", x.1, y.1);
+        }
+    }
+    let shown: Vec<f64> = from.iter().filter(|p| p.0 == 0).map(|p| p.1).collect();
+    assert!(shown.windows(2).any(|w| w[1] < w[0]), "the fixture is meant to have reordered frames");
 }

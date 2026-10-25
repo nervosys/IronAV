@@ -122,7 +122,7 @@ fn h_capabilities(_: &Value) -> Result<Value> {
         "tools": tools().iter().map(|t| json!({ "name": t.name, "description": t.description, "cli": t.cli, "read_only": t.read_only })).collect::<Vec<_>>(),
         "error_codes": ErrorCode::ALL,
         "ontology": ontology().summary(),
-        "not_implemented": "AV1, Opus, MP3 and other codecs, and containers such as MKV and WebM, appear in the ontology with status 'planned'. AAC-LC can be decoded (not HE-AAC/SBR, not encoded). H.264/HEVC are encoded and decoded in hardware only (NVIDIA NVENC/NVDEC; no software codec exists), and only as 4:2:0 (8-bit, or 10-bit for HEVC). MP4 can be read (including fragmented files) and written (fast-start, index first); it holds FLAC audio, and AAC audio that is copied from another MP4/M4A. A video plus an audio file are combined with extra_inputs."
+        "not_implemented": "AV1, Opus, MP3 and other codecs, and writing Matroska or MPEG-TS, appear in the ontology with status 'planned'. Matroska and WebM files can be read (their H.264/HEVC/AAC copied or decoded as from MP4); VP9, AV1 and Opus tracks in them are listed but cannot be decoded. AAC-LC can be decoded (not HE-AAC/SBR, not encoded). H.264/HEVC are encoded and decoded in hardware only (NVIDIA NVENC/NVDEC; no software codec exists), and only as 4:2:0 (8-bit, or 10-bit for HEVC). MP4 can be read (including fragmented files) and written (fast-start, index first); it holds FLAC audio, and AAC audio that is copied from another MP4/M4A. A video plus an audio file are combined with extra_inputs."
     }))
 }
 
