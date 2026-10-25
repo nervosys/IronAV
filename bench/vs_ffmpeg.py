@@ -7,7 +7,9 @@ The FFmpeg side runs in-process, so it pays no process start-up; the IronAV side
 per run, start-up included. That leans against IronAV (start-up is about 13 ms on the machine this was written on). Each figure is the median of 5 runs. The audio part generates its own signal. The video part
 needs av.mp4 (H.264, 720p), bf.mp4 (H.264 with B-frames) and src.y4m in the media directory and is
 skipped when they are missing. FFmpeg's decode figures do not write the pictures anywhere, while
-IronAV writes a Y4M file, so they overstate FFmpeg's advantage on decoding."""
+IronAV writes a Y4M file, so they overstate FFmpeg's advantage on decoding. (Writing the same file through
+PyAV's Y4M muxer took 7.6 s for 240 frames, which says more about that path than about FFmpeg, so no like-for-like
+number is given; run the `ffmpeg` command-line program for one.)"""
 import subprocess, json, os, time, statistics, sys
 import numpy as np, av
 IA = r"E:\cargo-target\release\ironav.exe"

@@ -234,6 +234,8 @@ struct State {
     coded_height: u32,
     display: [i32; 4],
     out: VecDeque<Frame>,
+    /// Host copy of the interleaved chroma plane, kept between pictures.
+    uv_scratch: Vec<u8>,
     error: Option<Error>,
 }
 
@@ -385,27 +387,37 @@ impl State {
         let (mut dptr, mut pitch) = (0u64, 0u32);
         // SAFETY: maps a picture index the parser just reported; unmapped below on every path.
         cu(unsafe { (self.api.map)(self.decoder, d.picture_index, &mut dptr, &mut pitch, &mut proc) }, "cuvidMapVideoFrame")?;
-        let copied = self.copy_planes(dptr, pitch);
+        let mut uv = std::mem::take(&mut self.uv_scratch);
+        let copied = self.copy_planes(dptr, pitch, &mut uv);
         // SAFETY: `dptr` came from the successful map above.
         unsafe { (self.api.unmap)(self.decoder, dptr) };
         let (w, h) = (self.width as usize, self.height as usize);
-        let (y, uv) = copied?;
+        let y = match copied {
+            Ok(y) => y,
+            Err(e) => {
+                self.uv_scratch = uv;
+                return Err(e);
+            }
+        };
         let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
         let (mut u, mut v) = (vec![0u8; cw * ch], vec![0u8; cw * ch]);
-        for (i, p) in uv.chunks_exact(2).enumerate() {
-            u[i] = p[0];
-            v[i] = p[1];
+        for ((u, v), p) in u.iter_mut().zip(v.iter_mut()).zip(uv.chunks_exact(2)) {
+            *u = p[0];
+            *v = p[1];
         }
+        self.uv_scratch = uv;
         Ok(Frame::Video(VideoFrame { width: self.width, height: self.height, pix_fmt: PixelFormat::Yuv420p, pts: d.timestamp, planes: vec![y, u, v] }))
     }
 
     /// NV12 luma and interleaved chroma of the display area, as tightly packed host buffers.
-    fn copy_planes(&self, dptr: u64, pitch: u32) -> Result<(Vec<u8>, Vec<u8>)> {
+    /// The chroma goes into `uv`, which is reused between pictures so it is not reallocated
+    /// (and page-faulted in) for every one.
+    fn copy_planes(&self, dptr: u64, pitch: u32, uv: &mut Vec<u8>) -> Result<Vec<u8>> {
         let (w, h) = (self.width as usize, self.height as usize);
         let (left, top) = (self.display[0].max(0) as u64 & !1, self.display[1].max(0) as u64 & !1);
         let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
         let mut y = vec![0u8; w * h];
-        let mut uv = vec![0u8; cw * 2 * ch];
+        uv.resize(cw * 2 * ch, 0);
         // Mapped frames keep the chroma plane right after the luma plane, whose height is the
         // coded height rounded up to even.
         let chroma_base = dptr + pitch as u64 * ((self.coded_height as u64 + 1) & !1);
@@ -432,8 +444,8 @@ impl State {
             cu(unsafe { (self.api.memcpy2d)(&m) }, "cuMemcpy2D")
         };
         copy(dptr, left, top, &mut y, w, h)?;
-        copy(chroma_base, left, top / 2, &mut uv, cw * 2, ch)?;
-        Ok((y, uv))
+        copy(chroma_base, left, top / 2, uv, cw * 2, ch)?;
+        Ok(y)
     }
 }
 
@@ -531,6 +543,7 @@ impl NvdecDecoder {
                 coded_height: 0,
                 display: [0; 4],
                 out: VecDeque::new(),
+                uv_scratch: Vec::new(),
                 error: None,
             }));
             // From here on the struct owns everything, so Drop cleans up on any error path.

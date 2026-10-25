@@ -198,8 +198,11 @@ four-byte bit writes, and blocks encoded in parallel). FFmpeg decodes its output
 NVENC used to wait for each frame before copying the next; it now keeps six in flight, which took the in-process
 conversion from about 0.65 s to 0.42 s (copying the same Y4M with no encoding takes 0.23-0.32 s of that). FLAC decoding was
 tuned too (four-byte CRC-16 steps, 64-bit bit-reader loads, unary codes found with a leading-zero count): 20-30 %
-faster in alternating same-machine runs of the in-process test, about 0.15 s for the 3-minute file. Not yet looked at:
-the NVDEC path.
+faster in alternating same-machine runs of the in-process test, about 0.15 s for the 3-minute file. NVDEC: decode alone (no output file; `IRONAV_PERF_MP4=clip.mp4 cargo test --release -p ironav-engine --test nvdec_perf
+-- --ignored --nocapture`) takes 0.36-0.67 s for the 240-frame 720p clip on this busy machine, of which 0.10-0.25 s is
+creating the decoder and CUDA context before the first picture; reusing one chroma buffer per picture made it
+15-25 % faster in alternating runs. The Y4M row above is mostly the 332 MB file being written. A like-for-like FFmpeg
+figure needs the `ffmpeg` command-line program, which is not installed here (PyAV's Y4M writer took 7.6 s).
 
 **Start-up.** `ironav` with no work to do took 79 ms to start, against 11 ms for a trivial program, because the window
 libraries were linked into it. They now live in a second program, `ironav-gui`, which `ironav gui` launches; `ironav`
