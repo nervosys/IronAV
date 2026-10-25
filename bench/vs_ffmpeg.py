@@ -4,8 +4,7 @@
     IRONAV_BIN=target/release/ironav python bench/vs_ffmpeg.py [media-dir]
 
 The FFmpeg side runs in-process, so it pays no process start-up; the IronAV side is a fresh process
-per run, start-up included. That leans against IronAV, and on Windows the start-up alone is about
-100 ms. Each figure is the median of 5 runs. The audio part generates its own signal. The video part
+per run, start-up included. That leans against IronAV (start-up is about 13 ms on the machine this was written on). Each figure is the median of 5 runs. The audio part generates its own signal. The video part
 needs av.mp4 (H.264, 720p), bf.mp4 (H.264 with B-frames) and src.y4m in the media directory and is
 skipped when they are missing. FFmpeg's decode figures do not write the pictures anywhere, while
 IronAV writes a Y4M file, so they overstate FFmpeg's advantage on decoding."""

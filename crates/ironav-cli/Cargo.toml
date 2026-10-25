@@ -28,3 +28,9 @@ native-gui = ["dep:ironav-gui"]
 [[bin]]
 name = "ironav"
 path = "src/main.rs"
+
+# The windows live in their own program so `ironav` starts in milliseconds.
+[[bin]]
+name = "ironav-gui"
+path = "src/gui_main.rs"
+required-features = ["native-gui"]

@@ -181,13 +181,13 @@ resident. Measured (release build, one Windows machine, 10 min of 48 kHz stereo 
 
 **Against FFmpeg** (`bench/vs_ffmpeg.py`; one Windows machine, RTX 3090 Ti, 24 threads; FFmpeg 8.x libraries through PyAV;
 median of 5). The FFmpeg side runs in-process and pays no process start; the IronAV side is a new process each time
-(about 100 ms of start-up on this machine, which `python -c pass` also pays), so the table leans against IronAV:
+(about 13 ms now; it was 79 ms before the windows moved into their own program, see below), so the table leans against IronAV:
 
 | Job | IronAV | FFmpeg | |
 |---|---|---|---|
 | WAV to FLAC, 180 s stereo | 0.38-0.45 s | 0.21-0.22 s | FFmpeg about 2x faster; IronAV output 0.1 % smaller |
 | FLAC to WAV, 180 s | 0.33 s | 0.12 s (decode only) | FFmpeg about 2.5x faster |
-| NVENC H.264, 240 frames 720p from Y4M | 0.56-0.74 s | 0.42-0.44 s (`h264_nvenc`) | FFmpeg about 1.3-1.6x faster; sizes differ because rate control differs |
+| NVENC H.264, 240 frames 720p from Y4M | 0.56-0.74 s | 0.42-0.68 s (`h264_nvenc`) | FFmpeg faster in quiet runs (1.3-1.6x), about level in the noisiest; sizes differ because rate control differs |
 | NVDEC H.264 to a Y4M file, 240 frames 720p | 0.84 s | 0.42 s (`cuda` hwaccel, no file written) | not like for like; FFmpeg's figure writes nothing |
 
 **So IronAV is currently slower than FFmpeg on every job measured here.** The "lower latency, higher throughput"
@@ -197,7 +197,12 @@ tuned (cheaper Rice-parameter search, one residual per predictor family instead 
 four-byte bit writes, and blocks encoded in parallel). FFmpeg decodes its output bit-exactly (checked on the 3-minute file), and the committed libFLAC fixtures still pass.
 NVENC used to wait for each frame before copying the next; it now keeps six in flight, which took the in-process
 conversion from about 0.65 s to 0.42 s (copying the same Y4M with no encoding takes 0.23-0.32 s of that). Not yet
-looked at: FLAC decoding, the NVDEC path, and process start-up. Timings on this machine vary by a factor of two from run to run when other work is going on.
+looked at: FLAC decoding and the NVDEC path.
+
+**Start-up.** `ironav` with no work to do took 79 ms to start, against 11 ms for a trivial program, because the window
+libraries were linked into it. They now live in a second program, `ironav-gui`, which `ironav gui` launches; `ironav`
+starts in 13 ms (median of 25 on this machine). Both programs are built by default and must stay in the same directory.
+`cargo build --release --no-default-features -p ironav-cli` builds only the small one. Timings on this machine vary by a factor of two from run to run when other work is going on.
 NVENC in earlier runs: 240 frames of 1280x720 (a 332 MB Y4M) in 0.6-3.8 s wall depending on load.
 
 

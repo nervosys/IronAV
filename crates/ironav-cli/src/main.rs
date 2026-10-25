@@ -166,15 +166,22 @@ fn run_job(v: Value, progress: bool) -> Result<Value> {
     Ok(serde_json::to_value(report)?)
 }
 
-#[cfg(feature = "native-gui")]
+/// Run the sibling `ironav-gui` program and wait for its window to close. It is a separate
+/// executable so that this one does not load the graphics stack on every call.
 fn native_gui(file: Option<String>, player: bool) -> Result<()> {
-    if player { ironav_gui::run_player(file) } else { ironav_gui::run(file) }
-}
-
-#[cfg(not(feature = "native-gui"))]
-fn native_gui(_file: Option<String>, _player: bool) -> Result<()> {
-    Err(Error::new(ironav_core::ErrorCode::UnsupportedFormat, "this build was compiled without the native GUI")
-        .hint("rebuild with default features, or use `ironav gui --web`"))
+    let name = if cfg!(windows) { "ironav-gui.exe" } else { "ironav-gui" };
+    let exe = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join(name))).filter(|p| p.exists());
+    let Some(exe) = exe else {
+        return Err(Error::new(ironav_core::ErrorCode::UnsupportedFormat, "the native GUI program (ironav-gui) is not installed next to ironav")
+            .hint("build with default features (cargo build --release), or use `ironav gui --web`"));
+    };
+    let mut cmd = std::process::Command::new(exe);
+    if player {
+        cmd.arg("--play");
+    }
+    cmd.args(file);
+    let status = cmd.status().map_err(|e| Error::new(ironav_core::ErrorCode::Io, format!("could not start ironav-gui: {e}")))?;
+    if status.success() { Ok(()) } else { std::process::exit(status.code().unwrap_or(1)) }
 }
 
 fn main() {
