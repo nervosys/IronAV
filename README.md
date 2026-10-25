@@ -49,9 +49,18 @@ Export: `ironav ontology jsonld` (also an MCP resource).
 OpenCL across Windows, Linux, macOS, Android and iOS: capability matrix, driver detection, and policy-based selection
 (`auto`, `off`, `require`, or a named backend) that explains every rejected candidate.
 A backend is *usable* only if its driver is detected **and** a native provider implements the codec and direction.
-Today there is exactly one provider: **NVIDIA NVENC encode of H.264 and HEVC** (Windows and Linux). Every other
+Today there is one vendor: **NVIDIA, NVENC encode and NVDEC decode of H.264 and HEVC** (Windows and Linux). Every other
 backend is detected and reported but not driven, and `select` says so per candidate. Where no provider applies,
 `auto` falls back to software and `require` fails with `hardware-unavailable`.
+
+**Where this has been run.** Windows 11 (RTX 3090 Ti) is where it was developed. Linux was tried once, in Debian under
+WSL 2 with the same GPU: the workspace tests pass there (without the sound and window crates, which need system packages
+that were not installed), and NVENC and NVDEC both work on real video. That run found and fixed two Linux-only bugs:
+the NVDEC structs used 4-byte integers where the C header's `unsigned long` is 8 bytes on Linux (decoding silently
+produced no pictures), and the driver search did not look in WSL's `/usr/lib/wsl/lib` or `LD_LIBRARY_PATH`. Native
+Linux (not WSL), macOS, other GPU vendors, the sound output and the windows on any platform other than Windows have
+not been run. A GitHub Actions workflow for Linux, macOS and Windows is in `.github/workflows`; it has not run yet
+because the account's Actions billing refused to start it.
 
 NVENC is loaded from the driver at run time (`nvEncodeAPI64.dll` / `libnvidia-encode.so.1`), so the same binary runs on
 machines without NVIDIA hardware. It needs a driver that supports NVENC API 13.1 or newer and refuses older ones with a
