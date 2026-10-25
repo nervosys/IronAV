@@ -1,6 +1,6 @@
 use crate::job::Job;
 use crate::plan::{plan, rate_control, Action, Plan};
-use ironav_codec::{build_filter, new_decoder, new_encoder};
+use ironav_codec::{build_filter, new_encoder};
 use ironav_core::{Decoder, Encoder, Error, ErrorCode, Filter, Frame, MediaType, Packet, Rational, Result};
 use ironav_hwaccel::{new_video_decoder, new_video_encoder, Direction, RateControl};
 use ironav_formats::{create_muxer, open_demuxer};
@@ -170,7 +170,7 @@ fn execute(
                     hw_dec_name = Some(backend.name());
                     new_video_decoder(backend, src.codec, &src.params)?
                 }
-                None => new_decoder(src.codec, &src.params, src.bits)?,
+                None => ironav_codec::new_decoder_for(src)?,
             };
             (Some(decoder), Some(encoder), fs)
         } else {

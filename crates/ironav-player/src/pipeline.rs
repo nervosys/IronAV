@@ -3,7 +3,7 @@
 
 use crate::output::{AudioOutput, NullOutput};
 use crate::{AudioMode, Cmd, Inner, TimedFrame};
-use ironav_codec::{is_implemented, new_decoder};
+use ironav_codec::is_implemented;
 use ironav_core::{Decoder, Error, ErrorCode, Frame, MediaType, Result, StreamInfo, StreamParams};
 use ironav_formats::open_demuxer;
 use ironav_hwaccel::{new_video_decoder, probe_all, select, Direction, HwPolicy};
@@ -24,7 +24,7 @@ const VIDEO_BYTES_AHEAD: usize = 256 << 20;
 /// A decoder for the video stream: software if one exists, otherwise a GPU decoder.
 pub fn open_video_decoder(s: &StreamInfo, hwaccel: &str) -> Result<(Box<dyn Decoder>, &'static str)> {
     if is_implemented(s.codec, false) {
-        return Ok((new_decoder(s.codec, &s.params, s.bits)?, "software"));
+        return Ok((ironav_codec::new_decoder_for(s)?, "software"));
     }
     let policy = HwPolicy::parse(hwaccel)?;
     let sel = select(s.codec, Direction::Decode, policy, &probe_all())?;
@@ -319,7 +319,7 @@ fn audio_loop(inner: &Inner, path: &str, stream: &StreamInfo, mut dec: Box<dyn D
         if need_seek {
             need_seek = false;
             demux.seek(trim_before)?;
-            dec = new_decoder(stream.codec, &stream.params, stream.bits)?;
+            dec = ironav_codec::new_decoder_for(stream)?;
             conv.reset();
         }
         let Some(p) = demux.read_packet()? else {

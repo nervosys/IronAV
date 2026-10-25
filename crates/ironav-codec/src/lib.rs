@@ -3,6 +3,7 @@
 //! The registries ([`implemented`], [`FILTERS`]) are the single source of truth for
 //! "what can IronAV actually do"; the ontology and the planner both read them.
 
+pub mod aac;
 pub mod flac;
 mod filters;
 mod pcm;
@@ -29,6 +30,9 @@ pub fn implemented() -> Vec<CodecImpl> {
     CodecId::ALL
         .iter()
         .filter_map(|&c| {
+            if c == CodecId::Aac {
+                return Some(CodecImpl { codec: c, decode: true, encode: false, implementation: "ironav-aac" });
+            }
             let implementation = if c.sample_format().is_some() {
                 "ironav-pcm"
             } else if c == CodecId::RawVideo {
@@ -56,6 +60,14 @@ fn unsupported(codec: CodecId, what: &str) -> Error {
     Error::new(ErrorCode::UnsupportedCodec, format!("no software {what} for {}", codec.name()))
         .hint("this codec is in the ontology but not implemented yet; use one of the alternatives, or check `ironav capabilities`")
         .alternatives(alts)
+}
+
+/// A decoder for a stream, including the codec configuration (AAC's AudioSpecificConfig) it carries.
+pub fn new_decoder_for(s: &ironav_core::StreamInfo) -> Result<Box<dyn Decoder>> {
+    match s.codec {
+        CodecId::Aac => Ok(Box::new(aac::AacDecoder::new(&s.extradata, &s.params)?)),
+        _ => new_decoder(s.codec, &s.params, s.bits),
+    }
 }
 
 /// `bits` is the stream's bits per sample where that is meaningful (PCM, FLAC).

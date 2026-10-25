@@ -326,7 +326,7 @@ impl Player {
         let mut audio = None;
         if opts.audio != AudioMode::Off {
             if let Some(s) = pick(&streams, MediaType::Audio) {
-                match ironav_codec::new_decoder(s.codec, &s.params, s.bits) {
+                match ironav_codec::new_decoder_for(s) {
                     Ok(dec) => audio = Some((s.clone(), dec)),
                     Err(_) => warnings.push(format!("audio track ({}) cannot be decoded here, so it is skipped", s.codec.name())),
                 }

@@ -1,5 +1,5 @@
 use crate::job::{FilterCall, Job};
-use ironav_codec::{build_filter, new_decoder, new_encoder, FILTERS};
+use ironav_codec::{build_filter, new_encoder, FILTERS};
 use ironav_core::{CodecId, Error, ErrorCode, MediaType, Result, StreamInfo, StreamParams};
 use ironav_formats::{find_format, format_for_path, open_demuxer};
 use crate::job::StreamOpts;
@@ -195,7 +195,7 @@ pub fn plan(job: &Job) -> Result<Plan> {
             // Hardware decode is used only for codecs with no software decoder (H.264, HEVC);
             // asking for it otherwise would make `require` fail for no reason.
             if ironav_codec::is_implemented(s.codec, false) || !provider_codecs(Direction::Decode).contains(&s.codec) {
-                new_decoder(s.codec, &s.params, s.bits)?;
+                ironav_codec::new_decoder_for(s)?;
             } else {
                 let sel = select(s.codec, Direction::Decode, policy, &probes)?;
                 if sel.chosen.is_none() {

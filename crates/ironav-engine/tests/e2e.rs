@@ -626,3 +626,21 @@ fn format_filter_converts_pixel_formats_and_explains_mistakes() {
     missing.filters.push(FilterCall::parse_shorthand("format").unwrap());
     assert_eq!(plan(&missing).unwrap_err().code, ErrorCode::InvalidArgument);
 }
+
+/// 0.8 s of stereo AAC-LC from FFmpeg's encoder with short windows, TNS, PNS, intensity and mid/side
+/// stereo all in use; the reference is what FFmpeg's decoder produces from the same file.
+#[test]
+fn aac_decodes_to_what_ffmpeg_decodes() {
+    let dir = scratch("aac");
+    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    let input = data.join("aac_stereo_tools.m4a");
+    let out = dir.join("out.wav");
+    let mut j = job(&input, &out);
+    j.audio.codec = Some("pcm_s16le".into());
+    run(&j, &mut |_| {}).unwrap();
+    let got: Vec<i16> = pcm(&out).chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
+    let want: Vec<i16> = std::fs::read(data.join("aac_stereo_tools.ffmpeg.s16")).unwrap().chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
+    assert_eq!(got.len(), want.len());
+    let worst = got.iter().zip(&want).map(|(a, b)| (*a as i32 - *b as i32).abs()).max().unwrap();
+    assert!(worst <= 2, "largest difference from FFmpeg's decode is {worst} LSB");
+}

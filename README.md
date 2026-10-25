@@ -5,11 +5,11 @@ A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so 
 
 > **Status: foundation (v0.1).** The architecture, agent interface, ontology, hardware model, CLI, MCP server
 > and both GUIs are working and tested. The codec/container set is deliberately small so far:
-> **WAV, FLAC and Y4M containers; PCM (8/16/24/32-bit, float), FLAC and raw-video codecs; `volume`, `gray`, `hflip` filters.**
+> **WAV, FLAC and Y4M containers; PCM (8/16/24/32-bit, float), FLAC and raw-video codecs, and an AAC-LC decoder; `volume`, `gray`, `hflip` filters.**
 > **H.264 and HEVC can be encoded and decoded on NVIDIA GPUs (NVENC/NVDEC)**, and MP4 files can be read and written.
-> There is no software H.264/HEVC codec, so those need an NVIDIA GPU. MP4 can carry FLAC audio next to the video, but not
-> AAC or Opus (no encoder or decoder exists here yet); an MP4's AAC track is listed by `probe` and must be left out with
-> `--acodec none`. AV1/AAC/Opus, MKV/WebM etc. are modelled in the ontology as `planned`.
+> There is no software H.264/HEVC codec, so those need an NVIDIA GPU. MP4 can carry FLAC audio next to the video, and AAC
+> audio copied from another MP4/M4A (AAC can be decoded but not encoded). Opus, AV1, MKV/WebM etc. are modelled in the
+> ontology as `planned`.
 > IronAV is not yet a drop-in replacement for FFmpeg or HandBrake.
 
 ## Interfaces
@@ -93,7 +93,7 @@ ironav convert -i in.mp4 -o out.mp4                                      # strea
 `--acodec none` / `--vcodec none` leave a stream out. Copying H.264/HEVC with B-frames into an MP4 works: the writer
 records composition offsets (`ctts`) and an edit list, and a copy of an x264 file with B-frames decodes to the same
 50 frames, bit for bit, at the same times (checked with FFmpeg's decoder through PyAV).
-AAC audio can be copied into an MP4 too (not decoded or encoded: there is no AAC codec yet). The writer builds the `esds`
+AAC audio can be copied into an MP4 too (see the AAC decoder below for decoding). The writer builds the `esds`
 box from the stream's AudioSpecificConfig and keeps the encoder-delay edit list, so a copy of an x264+AAC file decodes
 to the identical 50 frames and 88,064 audio samples as the original.
 Fragmented MP4 (`moof`/`traf`/`trun`, as made by streaming tools and `-movflags frag_keyframe`) is read too, with or without
@@ -181,7 +181,7 @@ What was and was not checked, on one machine (Windows, RTX 3090 Ti):
   beyond building. The `level` meter reports what was handed to the device, not what came out of the speakers.
   Audio/video sync was not measured against a reference.
 - The TUI is tested by rendering to a test buffer; it has not been exercised in a real terminal emulator.
-- Players keep their position only in memory; MP4 AAC audio is skipped with a warning (no decoder); there is no subtitle,
+- Players keep their position only in memory; there is no subtitle,
   playlist or network-stream support, and no GPU rendering (pictures are converted to RGB on the CPU).
 
 ## FLAC
@@ -196,6 +196,26 @@ sources are written as 24-bit FLAC.
 channels, 1-100,003 samples, and three libFLAC compression levels, in both directions (IronAV→libFLAC and
 libFLAC→IronAV), all bit-exact. Small libFLAC-produced fixtures are committed so `cargo test` keeps checking this.
 On one synthetic 3-minute stereo signal the output size equals libFLAC's mid compression level (0.652 of the WAV).
+
+## AAC
+
+AAC-LC **decoder** (ISO/IEC 14496-3), written from the specification with the Huffman codebooks, scalefactor-band
+and TNS tables taken from FFmpeg's `aactab.c` by a script (`tools/gen_aac_tables.py`) so none were typed in by hand. It
+handles single and paired channel elements (mono, stereo, 3.0 to 7.1), long, start, short and stop windows with sine and
+KBD shapes, mid/side and intensity stereo, perceptual noise substitution, TNS and the pulse tool. Output is float, so
+converting to FLAC or 16-bit PCM clips whatever the codec overshot, as FFmpeg's output would too.
+
+**Checked against FFmpeg's AAC decoder** (through PyAV) on eight streams made by FFmpeg's encoder: mono, stereo at 8, 22.05,
+44.1, 48 and 96 kHz, 5.1, a low-bitrate PNS stream, and one with TNS, PNS, intensity and mid/side all enabled. All decode
+to within float rounding of FFmpeg's output (about 136 dB SNR). Short windows, TNS, PNS, intensity and mid/side were all
+confirmed to occur in those streams; **the pulse tool did not occur in any of them, so that path is untested**, and
+every stream came from one encoder. One of them is committed with FFmpeg's decode as a regression test.
+
+Not decoded, and refused with an explanation rather than decoded wrongly: HE-AAC (SBR/PS), AAC Main prediction, LTP,
+coupling channel elements, 960-sample frames, gain control, and channel layouts given by a program config element.
+There is no AAC encoder. Raw `.aac` (ADTS) files are not read yet; AAC comes from MP4/M4A.
+On a 5-minute stereo 44.1 kHz file the decoder takes roughly 0.3-0.5 s (FFmpeg's: about 0.11 s) on a noisy machine, so it
+is a few times slower than FFmpeg's.
 
 ## Performance
 
