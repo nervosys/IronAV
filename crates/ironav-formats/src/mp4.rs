@@ -119,8 +119,8 @@ struct Track {
     flac: FlacStats,
     /// AudioSpecificConfig of an AAC track.
     asc: Vec<u8>,
-    /// Audio media time skipped at the start (encoder delay), written as an edit list.
-    lead_in: u64,
+    /// Time skipped at the start of the stream (in `time_base` units), written as an edit list.
+    lead_in: i64,
 }
 
 impl Track {
@@ -271,8 +271,8 @@ impl Track {
     }
 
     /// Composition offsets (presentation minus decode time, shifted to be non-negative) as
-    /// run-length `(count, offset)` entries, and the media time at which the first frame is shown.
-    fn composition(&self) -> (Vec<(u32, u32)>, u64) {
+    /// run-length `(count, offset)` entries, and the shift that was added to make them so.
+    fn composition(&self) -> (Vec<(u32, u32)>, i64) {
         let offsets: Vec<i64> = self.pts.iter().enumerate().map(|(i, &p)| p - i as i64 * self.video_delta as i64).collect();
         let shift = -offsets.iter().copied().min().unwrap_or(0).min(0);
         let mut runs: Vec<(u32, u32)> = Vec::new();
@@ -283,8 +283,7 @@ impl Track {
                 _ => runs.push((1, o)),
             }
         }
-        let first_shown = self.pts.iter().map(|&p| p + shift).min().unwrap_or(0).max(0) as u64;
-        (runs, first_shown)
+        (runs, shift)
     }
 
     /// `shift` is added to every chunk offset (used when the movie box is moved in front of the data).
@@ -354,22 +353,24 @@ impl Track {
         let mut stbl = vec![stsd, stts];
         let mut edts = Vec::new();
         if self.is_video() && self.reordered {
-            let (runs, first_shown) = self.composition();
+            let (runs, shift) = self.composition();
             let mut ctts = u32s(&[runs.len() as u32]);
             for (count, offset) in runs {
                 ctts.extend_from_slice(&u32s(&[count, offset]));
             }
             stbl.push(full(b"ctts", 0, 0, &ctts));
-            if first_shown > 0 {
-                // Skip the lead-in before the first shown frame; the movie timescale is 1000.
-                let mut elst = u32s(&[1, self.movie_ms() as u32, first_shown as u32]);
+            // The source's own edit (if any), moved by the shift that keeps offsets non-negative.
+            let start = self.media_time(self.lead_in) + shift;
+            if start > 0 {
+                let mut elst = u32s(&[1, self.movie_ms() as u32, start as u32]);
                 elst.extend_from_slice(&0x0001_0000u32.to_be_bytes()); // media rate 1.0
                 edts = bx(b"edts", &full(b"elst", 0, 0, &elst));
             }
         }
         if !self.is_video() && self.lead_in > 0 {
-            let lead_ms = self.lead_in * 1000 / self.timescale as u64;
-            let mut elst = u32s(&[1, self.movie_ms().saturating_sub(lead_ms) as u32, self.lead_in as u32]);
+            let lead = self.media_time(self.lead_in) as u64;
+            let lead_ms = lead * 1000 / self.timescale as u64;
+            let mut elst = u32s(&[1, self.movie_ms().saturating_sub(lead_ms) as u32, lead as u32]);
             elst.extend_from_slice(&0x0001_0000u32.to_be_bytes());
             edts = bx(b"edts", &full(b"elst", 0, 0, &elst));
         }
@@ -590,7 +591,7 @@ impl Muxer for Mp4Muxer {
                 params: ParamSets::default(),
                 flac: FlacStats::new(),
                 asc: s.extradata.clone(),
-                lead_in: s.lead_in.max(0) as u64,
+                lead_in: s.lead_in.max(0),
             });
         }
 
@@ -762,7 +763,7 @@ mod tests {
             duration: None,
             bits: None,
             extradata: Vec::new(),
-            lead_in: 0,
+            lead_in: 1001,
             params: StreamParams::Video { width: 64, height: 48, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational::new(30000, 1001) },
         };
         m.write_header(&[info]).unwrap();

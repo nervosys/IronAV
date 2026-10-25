@@ -208,8 +208,9 @@ pub struct StreamInfo {
     /// AudioSpecificConfig). Empty when the codec has none.
     #[serde(skip)]
     pub extradata: Vec<u8>,
-    /// Audio only: time (in `time_base` units) at the start of the stream that a container's edit list
-    /// skips, such as encoder delay. Copying the stream keeps it so audio stays in sync with video.
+    /// Time (in `time_base` units) at the start of the stream that a container's edit list skips, such
+    /// as encoder delay or the lead-in before the first shown frame. Copying the stream keeps it so
+    /// audio and video stay in sync.
     #[serde(skip)]
     pub lead_in: i64,
     #[serde(flatten)]

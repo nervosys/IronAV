@@ -10,7 +10,7 @@
 //! sample), which is the form the hardware decoder and the MP4 writer both use. Other codecs
 //! are exposed so they can be named in errors, and their samples pass through untouched.
 
-use ironav_core::{CodecId, Demuxer, Error, ErrorCode, MediaType, Packet, PixelFormat, Rational, Result, StreamInfo, StreamParams};
+use ironav_core::{CodecId, Demuxer, Error, ErrorCode, Packet, PixelFormat, Rational, Result, StreamInfo, StreamParams};
 use std::io::{Read, Seek, SeekFrom};
 
 /// Sanity cap on the size of the index we are willing to hold in memory.
@@ -144,6 +144,7 @@ impl<R: Read + Seek + Send> Mp4Demuxer<R> {
         let len = r.seek(SeekFrom::End(0))?;
         let mut at = 0u64;
         let mut moov = None;
+        let mut moofs: Vec<(u64, u64, u64)> = Vec::new(); // (box start, body start, body length)
         while at + 8 <= len {
             r.seek(SeekFrom::Start(at))?;
             let mut h = [0u8; 16];
@@ -174,16 +175,24 @@ impl<R: Read + Seek + Send> Mp4Demuxer<R> {
                 r.read_exact(&mut body)?;
                 moov = Some(body);
             }
+            if &h[4..8] == b"moof" {
+                if total - hdr > MAX_MOOV {
+                    return Err(corrupt("a fragment header is implausibly large"));
+                }
+                moofs.push((at, at + hdr, total - hdr));
+            }
             at += total;
         }
         let moov = moov.ok_or_else(|| {
             Error::new(ErrorCode::UnsupportedFormat, "MP4 has no 'moov' index (a file cut short while recording, or not an MP4)")
         })?;
-        if child(&moov, b"mvex")?.is_some() {
-            return Err(Error::new(ErrorCode::UnsupportedFormat, "fragmented MP4 (with moof boxes) is not supported yet").hint("remux it to a regular MP4 first"));
+        let mvex = child(&moov, b"mvex")?;
+        if mvex.is_none() && !moofs.is_empty() {
+            return Err(corrupt("the file has fragments but its index does not say so (no 'mvex')"));
         }
 
         let mut tracks = Vec::new();
+        let mut ids: Vec<u32> = Vec::new();
         let mut samples = Vec::new();
         for b in boxes(&moov) {
             let (kind, body) = b?;
@@ -191,7 +200,39 @@ impl<R: Read + Seek + Send> Mp4Demuxer<R> {
                 continue;
             }
             if let Some(t) = parse_trak(body, tracks.len(), &mut samples)? {
+                let tkhd = need(body, b"tkhd", "trak")?;
+                ids.push(if tkhd.first() == Some(&1) { be32(tkhd, 20)? } else { be32(tkhd, 12)? });
                 tracks.push(t);
+            }
+        }
+        if let Some(mvex) = mvex {
+            let mut defaults: Vec<[u32; 3]> = vec![[0; 3]; ids.len()]; // duration, size, flags from each 'trex'
+            for b in boxes(mvex) {
+                let (kind, trex) = b?;
+                if &kind == b"trex" {
+                    if let Some(i) = ids.iter().position(|&id| id == be32(trex, 4).unwrap_or(0)) {
+                        defaults[i] = [be32(trex, 12)?, be32(trex, 16)?, be32(trex, 20)?];
+                    }
+                }
+            }
+            let mut next_dts = vec![0i64; ids.len()];
+            for (start, body_at, body_len) in moofs {
+                r.seek(SeekFrom::Start(body_at))?;
+                let mut body = vec![0u8; body_len as usize];
+                r.read_exact(&mut body)?;
+                parse_moof(&body, start, &ids, &defaults, &mut next_dts, &mut samples)?;
+            }
+            // The index of a fragmented file is empty, so frame rate and length come from the fragments.
+            for (i, t) in tracks.iter_mut().enumerate() {
+                let (n, total) = samples.iter().filter(|s| s.stream as usize == i).fold((0i64, 0i64), |(n, d), s| (n + 1, d + s.duration as i64));
+                t.stream.duration = Some(total);
+                if let StreamParams::Video { frame_rate, .. } = &mut t.stream.params {
+                    if total > 0 {
+                        let (num, den) = (n * t.stream.time_base.den, total);
+                        let g = gcd(num, den);
+                        *frame_rate = Rational::new(num / g, den / g);
+                    }
+                }
             }
         }
         if tracks.is_empty() {
@@ -204,6 +245,88 @@ impl<R: Read + Seek + Send> Mp4Demuxer<R> {
         let streams = tracks.iter().map(|t| t.stream.clone()).collect();
         Ok(Self { r, pos: u64::MAX, streams, tracks, samples, next: 0, discarded: vec![false; n], seen: vec![0; n] })
     }
+}
+
+fn be64(d: &[u8], at: usize) -> Result<u64> {
+    d.get(at..at + 8).map(|b| u64::from_be_bytes(b.try_into().unwrap())).ok_or_else(|| corrupt("box is shorter than its fields"))
+}
+
+/// Add the samples of one `moof` to `samples`. `defaults` holds each track's `trex` duration, size
+/// and flags; `next_dts` is where each track's next sample starts when a fragment has no `tfdt`.
+fn parse_moof(moof: &[u8], moof_start: u64, ids: &[u32], defaults: &[[u32; 3]], next_dts: &mut [i64], samples: &mut Vec<Sample>) -> Result<()> {
+    for b in boxes(moof) {
+        let (kind, traf) = b?;
+        if &kind != b"traf" {
+            continue;
+        }
+        let tfhd = need(traf, b"tfhd", "traf")?;
+        let flags = be32(tfhd, 0)? & 0xFF_FFFF;
+        let Some(ti) = ids.iter().position(|&id| id == be32(tfhd, 4).unwrap_or(0)) else { continue };
+        let mut at = 8;
+        let mut base = moof_start;
+        if flags & 1 != 0 {
+            base = be64(tfhd, at)?;
+            at += 8;
+        }
+        if flags & 2 != 0 {
+            at += 4;
+        }
+        let mut def = defaults[ti];
+        for (bit, slot) in [(0x8, 0), (0x10, 1), (0x20, 2)] {
+            if flags & bit != 0 {
+                def[slot] = be32(tfhd, at)?;
+                at += 4;
+            }
+        }
+        if let Some(tfdt) = child(traf, b"tfdt")? {
+            next_dts[ti] = if tfdt.first() == Some(&1) { be64(tfdt, 4)? as i64 } else { be32(tfdt, 4)? as i64 };
+        }
+        let mut cursor = base;
+        for b in boxes(traf) {
+            let (kind, trun) = b?;
+            if &kind != b"trun" {
+                continue;
+            }
+            let flags = be32(trun, 0)? & 0xFF_FFFF;
+            let count = be32(trun, 4)? as usize;
+            if count > trun.len() {
+                return Err(corrupt("a fragment run claims more samples than it holds"));
+            }
+            let mut at = 8;
+            if flags & 1 != 0 {
+                cursor = base.wrapping_add_signed(be32(trun, at)? as i32 as i64);
+                at += 4;
+            }
+            let first_flags = if flags & 4 != 0 {
+                at += 4;
+                Some(be32(trun, at - 4)?)
+            } else {
+                None
+            };
+            for i in 0..count {
+                let mut field = |present: bool, default: u32| -> Result<u32> {
+                    if present {
+                        at += 4;
+                        be32(trun, at - 4)
+                    } else {
+                        Ok(default)
+                    }
+                };
+                let duration = field(flags & 0x100 != 0, def[0])?;
+                let size = field(flags & 0x200 != 0, def[1])?;
+                let sample_flags = match (flags & 0x400 != 0, i, first_flags) {
+                    (true, _, _) => field(true, 0)?,
+                    (false, 0, Some(f)) => f,
+                    _ => def[2],
+                };
+                let cts = field(flags & 0x800 != 0, 0)? as i32; // version 0 offsets are unsigned but never reach 2^31
+                samples.push(Sample { stream: ti as u16, sync: sample_flags & 0x1_0000 == 0, offset: cursor, size, dts: next_dts[ti], cts_offset: cts, duration });
+                cursor += size as u64;
+                next_dts[ti] += duration as i64;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn parse_trak(trak: &[u8], index: usize, samples: &mut Vec<Sample>) -> Result<Option<TrackInfo>> {
@@ -391,7 +514,7 @@ fn parse_trak(trak: &[u8], index: usize, samples: &mut Vec<Sample>) -> Result<Op
         (codec, params, bits, Config { prefix: Vec::new(), nal_length: 0, bits: 8 }, false)
     };
     let duration: i64 = samples[first..].iter().map(|s| s.duration as i64).sum();
-    let lead_in = if codec.media_type() == MediaType::Audio { edit_lead_in(trak)? } else { 0 };
+    let lead_in = edit_lead_in(trak)?;
     let stream = StreamInfo { index, codec, time_base, duration: Some(duration), bits, extradata, lead_in, params };
     Ok(Some(TrackInfo { stream, config, convert }))
 }

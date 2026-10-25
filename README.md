@@ -78,8 +78,7 @@ exact 8.000 s duration, all frames decoded, and seeking lands on the right keyfr
 
 ### Reading MP4 and decoding on the GPU (NVDEC)
 
-`ironav probe`, `convert` and the other tools read MP4 (regular files with the index anywhere; **fragmented MP4 is not
-supported**). H.264/HEVC video is decoded by NVDEC through the driver's `nvcuvid` library, loaded at run time like NVENC;
+`ironav probe`, `convert` and the other tools read MP4 (regular files with the index anywhere, and fragmented files). H.264/HEVC video is decoded by NVDEC through the driver's `nvcuvid` library, loaded at run time like NVENC;
 the output is cropped to the display size and returned as planar `yuv420p` in display order, so B-frame streams work.
 8-bit and 10-bit 4:2:0 are accepted (10-bit comes back as `yuv420p10le`); 4:2:2/4:4:4 and 12-bit are refused with a clear error.
 10-bit HEVC decoding was compared with FFmpeg's software decoder on a 60-frame 720p Main 10 clip: every sample of every
@@ -97,6 +96,9 @@ records composition offsets (`ctts`) and an edit list, and a copy of an x264 fil
 AAC audio can be copied into an MP4 too (not decoded or encoded: there is no AAC codec yet). The writer builds the `esds`
 box from the stream's AudioSpecificConfig and keeps the encoder-delay edit list, so a copy of an x264+AAC file decodes
 to the identical 50 frames and 88,064 audio samples as the original.
+Fragmented MP4 (`moof`/`traf`/`trun`, as made by streaming tools and `-movflags frag_keyframe`) is read too, with or without
+`default-base-is-moof`; checked on two fragmented files made by FFmpeg, which copy to the same frames, times and audio samples.
+Fragmented MP4 is not written.
 
 Checked against FFmpeg's software decoders (via PyAV), frame by frame: NVDEC output is **identical** for 240/240 frames of
 720p H.264 and of HEVC (made by IronAV), and for 50/50 frames of 1080p H.264 with B-frames made by x264 (a different

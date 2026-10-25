@@ -62,7 +62,7 @@ pub static FORMATS: &[FormatSpec] = &[
     FormatSpec {
         name: "mp4",
         extensions: &["mp4", "m4v"],
-        description: "MP4 (ISO BMFF) with H.264 or HEVC video and optionally FLAC audio, or AAC audio copied from another file. Read as well as written; written with the index first (fast-start); fragmented files are not read",
+        description: "MP4 (ISO BMFF) with H.264 or HEVC video and optionally FLAC audio, or AAC audio copied from another file. Read as well as written; written with the index first (fast-start); fragmented files (moof) are read but never written",
         media: MediaType::Video,
         demux: true,
         mux: true,
