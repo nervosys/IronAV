@@ -28,14 +28,19 @@ impl<'a> BitReader<'a> {
         }
         let byte = self.pos >> 3;
         let off = self.pos & 7;
-        let nbytes = (off + n + 7) >> 3;
-        let mut acc = 0u64;
-        for i in 0..nbytes {
-            acc = (acc << 8) | self.data[byte + i] as u64;
-        }
-        acc >>= nbytes * 8 - off - n;
+        let acc = if let Some(w) = self.data.get(byte..byte + 8) {
+            // Eight bytes cover any read of up to 32 bits at any bit offset.
+            u64::from_be_bytes(w.try_into().unwrap()) << off >> (64 - n)
+        } else {
+            let nbytes = (off + n + 7) >> 3;
+            let mut acc = 0u64;
+            for i in 0..nbytes {
+                acc = (acc << 8) | self.data[byte + i] as u64;
+            }
+            (acc >> (nbytes * 8 - off - n)) & ((1u64 << n) - 1)
+        };
         self.pos += n;
-        Ok((acc & ((1u64 << n) - 1)) as u32)
+        Ok(acc as u32)
     }
 
     /// Read up to 33 bits as an unsigned value.
@@ -66,15 +71,28 @@ impl<'a> BitReader<'a> {
             if self.pos >= self.end {
                 return Err(eof());
             }
+            let byte = self.pos >> 3;
             let off = (self.pos & 7) as u32;
-            let b = (self.data[self.pos >> 3] << off) as u32 & 0xFF;
-            if b == 0 {
-                let avail = 8 - off;
-                count += avail;
-                self.pos += avail as usize;
+            // Look at up to 56 bits at once; bits past the end of the data read as zero.
+            let (w, avail) = match self.data.get(byte..byte + 8) {
+                Some(b) => (u64::from_be_bytes(b.try_into().unwrap()) << off, 8),
+                None => {
+                    let mut buf = [0u8; 8];
+                    let avail = self.data.len() - byte;
+                    buf[..avail].copy_from_slice(&self.data[byte..]);
+                    (u64::from_be_bytes(buf) << off, avail)
+                }
+            };
+            if w == 0 {
+                let step = (avail as u32 * 8).saturating_sub(off).max(1);
+                count += step;
+                self.pos += step as usize;
                 continue;
             }
-            let lz = (b as u8).leading_zeros();
+            let lz = w.leading_zeros();
+            if self.pos + lz as usize >= self.end {
+                return Err(eof());
+            }
             count += lz;
             self.pos += lz as usize + 1;
             return Ok(count);

@@ -196,8 +196,10 @@ machine (`cargo test --release -p ironav-codec --test flac_perf -- --ignored --n
 tuned (cheaper Rice-parameter search, one residual per predictor family instead of eight, a cached window, batched
 four-byte bit writes, and blocks encoded in parallel). FFmpeg decodes its output bit-exactly (checked on the 3-minute file), and the committed libFLAC fixtures still pass.
 NVENC used to wait for each frame before copying the next; it now keeps six in flight, which took the in-process
-conversion from about 0.65 s to 0.42 s (copying the same Y4M with no encoding takes 0.23-0.32 s of that). Not yet
-looked at: FLAC decoding and the NVDEC path.
+conversion from about 0.65 s to 0.42 s (copying the same Y4M with no encoding takes 0.23-0.32 s of that). FLAC decoding was
+tuned too (four-byte CRC-16 steps, 64-bit bit-reader loads, unary codes found with a leading-zero count): 20-30 %
+faster in alternating same-machine runs of the in-process test, about 0.15 s for the 3-minute file. Not yet looked at:
+the NVDEC path.
 
 **Start-up.** `ironav` with no work to do took 79 ms to start, against 11 ms for a trivial program, because the window
 libraries were linked into it. They now live in a second program, `ironav-gui`, which `ironav gui` launches; `ironav`
