@@ -91,8 +91,9 @@ ironav convert -i in.mp4 -o out.mp4 --vcodec hevc --qp 24 --acodec none  # GPU d
 ironav convert -i in.mp4 -o out.mp4                                      # stream copy (remux), no GPU needed
 ```
 
-`--acodec none` / `--vcodec none` leave a stream out. Copying H.264/HEVC into an MP4 is refused for streams with
-B-frames, because the MP4 writer does not write composition offsets yet; re-encode them instead.
+`--acodec none` / `--vcodec none` leave a stream out. Copying H.264/HEVC with B-frames into an MP4 works: the writer
+records composition offsets (`ctts`) and an edit list, and a copy of an x264 file with B-frames decodes to the same
+50 frames, bit for bit, at the same times (checked with FFmpeg's decoder through PyAV).
 
 Checked against FFmpeg's software decoders (via PyAV), frame by frame: NVDEC output is **identical** for 240/240 frames of
 720p H.264 and of HEVC (made by IronAV), and for 50/50 frames of 1080p H.264 with B-frames made by x264 (a different

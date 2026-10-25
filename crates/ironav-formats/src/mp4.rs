@@ -3,10 +3,10 @@
 //! Input packets are Annex B access units from the encoder. They are rewritten as
 //! length-prefixed samples, parameter sets are lifted out into the `avcC` / `hvcC` box, and the
 //! `moov` index is first written after the media data; when the muxer is given its file path it then
-//! copies the file once with the index moved in front ("fast start"). Timing is
-//! constant frame rate with no frame reordering, which is exactly what the NVENC provider
-//! produces; a stream with B-frames would need `ctts` and is not supported here. FLAC frames are
-//! stored as they come, one per sample, with the STREAMINFO block in a `dfLa` box.
+//! copies the file once with the index moved in front ("fast start"). Decode times are constant
+//! frame rate. A stream whose presentation order differs from decode order (B-frames) gets a `ctts`
+//! box of composition offsets and an edit list that starts the track at its first shown frame.
+//! FLAC frames are stored as they come, one per sample, with the STREAMINFO block in a `dfLa` box.
 //!
 //! Layout while writing: `ftyp`, `mdat` (64-bit size, patched at the end), `moov`. Each track's samples are
 //! gathered into chunks of about half a second, so a player reading both tracks finds the
@@ -14,7 +14,7 @@
 
 use crate::flac::{flac_audio_params, FlacStats};
 use crate::WriteSeek;
-use ironav_core::{CodecId, Error, ErrorCode, Muxer, Packet, Result, StreamInfo, StreamParams};
+use ironav_core::{CodecId, Error, ErrorCode, Muxer, Packet, Rational, Result, StreamInfo, StreamParams};
 use std::io::{Seek, SeekFrom};
 
 /// Split an Annex B buffer into NAL units (start codes removed, trailing zero padding trimmed).
@@ -107,8 +107,13 @@ struct Track {
     pending_samples: u32,
     pending_dur: u64,
     duration: u64,
+    /// Packet time base, to turn presentation times into media time units.
+    time_base: Rational,
     /// Presentation time of the previous video sample, to catch reordered (B-frame) streams.
     last_pts: Option<i64>,
+    reordered: bool,
+    /// Presentation time of every video sample in decode order, in media time units.
+    pts: Vec<i64>,
     params: ParamSets,
     flac: FlacStats,
 }
@@ -224,6 +229,34 @@ impl Track {
         self.duration * 1000 / self.timescale as u64
     }
 
+    /// A packet time in this track's media time units (rounded to nearest).
+    fn media_time(&self, pts: i64) -> i64 {
+        let tb = self.time_base;
+        if tb.num <= 0 || tb.den <= 0 {
+            return pts * self.video_delta as i64; // no usable time base: the time is a frame count
+        }
+        let n = pts as i128 * tb.num as i128 * self.timescale as i128;
+        let d = tb.den as i128;
+        ((n + if n >= 0 { d / 2 } else { -(d / 2) }) / d) as i64
+    }
+
+    /// Composition offsets (presentation minus decode time, shifted to be non-negative) as
+    /// run-length `(count, offset)` entries, and the media time at which the first frame is shown.
+    fn composition(&self) -> (Vec<(u32, u32)>, u64) {
+        let offsets: Vec<i64> = self.pts.iter().enumerate().map(|(i, &p)| p - i as i64 * self.video_delta as i64).collect();
+        let shift = -offsets.iter().copied().min().unwrap_or(0).min(0);
+        let mut runs: Vec<(u32, u32)> = Vec::new();
+        for &o in &offsets {
+            let o = (o + shift).clamp(0, u32::MAX as i64) as u32;
+            match runs.last_mut() {
+                Some(last) if last.1 == o => last.0 += 1,
+                _ => runs.push((1, o)),
+            }
+        }
+        let first_shown = self.pts.iter().map(|&p| p + shift).min().unwrap_or(0).max(0) as u64;
+        (runs, first_shown)
+    }
+
     /// `shift` is added to every chunk offset (used when the movie box is moved in front of the data).
     fn trak(&self, id: u32, shift: u64) -> Result<Vec<u8>> {
         let ms = self.movie_ms() as u32;
@@ -289,6 +322,21 @@ impl Track {
         let co64 = full(b"co64", 0, 0, &co64);
 
         let mut stbl = vec![stsd, stts];
+        let mut edts = Vec::new();
+        if self.is_video() && self.reordered {
+            let (runs, first_shown) = self.composition();
+            let mut ctts = u32s(&[runs.len() as u32]);
+            for (count, offset) in runs {
+                ctts.extend_from_slice(&u32s(&[count, offset]));
+            }
+            stbl.push(full(b"ctts", 0, 0, &ctts));
+            if first_shown > 0 {
+                // Skip the lead-in before the first shown frame; the movie timescale is 1000.
+                let mut elst = u32s(&[1, self.movie_ms() as u32, first_shown as u32]);
+                elst.extend_from_slice(&0x0001_0000u32.to_be_bytes()); // media rate 1.0
+                edts = bx(b"edts", &full(b"elst", 0, 0, &elst));
+            }
+        }
         if self.is_video() {
             let mut stss = u32s(&[self.sync.len() as u32]);
             stss.extend_from_slice(&u32s(&self.sync));
@@ -298,7 +346,7 @@ impl Track {
         let stbl = bx(b"stbl", &stbl.concat());
         let minf = bx(b"minf", &[media_header, dinf, stbl].concat());
         let mdia = bx(b"mdia", &[mdhd, hdlr, minf].concat());
-        Ok(bx(b"trak", &[tkhd, mdia].concat()))
+        Ok(bx(b"trak", &[tkhd, edts, mdia].concat()))
     }
 
     /// Convert one Annex B access unit to a length-prefixed sample, collecting parameter sets.
@@ -492,7 +540,10 @@ impl Muxer for Mp4Muxer {
                 pending_samples: 0,
                 pending_dur: 0,
                 duration: 0,
+                time_base: s.time_base,
                 last_pts: None,
+                reordered: false,
+                pts: Vec::new(),
                 params: ParamSets::default(),
                 flac: FlacStats::new(),
             });
@@ -527,11 +578,9 @@ impl Muxer for Mp4Muxer {
         let tr = self.tracks.get_mut(t).ok_or_else(|| Error::new(ErrorCode::Internal, format!("packet for unknown output stream {t}")))?;
         let (sample, key, delta) = if tr.is_video() {
             let Some((sample, key)) = tr.video_sample(&p.data) else { return Ok(()) };
-            if tr.last_pts.is_some_and(|last| p.pts < last) {
-                return Err(Error::new(ErrorCode::UnsupportedFormat, "the video has B-frames (presentation order differs from decode order), which this MP4 writer cannot time yet")
-                    .hint("re-encode the video (for example with --vcodec h264) instead of copying it"));
-            }
+            tr.reordered |= tr.last_pts.is_some_and(|last| p.pts < last);
             tr.last_pts = Some(p.pts);
+            tr.pts.push(tr.media_time(p.pts));
             (sample, key, tr.video_delta)
         } else {
             if p.duration <= 0 {
@@ -653,6 +702,38 @@ mod tests {
             data = &data[size..];
         }
         None
+    }
+
+    #[test]
+    fn reordered_video_gets_composition_offsets_and_an_edit_list() {
+        let sink = Arc::new(Mutex::new(Cursor::new(Vec::new())));
+        let mut m = Mp4Muxer::new(Box::new(Shared(sink.clone())));
+        let info = StreamInfo {
+            index: 0,
+            codec: CodecId::H264,
+            time_base: Rational::new(1, 30000),
+            duration: None,
+            bits: None,
+            params: StreamParams::Video { width: 64, height: 48, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational::new(30000, 1001) },
+        };
+        m.write_header(&[info]).unwrap();
+        let sps = vec![0, 0, 0, 1, 0x67, 100, 0, 40, 0xAC];
+        let pps = vec![0, 0, 0, 1, 0x68, 0xEE, 0x3C];
+        let idr = [sps, pps, vec![0, 0, 0, 1, 0x65], vec![7; 20]].concat();
+        let p = [&[0u8, 0, 0, 1, 0x41][..], &[5; 6]].concat();
+        // Decode order I P B P with presentation order I B P P, one frame of delay.
+        for (pts, data) in [(1001, &idr), (4004, &p), (2002, &p), (3003, &p)] {
+            m.write_packet(&Packet { stream: 0, pts, duration: 1001, data: data.clone() }).unwrap();
+        }
+        m.finish().unwrap();
+        let file = sink.lock().unwrap().get_ref().clone();
+        let moov = find(&file, &[b"moov"]).unwrap();
+        let ctts = find(moov, &[b"trak", b"mdia", b"minf", b"stbl", b"ctts"]).unwrap();
+        let words: Vec<u32> = ctts[4..].chunks(4).map(|w| u32::from_be_bytes(w.try_into().unwrap())).collect();
+        // dts 0, 1001, 2002, 3003 against pts 1001, 4004, 2002, 3003: three runs of offsets.
+        assert_eq!(words, vec![3, 1, 1001, 1, 3003, 2, 0]);
+        let elst = find(moov, &[b"trak", b"edts", b"elst"]).unwrap();
+        assert_eq!(u32::from_be_bytes(elst[12..16].try_into().unwrap()), 1001, "the edit starts at the first shown frame");
     }
 
     #[test]
