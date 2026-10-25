@@ -417,9 +417,11 @@ impl NvencEncoder {
         Err(Error::new(ErrorCode::Internal, format!("NVENC {what} failed (status {status}{}{detail})", if detail.is_empty() { "" } else { ": " })))
     }
 
-    /// Read every finished packet in `pending` order.
-    fn drain(&mut self, out: &mut Vec<Packet>) -> Result<()> {
-        while let Some(slot) = self.pending.pop_front() {
+    /// Read finished packets in `pending` order until at most `keep` frames are still in flight.
+    /// Leaving a few in flight lets the GPU encode one frame while the CPU copies the next.
+    fn drain(&mut self, out: &mut Vec<Packet>, keep: usize) -> Result<()> {
+        while self.pending.len() > keep {
+            let slot = self.pending.pop_front().expect("checked length");
             let mut lock = Blob::<SZ_LOCK_BITSTREAM>::new();
             lock.u32(0, LOCK_BITSTREAM_VER);
             lock.ptr(8, self.slots[slot].output);
@@ -522,7 +524,7 @@ impl Encoder for NvencEncoder {
             return Ok(out); // the driver is buffering; this frame's packet arrives later
         }
         self.check(st, "encode picture")?;
-        self.drain(&mut out)?;
+        self.drain(&mut out, self.slots.len() - 2)?;
         Ok(out)
     }
 
@@ -542,7 +544,7 @@ impl Encoder for NvencEncoder {
         };
         self.check(st, "flush")?;
         let mut out = Vec::new();
-        self.drain(&mut out)?;
+        self.drain(&mut out, 0)?;
         Ok(out)
     }
 }

@@ -187,7 +187,7 @@ median of 5). The FFmpeg side runs in-process and pays no process start; the Iro
 |---|---|---|---|
 | WAV to FLAC, 180 s stereo | 0.38-0.45 s | 0.21-0.22 s | FFmpeg about 2x faster; IronAV output 0.1 % smaller |
 | FLAC to WAV, 180 s | 0.33 s | 0.12 s (decode only) | FFmpeg about 2.5x faster |
-| NVENC H.264, 240 frames 720p from Y4M | 0.79 s | 0.38 s (`h264_nvenc`) | FFmpeg about 2x faster; sizes differ because rate control differs |
+| NVENC H.264, 240 frames 720p from Y4M | 0.56-0.74 s | 0.42-0.44 s (`h264_nvenc`) | FFmpeg about 1.3-1.6x faster; sizes differ because rate control differs |
 | NVDEC H.264 to a Y4M file, 240 frames 720p | 0.84 s | 0.42 s (`cuda` hwaccel, no file written) | not like for like; FFmpeg's figure writes nothing |
 
 **So IronAV is currently slower than FFmpeg on every job measured here.** The "lower latency, higher throughput"
@@ -195,8 +195,9 @@ goal is a goal, not a result. The FLAC encoder alone (no file, no process) takes
 machine (`cargo test --release -p ironav-codec --test flac_perf -- --ignored --nocapture`); it was 1.1 s before it was
 tuned (cheaper Rice-parameter search, one residual per predictor family instead of eight, a cached window, batched
 four-byte bit writes, and blocks encoded in parallel). FFmpeg decodes its output bit-exactly (checked on the 3-minute file), and the committed libFLAC fixtures still pass.
-Not yet looked at: FLAC decoding, the NVENC and NVDEC paths (where the time goes between upload, encode and Y4M I/O),
-and process start-up. Timings on this machine vary by a factor of two from run to run when other work is going on.
+NVENC used to wait for each frame before copying the next; it now keeps six in flight, which took the in-process
+conversion from about 0.65 s to 0.42 s (copying the same Y4M with no encoding takes 0.23-0.32 s of that). Not yet
+looked at: FLAC decoding, the NVDEC path, and process start-up. Timings on this machine vary by a factor of two from run to run when other work is going on.
 NVENC in earlier runs: 240 frames of 1280x720 (a 332 MB Y4M) in 0.6-3.8 s wall depending on load.
 
 
