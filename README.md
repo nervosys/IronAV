@@ -5,11 +5,11 @@ A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so 
 
 > **Status: foundation (v0.1).** The architecture, agent interface, ontology, hardware model, CLI, MCP server
 > and both GUIs are working and tested. The codec/container set is deliberately small so far:
-> **WAV, FLAC and Y4M containers; PCM (8/16/24/32-bit, float), FLAC and raw-video codecs, and an AAC-LC decoder; `volume`, `gray`, `hflip` filters.**
+> **WAV, FLAC and Y4M containers; PCM (8/16/24/32-bit, float), FLAC and raw-video codecs, an AAC-LC decoder and an Opus decoder; `volume`, `gray`, `hflip` filters.**
 > **H.264 and HEVC can be encoded and decoded on NVIDIA GPUs (NVENC/NVDEC)**, MP4 files can be read and written, and
 > Matroska/WebM files can be read.
 > There is no software H.264/HEVC codec, so those need an NVIDIA GPU. MP4 can carry FLAC audio next to the video, and AAC
-> audio copied from another MP4/M4A (AAC can be decoded but not encoded). Opus, AV1, writing Matroska etc. are modelled in
+> audio copied from another MP4/M4A (AAC and Opus can be decoded but not encoded). AV1, writing Matroska etc. are modelled in
 > the ontology as `planned`.
 > IronAV is not yet a drop-in replacement for FFmpeg or HandBrake.
 
@@ -107,12 +107,12 @@ Fragmented MP4 is not written.
 Xiph/EBML/fixed lacing, clusters of unknown size, a file cut short mid-cluster), and the frames then go through the same
 reader as MP4, so probing, hardware decoding, seeking, playing and copying H.264/HEVC/AAC into an MP4 all work on them.
 Matroska keeps presentation times only, so for B-frame video the decode times are taken to be the sorted presentation
-times. Audio whose frame length is known (AAC, MP3, anything with a `DefaultDuration`) gets a sample-rate time base, so its
+times. Audio whose frame length is known (AAC, MP3, Opus, anything with a `DefaultDuration`) gets a sample-rate time base, so its
 times are exact despite the file's millisecond ticks.
 Checked on files remuxed by FFmpeg: an x264 file with B-frames and AAC and an HEVC file copy into MP4 with the same frames
 (identical pixels when decoded by FFmpeg) and audio samples; the 1080p H.264 file decodes on the GPU to the same 50 frames
-as FFmpeg's decoder; AAC in a `.mka` decodes to within 1 LSB of FFmpeg's. A VP9/Opus WebM is listed by `probe` but cannot
-be decoded (there are no VP9 or Opus decoders yet).
+as FFmpeg's decoder; AAC in a `.mka` decodes to within 1 LSB of FFmpeg's. Opus in Matroska decodes too (see below); a VP9 WebM is listed by `probe`
+but cannot be decoded (there is no VP9 decoder yet).
 Not handled: tracks with a content encoding (header stripping, compression, encryption) are refused; chapters, tags, cues
 and attachments are ignored; subtitle tracks are skipped; Matroska is never written. A copied track starts at its own first
 timestamp rounded to the output's frame grid, so a video that starts a fraction of a frame after the audio in the source
@@ -234,6 +234,28 @@ coupling channel elements, 960-sample frames, gain control, and channel layouts 
 There is no AAC encoder. Raw `.aac` (ADTS) files are not read yet; AAC comes from MP4/M4A.
 On a 5-minute stereo 44.1 kHz file the decoder takes roughly 0.3-0.5 s (FFmpeg's: about 0.11 s) on a noisy machine, so it
 is a few times slower than FFmpeg's.
+
+## Opus
+
+Opus **decoder** (RFC 6716): SILK, CELT and hybrid frames, every frame size from 2.5 to 60 ms, mono and stereo, packets of
+all four framing codes, in-band redundancy frames, and the output gain and pre-skip from the `OpusHead` (the pre-skip is
+dropped, so a file starts where its audio does). The band-energy, bit-allocation, pulse-vector, inverse-MDCT, linear-prediction
+and excitation stages follow FFmpeg's native Opus decoder, with its tables (`tools/gen_opus_tables.py` reads them from
+`libavcodec/opus/tab.c`, so none were typed in). The 8/12/16 kHz SILK output is brought to 48 kHz by a polyphase
+windowed-sinc filter of our own, with the same delay (4, 8 and 11 input samples) as the reference decoder.
+
+**Checked against FFmpeg's native Opus decoder** (through PyAV) on fifteen streams made by libopus, plus a pure sine in CELT
+and in SILK: SILK narrow band at 20 ms, medium band at 10 ms and wide band at 20, 40 and 60 ms (mono and stereo); hybrid at 10
+and 20 ms; CELT at 2.5, 5, 10, 20 and 40 ms, mono and stereo. **CELT frames match to float rounding (about 138 dB SNR).**
+SILK and hybrid frames match at 42-48 dB for wide and medium band and **only 24 dB for narrow band**. That difference comes
+from our upsampling filter (FFmpeg's resampler is longer than a filter with a fixed delay of 8 taps per phase can be), though
+I did not isolate it further. Three of those streams are committed with FFmpeg's decode as regression tests (CELT to within 3
+LSB, SILK and hybrid above 35 dB).
+Not covered: multichannel Opus (channel-mapping families 1 and 255 are refused), a packet-loss concealment pass (a damaged or
+empty frame decodes to silence), and the way the reference decoder flushes its resampler when the stream switches between SILK
+and CELT, which our fixed-delay filter does not reproduce, so the few samples at such a switch can differ. The libopus encoder
+only produced streams in one mode at a time, so **mode switches within a stream were not tested**, nor were redundancy frames.
+Opus is read from Matroska/WebM (`.mka`, `.webm`); there is no Ogg Opus reader and no Opus encoder.
 
 ## Performance
 

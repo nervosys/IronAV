@@ -655,6 +655,45 @@ fn aac_matches_ffmpeg(scratch_name: &str, file: &str) {
     assert!(worst <= 2, "largest difference from FFmpeg's decode is {worst} LSB");
 }
 
+/// Decode an Opus file and compare it with FFmpeg's native decoder (pre-skip removed in both; ours
+/// keeps the encoder's trailing padding, which FFmpeg trims). Returns the SNR in dB and the worst
+/// difference in LSB.
+fn opus_vs_ffmpeg(file: &str) -> (f64, i32) {
+    let dir = scratch(&format!("opus-{file}"));
+    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    let out = dir.join("out.wav");
+    let mut j = job(&data.join(format!("{file}.mka")), &out);
+    j.audio.codec = Some("pcm_s16le".into());
+    run(&j, &mut |_| {}).unwrap();
+    let s16 = |b: Vec<u8>| -> Vec<i32> { b.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as i32).collect() };
+    let got = s16(pcm(&out));
+    let want = s16(std::fs::read(data.join(format!("{file}.ffmpeg.s16"))).unwrap());
+    assert!(got.len() >= want.len() && got.len() < want.len() + 4 * 2000, "{} samples against {}", got.len(), want.len());
+    let (mut sig, mut err, mut worst) = (0f64, 0f64, 0);
+    for (a, b) in got.iter().zip(&want) {
+        sig += (*b as f64).powi(2);
+        err += ((a - b) as f64).powi(2);
+        worst = worst.max((a - b).abs());
+    }
+    (10.0 * (sig / err.max(1e-9)).log10(), worst)
+}
+
+#[test]
+fn celt_opus_decodes_to_what_ffmpeg_decodes() {
+    let (snr, worst) = opus_vs_ffmpeg("opus_celt_stereo");
+    assert!(worst <= 3, "largest difference from FFmpeg is {worst} LSB (SNR {snr:.1} dB)");
+}
+
+/// SILK and hybrid frames are upsampled by our own filter, so they agree with FFmpeg's resampler to
+/// about 40 dB rather than to the bit.
+#[test]
+fn silk_and_hybrid_opus_decode_close_to_what_ffmpeg_decodes() {
+    for file in ["opus_silk_mono", "opus_hybrid_stereo"] {
+        let (snr, _) = opus_vs_ffmpeg(file);
+        assert!(snr > 35.0, "{file}: SNR against FFmpeg is only {snr:.1} dB");
+    }
+}
+
 /// 20 frames of H.264 with B-frames and the AAC clip, muxed into Matroska by FFmpeg. Copying it into an
 /// MP4 must keep every packet and its time, so reading the copy gives back what the Matroska reader gave.
 #[test]

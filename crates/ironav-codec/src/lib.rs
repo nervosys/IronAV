@@ -6,6 +6,7 @@
 pub mod aac;
 pub mod flac;
 mod filters;
+pub mod opus;
 mod pcm;
 mod pixconv;
 mod rawvideo;
@@ -32,6 +33,9 @@ pub fn implemented() -> Vec<CodecImpl> {
         .filter_map(|&c| {
             if c == CodecId::Aac {
                 return Some(CodecImpl { codec: c, decode: true, encode: false, implementation: "ironav-aac" });
+            }
+            if c == CodecId::Opus {
+                return Some(CodecImpl { codec: c, decode: true, encode: false, implementation: "ironav-opus" });
             }
             let implementation = if c.sample_format().is_some() {
                 "ironav-pcm"
@@ -66,6 +70,7 @@ fn unsupported(codec: CodecId, what: &str) -> Error {
 pub fn new_decoder_for(s: &ironav_core::StreamInfo) -> Result<Box<dyn Decoder>> {
     match s.codec {
         CodecId::Aac => Ok(Box::new(aac::AacDecoder::new(&s.extradata, &s.params)?)),
+        CodecId::Opus => Ok(Box::new(opus::OpusDecoder::new(&s.extradata, &s.params)?)),
         _ => new_decoder(s.codec, &s.params, s.bits),
     }
 }

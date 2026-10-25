@@ -81,6 +81,8 @@ struct Frame {
     /// Index within a laced block.
     lace: u32,
     duration: Option<i64>,
+    /// The first bytes of the frame (Opus gives its length in the first one).
+    head: [u8; 2],
 }
 
 struct Scan<R: Read + Seek> {
@@ -374,7 +376,14 @@ impl<R: Read + Seek> Scan<R> {
         let mut offset = self.pos;
         for (lace, s) in sizes.into_iter().enumerate() {
             let size = u32::try_from(s).map_err(|_| bad("a frame is larger than 4 GiB"))?;
-            self.frames.push(Frame { track, tc, key, offset, size, lace: lace as u32, duration: None });
+            let mut head = [0u8; 2];
+            if size > 0 {
+                self.skip_to(offset)?;
+                for h in head.iter_mut().take(size.min(2) as usize) {
+                    *h = self.need()?;
+                }
+            }
+            self.frames.push(Frame { track, tc, key, offset, size, lace: lace as u32, duration: None, head });
             offset += s;
         }
         self.skip_to(end)?;
@@ -614,16 +623,27 @@ fn build_track(t: &MkTrack, index: usize, frames: &[&Frame], scale: u64, samples
         convert = false;
         let rate = t.rate.round() as u32;
         bits = t.bits;
-        if codec == CodecId::Aac {
+        if codec == CodecId::Aac || codec == CodecId::Opus {
             extradata = t.private.clone();
             bits = None;
         }
-        match audio_frame_len(t, codec).filter(|_| rate > 0) {
+        // Opus always counts in 48 kHz samples, whatever rate the file says it came from.
+        let opus = codec == CodecId::Opus;
+        let rate = if opus { 48_000 } else { rate };
+        let fixed = audio_frame_len(t, codec);
+        match fixed.filter(|_| rate > 0).or(if opus { Some(0) } else { None }) {
             Some(len) => {
                 time_base = Rational::new(1, rate as i64);
                 let tolerance = rate as i64 / 500 + 1; // the file's ticks are coarser than a sample
                 let mut next: Option<i64> = None;
                 for f in frames {
+                    let len = if opus {
+                        // a block's frames share one TOC byte, and so one length
+                        let n = ironav_codec::opus::packet_samples(&f.head[..f.size.min(2) as usize]).unwrap_or(960);
+                        if f.size == 0 { 960 } else { n as u32 }
+                    } else {
+                        len
+                    };
                     let at = (f.tc as i128 * scale as i128 * rate as i128 + 500_000_000) / 1_000_000_000;
                     let at = at as i64 + f.lace as i64 * len as i64;
                     let pts = match next {
