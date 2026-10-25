@@ -657,7 +657,7 @@ mod tests {
         assert_eq!(size_of::<ProcParams>(), 264);
         assert_eq!(size_of::<Caps>(), 88);
         assert_eq!(size_of::<Memcpy2D>(), 128);
-        assert_eq!(std::mem::offset_of!(CreateInfo, vid_lock), 72);
+        assert_eq!(std::mem::offset_of!(CreateInfo, vid_lock), if cfg!(windows) { 72 } else { 120 });
         assert_eq!(std::mem::offset_of!(ParserParams, user_data), 40);
         assert_eq!(std::mem::offset_of!(VideoFormat, display_area), 24);
         assert_eq!(std::mem::offset_of!(ProcParams, output_stream), 56);
