@@ -298,10 +298,10 @@ pub fn new_video_encoder(
 ) -> Result<Box<dyn ironav_core::Encoder>> {
     #[cfg(any(windows, target_os = "linux"))]
     if backend == Backend::Cuda {
-        let ironav_core::StreamParams::Video { width, height, frame_rate, .. } = params else {
+        let ironav_core::StreamParams::Video { width, height, frame_rate, pix_fmt, .. } = params else {
             return Err(Error::invalid_arg("hardware video encoder needs a video stream"));
         };
-        return Ok(Box::new(nvenc::NvencEncoder::new(codec, *width, *height, *frame_rate, rate)?));
+        return Ok(Box::new(nvenc::NvencEncoder::new(codec, *width, *height, pix_fmt.bit_depth(), *frame_rate, rate)?));
     }
     let _ = (params, rate);
     Err(Error::new(
@@ -314,10 +314,10 @@ pub fn new_video_encoder(
 pub fn new_video_decoder(backend: Backend, codec: CodecId, params: &ironav_core::StreamParams) -> Result<Box<dyn ironav_core::Decoder>> {
     #[cfg(any(windows, target_os = "linux"))]
     if backend == Backend::Cuda {
-        let ironav_core::StreamParams::Video { width, height, .. } = params else {
+        let ironav_core::StreamParams::Video { width, height, pix_fmt, .. } = params else {
             return Err(Error::invalid_arg("hardware video decoder needs a video stream"));
         };
-        return Ok(Box::new(nvdec::NvdecDecoder::new(codec, *width, *height)?));
+        return Ok(Box::new(nvdec::NvdecDecoder::new(codec, *width, *height, pix_fmt.bit_depth())?));
     }
     let _ = params;
     Err(Error::new(

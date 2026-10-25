@@ -13,6 +13,12 @@ pub fn rgb_frame(v: &VideoFrame, max_w: Option<u32>, max_h: Option<u32>) -> (u32
         scaled.pts = v.pts;
         src = &scaled;
     }
+    // High-bit-depth pictures are narrowed to 8 bits first; a screen shows 8 bits anyway.
+    let narrowed;
+    if src.pix_fmt.bit_depth() > 8 {
+        narrowed = ironav_codec::convert_pixel_format(src.clone(), PixelFormat::Yuv420p, ironav_codec::Matrix::Bt709);
+        src = &narrowed;
+    }
     let (w, h) = (src.width as usize, src.height as usize);
     let mut out = vec![0u8; w * h * 3];
     let hd = v.height >= 720;
@@ -126,5 +132,14 @@ mod tests {
         assert_eq!((w, h), (16, 8));
         let png = to_png(w, h, &rgb).unwrap();
         assert_eq!(&png[1..4], b"PNG");
+    }
+
+    #[test]
+    fn ten_bit_pictures_become_the_same_rgb_as_their_eight_bit_version() {
+        let words = |v: u16, n: usize| (0..n).flat_map(|_| v.to_le_bytes()).collect::<Vec<u8>>();
+        // Studio-range red-ish: Y=81<<2, Cb=90<<2, Cr=240<<2 in 10-bit.
+        let ten = VideoFrame { width: 2, height: 2, pix_fmt: PixelFormat::Yuv420p10, pts: 0, planes: vec![words(81 << 2, 4), words(90 << 2, 1), words(240 << 2, 1)] };
+        let eight = VideoFrame { width: 2, height: 2, pix_fmt: PixelFormat::Yuv420p, pts: 0, planes: vec![vec![81; 4], vec![90], vec![240]] };
+        assert_eq!(rgb_frame(&ten, None, None), rgb_frame(&eight, None, None));
     }
 }

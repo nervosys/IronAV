@@ -42,6 +42,9 @@ const NV_ENC_SUCCESS: i32 = 0;
 const NV_ENC_ERR_NEED_MORE_INPUT: i32 = 17;
 const DEVICE_TYPE_CUDA: u32 = 1;
 const BUFFER_FORMAT_IYUV: u32 = 0x100;
+/// 10-bit semi-planar (P010): Y plane then interleaved UV, 16-bit words with the value in the top 10 bits.
+const BUFFER_FORMAT_YUV420_10BIT: u32 = 0x1_0000;
+const PROFILE_HEVC_MAIN10: Guid = guid(0xfa4d2b6c, 0x3a5b, 0x411a, [0x80, 0x18, 0x0a, 0x3f, 0x5e, 0x3c, 0x9b, 0xe5]);
 const RC_CONSTQP: u32 = 0;
 const RC_VBR: u32 = 1;
 const PIC_STRUCT_FRAME: u32 = 1;
@@ -188,6 +191,9 @@ pub struct NvencEncoder {
     enc: *mut c_void,
     width: u32,
     height: u32,
+    /// Bits per sample of the input, 8 or 10 (10 only for HEVC).
+    bits: u8,
+    buffer_format: u32,
     aligned_h: usize,
     slots: Vec<Slot>,
     next: usize,
@@ -204,12 +210,15 @@ unsafe impl Send for NvencEncoder {}
 impl NvencEncoder {
     /// Open an NVENC session on the first NVIDIA GPU and configure it. `frame_rate` and the
     /// dimensions come from the stream; width and height must be even.
-    pub fn new(codec: CodecId, width: u32, height: u32, frame_rate: Rational, rate: RateControl) -> Result<Self> {
+    pub fn new(codec: CodecId, width: u32, height: u32, bits: u8, frame_rate: Rational, rate: RateControl) -> Result<Self> {
         let codec_guid = match codec {
             CodecId::H264 => CODEC_H264,
             CodecId::Hevc => CODEC_HEVC,
             other => return Err(Error::invalid_arg(format!("NVENC provider cannot encode {}", other.name())).alternatives(["h264", "hevc"])),
         };
+        if bits != 8 && !(bits == 10 && codec == CodecId::Hevc) {
+            return Err(Error::invalid_arg(format!("NVENC provider encodes {} at 8 bits{}, not {bits}", codec.name(), if codec == CodecId::Hevc { " or 10 bits" } else { "" })));
+        }
         if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
             return Err(Error::invalid_arg(format!("NVENC needs even, non-zero dimensions, got {width}x{height}"))
                 .hint("crop or scale the video to even dimensions first"));
@@ -281,6 +290,8 @@ impl NvencEncoder {
                 enc: ptr::null_mut(),
                 width,
                 height,
+                bits,
+                buffer_format: if bits == 10 { BUFFER_FORMAT_YUV420_10BIT } else { BUFFER_FORMAT_IYUV },
                 aligned_h: (height as usize + 31) & !31,
                 slots: Vec::new(),
                 next: 0,
@@ -336,6 +347,11 @@ impl NvencEncoder {
                 preset.u32(cc + 20, gop); // idrPeriod
                 preset.bit(cc + 16, 7, true); // repeatSPSPPS
                 preset.0[cc + 17] = (preset.0[cc + 17] & !0b110) | (1 << 1); // chromaFormatIDC = 1
+                if bits == 10 {
+                    preset.bytes(PRESET_CFG + 4, &PROFILE_HEVC_MAIN10);
+                    preset.u32(cc + 200, 10); // outputBitDepth
+                    preset.u32(cc + 204, 10); // inputBitDepth
+                }
             }
 
             let mut init = Blob::<SZ_INITIALIZE>::new();
@@ -351,7 +367,7 @@ impl NvencEncoder {
             init.u32(64, 1); // enablePTD: the encoder picks picture types
             init.ptr(88, preset.0[PRESET_CFG..].as_ptr().cast());
             init.u32(136, TUNING_HIGH_QUALITY);
-            init.u32(140, BUFFER_FORMAT_IYUV);
+            init.u32(140, this.buffer_format);
             let f: FnPtr = this.func(F_INITIALIZE)?;
             let st = f(this.enc, init.0.as_mut_ptr().cast());
             this.check(st, "initialize encoder")?;
@@ -364,7 +380,7 @@ impl NvencEncoder {
                 ib.u32(0, CREATE_INPUT_VER);
                 ib.u32(4, aligned_w);
                 ib.u32(8, this.aligned_h as u32);
-                ib.u32(16, BUFFER_FORMAT_IYUV);
+                ib.u32(16, this.buffer_format);
                 let f: FnPtr = this.func(F_CREATE_INPUT)?;
                 this.check(f(this.enc, ib.0.as_mut_ptr().cast()), "create input buffer")?;
                 let input = ib.get_ptr(24);
@@ -447,11 +463,13 @@ impl Encoder for NvencEncoder {
         let Frame::Video(v) = frame else {
             return Err(Error::invalid_input("NVENC encoder received an audio frame"));
         };
-        if v.pix_fmt != PixelFormat::Yuv420p || v.width != self.width || v.height != self.height {
+        let want = if self.bits == 10 { PixelFormat::Yuv420p10 } else { PixelFormat::Yuv420p };
+        if v.pix_fmt != want || v.width != self.width || v.height != self.height {
             return Err(Error::invalid_input(format!(
-                "NVENC encoder was opened for {}x{} yuv420p but got {}x{} {}",
+                "NVENC encoder was opened for {}x{} {} but got {}x{} {}",
                 self.width,
                 self.height,
+                want.name(),
                 v.width,
                 v.height,
                 v.pix_fmt.name()
@@ -462,10 +480,23 @@ impl Encoder for NvencEncoder {
         }
         let (w, h) = (self.width as usize, self.height as usize);
         let (cw, ch) = (w / 2, h / 2);
+        let bps = if self.bits == 10 { 2 } else { 1 };
         let [y, u, vv] = v.planes.as_slice() else { return Err(Error::invalid_input("yuv420p frame needs 3 planes")) };
-        if y.len() < w * h || u.len() < cw * ch || vv.len() < cw * ch {
+        if y.len() < w * h * bps || u.len() < cw * ch * bps || vv.len() < cw * ch * bps {
             return Err(Error::invalid_input("video frame planes are smaller than its dimensions"));
         }
+        // 10-bit input goes in as P010: the value in the top ten bits of each word, U and V
+        // interleaved. Build that layout on the host, then copy it row by row like 8-bit input.
+        let staged: Option<(Vec<u8>, Vec<u8>)> = (bps == 2).then(|| {
+            let top = |p: &[u8]| (u16::from_le_bytes([p[0], p[1]]) << 6).to_le_bytes();
+            let ys: Vec<u8> = y[..w * h * 2].chunks_exact(2).flat_map(top).collect();
+            let mut uv = Vec::with_capacity(cw * ch * 4);
+            for (a, b) in u[..cw * ch * 2].chunks_exact(2).zip(vv[..cw * ch * 2].chunks_exact(2)) {
+                uv.extend_from_slice(&top(a));
+                uv.extend_from_slice(&top(b));
+            }
+            (ys, uv)
+        });
 
         self.bind_context();
         if self.pending.len() >= self.slots.len() {
@@ -490,10 +521,18 @@ impl Encoder for NvencEncoder {
                     ptr::copy_nonoverlapping(src.as_ptr().add(r * src_w), base.add(dst_off + r * dst_pitch), src_w);
                 }
             };
-            copy(0, pitch, y, w, h);
             let u_off = pitch * self.aligned_h;
-            copy(u_off, pitch / 2, u, cw, ch);
-            copy(u_off + (pitch / 2) * (self.aligned_h / 2), pitch / 2, vv, cw, ch);
+            match &staged {
+                Some((ys, uv)) => {
+                    copy(0, pitch, ys, w * 2, h);
+                    copy(u_off, pitch, uv, cw * 4, ch);
+                }
+                None => {
+                    copy(0, pitch, y, w, h);
+                    copy(u_off, pitch / 2, u, cw, ch);
+                    copy(u_off + (pitch / 2) * (self.aligned_h / 2), pitch / 2, vv, cw, ch);
+                }
+            }
             let f: FnPtr = self.func(F_UNLOCK_INPUT)?;
             self.check(f(self.enc, input), "unlock input buffer")?;
             pitch
@@ -509,7 +548,7 @@ impl Encoder for NvencEncoder {
         pic.u64(32, 1);
         pic.ptr(40, input);
         pic.ptr(48, output);
-        pic.u32(64, BUFFER_FORMAT_IYUV);
+        pic.u32(64, self.buffer_format);
         pic.u32(68, PIC_STRUCT_FRAME);
         self.frame_idx = self.frame_idx.wrapping_add(1);
 
@@ -575,11 +614,13 @@ impl Drop for NvencEncoder {
 }
 
 /// True if `params` describe a stream this provider can accept without conversion.
-pub fn accepts(params: &StreamParams) -> std::result::Result<(), String> {
+pub fn accepts(params: &StreamParams, codec: CodecId) -> std::result::Result<(), String> {
     match params {
         StreamParams::Video { width, height, pix_fmt, .. } => {
-            if *pix_fmt != PixelFormat::Yuv420p {
-                Err(format!("NVENC input must be yuv420p, got {}", pix_fmt.name()))
+            if *pix_fmt == PixelFormat::Yuv420p10 && codec != CodecId::Hevc {
+                Err(format!("NVENC encodes 10-bit video as HEVC only, not {}", codec.name()))
+            } else if !matches!(pix_fmt, PixelFormat::Yuv420p | PixelFormat::Yuv420p10) {
+                Err(format!("NVENC input must be yuv420p (or yuv420p10le for HEVC), got {}", pix_fmt.name()))
             } else if width % 2 != 0 || height % 2 != 0 {
                 Err(format!("NVENC needs even dimensions, got {width}x{height}"))
             } else {
@@ -622,10 +663,14 @@ mod tests {
     #[test]
     fn rejects_unsupported_input_before_touching_the_driver() {
         let odd = StreamParams::Video { width: 33, height: 32, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational::new(30, 1) };
-        assert!(accepts(&odd).is_err());
+        assert!(accepts(&odd, CodecId::H264).is_err());
         let rgb = StreamParams::Video { width: 32, height: 32, pix_fmt: PixelFormat::Rgb24, frame_rate: Rational::new(30, 1) };
-        assert!(accepts(&rgb).unwrap_err().contains("yuv420p"));
-        assert!(NvencEncoder::new(CodecId::H264, 33, 32, Rational::new(30, 1), RateControl::ConstQp(23)).is_err());
+        assert!(accepts(&rgb, CodecId::H264).unwrap_err().contains("yuv420p"));
+        let ten = StreamParams::Video { width: 32, height: 32, pix_fmt: PixelFormat::Yuv420p10, frame_rate: Rational::new(30, 1) };
+        assert!(accepts(&ten, CodecId::Hevc).is_ok());
+        assert!(accepts(&ten, CodecId::H264).unwrap_err().contains("HEVC only"));
+        assert!(NvencEncoder::new(CodecId::H264, 32, 32, 10, Rational::new(30, 1), RateControl::ConstQp(23)).is_err());
+        assert!(NvencEncoder::new(CodecId::H264, 33, 32, 8, Rational::new(30, 1), RateControl::ConstQp(23)).is_err());
     }
 
     fn synthetic(w: u32, h: u32, n: i64) -> Vec<Frame> {
@@ -655,7 +700,7 @@ mod tests {
 
     /// Runs on a real GPU when one is present; otherwise reports why it skipped.
     fn roundtrip(codec: CodecId) {
-        let mut enc = match NvencEncoder::new(codec, 640, 360, Rational::new(30, 1), RateControl::ConstQp(26)) {
+        let mut enc = match NvencEncoder::new(codec, 640, 360, 8, Rational::new(30, 1), RateControl::ConstQp(26)) {
             Ok(e) => e,
             Err(e) if e.code == ErrorCode::HardwareUnavailable => {
                 eprintln!("skipping NVENC test: {}", e.message);
@@ -689,5 +734,37 @@ mod tests {
     #[test]
     fn hevc_encodes_on_the_gpu_in_order() {
         roundtrip(CodecId::Hevc);
+    }
+
+    #[test]
+    fn hevc_main10_encodes_ten_bit_frames() {
+        let mut enc = match NvencEncoder::new(CodecId::Hevc, 640, 360, 10, Rational::new(30, 1), RateControl::ConstQp(26)) {
+            Ok(e) => e,
+            Err(e) if e.code == ErrorCode::HardwareUnavailable => {
+                eprintln!("skipping NVENC test: {}", e.message);
+                return;
+            }
+            Err(e) => panic!("{e:?}"),
+        };
+        let (w, h) = (640usize, 360usize);
+        let frame = |t: i64| {
+            let y: Vec<u8> = (0..w * h).flat_map(|i| ((((i % w) * 3 + (i / w) + t as usize * 7) % 1024) as u16).to_le_bytes()).collect();
+            let c: Vec<u8> = (0..w * h / 4).flat_map(|_| 512u16.to_le_bytes()).collect();
+            Frame::Video(ironav_core::VideoFrame { width: w as u32, height: h as u32, pix_fmt: PixelFormat::Yuv420p10, pts: t, planes: vec![y, c.clone(), c] })
+        };
+        let mut packets = Vec::new();
+        for t in 0..30 {
+            packets.extend(enc.encode(&frame(t)).unwrap());
+        }
+        packets.extend(enc.flush().unwrap());
+        assert_eq!(packets.len(), 30);
+        // The SPS says Main 10: general_profile_idc 2, after the 2-byte NAL header and 1 byte.
+        let bytes: Vec<u8> = packets.iter().flat_map(|p| p.data.clone()).collect();
+        let at = bytes.windows(5).position(|b| b[..3] == [0, 0, 1] && (b[3] >> 1) & 0x3F == 33).expect("an SPS");
+        assert_eq!(bytes[at + 3 + 3] & 0x1F, 2, "profile_idc should be Main 10");
+        // An 8-bit frame is refused by a 10-bit session, and the other way round.
+        let eight = Frame::Video(ironav_core::VideoFrame { width: 640, height: 360, pix_fmt: PixelFormat::Yuv420p, pts: 0, planes: vec![vec![0; w * h], vec![0; w * h / 4], vec![0; w * h / 4]] });
+        let mut enc2 = NvencEncoder::new(CodecId::Hevc, 640, 360, 10, Rational::new(30, 1), RateControl::ConstQp(26)).unwrap();
+        assert!(enc2.encode(&eight).is_err());
     }
 }

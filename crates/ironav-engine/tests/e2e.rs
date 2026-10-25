@@ -172,6 +172,50 @@ fn y4m_hflip_and_gray() {
 }
 
 #[test]
+fn ten_bit_video_flips_scales_and_converts() {
+    let d = scratch("y4m10");
+    let (a, b, c, e) = (d.join("a.y4m"), d.join("b.y4m"), d.join("c.y4m"), d.join("e.y4m"));
+    // 8x4 4:2:0, 10-bit: luma values 0, 100, ... (little-endian words), then flat chroma.
+    let words = |v: &[u16]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+    let luma: Vec<u16> = (0..32).map(|i| (i * 33) as u16).collect(); // 0..=1023
+    let mut f = b"YUV4MPEG2 W8 H4 F30:1 Ip A1:1 C420p10
+".to_vec();
+    f.extend_from_slice(b"FRAME
+");
+    f.extend_from_slice(&words(&luma));
+    f.extend_from_slice(&words(&[512; 8]));
+    f.extend_from_slice(&words(&[512; 8]));
+    std::fs::write(&a, &f).unwrap();
+
+    // hflip keeps whole 16-bit samples together.
+    let mut j = job(&a, &b);
+    j.filters.push(FilterCall::parse_shorthand("hflip").unwrap());
+    run(&j, &mut |_| {}).unwrap();
+    let out = std::fs::read(&b).unwrap();
+    assert!(String::from_utf8_lossy(&out[..40]).contains("C420p10"));
+    let body = &out[out.len() - 96..];
+    let got: Vec<u16> = body[..64].chunks(2).map(|w| u16::from_le_bytes([w[0], w[1]])).collect();
+    assert_eq!(&got[..8], &[231, 198, 165, 132, 99, 66, 33, 0]);
+
+    // scale keeps the format and halves the size.
+    let mut j = job(&a, &c);
+    j.filters.push(FilterCall::parse_shorthand("scale:width=4,height=2").unwrap());
+    run(&j, &mut |_| {}).unwrap();
+    let out = std::fs::read(&c).unwrap();
+    assert!(String::from_utf8_lossy(&out[..50]).contains("W4 H2") && String::from_utf8_lossy(&out[..50]).contains("C420p10"));
+    let header_end = out.iter().position(|&x| x == b'\n').unwrap() + 1;
+    assert_eq!(out.len() - header_end, 6 + (4 * 2 + 2 * 2) * 2);
+
+    // format to 8-bit: the header changes and full scale maps to 255.
+    let mut j = job(&a, &e);
+    j.filters.push(FilterCall::parse_shorthand("format:pix_fmt=yuv420p").unwrap());
+    run(&j, &mut |_| {}).unwrap();
+    let out = std::fs::read(&e).unwrap();
+    assert!(String::from_utf8_lossy(&out[..40]).contains("C420jpeg"));
+    assert_eq!(out[out.len() - 17], 255); // last luma sample, 31 * 33 = 1023, with 16 chroma bytes after it
+}
+
+#[test]
 fn ontology_is_consistent_with_registries() {
     let o = ontology();
     for c in ironav_codec::implemented() {

@@ -68,7 +68,9 @@ pub fn resize_frame(v: &VideoFrame, w: u32, h: u32) -> VideoFrame {
         .planes
         .iter()
         .zip(src_layout.iter().zip(&dst_layout))
-        .map(|(p, (&(sw, sh, bpp), &(dw, dh, _)))| resize_plane(p, sw, sh, dw, dh, bpp))
+        .map(|(p, (&(sw, sh, bpp), &(dw, dh, _)))| {
+            if v.pix_fmt.bit_depth() > 8 { resize_plane16(p, sw, sh, dw, dh) } else { resize_plane(p, sw, sh, dw, dh, bpp) }
+        })
         .collect();
     VideoFrame { width: w, height: h, pix_fmt: v.pix_fmt, pts: v.pts, planes }
 }
@@ -104,6 +106,29 @@ fn taps(src: usize, dst: usize) -> Taps {
         weights.push(q);
     }
     Taps { start, weights }
+}
+
+/// Resize one plane of little-endian 16-bit samples (10-bit video), keeping the same filter.
+pub(crate) fn resize_plane16(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<u8> {
+    let (hx, vy) = (taps(sw, dw), taps(sh, dh));
+    let px = |i: usize| u16::from_le_bytes([src[i * 2], src[i * 2 + 1]]) as i32;
+    let mut mid = vec![0u16; dw * sh];
+    for y in 0..sh {
+        for x in 0..dw {
+            let (s, w) = (hx.start[x], &hx.weights[x]);
+            let acc: i32 = w.iter().enumerate().map(|(k, &wk)| wk * px(y * sw + (s + k).min(sw - 1))).sum();
+            mid[y * dw + x] = ((acc + ONE / 2) >> BITS).clamp(0, 65535) as u16;
+        }
+    }
+    let mut out = Vec::with_capacity(dw * dh * 2);
+    for y in 0..dh {
+        let (s, w) = (vy.start[y], &vy.weights[y]);
+        for x in 0..dw {
+            let acc: i32 = w.iter().enumerate().map(|(k, &wk)| wk * mid[(s + k).min(sh - 1) * dw + x] as i32).sum();
+            out.extend_from_slice(&(((acc + ONE / 2) >> BITS).clamp(0, 65535) as u16).to_le_bytes());
+        }
+    }
+    out
 }
 
 /// Resize one plane of `bpp`-byte pixels (interleaved channels are treated independently).

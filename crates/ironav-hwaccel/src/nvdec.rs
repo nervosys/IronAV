@@ -23,6 +23,7 @@ const CODEC_H264: u32 = 4;
 const CODEC_HEVC: u32 = 8;
 const CHROMA_420: u32 = 1;
 const SURFACE_NV12: u32 = 0;
+const SURFACE_P016: u32 = 1;
 const DEINTERLACE_WEAVE: u32 = 0;
 const CREATE_PREFER_CUVID: u32 = 4;
 const PKT_ENDOFSTREAM: u32 = 1;
@@ -232,6 +233,8 @@ struct State {
     /// Display size the stream declared; the decoded pictures must match it.
     width: u32,
     height: u32,
+    /// Bits per sample the caller expects (8 or 10); the stream must have the same depth.
+    bits: u8,
     decoder: *mut c_void,
     /// Coded height of the current decoder, for locating the chroma plane in a mapped frame.
     coded_height: u32,
@@ -253,18 +256,21 @@ impl State {
         if f.codec != want {
             return self.fail(Error::invalid_input(format!("the bitstream is not {}", self.codec.name())));
         }
-        if f.chroma_format != CHROMA_420 || f.bit_depth_luma_minus8 != 0 || f.bit_depth_chroma_minus8 != 0 {
+        let stream_bits = f.bit_depth_luma_minus8 + 8;
+        if f.chroma_format != CHROMA_420 || f.bit_depth_luma_minus8 != f.bit_depth_chroma_minus8 || !matches!(stream_bits, 8 | 10) {
             return self.fail(
                 Error::new(
                     ErrorCode::UnsupportedCodec,
-                    format!(
-                        "NVDEC provider handles 8-bit 4:2:0 only; the stream is {}-bit with chroma format {}",
-                        f.bit_depth_luma_minus8 as u32 + 8,
-                        f.chroma_format
-                    ),
+                    format!("NVDEC provider handles 8-bit and 10-bit 4:2:0; the stream is {stream_bits}-bit with chroma format {}", f.chroma_format),
                 )
-                .hint("only 8-bit yuv420p video can be decoded so far"),
+                .hint("convert the source to yuv420p or yuv420p10le first"),
             );
+        }
+        if stream_bits != self.bits {
+            return self.fail(Error::new(
+                ErrorCode::UnsupportedFormat,
+                format!("the stream is {stream_bits}-bit but was declared {}-bit", self.bits),
+            ));
         }
         let (l, t, r, b) = (f.display_area[0], f.display_area[1], f.display_area[2], f.display_area[3]);
         let (dw, dh) = ((r - l).max(0) as u32, (b - t).max(0) as u32);
@@ -276,7 +282,7 @@ impl State {
         let mut caps = Caps {
             codec: f.codec,
             chroma_format: f.chroma_format,
-            bit_depth_minus8: 0,
+            bit_depth_minus8: f.bit_depth_luma_minus8 as u32,
             reserved1: [0; 3],
             is_supported: 0,
             num_nvdecs: 0,
@@ -317,13 +323,13 @@ impl State {
             codec: f.codec,
             chroma_format: f.chroma_format,
             creation_flags: CREATE_PREFER_CUVID.into(),
-            bit_depth_minus8: 0,
+            bit_depth_minus8: (self.bits - 8).into(),
             intra_decode_only: 0,
             max_width: f.coded_width.into(),
             max_height: f.coded_height.into(),
             reserved1: 0,
             display_area: [0; 4],
-            output_format: SURFACE_NV12,
+            output_format: if self.bits == 10 { SURFACE_P016 } else { SURFACE_NV12 },
             deinterlace: DEINTERLACE_WEAVE,
             target_width: f.coded_width.into(),
             target_height: f.coded_height.into(),
@@ -403,13 +409,26 @@ impl State {
             }
         };
         let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-        let (mut u, mut v) = (vec![0u8; cw * ch], vec![0u8; cw * ch]);
-        for ((u, v), p) in u.iter_mut().zip(v.iter_mut()).zip(uv.chunks_exact(2)) {
-            *u = p[0];
-            *v = p[1];
-        }
+        let (planes, pix_fmt) = if self.bits == 10 {
+            // P016 keeps the 10 bits in the top of each 16-bit word; yuv420p10le wants them at the bottom.
+            let low = |p: &[u8]| (u16::from_le_bytes([p[0], p[1]]) >> 6).to_le_bytes();
+            let y: Vec<u8> = y.chunks_exact(2).flat_map(low).collect();
+            let (mut u, mut v) = (Vec::with_capacity(cw * ch * 2), Vec::with_capacity(cw * ch * 2));
+            for p in uv.chunks_exact(4) {
+                u.extend_from_slice(&low(&p[0..2]));
+                v.extend_from_slice(&low(&p[2..4]));
+            }
+            (vec![y, u, v], PixelFormat::Yuv420p10)
+        } else {
+            let (mut u, mut v) = (vec![0u8; cw * ch], vec![0u8; cw * ch]);
+            for ((u, v), p) in u.iter_mut().zip(v.iter_mut()).zip(uv.chunks_exact(2)) {
+                *u = p[0];
+                *v = p[1];
+            }
+            (vec![y, u, v], PixelFormat::Yuv420p)
+        };
         self.uv_scratch = uv;
-        Ok(Frame::Video(VideoFrame { width: self.width, height: self.height, pix_fmt: PixelFormat::Yuv420p, pts: d.timestamp, planes: vec![y, u, v] }))
+        Ok(Frame::Video(VideoFrame { width: self.width, height: self.height, pix_fmt, pts: d.timestamp, planes }))
     }
 
     /// NV12 luma and interleaved chroma of the display area, as tightly packed host buffers.
@@ -417,10 +436,11 @@ impl State {
     /// (and page-faulted in) for every one.
     fn copy_planes(&self, dptr: u64, pitch: u32, uv: &mut Vec<u8>) -> Result<Vec<u8>> {
         let (w, h) = (self.width as usize, self.height as usize);
-        let (left, top) = (self.display[0].max(0) as u64 & !1, self.display[1].max(0) as u64 & !1);
+        let bps = if self.bits == 10 { 2 } else { 1 };
+        let (left, top) = ((self.display[0].max(0) as u64 & !1) * bps as u64, self.display[1].max(0) as u64 & !1);
         let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-        let mut y = vec![0u8; w * h];
-        uv.resize(cw * 2 * ch, 0);
+        let mut y = vec![0u8; w * h * bps];
+        uv.resize(cw * 2 * ch * bps, 0);
         // Mapped frames keep the chroma plane right after the luma plane, whose height is the
         // coded height rounded up to even.
         let chroma_base = dptr + pitch as u64 * ((self.coded_height as u64 + 1) & !1);
@@ -446,8 +466,8 @@ impl State {
             // SAFETY: the destination holds `width * rows` bytes and the source is a mapped frame.
             cu(unsafe { (self.api.memcpy2d)(&m) }, "cuMemcpy2D")
         };
-        copy(dptr, left, top, &mut y, w, h)?;
-        copy(chroma_base, left, top / 2, uv, cw * 2, ch)?;
+        copy(dptr, left, top, &mut y, w * bps, h)?;
+        copy(chroma_base, left, top / 2, uv, cw * 2 * bps, ch)?;
         Ok(y)
     }
 }
@@ -488,7 +508,8 @@ unsafe impl Send for NvdecDecoder {}
 impl NvdecDecoder {
     /// Open a decoder for `codec` on the first NVIDIA GPU. `width` and `height` are the
     /// stream's display size; frames of any other size are rejected.
-    pub fn new(codec: CodecId, width: u32, height: u32) -> Result<Self> {
+    /// `bits` is the sample depth of the stream, 8 or 10.
+    pub fn new(codec: CodecId, width: u32, height: u32, bits: u8) -> Result<Self> {
         let parser_codec = match codec {
             CodecId::H264 => CODEC_H264,
             CodecId::Hevc => CODEC_HEVC,
@@ -542,6 +563,7 @@ impl NvdecDecoder {
                 codec,
                 width,
                 height,
+                bits,
                 decoder: ptr::null_mut(),
                 coded_height: 0,
                 display: [0; 4],
@@ -634,8 +656,8 @@ impl Drop for NvdecDecoder {
 /// True if `params` describe a stream this provider can decode.
 pub fn accepts(params: &StreamParams) -> std::result::Result<(), String> {
     match params {
-        StreamParams::Video { pix_fmt, .. } if *pix_fmt == PixelFormat::Yuv420p => Ok(()),
-        StreamParams::Video { pix_fmt, .. } => Err(format!("NVDEC provider decodes 8-bit yuv420p only, the stream is {}", pix_fmt.name())),
+        StreamParams::Video { pix_fmt, .. } if matches!(pix_fmt, PixelFormat::Yuv420p | PixelFormat::Yuv420p10) => Ok(()),
+        StreamParams::Video { pix_fmt, .. } => Err(format!("NVDEC provider decodes yuv420p and yuv420p10le only, the stream is {}", pix_fmt.name())),
         _ => Err("NVDEC only decodes video".to_string()),
     }
 }
@@ -666,7 +688,7 @@ mod tests {
 
     #[test]
     fn rejects_other_codecs_without_touching_the_driver() {
-        let e = NvdecDecoder::new(CodecId::Flac, 64, 64).err().unwrap();
+        let e = NvdecDecoder::new(CodecId::Flac, 64, 64, 8).err().unwrap();
         assert_eq!(e.code, ErrorCode::InvalidArgument);
     }
 }

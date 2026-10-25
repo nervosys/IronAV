@@ -204,8 +204,9 @@ impl Track {
         c.extend_from_slice(&0xF000u16.to_be_bytes()); // min spatial segmentation
         c.push(0xFC); // parallelism type
         c.push(0xFC | 1); // chroma 4:2:0
-        c.push(0xF8); // luma bit depth 8
-        c.push(0xF8); // chroma bit depth 8
+        let (luma_minus8, chroma_minus8) = hevc_bit_depths(&p).unwrap_or((0, 0));
+        c.push(0xF8 | luma_minus8); // luma bit depth - 8
+        c.push(0xF8 | chroma_minus8); // chroma bit depth - 8
         c.extend_from_slice(&0u16.to_be_bytes()); // average frame rate: unspecified
         c.push((1 << 3) | (nesting << 2) | 3); // 1 temporal layer, 4-byte lengths
         c.push(3);
@@ -333,6 +334,49 @@ pub struct Mp4Muxer {
     data_len: u64,
     /// When set, `finish` rewrites this file with the movie box in front of the media data.
     faststart: Option<std::path::PathBuf>,
+}
+
+/// Luma and chroma bit depth (minus 8) from an unescaped HEVC SPS, for a stream with a single
+/// temporal sub-layer (what the hardware encoder writes). `None` when the SPS is not that shape.
+fn hevc_bit_depths(sps: &[u8]) -> Option<(u8, u8)> {
+    if sps.len() < 16 || (sps[2] >> 1) & 7 != 0 {
+        return None;
+    }
+    let (data, mut pos) = (sps, 15 * 8); // after the 2-byte NAL header, 1 byte, and 12-byte profile_tier_level
+    let bit = |pos: &mut usize| -> Option<u32> {
+        let b = *data.get(*pos / 8)?;
+        let v = (b >> (7 - *pos % 8)) & 1;
+        *pos += 1;
+        Some(v as u32)
+    };
+    let ue = |pos: &mut usize| -> Option<u32> {
+        let mut zeros = 0;
+        while bit(pos)? == 0 {
+            zeros += 1;
+            if zeros > 31 {
+                return None;
+            }
+        }
+        let mut v = 0u32;
+        for _ in 0..zeros {
+            v = (v << 1) | bit(pos)?;
+        }
+        Some((1u32 << zeros) - 1 + v)
+    };
+    ue(&mut pos)?; // sps_seq_parameter_set_id
+    let chroma = ue(&mut pos)?;
+    if chroma == 3 {
+        bit(&mut pos)?; // separate_colour_plane_flag
+    }
+    ue(&mut pos)?; // width
+    ue(&mut pos)?; // height
+    if bit(&mut pos)? == 1 {
+        for _ in 0..4 {
+            ue(&mut pos)?; // conformance window offsets
+        }
+    }
+    let (l, c) = (ue(&mut pos)?, ue(&mut pos)?);
+    (l < 8 && c < 8).then_some((l as u8, c as u8))
 }
 
 impl Mp4Muxer {

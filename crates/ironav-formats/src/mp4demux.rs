@@ -102,6 +102,8 @@ struct Config {
     /// Annex B parameter sets to put before sync samples (empty for other codecs).
     prefix: Vec<u8>,
     nal_length: usize,
+    /// Bits per sample of the video: 8, or 10 for 4:2:0 high-bit-depth profiles.
+    bits: u8,
 }
 
 struct TrackInfo {
@@ -341,7 +343,7 @@ fn parse_trak(trak: &[u8], index: usize, samples: &mut Vec<Sample>) -> Result<Op
         let config = match codec {
             CodecId::H264 => parse_avcc(need(kids, b"avcC", "the avc1 entry")?)?,
             CodecId::Hevc => parse_hvcc(need(kids, b"hvcC", "the hvc1 entry")?)?,
-            _ => Config { prefix: Vec::new(), nal_length: 0 },
+            _ => Config { prefix: Vec::new(), nal_length: 0, bits: 8 },
         };
         let total: i64 = samples[first..].iter().map(|s| s.duration as i64).sum();
         let frame_rate = if total > 0 {
@@ -351,7 +353,8 @@ fn parse_trak(trak: &[u8], index: usize, samples: &mut Vec<Sample>) -> Result<Op
         } else {
             Rational::new(0, 1)
         };
-        let params = StreamParams::Video { width, height, pix_fmt: PixelFormat::Yuv420p, frame_rate };
+        let pix_fmt = if config.bits == 10 { PixelFormat::Yuv420p10 } else { PixelFormat::Yuv420p };
+        let params = StreamParams::Video { width, height, pix_fmt, frame_rate };
         (codec, params, None, config, matches!(codec, CodecId::H264 | CodecId::Hevc))
     } else {
         let codec = match &fourcc {
@@ -381,7 +384,7 @@ fn parse_trak(trak: &[u8], index: usize, samples: &mut Vec<Sample>) -> Result<Op
             bits = Some(((packed >> 36) & 31) as u8 + 1);
         }
         let params = StreamParams::Audio { sample_rate: rate, channels };
-        (codec, params, bits, Config { prefix: Vec::new(), nal_length: 0 }, false)
+        (codec, params, bits, Config { prefix: Vec::new(), nal_length: 0, bits: 8 }, false)
     };
     let duration: i64 = samples[first..].iter().map(|s| s.duration as i64).sum();
     let stream = StreamInfo { index, codec, time_base, duration: Some(duration), bits, params };
@@ -413,17 +416,16 @@ fn parse_avcc(c: &[u8]) -> Result<Config> {
         at += 2 + len;
     }
     // High profiles may state chroma format and bit depth after the parameter sets.
+    let mut bits = 8;
     if matches!(c[1], 100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134) {
         if let Some(ext) = c.get(at..at + 3) {
             let (chroma, luma, chroma_bits) = (ext[0] & 3, ext[1] & 7, ext[2] & 7);
-            if chroma != 1 || luma != 0 || chroma_bits != 0 {
-                return Err(unsupported_format(chroma, luma + 8));
-            }
+            bits = supported_depth(chroma, luma, chroma_bits)?;
         } else if matches!(c[1], 110 | 122 | 244) {
-            return Err(Error::new(ErrorCode::UnsupportedCodec, "H.264 high-bit-depth profile without a stated bit depth; only 8-bit 4:2:0 is supported"));
+            return Err(Error::new(ErrorCode::UnsupportedCodec, "H.264 high-bit-depth profile without a stated bit depth; only 8-bit and 10-bit 4:2:0 are supported"));
         }
     }
-    Ok(Config { prefix, nal_length: (c[4] & 3) as usize + 1 })
+    Ok(Config { prefix, nal_length: (c[4] & 3) as usize + 1, bits })
 }
 
 fn parse_hvcc(c: &[u8]) -> Result<Config> {
@@ -431,9 +433,7 @@ fn parse_hvcc(c: &[u8]) -> Result<Config> {
         return Err(corrupt("hvcC is malformed"));
     }
     let (chroma, luma, chroma_bits) = (c[16] & 3, c[17] & 7, c[18] & 7);
-    if chroma != 1 || luma != 0 || chroma_bits != 0 {
-        return Err(unsupported_format(chroma, luma + 8));
-    }
+    let bits = supported_depth(chroma, luma, chroma_bits)?;
     let mut prefix = Vec::new();
     let mut at = 23;
     for _ in 0..c[22] {
@@ -445,13 +445,22 @@ fn parse_hvcc(c: &[u8]) -> Result<Config> {
             at += 2 + len;
         }
     }
-    Ok(Config { prefix, nal_length: (c[21] & 3) as usize + 1 })
+    Ok(Config { prefix, nal_length: (c[21] & 3) as usize + 1, bits })
+}
+
+/// 8-bit or 10-bit 4:2:0 with the same depth for luma and chroma; anything else is refused.
+fn supported_depth(chroma: u8, luma_minus8: u8, chroma_minus8: u8) -> Result<u8> {
+    match (chroma, luma_minus8, chroma_minus8) {
+        (1, 0, 0) => Ok(8),
+        (1, 2, 2) => Ok(10),
+        _ => Err(unsupported_format(chroma, luma_minus8 + 8)),
+    }
 }
 
 fn unsupported_format(chroma: u8, bits: u8) -> Error {
     let chroma = ["4:0:0", "4:2:0", "4:2:2", "4:4:4"][chroma as usize & 3];
-    Error::new(ErrorCode::UnsupportedCodec, format!("the video is {bits}-bit {chroma}; only 8-bit 4:2:0 is supported"))
-        .hint("convert the source to 8-bit yuv420p first")
+    Error::new(ErrorCode::UnsupportedCodec, format!("the video is {bits}-bit {chroma}; only 8-bit and 10-bit 4:2:0 are supported"))
+        .hint("convert the source to yuv420p or yuv420p10le first")
 }
 
 impl<R: Read + Seek + Send> Demuxer for Mp4Demuxer<R> {
@@ -546,7 +555,7 @@ mod tests {
     }
 
     #[test]
-    fn avcc_yields_annex_b_parameter_sets_and_rejects_10_bit() {
+    fn avcc_yields_annex_b_parameter_sets_and_checks_bit_depth() {
         // version, profile 100, compat, level 40, 4-byte lengths, 1 SPS, 1 PPS, then the extension.
         let mut c = vec![1, 100, 0, 40, 0xFF, 0xE1, 0, 3, 0x67, 1, 2, 1, 0, 2, 0x68, 9];
         c.extend_from_slice(&[0xFD, 0xF8, 0xF8, 0]);
@@ -554,7 +563,11 @@ mod tests {
         assert_eq!(cfg.nal_length, 4);
         assert_eq!(cfg.prefix, vec![0, 0, 0, 1, 0x67, 1, 2, 0, 0, 0, 1, 0x68, 9]);
         let n = c.len();
-        c[n - 3] = 0xFA; // luma bit depth 10
+        c[n - 3] = 0xFA; // luma 10-bit but chroma 8-bit: mixed depths are refused
+        assert_eq!(parse_avcc(&c).unwrap_err().code, ErrorCode::UnsupportedCodec);
+        c[n - 2] = 0xFA; // both 10-bit
+        assert_eq!(parse_avcc(&c).unwrap().bits, 10);
+        c[n - 3] = 0xFC; // 4:2:2 is still refused
         assert_eq!(parse_avcc(&c).unwrap_err().code, ErrorCode::UnsupportedCodec);
     }
 

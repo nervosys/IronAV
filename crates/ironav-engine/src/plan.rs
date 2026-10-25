@@ -212,7 +212,7 @@ pub fn plan(job: &Job) -> Result<Plan> {
                 }
                 #[cfg(any(windows, target_os = "linux"))]
                 ironav_hwaccel::nvdec::accepts(&s.params).map_err(|m| {
-                    Error::new(ErrorCode::UnsupportedCodec, m).hint("only 8-bit yuv420p H.264/HEVC can be decoded so far")
+                    Error::new(ErrorCode::UnsupportedCodec, m).hint("only 8-bit and 10-bit 4:2:0 H.264/HEVC can be decoded so far")
                 })?;
                 hardware.push(sel);
             }
@@ -223,8 +223,8 @@ pub fn plan(job: &Job) -> Result<Plan> {
             let hw_chosen = hardware.iter().any(|h| h.direction == Direction::Encode && h.chosen.is_some());
             if hw_chosen {
                 #[cfg(any(windows, target_os = "linux"))]
-                ironav_hwaccel::nvenc::accepts(&params).map_err(|m| {
-                    Error::invalid_arg(m).hint("convert the input to 8-bit yuv420p with even dimensions, or set hwaccel to \"off\" if a software encoder exists")
+                ironav_hwaccel::nvenc::accepts(&params, to).map_err(|m| {
+                    Error::invalid_arg(m).hint("convert the input to yuv420p with even dimensions (10-bit yuv420p10le works for HEVC), or set hwaccel to \"off\" if a software encoder exists")
                 })?;
             } else if hw_encodable && !is_software_encodable(to) {
                 let why = hardware.last().map(|h| h.considered.iter().map(|c| format!("{}: {}", c.backend.name(), c.reason)).collect::<Vec<_>>().join("; ")).unwrap_or_default();

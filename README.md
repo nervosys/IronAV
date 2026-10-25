@@ -64,7 +64,7 @@ because the account's Actions billing refused to start it.
 
 NVENC is loaded from the driver at run time (`nvEncodeAPI64.dll` / `libnvidia-encode.so.1`), so the same binary runs on
 machines without NVIDIA hardware. It needs a driver that supports NVENC API 13.1 or newer and refuses older ones with a
-clear error rather than guessing struct layouts. Input must be 8-bit `yuv420p` with even dimensions; there are no
+clear error rather than guessing struct layouts. Input must be `yuv420p` (or `yuv420p10le` for HEVC, written as Main 10) with even dimensions; there are no
 B-frames and no look-ahead, so output order equals input order and each frame yields a packet immediately.
 
 ```
@@ -81,7 +81,9 @@ exact 8.000 s duration, all frames decoded, and seeking lands on the right keyfr
 `ironav probe`, `convert` and the other tools read MP4 (regular files with the index anywhere; **fragmented MP4 is not
 supported**). H.264/HEVC video is decoded by NVDEC through the driver's `nvcuvid` library, loaded at run time like NVENC;
 the output is cropped to the display size and returned as planar `yuv420p` in display order, so B-frame streams work.
-Only 8-bit 4:2:0 is accepted (10-bit and 4:2:2/4:4:4 are refused with a clear error).
+8-bit and 10-bit 4:2:0 are accepted (10-bit comes back as `yuv420p10le`); 4:2:2/4:4:4 and 12-bit are refused with a clear error.
+10-bit HEVC decoding was compared with FFmpeg's software decoder on a 60-frame 720p Main 10 clip: every sample of every
+frame is identical. 10-bit H.264 (High 10) and 10-bit encoding of H.264 are not offered (consumer NVENC cannot encode it).
 
 ```
 ironav convert -i in.mp4 -o out.y4m --vcodec rawvideo                    # decode to raw frames
@@ -112,7 +114,14 @@ took 1.5-2.0 s on the RTX 3090 Ti; I have not measured how much of that is the s
 `--filter format:pix_fmt=yuv420p` converts between gray8, yuv420p, yuv422p, yuv444p and rgb24, so sources the GPU encoder
 cannot take directly (4:4:4, 4:2:2, grey) can be fed to it. RGB uses limited-range BT.601 (`matrix=709` for BT.709);
 chroma is resampled with the same triangle filter as `scale`. Tested for known colour values, round trips and plane
-layouts; not compared against FFmpeg's converter. 10-bit formats do not exist yet.
+layouts; not compared against FFmpeg's converter.
+
+**10-bit.** `yuv420p10le` (16-bit little-endian words, value in the low 10 bits) is a pixel format in its own right: Y4M
+(`C420p10`), `scale`, `hflip`, `format`, the MP4 reader and writer (`hvcC` carries the depth) and the player all handle it.
+`format` converts to or from 10-bit by going through 8-bit 4:2:0, so only 10-bit to 10-bit keeps the extra precision,
+and converting to RGB or another layout loses it. `gray` does not take 10-bit input. An NVENC Main 10 encode of the
+decoded test clip came back with luma PSNR 58.9 dB against the source (a smooth synthetic gradient, so a high figure
+says the bit alignment is right, not how the encoder performs on real footage).
 
 ### Video and audio together
 
@@ -134,7 +143,7 @@ apart in file order.
 Validated by decoding the output with FFmpeg's decoders (via PyAV) and comparing every frame to the source: 240/240
 frames, correct order, High/Main profile, PSNR rising monotonically as QP falls, chroma bit-exact at QP 0. The struct
 layouts were generated from NVIDIA's `nvEncodeAPI.h` (SDK 13.1) with clang, and the tests pin their sizes. Tests that
-need a GPU skip themselves when none is usable. Not done: hardware scaling, 10-bit decode or encode, AV1, rate-control
+need a GPU skip themselves when none is usable. Not done: hardware scaling, 10-bit H.264, 12-bit, 4:2:2/4:4:4, AV1, rate-control
 tuning beyond QP/average bitrate, and the other vendors' providers.
 
 ## Playing media
