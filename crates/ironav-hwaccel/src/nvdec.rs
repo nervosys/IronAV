@@ -13,7 +13,7 @@
 use ironav_core::{CodecId, Decoder, Error, ErrorCode, Frame, Packet, PixelFormat, Result, StreamParams, VideoFrame};
 use libloading::Library;
 use std::collections::VecDeque;
-use std::ffi::c_void;
+use std::ffi::{c_ulong, c_void};
 use std::ptr;
 
 /// Codecs this provider can decode.
@@ -32,29 +32,31 @@ const MEM_HOST: u32 = 1;
 const MEM_DEVICE: u32 = 2;
 
 #[repr(C)]
+/// `unsigned long` fields of CUVIDDECODECREATEINFO are 4 bytes on Windows and 8 on Linux, so they
+/// are `c_ulong`; the enums and `short`s keep their own sizes.
 struct CreateInfo {
-    width: u32,
-    height: u32,
-    num_decode_surfaces: u32,
+    width: c_ulong,
+    height: c_ulong,
+    num_decode_surfaces: c_ulong,
     codec: u32,
     chroma_format: u32,
-    creation_flags: u32,
-    bit_depth_minus8: u32,
-    intra_decode_only: u32,
-    max_width: u32,
-    max_height: u32,
-    reserved1: u32,
+    creation_flags: c_ulong,
+    bit_depth_minus8: c_ulong,
+    intra_decode_only: c_ulong,
+    max_width: c_ulong,
+    max_height: c_ulong,
+    reserved1: c_ulong,
     display_area: [i16; 4],
     output_format: u32,
     deinterlace: u32,
-    target_width: u32,
-    target_height: u32,
-    num_output_surfaces: u32,
+    target_width: c_ulong,
+    target_height: c_ulong,
+    num_output_surfaces: c_ulong,
     vid_lock: *mut c_void,
     target_rect: [i16; 4],
-    enable_histogram: u32,
-    enable_decode_features: u32,
-    reserved2: [u32; 3],
+    enable_histogram: c_ulong,
+    enable_decode_features: c_ulong,
+    reserved2: [c_ulong; 3],
 }
 
 #[repr(C)]
@@ -78,8 +80,9 @@ struct ParserParams {
 
 #[repr(C)]
 struct SourcePacket {
-    flags: u32,
-    payload_size: u32,
+    // `unsigned long` in the header: 4 bytes on Windows, 8 on Linux.
+    flags: c_ulong,
+    payload_size: c_ulong,
     payload: *const u8,
     timestamp: i64,
 }
@@ -308,22 +311,22 @@ impl State {
         }
         let surfaces = (f.min_num_decode_surfaces as u32).max(1);
         let mut info = CreateInfo {
-            width: f.coded_width,
-            height: f.coded_height,
-            num_decode_surfaces: surfaces,
+            width: f.coded_width.into(),
+            height: f.coded_height.into(),
+            num_decode_surfaces: surfaces.into(),
             codec: f.codec,
             chroma_format: f.chroma_format,
-            creation_flags: CREATE_PREFER_CUVID,
+            creation_flags: CREATE_PREFER_CUVID.into(),
             bit_depth_minus8: 0,
             intra_decode_only: 0,
-            max_width: f.coded_width,
-            max_height: f.coded_height,
+            max_width: f.coded_width.into(),
+            max_height: f.coded_height.into(),
             reserved1: 0,
             display_area: [0; 4],
             output_format: SURFACE_NV12,
             deinterlace: DEINTERLACE_WEAVE,
-            target_width: f.coded_width,
-            target_height: f.coded_height,
+            target_width: f.coded_width.into(),
+            target_height: f.coded_height.into(),
             num_output_surfaces: 2,
             vid_lock: ptr::null_mut(),
             target_rect: [0; 4],
@@ -579,7 +582,7 @@ impl NvdecDecoder {
     fn feed(&mut self, data: &[u8], pts: i64, flags: u32) -> Result<Vec<Frame>> {
         // SAFETY: binds the context we retained to this thread.
         unsafe { (self.set_ctx)(self.ctx) };
-        let mut pkt = SourcePacket { flags, payload_size: data.len() as u32, payload: if data.is_empty() { ptr::null() } else { data.as_ptr() }, timestamp: pts };
+        let mut pkt = SourcePacket { flags: flags.into(), payload_size: data.len() as u32 as c_ulong, payload: if data.is_empty() { ptr::null() } else { data.as_ptr() }, timestamp: pts };
         // SAFETY: the parser calls back into `self.state` synchronously before returning.
         let r = unsafe { (self.state().api.parse)(self.parser, &mut pkt) };
         if let Some(e) = self.state().error.take() {
@@ -645,9 +648,10 @@ mod tests {
     /// Struct sizes as computed by clang from the NVIDIA headers.
     #[test]
     fn layout_matches_the_headers() {
-        assert_eq!(size_of::<CreateInfo>(), 112);
+        // `unsigned long` is 4 bytes on Windows and 8 on 64-bit Linux, which changes these two.
+        assert_eq!(size_of::<CreateInfo>(), if cfg!(windows) { 112 } else { 176 });
         assert_eq!(size_of::<ParserParams>(), 136);
-        assert_eq!(size_of::<SourcePacket>(), 24);
+        assert_eq!(size_of::<SourcePacket>(), if cfg!(windows) { 24 } else { 32 });
         assert_eq!(size_of::<DispInfo>(), 24);
         assert_eq!(size_of::<VideoFormat>(), 64);
         assert_eq!(size_of::<ProcParams>(), 264);
