@@ -338,18 +338,23 @@ fn lib_dirs() -> Vec<PathBuf> {
             vec![Path::new(&root).join("System32")]
         }
         Platform::MacOs | Platform::Ios => ["/usr/lib", "/usr/local/lib", "/opt/homebrew/lib"].map(PathBuf::from).to_vec(),
-        _ => [
-            "/usr/lib",
-            "/usr/lib64",
-            "/usr/lib/x86_64-linux-gnu",
-            "/usr/lib/aarch64-linux-gnu",
-            "/lib/x86_64-linux-gnu",
-            "/usr/local/lib",
-            "/opt/amdgpu/lib/x86_64-linux-gnu",
-            "/system/lib64",
-        ]
-        .map(PathBuf::from)
-        .to_vec(),
+        _ => {
+            // Directories the dynamic loader was told about come first, then the usual places;
+            // /usr/lib/wsl/lib holds the Windows GPU driver as seen from WSL.
+            let fixed = [
+                "/usr/lib/wsl/lib",
+                "/usr/lib",
+                "/usr/lib64",
+                "/usr/lib/x86_64-linux-gnu",
+                "/usr/lib/aarch64-linux-gnu",
+                "/lib/x86_64-linux-gnu",
+                "/usr/local/lib",
+                "/opt/amdgpu/lib/x86_64-linux-gnu",
+                "/system/lib64",
+            ];
+            let from_env = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+            from_env.split(':').filter(|d| !d.is_empty()).chain(fixed).map(PathBuf::from).collect()
+        }
     }
 }
 
