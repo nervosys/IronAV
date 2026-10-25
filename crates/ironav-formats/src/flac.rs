@@ -80,6 +80,8 @@ impl<R: Read + Seek + Send> FlacDemuxer<R> {
             time_base: Rational::new(1, rate as i64),
             duration: (total > 0).then_some(total),
             bits: Some(bits),
+            extradata: Vec::new(),
+            lead_in: 0,
             params: StreamParams::Audio { sample_rate: rate, channels },
         };
         let frames_start = r.stream_position()?;

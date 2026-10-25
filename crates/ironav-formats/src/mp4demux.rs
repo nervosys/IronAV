@@ -10,7 +10,7 @@
 //! sample), which is the form the hardware decoder and the MP4 writer both use. Other codecs
 //! are exposed so they can be named in errors, and their samples pass through untouched.
 
-use ironav_core::{CodecId, Demuxer, Error, ErrorCode, Packet, PixelFormat, Rational, Result, StreamInfo, StreamParams};
+use ironav_core::{CodecId, Demuxer, Error, ErrorCode, MediaType, Packet, PixelFormat, Rational, Result, StreamInfo, StreamParams};
 use std::io::{Read, Seek, SeekFrom};
 
 /// Sanity cap on the size of the index we are willing to hold in memory.
@@ -328,6 +328,7 @@ fn parse_trak(trak: &[u8], index: usize, samples: &mut Vec<Sample>) -> Result<Op
     let n = (samples.len() - first) as i64;
 
     let time_base = Rational::new(1, timescale as i64);
+    let mut extradata = Vec::new();
     let (codec, params, bits, config, convert) = if is_video {
         let codec = match &fourcc {
             b"avc1" | b"avc3" => CodecId::H264,
@@ -383,12 +384,82 @@ fn parse_trak(trak: &[u8], index: usize, samples: &mut Vec<Sample>) -> Result<Op
             channels = ((packed >> 41) & 7) as u16 + 1;
             bits = Some(((packed >> 36) & 31) as u8 + 1);
         }
+        if codec == CodecId::Aac {
+            extradata = aac_config(need(e.get(kids_at..).unwrap_or(&[]), b"esds", "the mp4a entry")?)?;
+        }
         let params = StreamParams::Audio { sample_rate: rate, channels };
         (codec, params, bits, Config { prefix: Vec::new(), nal_length: 0, bits: 8 }, false)
     };
     let duration: i64 = samples[first..].iter().map(|s| s.duration as i64).sum();
-    let stream = StreamInfo { index, codec, time_base, duration: Some(duration), bits, params };
+    let lead_in = if codec.media_type() == MediaType::Audio { edit_lead_in(trak)? } else { 0 };
+    let stream = StreamInfo { index, codec, time_base, duration: Some(duration), bits, extradata, lead_in, params };
     Ok(Some(TrackInfo { stream, config, convert }))
+}
+
+/// Media time at which the track's first non-empty edit starts, from `edts/elst`; 0 without one.
+fn edit_lead_in(trak: &[u8]) -> Result<i64> {
+    let Some(edts) = child(trak, b"edts")? else { return Ok(0) };
+    let Some(elst) = child(edts, b"elst")? else { return Ok(0) };
+    let wide = elst.first() == Some(&1);
+    let width = if wide { 20 } else { 12 };
+    let n = be32(elst, 4)? as usize;
+    for i in 0..n {
+        let entry = elst.get(8 + i * width..8 + (i + 1) * width).ok_or_else(|| corrupt("elst is cut short"))?;
+        let media_time = if wide { i64::from_be_bytes(entry[8..16].try_into().unwrap()) } else { i32::from_be_bytes(entry[4..8].try_into().unwrap()) as i64 };
+        if media_time >= 0 {
+            return Ok(media_time);
+        }
+    }
+    Ok(0)
+}
+
+/// The AudioSpecificConfig inside an `esds` box: ES descriptor (0x03) > decoder config (0x04,
+/// object type 0x40 = MPEG-4 AAC) > decoder specific info (0x05).
+fn aac_config(esds: &[u8]) -> Result<Vec<u8>> {
+    fn descriptor(d: &[u8], at: &mut usize) -> Result<(u8, usize)> {
+        let tag = *d.get(*at).ok_or_else(|| corrupt("esds is cut short"))?;
+        *at += 1;
+        let mut len = 0usize;
+        for _ in 0..4 {
+            let b = *d.get(*at).ok_or_else(|| corrupt("esds is cut short"))?;
+            *at += 1;
+            len = len << 7 | (b & 0x7F) as usize;
+            if b & 0x80 == 0 {
+                break;
+            }
+        }
+        Ok((tag, len))
+    }
+    let d = esds.get(4..).ok_or_else(|| corrupt("esds is cut short"))?; // version and flags
+    let mut at = 0;
+    let (tag, _) = descriptor(d, &mut at)?;
+    if tag != 3 {
+        return Err(corrupt("esds does not start with an ES descriptor"));
+    }
+    let flags = *d.get(at + 2).ok_or_else(|| corrupt("esds is cut short"))?;
+    at += 3; // ES_ID and flags
+    if flags & 0x80 != 0 {
+        at += 2;
+    }
+    if flags & 0x40 != 0 {
+        at += 1 + *d.get(at).ok_or_else(|| corrupt("esds is cut short"))? as usize;
+    }
+    if flags & 0x20 != 0 {
+        at += 2;
+    }
+    let (tag, _) = descriptor(d, &mut at)?;
+    if tag != 4 {
+        return Err(corrupt("esds has no decoder configuration"));
+    }
+    if d.get(at) != Some(&0x40) {
+        return Err(Error::new(ErrorCode::UnsupportedCodec, "the mp4a track is not MPEG-4 AAC (object type is not 0x40)"));
+    }
+    at += 13; // object type, stream type, buffer size, max and average bit rate
+    let (tag, len) = descriptor(d, &mut at)?;
+    if tag != 5 {
+        return Err(corrupt("esds has no AudioSpecificConfig"));
+    }
+    d.get(at..at + len).map(<[u8]>::to_vec).ok_or_else(|| corrupt("AudioSpecificConfig runs past the esds box"))
 }
 
 fn push_start_coded(out: &mut Vec<u8>, nal: &[u8]) {
@@ -591,6 +662,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn copied_aac_keeps_its_config_and_encoder_delay() {
+        let sink = Arc::new(Mutex::new(Cursor::new(Vec::new())));
+        let mut m = Mp4Muxer::new(Box::new(Shared(sink.clone())));
+        let asc = vec![0x12, 0x10]; // AAC-LC, 44.1 kHz, stereo
+        m.write_header(&[StreamInfo {
+            index: 0,
+            codec: CodecId::Aac,
+            time_base: Rational::new(1, 44100),
+            duration: None,
+            bits: None,
+            extradata: asc.clone(),
+            lead_in: 1024,
+            params: StreamParams::Audio { sample_rate: 44100, channels: 2 },
+        }])
+        .unwrap();
+        for i in 0..4 {
+            m.write_packet(&Packet { stream: 0, pts: i * 1024, duration: 1024, data: vec![i as u8; 10] }).unwrap();
+        }
+        m.finish().unwrap();
+        let file = sink.lock().unwrap().get_ref().clone();
+        let mut d = Mp4Demuxer::open(Cursor::new(file)).unwrap();
+        let s = &d.streams()[0];
+        assert_eq!((s.codec, s.extradata.clone(), s.lead_in), (CodecId::Aac, asc, 1024));
+        assert_eq!(d.read_packet().unwrap().unwrap().data, vec![0u8; 10]);
+    }
+
     /// Write a small video+audio MP4 with our own muxer and read it back.
     fn round_trip() -> (Vec<Packet>, Mp4Demuxer<Cursor<Vec<u8>>>) {
         let sink = Arc::new(Mutex::new(Cursor::new(Vec::new())));
@@ -602,6 +700,8 @@ mod tests {
                 time_base: Rational::new(1, 30),
                 duration: None,
                 bits: None,
+                extradata: Vec::new(),
+                lead_in: 0,
                 params: StreamParams::Video { width: 64, height: 48, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational::new(30000, 1001) },
             },
             StreamInfo {
@@ -610,6 +710,8 @@ mod tests {
                 time_base: Rational::new(1, 48000),
                 duration: None,
                 bits: Some(16),
+                extradata: Vec::new(),
+                lead_in: 0,
                 params: StreamParams::Audio { sample_rate: 48000, channels: 2 },
             },
         ];

@@ -204,6 +204,14 @@ pub struct StreamInfo {
     /// Bits per sample of the coded audio, when meaningful (PCM, FLAC).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bits: Option<u8>,
+    /// Codec configuration a container needs to describe the stream when it is copied (for AAC, the
+    /// AudioSpecificConfig). Empty when the codec has none.
+    #[serde(skip)]
+    pub extradata: Vec<u8>,
+    /// Audio only: time (in `time_base` units) at the start of the stream that a container's edit list
+    /// skips, such as encoder delay. Copying the stream keeps it so audio stays in sync with video.
+    #[serde(skip)]
+    pub lead_in: i64,
     #[serde(flatten)]
     pub params: StreamParams,
 }

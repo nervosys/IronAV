@@ -69,6 +69,8 @@ impl<R: BufRead + Seek + Send> Y4mDemuxer<R> {
             time_base: fps.invert(),
             duration: Some(frames as i64),
             bits: None,
+            extradata: Vec::new(),
+            lead_in: 0,
             params: StreamParams::Video { width: w, height: h, pix_fmt: pix, frame_rate: fps },
         };
         Ok(Self { r, streams: vec![stream], frame_bytes, index: 0, data_start, stride })

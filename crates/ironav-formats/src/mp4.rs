@@ -6,7 +6,8 @@
 //! copies the file once with the index moved in front ("fast start"). Decode times are constant
 //! frame rate. A stream whose presentation order differs from decode order (B-frames) gets a `ctts`
 //! box of composition offsets and an edit list that starts the track at its first shown frame.
-//! FLAC frames are stored as they come, one per sample, with the STREAMINFO block in a `dfLa` box.
+//! FLAC frames are stored as they come, one per sample, with the STREAMINFO block in a `dfLa` box;
+//! AAC frames likewise, described by an `esds` box built from the stream's AudioSpecificConfig.
 //!
 //! Layout while writing: `ftyp`, `mdat` (64-bit size, patched at the end), `moov`. Each track's samples are
 //! gathered into chunks of about half a second, so a player reading both tracks finds the
@@ -116,6 +117,10 @@ struct Track {
     pts: Vec<i64>,
     params: ParamSets,
     flac: FlacStats,
+    /// AudioSpecificConfig of an AAC track.
+    asc: Vec<u8>,
+    /// Audio media time skipped at the start (encoder delay), written as an edit list.
+    lead_in: u64,
 }
 
 impl Track {
@@ -130,6 +135,7 @@ impl Track {
     fn sample_entry(&self) -> Result<Vec<u8>> {
         match self.kind {
             Kind::Video { width, height } => self.video_entry(width, height),
+            Kind::Audio { rate, channels, bits } if self.codec == CodecId::Aac => Ok(self.aac_entry(rate, channels, bits)),
             Kind::Audio { rate, channels, bits } => Ok(self.audio_entry(rate, channels, bits)),
         }
     }
@@ -155,6 +161,30 @@ impl Track {
         e.extend_from_slice(&0xFFFFu16.to_be_bytes());
         e.extend_from_slice(&config);
         Ok(bx(kind, &e))
+    }
+
+    /// `mp4a` sample entry with an `esds` box carrying the AudioSpecificConfig.
+    fn aac_entry(&self, rate: u32, channels: u16, bits: u8) -> Vec<u8> {
+        let mut e = vec![0u8; 6];
+        e.extend_from_slice(&1u16.to_be_bytes()); // data reference index
+        e.extend_from_slice(&[0u8; 8]);
+        e.extend_from_slice(&channels.to_be_bytes());
+        e.extend_from_slice(&(bits as u16).to_be_bytes());
+        e.extend_from_slice(&[0u8; 4]);
+        e.extend_from_slice(&(rate.min(65535) << 16).to_be_bytes());
+        let asc = &self.asc;
+        let mut config = vec![0x40, 0x15, 0, 0, 0]; // AAC, audio stream, buffer size unknown
+        config.extend_from_slice(&[0u8; 8]); // maximum and average bit rate unknown
+        config.extend_from_slice(&[5, asc.len() as u8]);
+        config.extend_from_slice(asc);
+        let mut es = vec![0, 0, 0]; // ES_ID, no optional fields
+        es.extend_from_slice(&[4, config.len() as u8]);
+        es.extend_from_slice(&config);
+        es.extend_from_slice(&[6, 1, 2]); // SL config: MP4 file
+        let mut esds = vec![3, es.len() as u8];
+        esds.extend_from_slice(&es);
+        e.extend_from_slice(&full(b"esds", 0, 0, &esds));
+        bx(b"mp4a", &e)
     }
 
     /// `fLaC` sample entry with a `dfLa` box holding the STREAMINFO metadata block (FLAC in ISO BMFF).
@@ -337,6 +367,12 @@ impl Track {
                 edts = bx(b"edts", &full(b"elst", 0, 0, &elst));
             }
         }
+        if !self.is_video() && self.lead_in > 0 {
+            let lead_ms = self.lead_in * 1000 / self.timescale as u64;
+            let mut elst = u32s(&[1, self.movie_ms().saturating_sub(lead_ms) as u32, self.lead_in as u32]);
+            elst.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+            edts = bx(b"edts", &full(b"elst", 0, 0, &elst));
+        }
         if self.is_video() {
             let mut stss = u32s(&[self.sync.len() as u32]);
             stss.extend_from_slice(&u32s(&self.sync));
@@ -518,13 +554,20 @@ impl Muxer for Mp4Muxer {
                     }
                     (Kind::Video { width: *width, height: *height }, frame_rate.num as u32, frame_rate.den as u32)
                 }
+                (StreamParams::Audio { sample_rate, channels }, CodecId::Aac) => {
+                    if s.extradata.is_empty() || s.extradata.len() > 100 {
+                        return Err(Error::new(ErrorCode::UnsupportedFormat, "AAC needs its AudioSpecificConfig (2 to 100 bytes) to go into an MP4")
+                            .hint("copy the AAC from an MP4 or M4A file, which carries it"));
+                    }
+                    (Kind::Audio { rate: *sample_rate, channels: *channels, bits: 16 }, *sample_rate, 0)
+                }
                 (StreamParams::Audio { .. }, CodecId::Flac) => {
                     let (rate, channels, bits) = flac_audio_params(s)?;
                     (Kind::Audio { rate, channels, bits }, rate, 0)
                 }
                 _ => {
-                    return Err(Error::new(ErrorCode::UnsupportedCodec, format!("this MP4 writer holds h264, hevc and flac, not {}", s.codec.name()))
-                        .alternatives(["h264", "hevc", "flac"]));
+                    return Err(Error::new(ErrorCode::UnsupportedCodec, format!("this MP4 writer holds h264, hevc, aac (copied) and flac, not {}", s.codec.name()))
+                        .alternatives(["h264", "hevc", "aac", "flac"]));
                 }
             };
             self.tracks.push(Track {
@@ -546,6 +589,8 @@ impl Muxer for Mp4Muxer {
                 pts: Vec::new(),
                 params: ParamSets::default(),
                 flac: FlacStats::new(),
+                asc: s.extradata.clone(),
+                lead_in: s.lead_in.max(0) as u64,
             });
         }
 
@@ -599,7 +644,7 @@ impl Muxer for Mp4Muxer {
             Some(last) if last.1 == delta => last.0 += 1,
             _ => tr.stts.push((1, delta)),
         }
-        if !tr.is_video() {
+        if !tr.is_video() && tr.codec == CodecId::Flac {
             tr.flac.record(p);
         }
         tr.duration += delta as u64;
@@ -675,6 +720,8 @@ mod tests {
             time_base: Rational::new(1, 30),
             duration: None,
             bits: None,
+            extradata: Vec::new(),
+            lead_in: 0,
             params: StreamParams::Video { width: 64, height: 48, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational::new(30000, 1001) },
         };
         m.write_header(&[info]).unwrap();
@@ -714,6 +761,8 @@ mod tests {
             time_base: Rational::new(1, 30000),
             duration: None,
             bits: None,
+            extradata: Vec::new(),
+            lead_in: 0,
             params: StreamParams::Video { width: 64, height: 48, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational::new(30000, 1001) },
         };
         m.write_header(&[info]).unwrap();
@@ -780,6 +829,8 @@ mod tests {
             time_base: Rational::new(1, 30),
             duration: None,
             bits: None,
+            extradata: Vec::new(),
+            lead_in: 0,
             params: StreamParams::Video { width: 64, height: 48, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational::new(30, 1) },
         };
         m.write_header(&[info]).unwrap();
@@ -814,6 +865,8 @@ mod tests {
             time_base: Rational::new(1, 30),
             duration: None,
             bits: None,
+            extradata: Vec::new(),
+            lead_in: 0,
             params: StreamParams::Video { width: 64, height: 48, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational::new(30, 1) },
         };
         m.write_header(&[info]).unwrap();
@@ -828,6 +881,8 @@ mod tests {
                 time_base: Rational::new(1, 30),
                 duration: None,
                 bits: None,
+                extradata: Vec::new(),
+                lead_in: 0,
                 params: StreamParams::Video { width: 64, height: 48, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational::new(30, 1) },
             },
             StreamInfo {
@@ -836,6 +891,8 @@ mod tests {
                 time_base: Rational::new(1, 48000),
                 duration: None,
                 bits: Some(16),
+                extradata: Vec::new(),
+                lead_in: 0,
                 params: StreamParams::Audio { sample_rate: 48000, channels: 2 },
             },
         ]

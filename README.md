@@ -94,6 +94,9 @@ ironav convert -i in.mp4 -o out.mp4                                      # strea
 `--acodec none` / `--vcodec none` leave a stream out. Copying H.264/HEVC with B-frames into an MP4 works: the writer
 records composition offsets (`ctts`) and an edit list, and a copy of an x264 file with B-frames decodes to the same
 50 frames, bit for bit, at the same times (checked with FFmpeg's decoder through PyAV).
+AAC audio can be copied into an MP4 too (not decoded or encoded: there is no AAC codec yet). The writer builds the `esds`
+box from the stream's AudioSpecificConfig and keeps the encoder-delay edit list, so a copy of an x264+AAC file decodes
+to the identical 50 frames and 88,064 audio samples as the original.
 
 Checked against FFmpeg's software decoders (via PyAV), frame by frame: NVDEC output is **identical** for 240/240 frames of
 720p H.264 and of HEVC (made by IronAV), and for 50/50 frames of 1080p H.264 with B-frames made by x264 (a different

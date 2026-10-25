@@ -187,6 +187,8 @@ mod tests {
                 time_base: Rational::new(1, 48000),
                 duration: Some(48000),
                 bits: Some(16),
+                extradata: Vec::new(),
+                lead_in: 0,
                 params: StreamParams::Audio { sample_rate: 48000, channels: 2 },
             }],
         }

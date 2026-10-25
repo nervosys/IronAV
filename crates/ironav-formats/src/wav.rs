@@ -81,6 +81,8 @@ impl<R: Read + Seek + Send> WavDemuxer<R> {
                         time_base: Rational::new(1, rate as i64),
                         duration: Some(frames),
                         bits: Some(bits as u8),
+                        extradata: Vec::new(),
+                        lead_in: 0,
                         params: StreamParams::Audio { sample_rate: rate, channels },
                     };
                     return Ok(Self {
