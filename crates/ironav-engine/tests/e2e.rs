@@ -1115,3 +1115,40 @@ fn ogg_opus_output_copies_and_encodes() {
     .unwrap_err();
     assert_eq!(e.code, ErrorCode::UnsupportedCodec);
 }
+
+/// Ogg FLAC output: a WAV encoded into Ogg comes back bit-exact, its STREAMINFO (patched into the
+/// first page when the stream ended) says how long it is, and FLAC frames copy across unchanged.
+#[test]
+fn ogg_flac_output_is_lossless_and_copies() {
+    let dir = scratch("ogg-flac");
+    let n = 44_100 * 3 + 123;
+    let samples: Vec<i16> = (0..n * 2).map(|i| ((i as f64 * 0.013).sin() * 9000.0 + ((i * 7919) % 211) as f64) as i16).collect();
+    let wav = dir.join("in.wav");
+    write_wav(&wav, &samples, 2, 44_100);
+    let oga = dir.join("enc.oga");
+    let mut j = job(&wav, &oga);
+    j.audio.codec = Some("flac".into());
+    run(&j, &mut |_| {}).unwrap();
+    let bytes = std::fs::read(&oga).unwrap();
+    assert!(bytes.starts_with(b"OggS") && bytes[28..].starts_with(b"\x7fFLAC\x01\x00\x00\x01fLaC"));
+    let d = ironav_formats::open_demuxer(&oga).unwrap();
+    assert_eq!(d.format_name(), "ogg");
+    assert_eq!(d.streams()[0].duration, Some(n as i64));
+    drop(d);
+    let back = dir.join("back.wav");
+    let mut j = job(&oga, &back);
+    j.audio.codec = Some("pcm_s16le".into());
+    run(&j, &mut |_| {}).unwrap();
+    assert_eq!(pcm(&back), pcm(&wav), "lossless through Ogg");
+
+    // Ogg to native FLAC and back is a copy of the same frames
+    let flac = dir.join("copy.flac");
+    run(&job(&oga, &flac), &mut |_| {}).unwrap();
+    let oga2 = dir.join("copy2.oga");
+    run(&job(&flac, &oga2), &mut |_| {}).unwrap();
+    let (mut a, mut b) = (ironav_formats::open_demuxer(&oga).unwrap(), ironav_formats::open_demuxer(&oga2).unwrap());
+    while let Some(pa) = a.read_packet().unwrap() {
+        assert_eq!(pa.data, b.read_packet().unwrap().unwrap().data);
+    }
+    assert!(b.read_packet().unwrap().is_none());
+}

@@ -113,11 +113,11 @@ pub static FORMATS: &[FormatSpec] = &[
     FormatSpec {
         name: "ogg",
         extensions: &["ogg", "opus", "oga"],
-        description: "Ogg: read Opus, Vorbis and FLAC audio (Speex and Theora are refused); write Opus (copied or encoded)",
+        description: "Ogg: read Opus, Vorbis and FLAC audio (Speex and Theora are refused); write Opus and FLAC (copied or encoded)",
         media: MediaType::Audio,
         demux: true,
         mux: true,
-        codecs: &[CodecId::Opus],
+        codecs: &[CodecId::Opus, CodecId::Flac],
     },
     FormatSpec {
         name: "h264",
@@ -211,7 +211,7 @@ pub fn create_muxer(path: &Path, format: &str) -> Result<Box<dyn Muxer>> {
         "flac" => Ok(Box::new(flac::FlacMuxer::new(out))),
         "mp4" => Ok(Box::new(mp4::Mp4Muxer::with_faststart(out, path))),
         "mkv" => Ok(Box::new(mkvwrite::MatroskaWriter::new(out))),
-        "ogg" => Ok(Box::new(oggwrite::OggOpusWriter::new(out))),
+        "ogg" => Ok(Box::new(oggwrite::OggWriter::new(out))),
         "webm" => Ok(Box::new(mkvwrite::MatroskaWriter::webm(out))),
         "h264" => Ok(Box::new(annexb::AnnexBMuxer::new(out, CodecId::H264))),
         "hevc" => Ok(Box::new(annexb::AnnexBMuxer::new(out, CodecId::Hevc))),

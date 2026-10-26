@@ -259,11 +259,13 @@ only produced streams in one mode at a time, so **mode switches within a stream 
 Opus is read from Matroska/WebM (`.mka`, `.webm`) and from Ogg (`.opus`, `.ogg`); for writing see "Opus encoder" below. The Ogg reader (pages are checksummed; the file is read into memory, up to 1 GiB) takes only the first Opus, Vorbis or FLAC stream: Speex and Theora in Ogg are refused with a message naming the codec, and chained streams after the first are ignored. The final page's granule position shortens the last packet, so the output ends where the file says (for Opus the length is the granule minus the pre-skip). Tested on libopus files remuxed to Ogg (identical samples to the Matroska copies); multi-page packets are covered by a synthetic unit test only. FLAC in Ogg (the native-FLAC mapping, as FFmpeg's muxer writes it) decodes bit for bit to the PCM it was made from.
 
 
-### Ogg Opus output
+### Ogg Opus and FLAC output
 
 `.opus` (and `.ogg`/`.oga`) is written for Opus, copied from any file that holds it or encoded: `OpusHead`, `OpusTags`, then pages of about
 half a second whose granule positions follow RFC 7845 (the packets' durations, pre-skip included, add up to the last one's, so
-the stream ends where it should). Other codecs in Ogg (Vorbis, FLAC) can be read but not written.
+the stream ends where it should). FLAC is written in Ogg too (`--acodec flac -o out.oga`, native mapping): STREAMINFO in the first
+page is rewritten when the stream ends, so it carries the real length and frame sizes. Encoded and re-decoded it is bit-exact,
+and FFmpeg reads the same file bit-exact. Vorbis can be read from Ogg but not written.
 
 ### Opus encoder
 
