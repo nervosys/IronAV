@@ -79,9 +79,54 @@ pub fn new_decoder_for(s: &ironav_core::StreamInfo) -> Result<Box<dyn Decoder>> 
     match s.codec {
         CodecId::Aac => Ok(Box::new(aac::AacDecoder::new(&s.extradata, &s.params)?)),
         CodecId::Mp3 => Ok(Box::new(mp3::Mp3Decoder::new(&s.params)?)),
-        CodecId::Opus => Ok(Box::new(opus::OpusDecoder::new(&s.extradata, &s.params)?)),
-        CodecId::Vorbis => Ok(Box::new(vorbis::VorbisDecoder::new(&s.extradata, &s.params)?)),
+        CodecId::Opus => Ok(trimmed(s, Box::new(opus::OpusDecoder::new(&s.extradata, &s.params)?))),
+        CodecId::Vorbis => Ok(trimmed(s, Box::new(vorbis::VorbisDecoder::new(&s.extradata, &s.params)?))),
         _ => new_decoder(s.codec, &s.params, s.bits),
+    }
+}
+
+/// Cuts a packet's audio to the packet's duration. The Ogg reader shortens the last packet's
+/// duration to what the final page's granule position allows, which drops the codec's padding.
+struct EndTrim(Box<dyn Decoder>);
+
+impl EndTrim {
+    fn cut(frames: &mut [ironav_core::Frame], duration: i64) {
+        for f in frames {
+            if let ironav_core::Frame::Audio(a) = f {
+                let keep = duration.max(0) as usize * a.channels.max(1) as usize;
+                if a.samples.len() > keep {
+                    a.samples.truncate(keep);
+                }
+            }
+        }
+    }
+}
+
+impl Decoder for EndTrim {
+    fn decode(&mut self, packet: &ironav_core::Packet) -> Result<Vec<ironav_core::Frame>> {
+        let mut frames = self.0.decode(packet)?;
+        // a duration of 0 means unknown
+        if packet.duration > 0 {
+            Self::cut(&mut frames, packet.duration);
+        }
+        Ok(frames)
+    }
+    fn flush(&mut self) -> Result<Vec<ironav_core::Frame>> {
+        self.0.flush()
+    }
+}
+
+/// Wrap a decoder in [`EndTrim`] when the stream's packet durations are in samples (time base
+/// 1/rate), which is how the Ogg reader gives them; Matroska's millisecond durations are left alone.
+fn trimmed(s: &ironav_core::StreamInfo, d: Box<dyn Decoder>) -> Box<dyn Decoder> {
+    let rate = match s.params {
+        StreamParams::Audio { sample_rate, .. } => sample_rate as i64,
+        _ => 0,
+    };
+    if s.time_base.num == 1 && s.time_base.den == rate {
+        Box::new(EndTrim(d))
+    } else {
+        d
     }
 }
 

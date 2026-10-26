@@ -255,7 +255,7 @@ Not covered: multichannel Opus (channel-mapping families 1 and 255 are refused),
 empty frame decodes to silence), and the way the reference decoder flushes its resampler when the stream switches between SILK
 and CELT, which our fixed-delay filter does not reproduce, so the few samples at such a switch can differ. The libopus encoder
 only produced streams in one mode at a time, so **mode switches within a stream were not tested**, nor were redundancy frames.
-Opus is read from Matroska/WebM (`.mka`, `.webm`) and from Ogg (`.opus`, `.ogg`); there is no Opus encoder. The Ogg reader (pages are checksummed; the file is read into memory, up to 1 GiB) takes only the first Opus or Vorbis stream: FLAC and Theora in Ogg are refused with a message naming the codec, and chained streams after the first are ignored. The final page's granule position is not used, so the last packet's padding is not trimmed. Tested on libopus files remuxed to Ogg (identical samples to the Matroska copies); multi-page packets are covered by a synthetic unit test only.
+Opus is read from Matroska/WebM (`.mka`, `.webm`) and from Ogg (`.opus`, `.ogg`); there is no Opus encoder. The Ogg reader (pages are checksummed; the file is read into memory, up to 1 GiB) takes only the first Opus or Vorbis stream: FLAC and Theora in Ogg are refused with a message naming the codec, and chained streams after the first are ignored. The final page's granule position shortens the last packet, so the output ends where the file says (for Opus the length is the granule minus the pre-skip). Tested on libopus files remuxed to Ogg (identical samples to the Matroska copies); multi-page packets are covered by a synthetic unit test only.
 
 ## Vorbis
 
@@ -277,8 +277,7 @@ those spectral lines (35 dB SNR on the test file); libvorbis streams did not hit
 reproduces the old behaviour, and with it the FFmpeg-encoder test file matches bit for bit.
 
 Not covered: **floor type 0** (obsolete; a stream that uses it is refused) and streams with more than 8 channels. The Ogg
-granule position is not used, so the final block's padding is not trimmed (our output runs up to about one block longer than
-FFmpeg's) and a stream that begins mid-way is not shifted. Chained or multiplexed Ogg streams: only the first Vorbis stream is
+granule position of the last page trims the end; a stream that begins mid-way (a first granule above zero) is not shifted. Chained or multiplexed Ogg streams: only the first Vorbis stream is
 read. Mid-stream changes of the headers are not followed. There is no Vorbis encoder. Decoding 120 s of 44.1 kHz stereo to WAV takes 0.25 to 0.31 s inside IronAV's own timing (roughly 400x real time), while
 FFmpeg's decoder alone ran the same file in 0.08 to 0.19 s through PyAV; FFmpeg is still faster here by roughly 1.5 to 3x. This
 decoder is scalar `f32`; codebook lookups use a 10-bit table, longer codes walk a tree.

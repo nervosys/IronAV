@@ -7,8 +7,8 @@
 //!
 //! Timing comes from the packets themselves (an Opus packet knows its length; a Vorbis packet's
 //! block size follows from its mode, see `PacketTimer`), starting at zero: the Opus decoder drops
-//! the pre-skip announced by `OpusHead`. The granule position of the last page, which would trim
-//! the final packet's padding, is not used.
+//! the pre-skip announced by `OpusHead`. The granule position of the last page, which gives the
+//! true length, shortens the last packet (see `trim_end`); the decoders cut their output to it.
 //!
 //! Not handled: FLAC and other codecs in Ogg (refused), chained streams (only the first Opus or
 //! Vorbis stream is read) and files too big to hold in memory (refused above 1 GiB).
@@ -45,6 +45,20 @@ fn crc(data: &[u8]) -> u32 {
     data.iter().fold(0u32, |c, &b| (c << 8) ^ t[((c >> 24) as u8 ^ b) as usize])
 }
 
+/// Shorten the last packet so the stream ends at the final page's granule position (the sample
+/// count since the start; for Opus that includes the pre-skip, which counts from zero here too).
+/// The codec decoders cut their output to a packet's duration. Granules that disagree with the
+/// packets by a whole packet or more are not trusted.
+fn trim_end(samples: &mut [Sample], total: &mut i64, granule: Option<u64>) {
+    let (Some(g), Some(last)) = (granule, samples.last_mut()) else { return };
+    let Ok(g) = i64::try_from(g) else { return };
+    let excess = *total - g;
+    if excess > 0 && excess < last.duration as i64 {
+        last.duration -= excess as u32;
+        *total = g;
+    }
+}
+
 /// Open an Ogg file for reading.
 pub fn open<R: Read>(mut r: R) -> Result<Mp4Demuxer<Cursor<Vec<u8>>>> {
     let mut file = Vec::new();
@@ -62,6 +76,7 @@ pub fn open<R: Read>(mut r: R) -> Result<Mp4Demuxer<Cursor<Vec<u8>>>> {
     let mut seen = 0usize; // packets of the stream so far
     let mut start = 0usize; // where the packet being assembled begins in `data`
     let mut unsupported: Option<String> = None;
+    let mut last_granule: Option<u64> = None; // position after the last page that completed a packet
 
     let mut at = 0usize;
     while at + 27 <= file.len() {
@@ -109,6 +124,9 @@ pub fn open<R: Read>(mut r: R) -> Result<Mp4Demuxer<Cursor<Vec<u8>>>> {
             continue;
         }
 
+        let granule = u64::from_le_bytes(page[6..14].try_into().unwrap());
+        last_granule = (granule != u64::MAX).then_some(granule);
+
         let mut p = 27 + nseg;
         if flags & 0x01 == 0 {
             if start != data.len() {
@@ -153,6 +171,7 @@ pub fn open<R: Read>(mut r: R) -> Result<Mp4Demuxer<Cursor<Vec<u8>>>> {
             samples.push(Sample { stream: 0, sync: true, offset: off, size: size as u32, dts: pts, cts_offset: 0, duration: len });
             pts += len as i64;
         }
+        trim_end(&mut samples, &mut pts, last_granule);
         stream = StreamInfo {
             index: 0,
             codec: CodecId::Vorbis,
@@ -176,6 +195,7 @@ pub fn open<R: Read>(mut r: R) -> Result<Mp4Demuxer<Cursor<Vec<u8>>>> {
             samples.push(Sample { stream: 0, sync: true, offset: off, size: size as u32, dts: pts, cts_offset: 0, duration: len });
             pts += len as i64;
         }
+        trim_end(&mut samples, &mut pts, last_granule);
         stream = StreamInfo {
             index: 0,
             codec: CodecId::Opus,

@@ -7,8 +7,7 @@
 //! afterwards a packet of block size `n` after one of size `p` yields `(n + p) / 4` samples per
 //! channel.
 //!
-//! Not handled: floor type 0 (obsolete, refused when the setup header names it), the end-of-stream
-//! trim that Ogg's granule position asks for, and streams whose parameters change mid-way.
+//! Not handled: floor type 0 (obsolete, refused when the setup header names it) and streams whose parameters change mid-way.
 
 mod tables;
 
