@@ -1,6 +1,6 @@
 use crate::job::Job;
 use crate::plan::{plan, rate_control, Action, Plan};
-use ironav_codec::{build_filter, new_encoder};
+use ironav_codec::{build_filter, new_encoder_with};
 use ironav_core::{Decoder, Encoder, Error, ErrorCode, Filter, Frame, MediaType, Packet, Rational, Result};
 use ironav_hwaccel::{new_video_decoder, new_video_encoder, Direction, RateControl};
 use ironav_formats::{create_muxer, open_demuxer};
@@ -62,8 +62,13 @@ struct Runtime {
 
 impl Runtime {
     fn through(&mut self, frames: Vec<Frame>) -> Result<Vec<Packet>> {
+        self.through_from(0, frames)
+    }
+
+    /// Run `frames` through the filters from the `start`th on, then the encoder.
+    fn through_from(&mut self, start: usize, frames: Vec<Frame>) -> Result<Vec<Packet>> {
         let mut cur = frames;
-        for f in &mut self.filters {
+        for f in &mut self.filters[start..] {
             let mut next = Vec::with_capacity(cur.len());
             for fr in cur {
                 next.extend(f.process(fr)?);
@@ -162,7 +167,7 @@ fn execute(
                     hw_name = Some(backend.name());
                     new_video_encoder(backend, dst.codec, &dst.params, rate)?
                 }
-                _ => new_encoder(dst.codec, &dst.params, dst.bits)?,
+                _ => new_encoder_with(dst.codec, &dst.params, dst.bits, st.bitrate_kbps)?,
             };
             let hw_dec = st.hardware.iter().find(|h| h.direction == Direction::Decode).and_then(|h| h.chosen);
             let decoder = match hw_dec {
@@ -316,6 +321,11 @@ fn process(
         if rt.action == Action::Transcode {
             let frames = rt.decoder.as_mut().expect("decoder").flush()?;
             let mut out = rt.through(frames)?;
+            // a filter with look-ahead hands over what it held back, for the filters after it
+            for i in 0..rt.filters.len() {
+                let held = rt.filters[i].flush()?;
+                out.extend(rt.through_from(i + 1, held)?);
+            }
             out.extend(rt.encoder.as_mut().expect("encoder").flush()?);
             emit!(rt, out);
         }

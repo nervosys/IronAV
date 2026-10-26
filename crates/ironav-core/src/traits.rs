@@ -45,4 +45,8 @@ pub trait Filter: Send {
         input.clone()
     }
     fn process(&mut self, frame: Frame) -> Result<Vec<Frame>>;
+    /// Frames still held back when the stream ends (a filter with look-ahead).
+    fn flush(&mut self) -> Result<Vec<Frame>> {
+        Ok(Vec::new())
+    }
 }

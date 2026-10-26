@@ -5,7 +5,7 @@ A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so 
 
 > **Status: foundation (v0.1).** The architecture, agent interface, ontology, hardware model, CLI, MCP server
 > and both GUIs are working and tested. The codec/container set is deliberately small so far:
-> **WAV, FLAC and Y4M containers; PCM (8/16/24/32-bit, float), FLAC and raw-video codecs, an AAC-LC decoder, an Opus decoder and an Opus (CELT) encoder; `volume`, `gray`, `hflip` filters.**
+> **WAV, FLAC and Y4M containers; PCM (8/16/24/32-bit, float), FLAC and raw-video codecs, an AAC-LC decoder, an Opus decoder and an Opus (CELT) encoder; `volume`, `resample`, `gray`, `hflip` filters.**
 > **H.264 and HEVC can be encoded and decoded on NVIDIA GPUs (NVENC/NVDEC)**, MP4 files can be read and written, and
 > Matroska/WebM files can be read.
 > There is no software H.264/HEVC codec, so those need an NVIDIA GPU. MP4 can carry FLAC audio next to the video, and AAC
@@ -71,6 +71,7 @@ B-frames and no look-ahead, so output order equals input order and each frame yi
 ```
 ironav convert -i in.y4m -o out.h264 --vcodec h264 --qp 24        # quality-targeted (0-51, default 23)
 ironav convert -i in.y4m -o out.mp4  --vcodec hevc --vbitrate 4000   # ~4 Mbit/s, in an MP4
+ironav convert -i in.mp3 -o out.mka --acodec opus --abitrate 96 --filter resample:rate=48000   # Opus at 96 kbit/s
 ```
 
 The MP4 writer is constant-frame-rate, and puts the index in front of the media data (fast-start) by copying the finished file once,
@@ -267,6 +268,11 @@ generic over a `Coder` trait so that one body of code reads or writes a frame an
 encoder adds is the forward MDCT (checked to invert the decoder's synthesis), the band energies and their coarse/fine
 quantisation, the pulse search, and the stereo angle (mid/side with a coded angle, or one channel when the bit budget is
 small; a flipped right channel when the channels are mostly out of phase). Digital silence costs three bytes a frame.
+`--abitrate KBPS` sets the rate (6 to 510; the default is 64 per channel). The encoder takes 48 kHz only; the `resample`
+filter (a Kaiser-windowed-sinc polyphase filter for any rate ratio, phase-exact, with the cut-off at the lower Nyquist
+frequency so nothing aliases; checked on tones across 44.1/48/22.05/96/8/16 kHz) converts, and the planner tells you to
+use it. A 120 s, 44.1 kHz stereo MP3 becomes Opus at 96 kb/s in 0.58 s here (about 200 times real time, decode and
+resampling included); FFmpeg decodes it, at 17 dB SNR against the resampled source.
 The range encoder is checked symbol by symbol against the decoder's, including its bit counts.
 
 Checked: FFmpeg (through PyAV) opens the Matroska files and decodes them; our decoder's output and FFmpeg's agree to

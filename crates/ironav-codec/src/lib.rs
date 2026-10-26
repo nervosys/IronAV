@@ -12,6 +12,7 @@ pub mod vorbis;
 mod pcm;
 mod pixconv;
 mod rawvideo;
+mod resample;
 mod scale;
 
 pub use filters::{build_filter, FilterSpec, ParamSpec, FILTERS};
@@ -195,11 +196,22 @@ pub fn new_decoder(codec: CodecId, params: &StreamParams, bits: Option<u8>) -> R
 }
 
 pub fn new_encoder(codec: CodecId, params: &StreamParams, bits: Option<u8>) -> Result<Box<dyn Encoder>> {
+    new_encoder_with(codec, params, bits, None)
+}
+
+/// The bit rates, in kbit/s, a lossy audio encoder here accepts; `None` for codecs that have no bit rate.
+pub fn audio_bitrate_range(codec: CodecId) -> Option<(u32, u32)> {
+    (codec == CodecId::Opus).then_some((6, 510))
+}
+
+/// Like `new_encoder`, with a target bit rate for the codecs that take one (`audio_bitrate_range`).
+pub fn new_encoder_with(codec: CodecId, params: &StreamParams, bits: Option<u8>, bitrate_kbps: Option<u32>) -> Result<Box<dyn Encoder>> {
     match (codec, params) {
         (c, StreamParams::Audio { .. }) if c.sample_format().is_some() => Ok(Box::new(pcm::PcmEncoder::new(c.sample_format().unwrap()))),
         (CodecId::Flac, StreamParams::Audio { sample_rate, channels }) => Ok(Box::new(flac::FlacEncoder::new(*sample_rate, *channels, bits)?)),
         (CodecId::Opus, StreamParams::Audio { sample_rate, channels }) => {
-            Ok(Box::new(opus::OpusEncoder::new(*sample_rate, *channels as usize, opus::OpusEncoder::default_bitrate(*channels as usize))?))
+            let bitrate = bitrate_kbps.map_or(opus::OpusEncoder::default_bitrate(*channels as usize), |k| k * 1000);
+            Ok(Box::new(opus::OpusEncoder::new(*sample_rate, *channels as usize, bitrate)?))
         }
         (CodecId::RawVideo, StreamParams::Video { .. }) => Ok(Box::new(rawvideo::RawVideoEncoder)),
         (c, p) if c.media_type() != p.media_type() => Err(Error::invalid_arg(format!(

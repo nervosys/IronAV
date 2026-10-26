@@ -1,5 +1,5 @@
 use crate::job::{FilterCall, Job};
-use ironav_codec::{build_filter, new_encoder, FILTERS};
+use ironav_codec::{audio_bitrate_range, build_filter, new_encoder_with, FILTERS};
 use ironav_core::{CodecId, Error, ErrorCode, MediaType, Result, StreamInfo, StreamParams};
 use ironav_formats::{find_format, format_for_path, open_demuxer};
 use crate::job::StreamOpts;
@@ -26,6 +26,9 @@ pub struct Step {
     pub from_codec: CodecId,
     pub to_codec: CodecId,
     pub filters: Vec<FilterCall>,
+    /// The audio encoder's target bit rate, when one was asked for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bitrate_kbps: Option<u32>,
     /// Hardware decisions for each codec stage, with the reason for each candidate.
     pub hardware: Vec<Selection>,
 }
@@ -180,8 +183,24 @@ pub fn plan(job: &Job) -> Result<Plan> {
         }
 
         let action = if to == s.codec && chain.is_empty() { Action::Copy } else { Action::Transcode };
-        if media == MediaType::Audio && (opts.bitrate_kbps.is_some() || opts.qp.is_some()) {
-            return Err(Error::invalid_arg("bitrate_kbps and qp apply to video streams only"));
+        if media == MediaType::Audio && opts.qp.is_some() {
+            return Err(Error::invalid_arg("qp applies to video streams only"));
+        }
+        let mut audio_kbps = None;
+        if media == MediaType::Audio && opts.bitrate_kbps.is_some() {
+            let Some((lo, hi)) = audio_bitrate_range(to).filter(|_| action == Action::Transcode) else {
+                return Err(Error::invalid_arg(if action == Action::Copy {
+                    "bitrate_kbps has no effect when the stream is copied".to_string()
+                } else {
+                    format!("{} has no bit rate to set", to.name())
+                })
+                .hint("audio bitrate_kbps applies to opus"));
+            };
+            let k = opts.bitrate_kbps.unwrap_or(0);
+            if !(lo..=hi).contains(&k) {
+                return Err(Error::invalid_arg(format!("bitrate_kbps for {} must be {lo} to {hi}, got {k}", to.name())));
+            }
+            audio_kbps = Some(k);
         }
         if media == MediaType::Video && action == Action::Transcode {
             rate_control(opts)?;
@@ -238,21 +257,30 @@ pub fn plan(job: &Job) -> Result<Plan> {
                     "run `ironav hw probe`; NVENC needs an NVIDIA GPU with a driver that supports NVENC API 13.1"
                 }));
             } else {
-                new_encoder(to, &params, bits)?;
+                new_encoder_with(to, &params, bits, audio_kbps)?;
             }
         }
 
+        // an audio encoder stamps its packets in samples of its own rate, which a resampling
+        // filter may have changed
+        let (time_base, duration) = match (&params, action) {
+            (StreamParams::Audio { sample_rate, .. }, Action::Transcode) if *sample_rate > 0 => {
+                let d = s.duration.map(|d| (d as i128 * s.time_base.num as i128 * *sample_rate as i128 + s.time_base.den as i128 / 2) / s.time_base.den as i128);
+                (ironav_core::Rational::new(1, *sample_rate as i64), d.map(|d| d as i64))
+            }
+            _ => (s.time_base, s.duration),
+        };
         out_streams.push(StreamInfo {
             index: steps.len(),
             codec: to,
-            time_base: s.time_base,
-            duration: s.duration,
+            time_base,
+            duration,
             bits,
             extradata: if action == Action::Copy { s.extradata.clone() } else { ironav_codec::encoder_extradata(to, &params) },
             lead_in: if action == Action::Copy { s.lead_in } else { 0 },
             params,
         });
-        steps.push(Step { input_file: file, input_stream: s.index, output_stream: steps.len(), action, from_codec: s.codec, to_codec: to, filters: chain, hardware });
+        steps.push(Step { input_file: file, input_stream: s.index, output_stream: steps.len(), action, from_codec: s.codec, to_codec: to, filters: chain, bitrate_kbps: audio_kbps, hardware });
     }
 
     if let Some(i) = used.iter().position(|u| !u) {

@@ -40,7 +40,7 @@ pub struct StreamOpts {
     /// Target codec name, or `copy` to pass packets through untouched (the default).
     #[serde(default)]
     pub codec: Option<String>,
-    /// Video only: target average bitrate in kbit/s. Mutually exclusive with `qp`.
+    /// Target average bitrate in kbit/s: for video, mutually exclusive with `qp`; for audio, Opus only (6 to 510).
     #[serde(default)]
     pub bitrate_kbps: Option<u32>,
     /// Video only: constant quantizer, 0 (best) to 51 (smallest). Used when no bitrate is set;

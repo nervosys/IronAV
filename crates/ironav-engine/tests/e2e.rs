@@ -1000,3 +1000,59 @@ fn opus_encoder_output_decodes_close_to_its_input() {
     assert_eq!(e.code, ErrorCode::UnsupportedCodec);
     assert!(e.hint.as_deref().is_some_and(|h| h.contains("48000")), "{:?}", e.hint);
 }
+
+/// Sample-rate conversion into the Opus encoder, and the audio bit rate: 44.1 kHz audio is
+/// resampled by the `resample` filter (including the samples it holds back at the end), a lower
+/// `bitrate_kbps` makes a smaller file, and a bit rate on a codec without one is refused.
+#[test]
+fn resample_feeds_opus_and_bitrate_sets_the_size() {
+    let dir = scratch("opus-rate");
+    let n = 44_100 * 2;
+    let samples: Vec<i16> = (0..n)
+        .map(|i| {
+            let t = i as f64 / 44_100.0;
+            (20000.0 * (0.5 * (2.0 * std::f64::consts::PI * 440.0 * t).sin() + 0.3 * (2.0 * std::f64::consts::PI * 3100.0 * t).sin())) as i16
+        })
+        .collect();
+    let wav = dir.join("in.wav");
+    write_wav(&wav, &samples, 1, 44_100);
+    let resample = FilterCall::parse_shorthand("resample:rate=48000").unwrap();
+
+    // the reference: the same resampling written straight to PCM
+    let mut j = job(&wav, &dir.join("ref.wav"));
+    j.filters.push(resample.clone());
+    run(&j, &mut |_| {}).unwrap();
+    let want = pcm(&dir.join("ref.wav"));
+    assert_eq!(want.len() / 2, 96_000, "two seconds at 48 kHz");
+
+    let mut sizes = Vec::new();
+    for kbps in [24u32, 96] {
+        let out = dir.join(format!("out{kbps}.mka"));
+        let mut j = job(&wav, &out);
+        j.filters.push(resample.clone());
+        j.audio.codec = Some("opus".into());
+        j.audio.bitrate_kbps = Some(kbps);
+        let report = run(&j, &mut |_| {}).unwrap();
+        assert_eq!(report.plan.steps[0].bitrate_kbps, Some(kbps));
+        sizes.push(std::fs::metadata(&out).unwrap().len());
+        let back = dir.join(format!("back{kbps}.wav"));
+        let mut j = job(&out, &back);
+        j.audio.codec = Some("pcm_s16le".into());
+        run(&j, &mut |_| {}).unwrap();
+        let got = pcm(&back);
+        assert!((96_000..98_000).contains(&(got.len() / 2)), "{kbps} kbps: {} samples", got.len() / 2);
+        let snr = snr_db(&want, &got);
+        assert!(snr > if kbps == 24 { 12.0 } else { 22.0 }, "{kbps} kbps: {snr:.1} dB");
+    }
+    assert!(sizes[1] > 2 * sizes[0], "{sizes:?}");
+
+    let mut j = job(&wav, &dir.join("x.wav"));
+    j.audio.codec = Some("pcm_s16le".into());
+    j.audio.bitrate_kbps = Some(64);
+    assert_eq!(plan(&j).unwrap_err().code, ErrorCode::InvalidArgument);
+    let mut j = job(&wav, &dir.join("x.mka"));
+    j.filters.push(resample);
+    j.audio.codec = Some("opus".into());
+    j.audio.bitrate_kbps = Some(900);
+    assert_eq!(plan(&j).unwrap_err().code, ErrorCode::InvalidArgument);
+}

@@ -55,7 +55,7 @@ fn help() -> Value {
         "commands": {
             "capabilities": "what this build can do (start here)",
             "probe <path>": "inspect a media file",
-            "convert -i IN [-i MORE]... -o OUT [-f FMT] [--acodec C] [--vcodec C] [--vbitrate KBPS | --qp N] [--filter name[:k=v,..]]... [--hwaccel P] [-y] [--dry-run] [--progress]": "convert, handbrake/ffmpeg style",
+            "convert -i IN [-i MORE]... -o OUT [-f FMT] [--acodec C] [--vcodec C] [--abitrate KBPS] [--vbitrate KBPS | --qp N] [--filter name[:k=v,..]]... [--hwaccel P] [-y] [--dry-run] [--progress]": "convert, handbrake/ffmpeg style",
             "plan <job.json|->": "validate a JSON job without writing",
             "run <job.json|->": "execute a JSON job",
             "hw probe | hw select --codec C --direction decode|encode [--policy P]": "hardware acceleration",
@@ -108,6 +108,7 @@ fn dispatch(mut a: Args, progress: bool) -> Result<Value> {
             };
             job.audio.codec = a.flag(&["--acodec"])?;
             job.video.codec = a.flag(&["--vcodec"])?;
+            job.audio.bitrate_kbps = a.flag(&["--abitrate", "-b:a"])?.map(|v| v.parse().map_err(|_| Error::invalid_arg(format!("--abitrate must be a whole number of kbit/s, got '{v}'")))).transpose()?;
             job.video.bitrate_kbps = a.flag(&["--vbitrate", "-b:v"])?.map(|v| v.parse().map_err(|_| Error::invalid_arg(format!("--vbitrate must be a whole number of kbit/s, got '{v}'")))).transpose()?;
             job.video.qp = a.flag(&["--qp"])?.map(|v| v.parse().map_err(|_| Error::invalid_arg(format!("--qp must be a whole number 0-51, got '{v}'")))).transpose()?;
             for f in a.flags(&["--filter"])? {

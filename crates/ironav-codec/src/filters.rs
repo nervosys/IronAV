@@ -33,6 +33,14 @@ pub static FILTERS: &[FilterSpec] = &[
         output_pix_fmt: None,
     },
     FilterSpec {
+        name: "resample",
+        media: MediaType::Audio,
+        description: "Change the audio sample rate (a windowed-sinc polyphase filter that removes what the new rate cannot hold). Needed before an encoder that takes one rate only, such as Opus at 48000.",
+        params: &[ParamSpec { name: "rate", ty: "integer", default: None, description: "target sample rate in Hz, 1000 to 384000" }],
+        input_pix_fmts: &[],
+        output_pix_fmt: None,
+    },
+    FilterSpec {
         name: "gray",
         media: MediaType::Video,
         description: "Convert video to single-plane 8-bit grayscale (luma only).",
@@ -97,6 +105,14 @@ pub fn build_filter(name: &str, args: &Map<String, Value>) -> Result<Box<dyn Fil
                 return Err(Error::invalid_arg("volume.gain must be a finite number >= 0"));
             }
             Box::new(Volume { gain })
+        }
+        "resample" => {
+            let rate = match num("rate")? {
+                Some(r) if r.fract() == 0.0 && (1000.0..=384_000.0).contains(&r) => r as u32,
+                Some(r) => return Err(Error::invalid_arg(format!("resample.rate must be a whole number of Hz from 1000 to 384000, got {r}"))),
+                None => return Err(Error::invalid_arg("resample needs rate").hint("for example resample:rate=48000")),
+            };
+            Box::new(crate::resample::Resample::new(rate))
         }
         "format" => {
             let name = match args.get("pix_fmt") {
