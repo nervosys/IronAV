@@ -231,7 +231,7 @@ every stream came from one encoder. One of them is committed with FFmpeg's decod
 
 Not decoded, and refused with an explanation rather than decoded wrongly: HE-AAC (SBR/PS), AAC Main prediction, LTP,
 coupling channel elements, 960-sample frames, gain control, and channel layouts given by a program config element.
-There is no AAC encoder. Raw `.aac` (ADTS) files are not read yet; AAC comes from MP4/M4A.
+There is no AAC encoder. AAC comes from MP4/M4A, Matroska and raw `.aac` (ADTS) files; the ADTS reader strips each frame's header, builds the AudioSpecificConfig from it, and decodes to the same samples as the MP4 copy of the same audio (checked on the one fixture, remuxed by FFmpeg). ADTS frames with several raw data blocks and channel configuration 0 are not read, and nothing is trimmed at the start (as with FFmpeg).
 On a 5-minute stereo 44.1 kHz file the decoder takes roughly 0.3-0.5 s (FFmpeg's: about 0.11 s) on a noisy machine, so it
 is a few times slower than FFmpeg's.
 

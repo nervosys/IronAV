@@ -634,6 +634,12 @@ fn aac_decodes_to_what_ffmpeg_decodes() {
     aac_matches_ffmpeg("aac", "aac_stereo_tools.m4a");
 }
 
+/// The same audio as raw ADTS (remuxed by FFmpeg) decodes to the same samples.
+#[test]
+fn aac_in_adts_decodes_to_what_ffmpeg_decodes() {
+    aac_matches_ffmpeg("aac-adts", "aac_stereo_tools.aac");
+}
+
 /// The same audio remuxed into Matroska (by FFmpeg) decodes to the same samples.
 #[test]
 fn aac_in_matroska_decodes_to_what_ffmpeg_decodes() {

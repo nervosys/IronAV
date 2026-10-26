@@ -1,5 +1,6 @@
 //! Container demuxers and muxers, and the format registry.
 
+mod adts;
 mod annexb;
 pub(crate) mod flac;
 mod mkv;
@@ -90,6 +91,15 @@ pub static FORMATS: &[FormatSpec] = &[
         codecs: &[CodecId::Mp3],
     },
     FormatSpec {
+        name: "aac",
+        extensions: &["aac", "adts"],
+        description: "Raw AAC in ADTS (read-only); ID3 tags are skipped",
+        media: MediaType::Audio,
+        demux: true,
+        mux: false,
+        codecs: &[CodecId::Aac],
+    },
+    FormatSpec {
         name: "ogg",
         extensions: &["ogg", "opus", "oga"],
         description: "Ogg (read-only): Opus, Vorbis and FLAC audio; Speex and Theora in Ogg are refused",
@@ -164,6 +174,8 @@ pub fn open_demuxer(path: &Path) -> Result<Box<dyn Demuxer>> {
         Ok(Box::new(mkv::open(f.into_inner())?))
     } else if ogg::looks_like_ogg(magic) {
         Ok(Box::new(ogg::open(f)?))
+    } else if adts::looks_like_adts(magic) || behind_id3.as_ref().is_some_and(|b| b.len() >= 2 && b[0] == 0xFF && b[1] & 0xF6 == 0xF0) {
+        Ok(Box::new(adts::open(f)?))
     } else if mp3::looks_like_mp3(magic) {
         Ok(Box::new(mp3::open(f)?))
     } else if magic.starts_with(b"YUV4MPEG2") {

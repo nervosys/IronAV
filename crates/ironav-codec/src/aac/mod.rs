@@ -326,7 +326,7 @@ impl AacDecoder {
         };
         if extradata.is_empty() {
             return Err(Error::new(ErrorCode::UnsupportedFormat, "AAC decoding needs the stream's AudioSpecificConfig")
-                .hint("raw ADTS streams are not read yet; use an MP4 or M4A file"));
+                .hint("the container did not give the codec configuration; MP4, Matroska and ADTS files do"));
         }
         let cfg = parse_asc(extradata, *sample_rate, *channels)?;
         let state = (0..cfg.channels).map(|_| ChannelState { saved: vec![0.0; 1024], prev_kbd: false }).collect();
