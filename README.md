@@ -248,11 +248,15 @@ is a few times slower than FFmpeg's.
 ### AAC encoder
 
 `--acodec aac` (`--abitrate 8` to `512`, default 64 per channel) writes AAC-LC into MP4/M4A, ADTS (`.aac`) or Matroska, mono or
-stereo at any of AAC's sampling rates (others are refused with the list). Long windows only (sine shape), the decoder's own Huffman
+stereo at any of AAC's sampling rates (others are refused with the list). Sine windows, with **window switching**: a block whose
+first difference jumps (a 128-sample piece with 8x the energy of the four before it) becomes eight short windows, each in a group of
+its own, with start and stop windows around it, which costs one frame of look-ahead. On a noise burst over a quiet tone the error in
+the 900 samples before the attack fell to a third (test), and FFmpeg decodes a stereo file with four such attacks to the same samples as
+ours (136 dB). The detector is a simple energy rule, not tuned on music, and short blocks do not group windows, so they cost more side
+information than they might. The decoder's own Huffman
 and scalefactor-band tables, the cheapest of the eleven spectral codebooks chosen per band, sections merged, and mid/side per band
 where it looks cheaper. A feedback loop on the quantiser's step holds the bit rate (the first frames search for the right step), and the
-step follows each band's level partway (exponent 0.6), so noise is shaped but there is no psychoacoustic model. No window switching (an
-attack spreads its noise over 2048 samples), no TNS, PNS, intensity stereo or prediction, no bit reservoir, no more than two channels.
+step follows each band's level partway (exponent 0.6), so noise is shaped but there is no psychoacoustic model. No TNS, PNS, intensity stereo or prediction, no bit reservoir, no more than two channels.
 
 The stream starts with one frame of priming: in MP4 an edit list says so (our reader and FFmpeg skip it), in ADTS and Matroska it
 stays as 1024 leading samples, as with most encoders. MP4's edit list also ends the audio at the input's length, but players that ignore it

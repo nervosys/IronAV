@@ -27,6 +27,7 @@ const FLT_EPSILON: f32 = 1.192_092_9e-7;
 const FIXFIX: u32 = 0;
 const FIXVAR: u32 = 1;
 const VARFIX: u32 = 2;
+#[allow(dead_code)]
 const VARVAR: u32 = 3;
 
 /// Element types, as FFmpeg numbers them.
@@ -538,7 +539,8 @@ impl Sbr {
 
     /// High Frequency Generation - Patch Construction.
     fn hf_calc_npatches(&mut self) -> Res {
-        let (mut last_k, mut last_msb, mut sb) = (-1i32, -1i32, 0i32);
+        let (mut last_k, mut last_msb) = (-1i32, -1i32);
+        let mut sb;
         let mut msb = self.k[0];
         let mut usb = self.kx[1];
         let goal_sb = ((1000 << 11) + (self.sample_rate >> 1)) / self.sample_rate;

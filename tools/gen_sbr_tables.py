@@ -46,6 +46,8 @@ print()
 def arr(name, typ, vals, per=8, doc=None):
     if doc:
         print(f"/// {doc}")
+    if name == "QMF_WINDOW_DS":
+        print("#[allow(dead_code)]")
     print(f"pub static {name}: [{typ}; {len(vals)}] = [")
     for i in range(0, len(vals), per):
         print("    " + ", ".join(vals[i:i + per]) + ",")
