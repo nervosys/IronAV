@@ -11,11 +11,16 @@
 //! at which to stop), so playback is gapless the way FFmpeg's is: the delay plus the decoder's own
 //! 529 samples are dropped at the start, the padding less 529 at the end.
 //!
+//! Writing: the frames as they come, behind an Info frame that carries the frame count, the size and
+//! a LAME tag with the delay and padding, so players can play the file gapless and know its length.
+//! It is written when the first packet arrives (it copies that frame's header) and patched at the end.
+//!
 //! Not handled: streams that change sample rate (frames at other rates than the first are dropped).
 
 use crate::mp4demux::{Config, Mp4Demuxer, Sample, TrackInfo};
 use ironav_codec::mp3::{parse_header, Header};
-use ironav_core::{CodecId, Error, ErrorCode, Rational, Result, StreamInfo, StreamParams};
+use crate::WriteSeek;
+use ironav_core::{CodecId, Error, ErrorCode, Muxer, Packet, Rational, Result, StreamInfo, StreamParams};
 use std::io::{Read, Seek, SeekFrom};
 
 /// The largest file whose frames are indexed.
@@ -138,6 +143,104 @@ pub fn open<R: Read + Seek + Send>(mut r: R) -> Result<Mp4Demuxer<R>> {
     };
     let track = TrackInfo { stream, config: Config { prefix: Vec::new(), nal_length: 0, bits: 8 }, convert: false };
     Ok(Mp4Demuxer::from_parts(r, "mp3", vec![track], samples))
+}
+
+/// Writes MP3 frames, with an Info frame in front when the stream says how much of its start and end
+/// is not audio.
+pub struct Mp3Muxer {
+    out: Box<dyn WriteSeek>,
+    /// Decoded samples to skip at the start (the decoder's own 529 included), if the stream says.
+    start: Option<u32>,
+    /// The decoded position where the audio ends, when the stream says (a copied LAME tag does).
+    end: Option<u32>,
+    /// Where the Info frame starts, once written.
+    info_at: Option<u64>,
+    frames: u32,
+    bytes: u64,
+    samples: i64,
+    /// Offset of the delay field inside the Info frame.
+    delay_at: usize,
+    xing_at: usize,
+}
+
+impl Mp3Muxer {
+    pub fn new(out: Box<dyn WriteSeek>) -> Self {
+        Self { out, start: None, end: None, info_at: None, frames: 0, bytes: 0, samples: 0, delay_at: 0, xing_at: 0 }
+    }
+
+    /// The Info frame for a stream whose frames look like `first`: all zeros but the header and the tag.
+    fn info_frame(&mut self, first: &[u8], h: &Header) -> Vec<u8> {
+        let len = h.frame_len - (first[2] >> 1 & 1) as usize;
+        let mut f = vec![0u8; len];
+        f[..4].copy_from_slice(&first[..4]);
+        f[2] &= !2; // no padding byte
+        f[3] &= 0xCF; // no joint-stereo extension
+        let at = 4 + h.side_len();
+        f[at..at + 4].copy_from_slice(b"Info");
+        f[at + 4..at + 8].copy_from_slice(&3u32.to_be_bytes()); // flags: frame count and size
+        // parsers (FFmpeg's, and the reader above) only trust the delay behind one of three names
+        f[at + 16..at + 25].copy_from_slice(b"Lavc-IAV ");
+        self.xing_at = at;
+        self.delay_at = at + 16 + 9 + 12;
+        f
+    }
+}
+
+impl Muxer for Mp3Muxer {
+    fn write_header(&mut self, streams: &[StreamInfo]) -> Result<()> {
+        let [s] = streams else {
+            return Err(Error::invalid_arg("mp3 holds exactly one audio stream"));
+        };
+        if s.codec != CodecId::Mp3 {
+            return Err(Error::new(ErrorCode::UnsupportedCodec, format!("mp3 can only hold MP3 audio, not {}", s.codec.name())).alternatives(["mp3"]));
+        }
+        if let [a, b, c, d, e, f, g, h] = s.extradata[..] {
+            self.start = Some(u32::from_le_bytes([a, b, c, d]));
+            self.end = Some(u32::from_le_bytes([e, f, g, h]));
+        } else if s.lead_in > 0 {
+            self.start = Some(s.lead_in as u32);
+        }
+        Ok(())
+    }
+
+    fn write_packet(&mut self, p: &Packet) -> Result<()> {
+        if self.info_at.is_none() {
+            let Some(h) = parse_header(&p.data) else {
+                return Err(Error::invalid_input("mp3: a packet is not a Layer III frame"));
+            };
+            let pos = self.out.stream_position()?;
+            self.info_at = Some(pos);
+            if self.start.is_some() {
+                let info = self.info_frame(&p.data, &h);
+                self.out.write_all(&info)?;
+                self.bytes += info.len() as u64;
+            } else {
+                self.info_at = Some(u64::MAX); // nothing to patch
+            }
+        }
+        self.out.write_all(&p.data)?;
+        self.bytes += p.data.len() as u64;
+        self.frames += 1;
+        self.samples += p.duration;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        if let (Some(at), Some(start)) = (self.info_at.filter(|&a| a != u64::MAX), self.start) {
+            let total = self.frames as i64 * 1152;
+            let end = self.end.map_or(self.samples, |e| e as i64).min(total);
+            let delay = start.saturating_sub(529).min(2304);
+            let pad = ((total - end) as u32 + 529).min(4095);
+            self.out.seek(SeekFrom::Start(at + self.xing_at as u64 + 8))?;
+            self.out.write_all(&self.frames.to_be_bytes())?;
+            self.out.write_all(&(self.bytes as u32).to_be_bytes())?;
+            self.out.seek(SeekFrom::Start(at + self.delay_at as u64))?;
+            self.out.write_all(&[(delay >> 4) as u8, ((delay & 0xF) << 4) as u8 | (pad >> 8) as u8, pad as u8])?;
+            self.out.seek(SeekFrom::End(0))?;
+        }
+        self.out.flush()?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -182,18 +182,18 @@ pub fn plan(job: &Job) -> Result<Plan> {
                 .alternatives(spec.codecs.iter().map(|c| c.name())));
         }
 
-        // Opus is coded at 48 kHz only: bring other rates there rather than refuse
-        if media == MediaType::Audio && to == CodecId::Opus {
+        // Opus is coded at 48 kHz only, MP3 (MPEG-1) at 32, 44.1 or 48: bring other rates there rather than refuse
+        if media == MediaType::Audio && matches!(to, CodecId::Opus | CodecId::Mp3) {
             let from = if let StreamParams::Audio { sample_rate, .. } = &params { *sample_rate } else { 0 };
-            {
-                if from != 48_000 && from > 0 {
-                    let mut args = serde_json::Map::new();
-                    args.insert("rate".into(), 48_000.into());
-                    let call = FilterCall { name: "resample".into(), args };
-                    params = build_filter(&call.name, &call.args)?.output_params(&params);
-                    warnings.push(format!("{at}: resampled from {from} Hz to 48000 Hz, the rate Opus is coded at"));
-                    chain.push(call);
-                }
+            let want: &[u32] = if to == CodecId::Opus { &[48_000] } else { &[32_000, 44_100, 48_000] };
+            if from > 0 && !want.contains(&from) {
+                let rate = *want.iter().min_by_key(|&&r| r.abs_diff(from)).unwrap();
+                let mut args = serde_json::Map::new();
+                args.insert("rate".into(), rate.into());
+                let call = FilterCall { name: "resample".into(), args };
+                params = build_filter(&call.name, &call.args)?.output_params(&params);
+                warnings.push(format!("{at}: resampled from {from} Hz to {rate} Hz, a rate {} is coded at", to.name()));
+                chain.push(call);
             }
         }
 
@@ -209,7 +209,7 @@ pub fn plan(job: &Job) -> Result<Plan> {
                 } else {
                     format!("{} has no bit rate to set", to.name())
                 })
-                .hint("audio bitrate_kbps applies to opus and vorbis"));
+                .hint("audio bitrate_kbps applies to opus, vorbis, aac and mp3"));
             };
             let k = opts.bitrate_kbps.unwrap_or(0);
             if !(lo..=hi).contains(&k) {

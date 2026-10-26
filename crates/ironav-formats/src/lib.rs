@@ -86,10 +86,10 @@ pub static FORMATS: &[FormatSpec] = &[
     FormatSpec {
         name: "mp3",
         extensions: &["mp3"],
-        description: "MP3 (MPEG-1/2/2.5 Layer III) files, read-only; ID3 tags are skipped and a Xing/Info frame is not played",
+        description: "MP3 (MPEG-1/2/2.5 Layer III) files; ID3 tags are skipped and a Xing/Info frame is not played; written with an Info frame (frame count, gapless delay and padding)",
         media: MediaType::Audio,
         demux: true,
-        mux: false,
+        mux: true,
         codecs: &[CodecId::Mp3],
     },
     FormatSpec {
@@ -211,6 +211,7 @@ pub fn create_muxer(path: &Path, format: &str) -> Result<Box<dyn Muxer>> {
         "flac" => Ok(Box::new(flac::FlacMuxer::new(out))),
         "mp4" => Ok(Box::new(mp4::Mp4Muxer::with_faststart(out, path))),
         "aac" => Ok(Box::new(adts::AdtsMuxer::new(out))),
+        "mp3" => Ok(Box::new(mp3::Mp3Muxer::new(out))),
         "mkv" => Ok(Box::new(mkvwrite::MatroskaWriter::new(out))),
         "ogg" => Ok(Box::new(oggwrite::OggWriter::new(out))),
         "webm" => Ok(Box::new(mkvwrite::MatroskaWriter::webm(out))),

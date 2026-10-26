@@ -1308,3 +1308,55 @@ fn aac_encoder_output_decodes_close_to_its_input() {
     .unwrap_err();
     assert_eq!(e.code, ErrorCode::UnsupportedCodec, "{e:?}");
 }
+
+/// MP3 output: the file starts with an Info frame whose tag trims the encoder's delay, so decoding it gives back
+/// exactly the input's length and something close to the input; rates MPEG-1 lacks are resampled.
+#[test]
+fn mp3_encoder_output_decodes_close_to_its_input() {
+    let dir = scratch("mp3-enc");
+    let n = 44_100 * 3 + 321;
+    let samples: Vec<i16> = (0..n * 2)
+        .map(|i| {
+            let (t, c) = ((i / 2) as f64 / 44_100.0, (i % 2) as f64);
+            (9000.0 * (2.0 * std::f64::consts::PI * (440.0 + 110.0 * c) * t).sin() + 3000.0 * (2.0 * std::f64::consts::PI * 2500.0 * t).sin()) as i16
+        })
+        .collect();
+    let wav = dir.join("in.wav");
+    write_wav(&wav, &samples, 2, 44_100);
+    let want = pcm(&wav);
+    let mut sizes = Vec::new();
+    for (ext, kbps) in [("mp3", 64u32), ("mp3", 192), ("mka", 192)] {
+        let out = dir.join(format!("out{kbps}.{ext}"));
+        let mut j = job(&wav, &out);
+        j.audio.codec = Some("mp3".into());
+        j.audio.bitrate_kbps = Some(kbps);
+        run(&j, &mut |_| {}).unwrap();
+        let back = dir.join(format!("back{kbps}.{ext}.wav"));
+        let mut j = job(&out, &back);
+        j.audio.codec = Some("pcm_s16le".into());
+        run(&j, &mut |_| {}).unwrap();
+        let got = pcm(&back);
+        // the .mp3 is trimmed by its tag; Matroska keeps the encoder's delay
+        let lead = if ext == "mp3" { 0 } else { 1057 };
+        let frames = got.len() / 4;
+        if ext == "mp3" {
+            assert_eq!(frames, n, "{kbps}: {frames} frames for {n}");
+        } else {
+            assert!(frames >= n + lead && frames < n + lead + 1152, "{ext} {kbps}: {frames} frames for {n}");
+        }
+        let snr = snr_db(&want, &got[lead * 4..lead * 4 + want.len()]);
+        assert!(snr > if kbps == 64 { 10.0 } else { 18.0 }, "{ext} {kbps}: {snr:.1} dB");
+        if ext == "mp3" {
+            sizes.push(std::fs::metadata(&out).unwrap().len());
+        }
+    }
+    assert!(sizes[0] < sizes[1] / 2, "a lower bit rate makes a smaller file: {sizes:?}");
+
+    // 22.05 kHz is not an MPEG-1 rate: it is resampled, with a warning
+    let odd = dir.join("odd.wav");
+    write_wav(&odd, &vec![0i16; 8000], 1, 22_050);
+    let mut j = job(&odd, &dir.join("odd.mp3"));
+    j.audio.codec = Some("mp3".into());
+    let p = plan(&j).unwrap();
+    assert!(p.warnings.iter().any(|w| w.contains("resampled from 22050 Hz to 32000 Hz")), "{:?}", p.warnings);
+}

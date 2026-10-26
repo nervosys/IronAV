@@ -9,7 +9,10 @@
 //! the start of a stream, a frame that points back into data the decoder never saw (the bit
 //! reservoir) decodes to silence.
 
+mod enc;
 mod tables;
+
+pub use enc::{Mp3Encoder, DECODER_DELAY, LEAD_IN};
 
 use ironav_core::{AudioFrame, Decoder, Error, ErrorCode, Frame, Packet, Result, StreamParams};
 use std::f64::consts::PI;

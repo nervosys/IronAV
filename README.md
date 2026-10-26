@@ -370,12 +370,29 @@ frames and the 8 kHz mixed-block tables** are ported from FFmpeg but unverified.
 bit-reservoir data is missing (the first frames after a seek) decodes to silence. A LAME (or Lavf) tag's encoder delay and padding
 are applied: the reader hands the decoder where the audio starts and ends (delay plus the decoder's 529 samples at the start,
 padding less 529 at the end), and on the three LAME fixtures the output has exactly FFmpeg's length and samples. An MP3 in
-Matroska has no tag and is not trimmed. There is no MP3 encoder. Decoding 120 s of 44.1 kHz stereo (a dense, noisy test signal) to WAV
+Matroska has no tag and is not trimmed. Decoding 120 s of 44.1 kHz stereo (a dense, noisy test signal) to WAV
 takes 0.17 to 0.18 s end to end by IronAV's own timing (about 700x real time; it was 0.65 to 0.8 s before the frame index stopped
 seeking per frame, the synthesis filterbank used a fast DCT and the IMDCT its symmetry, and both ran in `f32` compiled for AVX2 and
 FMA, chosen at run time when the CPU has them). Of that, the decoder alone is about 0.10 s; FFmpeg's decoder alone ran the same
 file in 0.065 s through PyAV, so it is still about 1.6x faster. The Huffman decoding is the largest remaining part. The noisy
 machine makes these figures good to perhaps 20 %.
+
+### MP3 encoder
+
+`--acodec mp3` (`--abitrate 32` to `320`, snapped to the nearest rate MPEG-1 has; default 64 per channel) writes MPEG-1 Layer III to
+`.mp3` or Matroska, mono or stereo at 32, 44.1 or 48 kHz (other rates are resampled to the nearest of those, with a warning). The chain is
+the standard's: polyphase analysis, a 36-point MDCT, the aliasing butterflies, then a quantiser whose step follows each scalefactor band's
+level partway (exponent 0.6) with a low-pass that depends on the bit rate. The Huffman table of each of the three regions, the region
+split and the count1 table are chosen for the fewest bits. Constant bit rate with a real bit reservoir: a frame's data may start in the
+unused tail of the frames before it, so a packet is emitted only once later frames have filled it. Stereo is joint, coded as left/right or
+mid/side per frame. There is no psychoacoustic model and no look-ahead, so the reservoir only smooths; no window switching (an attack spreads
+its noise over 1152 samples), no intensity stereo, no scalefactor reuse, no MPEG-2/2.5 rates.
+
+An `.mp3` file starts with an Info frame holding the frame count and size and a tag with the delay and padding, so players can play it gapless
+and know its length; the tag carries the `Lavc` prefix because FFmpeg only reads the delay behind `LAME`, `Lavf` or `Lavc`. FFmpeg (through
+PyAV) decodes the files and trims them to exactly the input's length. On a 4 s stereo test signal (two tones and a little noise) 64 kb/s
+gives 16 dB SNR, 128 kb/s 23 dB and 320 kb/s 28 dB (libmp3lame at 128 kb/s: 21 dB, though it aims at hearing, not SNR). A 120 s stereo file
+becomes 160 kb/s MP3 in about 2 s. Converting an MP3 to MP3 is a copy; decode to WAV first, or add a filter, to re-encode.
 
 ## Matroska output
 

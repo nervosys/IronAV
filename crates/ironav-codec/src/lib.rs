@@ -38,7 +38,7 @@ pub fn implemented() -> Vec<CodecImpl> {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-aac" });
             }
             if c == CodecId::Mp3 {
-                return Some(CodecImpl { codec: c, decode: true, encode: false, implementation: "ironav-mp3" });
+                return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-mp3" });
             }
             if c == CodecId::Opus {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-opus" });
@@ -210,6 +210,7 @@ pub fn audio_bitrate_range(codec: CodecId) -> Option<(u32, u32)> {
         CodecId::Opus => Some((6, 510)),
         CodecId::Vorbis => Some((16, 500)),
         CodecId::Aac => Some((8, 512)),
+        CodecId::Mp3 => Some((32, 320)),
         _ => None,
     }
 }
@@ -230,6 +231,10 @@ pub fn new_encoder_with(codec: CodecId, params: &StreamParams, bits: Option<u8>,
         (CodecId::Aac, StreamParams::Audio { sample_rate, channels }) => {
             let bitrate = bitrate_kbps.map_or(aac::AacEncoder::default_bitrate(*channels as usize), |k| k * 1000);
             Ok(Box::new(aac::AacEncoder::new(*sample_rate, *channels as usize, bitrate)?))
+        }
+        (CodecId::Mp3, StreamParams::Audio { sample_rate, channels }) => {
+            let bitrate = bitrate_kbps.map_or(mp3::Mp3Encoder::default_bitrate(*channels as usize), |k| k * 1000);
+            Ok(Box::new(mp3::Mp3Encoder::new(*sample_rate, *channels as usize, bitrate)?))
         }
         (CodecId::RawVideo, StreamParams::Video { .. }) => Ok(Box::new(rawvideo::RawVideoEncoder)),
         (c, p) if c.media_type() != p.media_type() => Err(Error::invalid_arg(format!(
@@ -256,7 +261,11 @@ pub fn encoder_extradata(codec: CodecId, params: &StreamParams) -> Vec<u8> {
 /// Samples a decoder outputs ahead of the first input sample for a stream from this crate's encoder
 /// (containers record it so players can skip it).
 pub fn encoder_lead_in(codec: CodecId) -> i64 {
-    if codec == CodecId::Aac { aac::PRIMING } else { 0 }
+    match codec {
+        CodecId::Aac => aac::PRIMING,
+        CodecId::Mp3 => mp3::LEAD_IN,
+        _ => 0,
+    }
 }
 
 pub fn media_type_of(params: &StreamParams) -> MediaType {
