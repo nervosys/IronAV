@@ -5,7 +5,7 @@
 //! forward MDCT, band energies) and the parts that only an encoder has to decide (energy
 //! quantisation, the pulse search, the stereo angle).
 //!
-//! Not done: transient detection and short blocks, the pitch pre-filter, band boosts, a tuned
+//! Not done: the pitch pre-filter, finer time-frequency resolution changes, band boosts, a tuned
 //! allocation trim and variable bit rate.
 
 use super::*;
@@ -19,6 +19,29 @@ const SIZE: i32 = 3;
 const END: usize = 21;
 /// Undoes the decoder's scale: its transform is `IMDCT_SCALE` times a DCT-IV whose square is `FRAME / 2`.
 const KAPPA: f32 = 1.0 / (IMDCT_SCALE * (FRAME / 2) as f32);
+const KAPPA_SHORT: f32 = 1.0 / (IMDCT_SCALE * (OVERLAP / 2) as f32);
+const SHORT_BLOCKS: usize = FRAME / OVERLAP;
+/// A frame needs this many bits before short blocks are used: their side information must fit.
+const MIN_TRANSIENT_BITS: i32 = 160;
+
+/// Whether the frame holds an attack: some 2.5 ms block of the (pre-emphasised) signal is much
+/// louder than the ones before it. `x` is the frame's `FRAME + LOOKAHEAD` samples, the first block
+/// of which is only context.
+pub(super) fn detect_transient(x: &[&[f32]]) -> bool {
+    const FLOOR: f32 = 120.0 * 2e-5;
+    for ch in x {
+        let e: Vec<f32> = ch.chunks(OVERLAP).take(SHORT_BLOCKS + 1).map(|b| b.iter().map(|v| v * v).sum()).collect();
+        let mut avg = e[0].max(FLOOR);
+        for &cur in &e[1..] {
+            if cur > 12.0 * avg && cur > 20.0 * FLOOR {
+                return true;
+            }
+            // the quiet level the next block is judged against: it follows the signal down at once and up slowly
+            avg = if cur < avg { cur.max(FLOOR) } else { avg + 0.35 * (cur - avg) };
+        }
+    }
+    false
+}
 
 /// Rotate a band the way the decoder will undo (the inverse of `exp_rotation`).
 pub(super) fn exp_rotation_fwd(x: &mut [f32], len: usize, stride: usize, k: u32, spread: i32) {
@@ -166,30 +189,53 @@ pub(super) fn intensity_stereo(x: &mut [f32], y: &[f32], amp: [f32; 2]) {
     }
 }
 
+/// The MDCT of `n` samples of hop: `x` holds `n + OVERLAP` samples, the first of which is the
+/// block's first. It folds the window's two edges into `n` values and takes their DCT-IV, which
+/// inverts the decoder's inverse transform and window.
+fn fold_dct(dct: &mut Dct4, x: &[f32], n: usize, kappa: f32, out: &mut [f32]) {
+    let w = window;
+    let h = OVERLAP / 2;
+    let mut z = [0f32; FRAME];
+    // the rising edge folds the 120 samples around the block's start into 60 values
+    for jj in 0..h {
+        let ii = h - 1 - jj;
+        z[jj] = -w(ii) * x[ii] + w(OVERLAP - 1 - ii) * x[h + jj];
+    }
+    z[h..n - h].copy_from_slice(&x[OVERLAP..n]);
+    // and the falling edge, around the next block's start
+    for ii in 0..h {
+        z[n - h + ii] = w(OVERLAP - 1 - ii) * x[n + ii] + w(ii) * x[n + OVERLAP - 1 - ii];
+    }
+    let mut y = [0f32; FRAME];
+    for k in 0..n {
+        y[k] = z[n - 1 - k];
+    }
+    dct.run(&y[..n], 1, out);
+    for v in out[..n].iter_mut() {
+        *v *= kappa;
+    }
+}
+
 impl Celt {
+    /// Whether the frame last coded used short blocks.
+    pub fn was_transient(&self) -> bool {
+        self.p.transient
+    }
+
     /// The MDCT of one channel's frame: `x` is `FRAME + LOOKAHEAD` pre-emphasised samples, the first
     /// of which is the frame's first. It inverts the decoder's inverse transform and window.
+    fn forward_short(&mut self, x: &[f32], out: &mut [f32]) {
+        let mut blk = [0f32; OVERLAP];
+        for j in 0..SHORT_BLOCKS {
+            fold_dct(&mut self.dct[0], &x[j * OVERLAP..j * OVERLAP + 2 * OVERLAP], OVERLAP, KAPPA_SHORT, &mut blk);
+            for (k, v) in blk.iter().enumerate() {
+                out[j + SHORT_BLOCKS * k] = *v;
+            }
+        }
+    }
+
     fn forward(&mut self, x: &[f32], out: &mut [f32]) {
-        let w = window;
-        let mut z = [0f32; FRAME];
-        // the rising edge folds the 120 samples around the frame's start into 60 values
-        for jj in 0..OVERLAP / 2 {
-            let ii = OVERLAP / 2 - 1 - jj;
-            z[jj] = -w(ii) * x[ii] + w(OVERLAP - 1 - ii) * x[OVERLAP / 2 + jj];
-        }
-        z[OVERLAP / 2..FRAME - OVERLAP / 2].copy_from_slice(&x[OVERLAP..FRAME]);
-        // and the falling edge, around the next frame's start
-        for ii in 0..OVERLAP / 2 {
-            z[FRAME - OVERLAP / 2 + ii] = w(OVERLAP - 1 - ii) * x[FRAME + ii] + w(ii) * x[FRAME + OVERLAP - 1 - ii];
-        }
-        let mut y = [0f32; FRAME];
-        for k in 0..FRAME {
-            y[k] = z[FRAME - 1 - k];
-        }
-        self.dct[SIZE as usize].run(&y, 1, out);
-        for v in out.iter_mut() {
-            *v *= KAPPA;
-        }
+        fold_dct(&mut self.dct[SIZE as usize], x, FRAME, KAPPA, out);
     }
 
     /// Code the frame in `sig` (one slice of `FRAME + LOOKAHEAD` pre-emphasised samples per channel)
@@ -200,16 +246,17 @@ impl Celt {
         self.flushed = false;
         {
             let p = &mut self.p;
-            p.transient = false;
             p.coded_channels = channels as i32;
             p.start_band = 0;
             p.end_band = END;
             p.framebits = rc.frame_bits();
             p.size = SIZE;
-            p.blocks = 1;
-            p.blocksize = FRAME;
             p.apply_phase_inv = self.apply_phase_inv;
         }
+        let transient = !silent && rc.frame_bits() >= MIN_TRANSIENT_BITS && detect_transient(sig);
+        self.p.transient = transient;
+        self.p.blocks = if transient { SHORT_BLOCKS as u32 } else { 1 };
+        self.p.blocksize = FRAME / self.p.blocks as usize;
         let mut consumed = rc.tell();
         if consumed == 1 {
             rc.log(15, silent as u32);
@@ -220,20 +267,24 @@ impl Celt {
             }
             return;
         }
-        // no pitch post-filter, no transient
+        // no pitch post-filter
         if consumed + 16 <= self.p.framebits {
             rc.log(1, 0);
             consumed = rc.tell();
         }
         if consumed + 3 <= self.p.framebits {
-            rc.log(3, 0);
+            rc.log(3, transient as u32);
         }
 
         let mut log_e = [[0f32; MAX_BANDS]; 2];
         for c in 0..channels {
             let mut coeffs = std::mem::take(&mut self.block[c].coeffs);
             coeffs.fill(0.0);
-            self.forward(sig[c], &mut coeffs[..FRAME]);
+            if transient {
+                self.forward_short(sig[c], &mut coeffs[..FRAME]);
+            } else {
+                self.forward(sig[c], &mut coeffs[..FRAME]);
+            }
             for i in 0..END {
                 let off = (CELT_FREQ_BANDS[i] as usize) << SIZE;
                 let band = &mut coeffs[off..off + ((CELT_FREQ_RANGE[i] as usize) << SIZE)];
@@ -255,6 +306,10 @@ impl Celt {
         self.bitalloc(rc);
         self.encode_fine_energy(rc, &mut error);
         self.quant_bands(rc);
+        if self.p.anticollapse_needed != 0 {
+            // the decoder's noise filling for collapsed blocks is left off
+            Coder::raw(rc, 1, 0);
+        }
         self.encode_final_energy(rc, &mut error);
 
         if channels == 1 {

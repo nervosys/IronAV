@@ -491,6 +491,10 @@ impl<R: Coder> Bands<'_, R> {
         }
 
         if !stereo && level == 0 {
+            if R::ENC && b0 > 1 {
+                // the encoder's band arrives with the blocks interleaved; the quantiser wants them one after another
+                deinterleave_hadamard(&mut self.hadamard_tmp, x, n_b, b0 as usize, longblocks);
+            }
             let tf_change = self.p.tf_change[band];
             if tf_change > 0 {
                 recombine = tf_change as u32;
@@ -942,7 +946,8 @@ impl Celt {
         let size = p.size as usize;
         for i in p.start_band..p.end_band {
             if consumed + bits + tf_select_bit as i32 <= p.framebits {
-                diff ^= rc.log(bits as u32, 0) as usize;
+                // an encoder of short blocks asks for tf_change 1 (which the table maps to no change) in every band
+                diff ^= rc.log(bits as u32, (R::ENC && p.transient && i == p.start_band) as u32) as usize;
                 consumed = rc.tell();
                 tf_changed |= diff;
             }

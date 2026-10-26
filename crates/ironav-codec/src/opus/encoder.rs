@@ -40,6 +40,8 @@ pub struct OpusEncoder {
     /// Pre-emphasised samples not yet fully coded, from the start of the next frame.
     sig: Vec<Vec<f32>>,
     frames: u64,
+    /// Frames coded with short blocks.
+    pub transients: u64,
     /// Samples per channel received.
     input: u64,
 }
@@ -56,7 +58,7 @@ impl OpusEncoder {
         }
         // 20 ms of the bit rate, but never less than a few bytes or more than a frame can hold
         let bytes = (bitrate as usize * FRAME / RATE as usize / 8).clamp(8 * channels, 1275);
-        Ok(Self { celt: Celt::new(channels, true), channels, bytes, prev: [0.0; 2], sig: vec![vec![0.0; LOOKAHEAD]; channels], frames: 0, input: 0 })
+        Ok(Self { celt: Celt::new(channels, true), channels, bytes, prev: [0.0; 2], sig: vec![vec![0.0; LOOKAHEAD]; channels], frames: 0, transients: 0, input: 0 })
     }
 
     /// The bit rate used when none is asked for: 64 kb/s per channel.
@@ -84,6 +86,7 @@ impl OpusEncoder {
         data.extend(body);
         packets.push(Packet { stream: 0, pts: self.frames as i64 * FRAME as i64, duration, data });
         self.frames += 1;
+        self.transients += self.celt.was_transient() as u64;
         for s in self.sig.iter_mut() {
             s.drain(..FRAME);
         }
@@ -289,5 +292,52 @@ mod stress {
             let got = decode_all(1, &packets);
             assert!(got >= len && got < len + 960, "{len}: {got}");
         }
+    }
+}
+
+#[cfg(test)]
+mod attacks {
+    use super::*;
+    use ironav_core::{AudioFrame, Decoder, StreamParams};
+
+    /// A quiet tone with a hard-hit decaying note every 0.3 s: the kind of signal that short blocks are for.
+    fn hits(n: usize) -> Vec<f64> {
+        (0..n)
+            .map(|i| {
+                let t = i as f64 / 48_000.0;
+                let since = t % 0.3;
+                let hit = if since < 0.15 && t >= 0.3 { 0.8 * (-since * 40.0).exp() * (2.0 * std::f64::consts::PI * 1800.0 * since).sin() } else { 0.0 };
+                0.003 * (2.0 * std::f64::consts::PI * 200.0 * t).sin() + hit
+            })
+            .collect()
+    }
+
+    #[test]
+    fn attacks_use_short_blocks_and_decode_well() {
+        let input = hits(48_000 * 2);
+        let mut enc = OpusEncoder::new(48_000, 1, 64_000).unwrap();
+        let mut packets = Vec::new();
+        for chunk in input.chunks(960) {
+            packets.extend(enc.encode(&Frame::Audio(AudioFrame { sample_rate: 48_000, channels: 1, pts: 0, samples: chunk.to_vec() })).unwrap());
+        }
+        packets.extend(enc.flush().unwrap());
+        assert!(enc.transients >= 5 && enc.transients <= 12, "{} transient frames for 6 hits", enc.transients);
+        let params = StreamParams::Audio { sample_rate: 48_000, channels: 1 };
+        let mut dec = super::super::OpusDecoder::new(&opus_head(1), &params).unwrap();
+        let mut out = Vec::new();
+        for p in &packets {
+            for f in dec.decode(p).unwrap() {
+                let Frame::Audio(a) = f else { panic!() };
+                out.extend(a.samples);
+            }
+        }
+        let (mut sig, mut err) = (0f64, 0f64);
+        for (a, b) in input.iter().zip(&out) {
+            sig += a * a;
+            err += (a - b) * (a - b);
+        }
+        let snr = 10.0 * (sig / err).log10();
+        eprintln!("hits: {snr:.1} dB, {} short-block frames", enc.transients);
+        assert!(snr > 15.0, "{snr}");
     }
 }

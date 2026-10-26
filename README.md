@@ -284,7 +284,7 @@ The range encoder is checked symbol by symbol against the decoder's, including i
 Checked: FFmpeg (through PyAV) opens the Matroska files and decodes them; our decoder's output and FFmpeg's agree to
 83 dB, and both are 20.4 dB SNR against the source on a 6 s, 128 kb/s stereo test signal. Quality grows with the bit
 rate as it should (a tone-and-noise test signal, mono: 10 dB at 16 kb/s, 22 dB at 64, 29 at 128, 39 at 256). This is a first encoder, not libopus: there
-is **no transient detection** (so an attack spreads its quantisation noise before it), no short blocks, no pitch pre-filter,
+is only a simple transient detector (a frame with a sudden attack is coded as eight short blocks; on a test of decaying hits that is +1.3 dB SNR), no pitch pre-filter,
 no band boosts or tuned allocation trim, and no variable bit rate or SILK/hybrid modes, so at the same size it will sound
 worse than libopus. The end of a stream is exact in Ogg (the last page's granule position) and in Matroska/WebM (the last block carries a
 `DiscardPadding`, which our reader honours); FFmpeg decodes both to exactly the source's length. Not compared with libopus for quality: I have no libopus encoder to run.
