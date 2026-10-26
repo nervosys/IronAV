@@ -97,7 +97,25 @@ impl<'a> Bits<'a> {
         self.pos += 1;
         b as u32
     }
+    /// The next `n` (<= 24) bits, first bit highest, without consuming them; zeros past the end.
+    #[inline]
+    fn peek(&self, n: u32) -> u32 {
+        let at = self.pos >> 3;
+        let mut w = 0u32;
+        for i in 0..4 {
+            w = (w << 8) | self.d.get(at + i).copied().unwrap_or(0) as u32;
+        }
+        (w << (self.pos & 7)) >> (32 - n)
+    }
     fn get(&mut self, n: u32) -> u32 {
+        if n == 0 {
+            return 0;
+        }
+        if n <= 24 {
+            let v = self.peek(n);
+            self.pos += n as usize;
+            return v;
+        }
         let mut v = 0;
         for _ in 0..n {
             v = (v << 1) | self.bit();
@@ -111,11 +129,15 @@ impl<'a> Bits<'a> {
 /// A prefix code as a binary tree: `node[i][bit]` is a child index (> 0) or `!symbol` (< 0 as i32).
 struct Tree {
     nodes: Vec<[i32; 2]>,
+    /// Indexed by the next FAST_BITS bits: `symbol << 8 | length` for a code that short, else 0.
+    fast: Vec<u32>,
 }
+
+const FAST_BITS: u32 = 9;
 
 impl Tree {
     fn new() -> Self {
-        Tree { nodes: vec![[0, 0]] }
+        Tree { nodes: vec![[0, 0]], fast: Vec::new() }
     }
     fn insert(&mut self, code: u32, len: u32, sym: u32) {
         let mut at = 0usize;
@@ -132,8 +154,31 @@ impl Tree {
             }
         }
     }
+    /// Fill the lookup table for the short codes; call once the tree is complete.
+    fn finish(&mut self) {
+        self.fast = vec![0; 1 << FAST_BITS];
+        let mut stack = vec![(0usize, 0u32, 0u32)]; // node, bits so far, depth
+        while let Some((at, bits, depth)) = stack.pop() {
+            for bit in 0..2u32 {
+                let n = self.nodes[at][bit as usize];
+                let (code, d) = ((bits << 1) | bit, depth + 1);
+                if n < 0 && d <= FAST_BITS {
+                    let sym = !n as u32;
+                    let first = (code << (FAST_BITS - d)) as usize;
+                    self.fast[first..first + (1 << (FAST_BITS - d))].fill(sym << 8 | d);
+                } else if n > 0 && d < FAST_BITS {
+                    stack.push((n as usize, code, d));
+                }
+            }
+        }
+    }
     /// Read one symbol; `None` on a code that is not in the table.
     fn decode(&self, br: &mut Bits) -> Option<u32> {
+        let hit = self.fast[br.peek(FAST_BITS) as usize];
+        if hit != 0 {
+            br.pos += (hit & 0xFF) as usize;
+            return Some(hit >> 8);
+        }
         let mut at = 0usize;
         loop {
             let n = self.nodes[at][br.bit() as usize];
@@ -162,8 +207,8 @@ struct Statics {
     /// Block-type windows for the long transform.
     win: [[f64; 36]; 4],
     win_short: [f64; 12],
-    /// cos(n(2k+1)π/64), the 32-point transform the synthesis matrixing reduces to.
-    matrix: Vec<[f64; 32]>,
+    /// Twiddles of the fast DCT-II, `lee[log2(n)][k] = 1 / (2 cos(π(2k+1)/2n))`.
+    lee: [[f64; 16]; 6],
     window: [f64; 512],
     cs: [f64; 8],
     ca: [f64; 8],
@@ -173,7 +218,11 @@ fn statics() -> &'static Statics {
     static S: OnceLock<Statics> = OnceLock::new();
     S.get_or_init(|| {
         // Big-value tables: sequentially assigned prefix codes, as in FFmpeg's VLC init.
-        let mut big = vec![Tree::new()];
+        let mut big = vec![{
+            let mut t = Tree::new();
+            t.finish();
+            t
+        }];
         let (mut at_len, mut at_sym) = (0usize, 0usize);
         for t in 0..15 {
             let n = HUFF_SIZES_MINUS_ONE[t] as usize + 1;
@@ -186,6 +235,7 @@ fn statics() -> &'static Statics {
             }
             at_len += n;
             at_sym += n;
+            tree.finish();
             big.push(tree);
         }
         let quad = [0, 1].map(|t| {
@@ -193,6 +243,7 @@ fn statics() -> &'static Statics {
             for s in 0..16 {
                 tree.insert(QUAD_CODES[t][s] as u32, QUAD_BITS[t][s] as u32, s as u32);
             }
+            tree.finish();
             tree
         });
         let pow43 = (0..8206 + 16).map(|i| (i as f64).powf(4.0 / 3.0)).collect();
@@ -217,7 +268,7 @@ fn statics() -> &'static Statics {
             };
         }
         let win_short = std::array::from_fn(|i| (PI / 12.0 * (i as f64 + 0.5)).sin());
-        let matrix = (0..32).map(|n| std::array::from_fn(|k| ((n * (2 * k + 1)) as f64 * PI / 64.0).cos())).collect();
+        let lee = std::array::from_fn(|l| std::array::from_fn(|k| if k < (1usize << l) / 2 { 0.5 / (PI * (2 * k + 1) as f64 / (2.0 * (1usize << l) as f64)).cos() } else { 0.0 }));
         let mut window = [0.0; 512];
         for i in 0..=256 {
             let v = ENWINDOW[i] as f64 / 65536.0;
@@ -229,7 +280,7 @@ fn statics() -> &'static Statics {
         let ci = [-0.6, -0.535, -0.33, -0.185, -0.095, -0.041, -0.0142, -0.0037];
         let cs = ci.map(|c: f64| 1.0 / (1.0 + c * c).sqrt());
         let ca = std::array::from_fn(|i| ci[i] * cs[i]);
-        Statics { big, quad, pow43, exp2q, imdct36, imdct12, win, win_short, matrix, window, cs, ca }
+        Statics { big, quad, pow43, exp2q, imdct36, imdct12, win, win_short, lee, window, cs, ca }
     })
 }
 
@@ -853,12 +904,18 @@ fn imdct(s: &Statics, g: &Granule, overlap: &mut [[f64; 18]; 32], out: &mut [[f6
             }
         } else {
             let win = &s.win[if g.switch_point && sb < 2 { 0 } else { g.block_type as usize }];
-            for i in 0..36 {
-                let mut acc = 0.0;
+            // the 36 outputs mirror each other: y[17 - n] = -y[n] and y[35 - n] = y[18 + n]
+            for n in 0..9 {
+                let (mut lo, mut hi) = (0.0, 0.0);
+                let (cl, ch) = (&s.imdct36[n], &s.imdct36[18 + n]);
                 for k in 0..18 {
-                    acc += x[k] * s.imdct36[i][k];
+                    lo += x[k] * cl[k];
+                    hi += x[k] * ch[k];
                 }
-                z[i] = acc * win[i];
+                z[n] = lo * win[n];
+                z[17 - n] = -lo * win[17 - n];
+                z[18 + n] = hi * win[18 + n];
+                z[35 - n] = hi * win[35 - n];
             }
         }
         for t in 0..18 {
@@ -869,20 +926,43 @@ fn imdct(s: &Statics, g: &Granule, overlap: &mut [[f64; 18]; 32], out: &mut [[f6
     }
 }
 
+/// DCT-II of a power-of-two length, `out[n] = sum_k x[k] cos(π n (2k+1) / 2N)`, by Lee's recursion
+/// (N log N operations instead of N²). One function per length keeps every array its exact size.
+fn dct1(x: &[f64; 1], _: &[[f64; 16]; 6]) -> [f64; 1] {
+    *x
+}
+
+macro_rules! lee {
+    ($name:ident, $sub:ident, $n:literal, $h:literal, $lg:literal) => {
+        fn $name(x: &[f64; $n], lee: &[[f64; 16]; 6]) -> [f64; $n] {
+            let tw = &lee[$lg];
+            let (mut a, mut b) = ([0.0f64; $h], [0.0f64; $h]);
+            for k in 0..$h {
+                a[k] = x[k] + x[$n - 1 - k];
+                b[k] = (x[k] - x[$n - 1 - k]) * tw[k];
+            }
+            let (ea, eb) = ($sub(&a, lee), $sub(&b, lee));
+            let mut o = [0.0f64; $n];
+            for i in 0..$h {
+                o[2 * i] = ea[i];
+                o[2 * i + 1] = eb[i] + if i + 1 < $h { eb[i + 1] } else { 0.0 };
+            }
+            o
+        }
+    };
+}
+lee!(dct2, dct1, 2, 1, 1);
+lee!(dct4, dct2, 4, 2, 2);
+lee!(dct8, dct4, 8, 4, 3);
+lee!(dct16, dct8, 16, 8, 4);
+lee!(dct32, dct16, 32, 16, 5);
+
 /// One step of the polyphase synthesis filterbank: 32 subband samples in, 32 PCM samples out.
 fn synth(s: &Statics, v: &mut [f64; 1024], off: &mut usize, sb: &[f64; 32], out: &mut [f64; 32]) {
     *off = (*off + 1024 - 64) & 1023;
     // V[i] = sum_k cos((16+i)(2k+1)pi/64) S[k] needs only d[n] = sum_k cos(n(2k+1)pi/64) S[k], n < 32:
     // the cosine is symmetric about n = 32 (where it is 0) and antisymmetric about n = 64.
-    let mut d = [0.0f64; 32];
-    for (n, d) in d.iter_mut().enumerate() {
-        let m = &s.matrix[n];
-        let mut acc = 0.0;
-        for k in 0..32 {
-            acc += m[k] * sb[k];
-        }
-        *d = acc;
-    }
+    let d = dct32(sb, &s.lee);
     for i in 0..64 {
         let x = match i {
             0..=15 => d[16 + i],
@@ -892,13 +972,16 @@ fn synth(s: &Statics, v: &mut [f64; 1024], off: &mut usize, sb: &[f64; 32], out:
         };
         v[(*off + i) & 1023] = x;
     }
-    for j in 0..32 {
-        let mut acc = 0.0;
-        for i in 0..8 {
-            acc += s.window[64 * i + j] * v[(*off + 128 * i + j) & 1023];
-            acc += s.window[64 * i + 32 + j] * v[(*off + 128 * i + 96 + j) & 1023];
+    // `off` is a multiple of 64, so each 32-wide run of V is contiguous in the ring (and none wraps)
+    *out = [0.0; 32];
+    for i in 0..8 {
+        let base = (*off + 128 * i) & 1023;
+        let base_b = (*off + 128 * i + 96) & 1023;
+        let (va, vb) = (&v[base..base + 32], &v[base_b..base_b + 32]);
+        let (wa, wb) = (&s.window[64 * i..64 * i + 32], &s.window[64 * i + 32..64 * i + 64]);
+        for j in 0..32 {
+            out[j] += wa[j] * va[j] + wb[j] * vb[j];
         }
-        out[j] = acc;
     }
 }
 
@@ -914,6 +997,22 @@ impl Decoder for Mp3Decoder {
                 }
                 Ok(self.silence(&h, p.pts))
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_fast_dct_matches_the_definition() {
+        let s = statics();
+        let x: Vec<f64> = (0..32).map(|i| ((i * 7 + 3) % 11) as f64 - 5.0 + 0.37 * i as f64).collect();
+        let fast = dct32(x.as_slice().try_into().unwrap(), &s.lee);
+        for n in 0..32 {
+            let direct: f64 = (0..32).map(|k| x[k] * ((n * (2 * k + 1)) as f64 * PI / 64.0).cos()).sum();
+            assert!((fast[n] - direct).abs() < 1e-9, "n={n}: {} against {direct}", fast[n]);
         }
     }
 }

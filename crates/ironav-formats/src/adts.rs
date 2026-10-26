@@ -14,6 +14,9 @@ use crate::mp4demux::{Config, Mp4Demuxer, Sample, TrackInfo};
 use ironav_core::{CodecId, Error, ErrorCode, Rational, Result, StreamInfo, StreamParams};
 use std::io::{Read, Seek, SeekFrom};
 
+/// The largest file whose frames are indexed.
+const MAX_SCAN: u64 = 2 << 30;
+
 const RATES: [u32; 13] = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
 
 #[derive(Clone, Copy, PartialEq)]
@@ -45,48 +48,36 @@ pub fn looks_like_adts(magic: &[u8]) -> bool {
     magic.len() >= 7 && parse(magic).is_some()
 }
 
-fn read_exact_or_eof<R: Read>(r: &mut R, buf: &mut [u8]) -> std::io::Result<bool> {
-    let mut got = 0;
-    while got < buf.len() {
-        let n = r.read(&mut buf[got..])?;
-        if n == 0 {
-            return Ok(false);
-        }
-        got += n;
-    }
-    Ok(true)
-}
-
-/// Open an ADTS file for reading.
+/// Open an ADTS file for reading. The file is read once into memory to find its frames (a seek for
+/// every frame costs more than it should), then dropped; packets are read from `r`.
 pub fn open<R: Read + Seek + Send>(mut r: R) -> Result<Mp4Demuxer<R>> {
     let len = r.seek(SeekFrom::End(0))?;
+    if len > MAX_SCAN {
+        return Err(Error::new(ErrorCode::UnsupportedFormat, "AAC: files over 2 GiB are not supported"));
+    }
     r.seek(SeekFrom::Start(0))?;
-    let mut pos = 0u64;
-    let mut id3 = [0u8; 10];
-    if read_exact_or_eof(&mut r, &mut id3)? && id3.starts_with(b"ID3") {
-        let size = id3[6..10].iter().fold(0u64, |a, &b| (a << 7) | (b & 0x7F) as u64);
-        pos = 10 + size + if id3[5] & 0x10 != 0 { 10 } else { 0 };
+    let mut file = Vec::with_capacity(len as usize);
+    r.by_ref().take(len).read_to_end(&mut file)?;
+    let len = file.len();
+
+    let mut pos = 0usize;
+    if file.starts_with(b"ID3") && len >= 10 {
+        let size = file[6..10].iter().fold(0usize, |a, &b| (a << 7) | (b & 0x7F) as usize);
+        pos = 10 + size + if file[5] & 0x10 != 0 { 10 } else { 0 };
     }
 
     let mut first: Option<Header> = None;
     let mut samples = Vec::new();
     let mut total = 0i64;
-    let mut hdr = [0u8; 7];
     while pos + 7 <= len {
-        r.seek(SeekFrom::Start(pos))?;
-        if !read_exact_or_eof(&mut r, &mut hdr)? {
-            break;
-        }
-        let Some(h) = parse(&hdr) else {
+        let Some(h) = parse(&file[pos..pos + 7]) else {
             pos += 1;
             continue;
         };
-        let next = pos + h.frame as u64;
+        let next = pos + h.frame;
         let ok = if next + 7 <= len {
-            r.seek(SeekFrom::Start(next))?;
-            let mut n = [0u8; 7];
             // a different header after the frame is fine when only a trailer (ID3v1, APE) is left
-            read_exact_or_eof(&mut r, &mut n)? && parse(&n).is_some_and(|n| n.sfi == h.sfi && n.channels == h.channels) || len - next <= 256
+            parse(&file[next..next + 7]).is_some_and(|n| n.sfi == h.sfi && n.channels == h.channels) || len - next <= 256
         } else {
             next <= len // the last frame must be whole
         };
@@ -96,7 +87,7 @@ pub fn open<R: Read + Seek + Send>(mut r: R) -> Result<Mp4Demuxer<R>> {
         }
         let f = *first.get_or_insert(h);
         if (f.sfi, f.channels) == (h.sfi, h.channels) {
-            samples.push(Sample { stream: 0, sync: true, offset: pos + h.len as u64, size: (h.frame - h.len) as u32, dts: total, cts_offset: 0, duration: 1024 });
+            samples.push(Sample { stream: 0, sync: true, offset: (pos + h.len) as u64, size: (h.frame - h.len) as u32, dts: total, cts_offset: 0, duration: 1024 });
             total += 1024;
         }
         pos = next;

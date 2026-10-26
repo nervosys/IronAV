@@ -53,8 +53,11 @@ impl<'a> Bits<'a> {
             Some(w) => u64::from_be_bytes(w.try_into().unwrap()),
             None => {
                 let mut w = [0u8; 8];
+                // a reader far past the end (a corrupt frame) has nothing left to copy
                 let avail = self.data.len().saturating_sub(byte).min(8);
-                w[..avail].copy_from_slice(&self.data[byte..byte + avail]);
+                if avail > 0 {
+                    w[..avail].copy_from_slice(&self.data[byte..byte + avail]);
+                }
                 u64::from_be_bytes(w)
             }
         };
@@ -887,6 +890,15 @@ impl Decoder for AacDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reading_far_past_the_end_gives_zeros() {
+        let mut b = Bits::new(&[0xFF, 0xFF]);
+        b.pos = 100_000;
+        assert_eq!(b.read(8), 0);
+        b.pos = 9;
+        assert_eq!(b.peek(7), 0x7F);
+    }
 
     #[test]
     fn every_codebook_is_a_complete_prefix_code() {

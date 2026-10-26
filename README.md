@@ -298,8 +298,11 @@ frames and the 8 kHz mixed-block tables** are ported from FFmpeg but unverified.
 bit-reservoir data is missing (the first frames after a seek) decodes to silence. A LAME (or Lavf) tag's encoder delay and padding
 are applied: the reader hands the decoder where the audio starts and ends (delay plus the decoder's 529 samples at the start,
 padding less 529 at the end), and on the three LAME fixtures the output has exactly FFmpeg's length and samples. An MP3 in
-Matroska has no tag and is not trimmed. There is no MP3 encoder. Decoding 120 s of 44.1 kHz stereo to WAV takes about 0.8 s end to end here (roughly 150x real time; noisy
-machine, `f64` throughout, no SIMD); that is a figure for this code, not a comparison with FFmpeg, which I did not time.
+Matroska has no tag and is not trimmed. There is no MP3 encoder. Decoding 120 s of 44.1 kHz stereo (a dense, noisy test signal) to WAV
+takes 0.24 to 0.28 s end to end by IronAV's own timing (about 450x real time; it was 0.65 to 0.8 s before the frame index stopped
+seeking per frame, the synthesis filterbank used a fast DCT and the IMDCT its symmetry). Of that, the decoder alone is about 0.16 s;
+FFmpeg's decoder alone ran the same file in 0.065 s through PyAV, so it is still about 2.5x faster. The decoder is scalar `f64`
+without SIMD; the noisy machine makes these figures good to perhaps 20 %.
 
 ## Matroska output
 

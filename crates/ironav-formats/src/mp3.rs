@@ -18,97 +18,75 @@ use ironav_codec::mp3::{parse_header, Header};
 use ironav_core::{CodecId, Error, ErrorCode, Rational, Result, StreamInfo, StreamParams};
 use std::io::{Read, Seek, SeekFrom};
 
+/// The largest file whose frames are indexed.
+const MAX_SCAN: u64 = 2 << 30;
+
 /// Whether `magic` starts an MP3 file: an ID3v2 tag or a Layer III frame header.
 pub fn looks_like_mp3(magic: &[u8]) -> bool {
     magic.starts_with(b"ID3") || parse_header(magic).is_some()
 }
 
-fn read_exact_or_eof<R: Read>(r: &mut R, buf: &mut [u8]) -> std::io::Result<bool> {
-    let mut got = 0;
-    while got < buf.len() {
-        let n = r.read(&mut buf[got..])?;
-        if n == 0 {
-            return Ok(false);
-        }
-        got += n;
-    }
-    Ok(true)
-}
-
 /// The encoder delay and end padding of a LAME tag in the Xing/Info frame at `at`.
-fn lame_tag<R: Read + Seek>(r: &mut R, at: u64, h: &Header) -> Result<Option<(u32, u32)>> {
-    let xing = at + 4 + if h.crc { 2 } else { 0 } + h.side_len() as u64;
-    let mut b = [0u8; 4];
-    r.seek(SeekFrom::Start(xing))?;
-    if !read_exact_or_eof(r, &mut b)? || !matches!(&b, b"Xing" | b"Info") || !read_exact_or_eof(r, &mut b)? {
-        return Ok(None);
+fn lame_tag(file: &[u8], at: usize, h: &Header) -> Option<(u32, u32)> {
+    let xing = at + 4 + if h.crc { 2 } else { 0 } + h.side_len();
+    let tag = file.get(xing..xing + 8)?;
+    if !matches!(&tag[..4], b"Xing" | b"Info") {
+        return None;
     }
-    let flags = u32::from_be_bytes(b);
+    let flags = u32::from_be_bytes(tag[4..8].try_into().unwrap());
     // optional fields: frames, bytes, TOC, quality; then the encoder string and the LAME fields
-    let skip = [(1, 4i64), (2, 4), (4, 100), (8, 4)].iter().filter(|(f, _)| flags & f != 0).map(|(_, n)| n).sum::<i64>();
-    r.seek(SeekFrom::Current(skip))?;
-    let mut enc = [0u8; 9];
-    if !read_exact_or_eof(r, &mut enc)? || !(enc.starts_with(b"LAME") || enc.starts_with(b"Lavf") || enc.starts_with(b"Lavc")) {
-        return Ok(None);
+    let skip: usize = [(1, 4), (2, 4), (4, 100), (8, 4)].iter().filter(|(f, _)| flags & f != 0).map(|(_, n)| n).sum();
+    let enc_at = xing + 8 + skip;
+    let enc = file.get(enc_at..enc_at + 9)?;
+    if !(enc.starts_with(b"LAME") || enc.starts_with(b"Lavf") || enc.starts_with(b"Lavc")) {
+        return None;
     }
-    r.seek(SeekFrom::Current(12))?; // revision/method, lowpass, replay gain, flags, ABR bitrate
-    let mut t = [0u8; 3];
-    if !read_exact_or_eof(r, &mut t)? {
-        return Ok(None);
-    }
+    // revision/method, lowpass, replay gain, flags, ABR bitrate: 12 bytes, then the delay
+    let t = file.get(enc_at + 9 + 12..enc_at + 9 + 12 + 3)?;
     let delay = (t[0] as u32) << 4 | (t[1] as u32) >> 4;
     let pad = ((t[1] as u32) & 0xF) << 8 | t[2] as u32;
     // a delay beyond a few frames is a garbage field
-    Ok((delay <= 2304 && pad <= 4095).then_some((delay, pad)))
+    (delay <= 2304 && pad <= 4095).then_some((delay, pad))
 }
 
-/// Whether the frame at `h` holds a Xing/Info/VBRI tag instead of audio.
-fn is_info_frame<R: Read + Seek>(r: &mut R, at: u64, h: &Header) -> Result<bool> {
+/// Whether the frame at `at` holds a Xing/Info/VBRI tag instead of audio.
+fn is_info_frame(file: &[u8], at: usize, h: &Header) -> bool {
     let xing = 4 + if h.crc { 2 } else { 0 } + h.side_len();
-    let mut tag = [0u8; 4];
-    for off in [xing, 4 + 32] {
-        r.seek(SeekFrom::Start(at + off as u64))?;
-        if read_exact_or_eof(r, &mut tag)? && matches!(&tag, b"Xing" | b"Info" | b"VBRI") {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    [xing, 4 + 32].iter().any(|&off| file.get(at + off..at + off + 4).is_some_and(|t| matches!(t, b"Xing" | b"Info" | b"VBRI")))
 }
 
-/// Open an MP3 file for reading.
+/// Open an MP3 file for reading. The file is read once into memory to find its frames (a seek for
+/// every frame costs more than the decoding does), then dropped; packets are read from `r`.
 pub fn open<R: Read + Seek + Send>(mut r: R) -> Result<Mp4Demuxer<R>> {
     let len = r.seek(SeekFrom::End(0))?;
+    if len > MAX_SCAN {
+        return Err(Error::new(ErrorCode::UnsupportedFormat, "MP3: files over 2 GiB are not supported"));
+    }
     r.seek(SeekFrom::Start(0))?;
-    let mut pos = 0u64;
-    let mut id3 = [0u8; 10];
-    if read_exact_or_eof(&mut r, &mut id3)? && id3.starts_with(b"ID3") {
-        let size = id3[6..10].iter().fold(0u64, |a, &b| (a << 7) | (b & 0x7F) as u64);
-        pos = 10 + size + if id3[5] & 0x10 != 0 { 10 } else { 0 };
+    let mut file = Vec::with_capacity(len as usize);
+    r.by_ref().take(len).read_to_end(&mut file)?;
+    let len = file.len();
+
+    let mut pos = 0usize;
+    if file.starts_with(b"ID3") && len >= 10 {
+        let size = file[6..10].iter().fold(0usize, |a, &b| (a << 7) | (b & 0x7F) as usize);
+        pos = 10 + size + if file[5] & 0x10 != 0 { 10 } else { 0 };
     }
 
     let mut first: Option<Header> = None;
     let mut samples = Vec::new();
     let mut total = 0i64;
-    let mut hdr = [0u8; 4];
     let mut lame = None;
-    loop {
-        if pos + 4 > len {
-            break;
-        }
-        r.seek(SeekFrom::Start(pos))?;
-        if !read_exact_or_eof(&mut r, &mut hdr)? {
-            break;
-        }
-        let Some(h) = parse_header(&hdr) else {
+    while pos + 4 <= len {
+        let Some(h) = parse_header(&file[pos..pos + 4]) else {
             pos += 1;
             continue;
         };
         // the next header must agree, unless this is the last frame
-        let next = pos + h.frame_len as u64;
+        let next = pos + h.frame_len;
         let ok = if next + 4 <= len {
-            r.seek(SeekFrom::Start(next))?;
             // a different header after the frame is fine when only a trailer (ID3v1, APE) is left
-            read_exact_or_eof(&mut r, &mut hdr)? && parse_header(&hdr).is_some_and(|n| n.sample_rate == h.sample_rate && n.lsf == h.lsf) || len - next <= 256
+            parse_header(&file[next..next + 4]).is_some_and(|n| n.sample_rate == h.sample_rate && n.lsf == h.lsf) || len - next <= 256
         } else {
             true
         };
@@ -116,20 +94,20 @@ pub fn open<R: Read + Seek + Send>(mut r: R) -> Result<Mp4Demuxer<R>> {
             pos += 1;
             continue;
         }
-        let size = (h.frame_len as u64).min(len - pos);
+        let size = h.frame_len.min(len - pos);
         match &first {
             None => {
-                let info = is_info_frame(&mut r, pos, &h)?;
+                let info = is_info_frame(&file, pos, &h);
                 first = Some(h);
                 if info {
-                    lame = lame_tag(&mut r, pos, &h)?;
+                    lame = lame_tag(&file, pos, &h);
                 } else {
-                    samples.push(Sample { stream: 0, sync: true, offset: pos, size: size as u32, dts: total, cts_offset: 0, duration: h.samples() as u32 });
+                    samples.push(Sample { stream: 0, sync: true, offset: pos as u64, size: size as u32, dts: total, cts_offset: 0, duration: h.samples() as u32 });
                     total += h.samples() as i64;
                 }
             }
             Some(f) if f.sample_rate == h.sample_rate && f.lsf == h.lsf => {
-                samples.push(Sample { stream: 0, sync: true, offset: pos, size: size as u32, dts: total, cts_offset: 0, duration: h.samples() as u32 });
+                samples.push(Sample { stream: 0, sync: true, offset: pos as u64, size: size as u32, dts: total, cts_offset: 0, duration: h.samples() as u32 });
                 total += h.samples() as i64;
             }
             Some(_) => {}
