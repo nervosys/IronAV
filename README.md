@@ -295,9 +295,10 @@ files: no panics.
 
 Not covered, and not tested because the encoder used never produced them: **mixed blocks, intensity stereo, CRC-protected
 frames and the 8 kHz mixed-block tables** are ported from FFmpeg but unverified. Layers I and II are refused. A frame whose
-bit-reservoir data is missing (the first frames after a seek) decodes to silence. The LAME tag's encoder delay and padding are
-not used, so decoded audio starts with the encoder's delay (1105 samples is what FFmpeg trims) and ends with its padding. There
-is no MP3 encoder. Decoding 120 s of 44.1 kHz stereo to WAV takes about 0.8 s end to end here (roughly 150x real time; noisy
+bit-reservoir data is missing (the first frames after a seek) decodes to silence. A LAME (or Lavf) tag's encoder delay and padding
+are applied: the reader hands the decoder where the audio starts and ends (delay plus the decoder's 529 samples at the start,
+padding less 529 at the end), and on the three LAME fixtures the output has exactly FFmpeg's length and samples. An MP3 in
+Matroska has no tag and is not trimmed. There is no MP3 encoder. Decoding 120 s of 44.1 kHz stereo to WAV takes about 0.8 s end to end here (roughly 150x real time; noisy
 machine, `f64` throughout, no SIMD); that is a figure for this code, not a comparison with FFmpeg, which I did not time.
 
 ## Performance

@@ -78,7 +78,14 @@ fn unsupported(codec: CodecId, what: &str) -> Error {
 pub fn new_decoder_for(s: &ironav_core::StreamInfo) -> Result<Box<dyn Decoder>> {
     match s.codec {
         CodecId::Aac => Ok(Box::new(aac::AacDecoder::new(&s.extradata, &s.params)?)),
-        CodecId::Mp3 => Ok(Box::new(mp3::Mp3Decoder::new(&s.params)?)),
+        CodecId::Mp3 => {
+            let d: Box<dyn Decoder> = Box::new(mp3::Mp3Decoder::new(&s.params)?);
+            // extradata from the MP3 reader: where the LAME tag says the audio starts and ends
+            Ok(match s.extradata[..] {
+                [a, b, c, d2, e, f, g, h] => Box::new(Gapless { inner: d, start: u32::from_le_bytes([a, b, c, d2]) as u64, end: u32::from_le_bytes([e, f, g, h]) as u64, pos: 0 }),
+                _ => d,
+            })
+        }
         CodecId::Opus => Ok(trimmed(s, Box::new(opus::OpusDecoder::new(&s.extradata, &s.params)?))),
         CodecId::Vorbis => Ok(trimmed(s, Box::new(vorbis::VorbisDecoder::new(&s.extradata, &s.params)?))),
         _ => new_decoder(s.codec, &s.params, s.bits),
@@ -113,6 +120,49 @@ impl Decoder for EndTrim {
     }
     fn flush(&mut self) -> Result<Vec<ironav_core::Frame>> {
         self.0.flush()
+    }
+}
+
+/// Drops decoded samples before `start` and from `end` on (positions in the decoder's own output),
+/// and renumbers the frames' pts from the first kept sample.
+struct Gapless {
+    inner: Box<dyn Decoder>,
+    start: u64,
+    end: u64,
+    pos: u64,
+}
+
+impl Gapless {
+    fn keep(&mut self, frames: Vec<ironav_core::Frame>) -> Vec<ironav_core::Frame> {
+        let mut out = Vec::with_capacity(frames.len());
+        for f in frames {
+            let ironav_core::Frame::Audio(mut a) = f else {
+                out.push(f);
+                continue;
+            };
+            let ch = a.channels.max(1) as usize;
+            let (from, to) = (self.pos, self.pos + a.frames() as u64);
+            self.pos = to;
+            let (lo, hi) = (from.max(self.start), to.min(self.end));
+            if lo >= hi {
+                continue;
+            }
+            a.samples = a.samples[(lo - from) as usize * ch..(hi - from) as usize * ch].to_vec();
+            a.pts = (lo - self.start) as i64;
+            out.push(ironav_core::Frame::Audio(a));
+        }
+        out
+    }
+}
+
+impl Decoder for Gapless {
+    fn decode(&mut self, packet: &ironav_core::Packet) -> Result<Vec<ironav_core::Frame>> {
+        let frames = self.inner.decode(packet)?;
+        Ok(self.keep(frames))
+    }
+    fn flush(&mut self) -> Result<Vec<ironav_core::Frame>> {
+        let frames = self.inner.flush()?;
+        Ok(self.keep(frames))
     }
 }
 

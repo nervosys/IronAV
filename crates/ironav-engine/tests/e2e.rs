@@ -679,8 +679,9 @@ fn opus_vs_ffmpeg(file: &str, ext: &str) -> (f64, i32) {
 }
 
 /// Decode an MP3 file and compare it with FFmpeg's `mp3float` output, which starts 1105 samples in
-/// (576 of the decoder's delay and 529 more, as FFmpeg's MP3 reader trims a LAME stream) and is
-/// trimmed at the end too.
+/// (576 of the encoder's delay and 529 more, as FFmpeg's MP3 reader trims a LAME stream) and is
+/// trimmed at the end too. IronAV's reader does the same from the LAME tag; for a file without one
+/// (the Matroska copy) the start is skipped here.
 fn mp3_vs_ffmpeg(file: &str, ext: &str, channels: usize) -> (f64, i32) {
     let dir = scratch(&format!("mp3-{file}-{ext}"));
     let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
@@ -691,8 +692,12 @@ fn mp3_vs_ffmpeg(file: &str, ext: &str, channels: usize) -> (f64, i32) {
     let s16 = |b: Vec<u8>| -> Vec<i32> { b.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as i32).collect() };
     let got = s16(pcm(&out));
     let want = s16(std::fs::read(data.join(format!("{file}.ffmpeg.s16"))).unwrap());
-    let got = &got[1105 * channels..];
+    // the .mp3 files carry a LAME tag, so the reader trims them itself; the Matroska copy has none
+    let got = if ext == "mp3" { &got[..] } else { &got[1105 * channels..] };
     assert!(got.len() >= want.len(), "{} samples against {}", got.len(), want.len());
+    if ext == "mp3" {
+        assert_eq!(got.len(), want.len(), "the LAME tag should give FFmpeg's length");
+    }
     let (mut sig, mut err, mut worst) = (0f64, 0f64, 0);
     for (a, b) in got.iter().zip(&want) {
         sig += (*b as f64).powi(2);

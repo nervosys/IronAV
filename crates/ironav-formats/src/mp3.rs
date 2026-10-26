@@ -6,9 +6,12 @@
 //! frames is stepped over a byte at a time. A leading Xing/Info/VBRI frame (a header describing the
 //! file, holding no audio) is skipped.
 //!
-//! Not handled: the encoder delay and padding in a LAME tag (decoded audio starts with the
-//! encoder's delay of silence, as the frames hold it), and streams that change sample rate
-//! (frames at other rates than the first are dropped).
+//! The encoder delay and padding in a LAME tag, when there is one, go to the decoder as extradata
+//! (two little-endian u32: how many decoded samples to drop at the start, and the decoded position
+//! at which to stop), so playback is gapless the way FFmpeg's is: the delay plus the decoder's own
+//! 529 samples are dropped at the start, the padding less 529 at the end.
+//!
+//! Not handled: streams that change sample rate (frames at other rates than the first are dropped).
 
 use crate::mp4demux::{Config, Mp4Demuxer, Sample, TrackInfo};
 use ironav_codec::mp3::{parse_header, Header};
@@ -30,6 +33,33 @@ fn read_exact_or_eof<R: Read>(r: &mut R, buf: &mut [u8]) -> std::io::Result<bool
         got += n;
     }
     Ok(true)
+}
+
+/// The encoder delay and end padding of a LAME tag in the Xing/Info frame at `at`.
+fn lame_tag<R: Read + Seek>(r: &mut R, at: u64, h: &Header) -> Result<Option<(u32, u32)>> {
+    let xing = at + 4 + if h.crc { 2 } else { 0 } + h.side_len() as u64;
+    let mut b = [0u8; 4];
+    r.seek(SeekFrom::Start(xing))?;
+    if !read_exact_or_eof(r, &mut b)? || !matches!(&b, b"Xing" | b"Info") || !read_exact_or_eof(r, &mut b)? {
+        return Ok(None);
+    }
+    let flags = u32::from_be_bytes(b);
+    // optional fields: frames, bytes, TOC, quality; then the encoder string and the LAME fields
+    let skip = [(1, 4i64), (2, 4), (4, 100), (8, 4)].iter().filter(|(f, _)| flags & f != 0).map(|(_, n)| n).sum::<i64>();
+    r.seek(SeekFrom::Current(skip))?;
+    let mut enc = [0u8; 9];
+    if !read_exact_or_eof(r, &mut enc)? || !(enc.starts_with(b"LAME") || enc.starts_with(b"Lavf") || enc.starts_with(b"Lavc")) {
+        return Ok(None);
+    }
+    r.seek(SeekFrom::Current(12))?; // revision/method, lowpass, replay gain, flags, ABR bitrate
+    let mut t = [0u8; 3];
+    if !read_exact_or_eof(r, &mut t)? {
+        return Ok(None);
+    }
+    let delay = (t[0] as u32) << 4 | (t[1] as u32) >> 4;
+    let pad = ((t[1] as u32) & 0xF) << 8 | t[2] as u32;
+    // a delay beyond a few frames is a garbage field
+    Ok((delay <= 2304 && pad <= 4095).then_some((delay, pad)))
 }
 
 /// Whether the frame at `h` holds a Xing/Info/VBRI tag instead of audio.
@@ -60,6 +90,7 @@ pub fn open<R: Read + Seek + Send>(mut r: R) -> Result<Mp4Demuxer<R>> {
     let mut samples = Vec::new();
     let mut total = 0i64;
     let mut hdr = [0u8; 4];
+    let mut lame = None;
     loop {
         if pos + 4 > len {
             break;
@@ -90,7 +121,9 @@ pub fn open<R: Read + Seek + Send>(mut r: R) -> Result<Mp4Demuxer<R>> {
             None => {
                 let info = is_info_frame(&mut r, pos, &h)?;
                 first = Some(h);
-                if !info {
+                if info {
+                    lame = lame_tag(&mut r, pos, &h)?;
+                } else {
                     samples.push(Sample { stream: 0, sync: true, offset: pos, size: size as u32, dts: total, cts_offset: 0, duration: h.samples() as u32 });
                     total += h.samples() as i64;
                 }
@@ -109,13 +142,19 @@ pub fn open<R: Read + Seek + Send>(mut r: R) -> Result<Mp4Demuxer<R>> {
     if samples.is_empty() {
         return Err(Error::new(ErrorCode::InvalidInput, "MP3: the file holds no audio frames"));
     }
+    // the decoder's own delay is 528 samples + 1
+    let extradata = lame.map_or(Vec::new(), |(delay, pad)| {
+        let start = (delay + 529).min(total as u32);
+        let end = (total - (pad as i64 - 529).max(0)).max(start as i64) as u32;
+        [start.to_le_bytes(), end.to_le_bytes()].concat()
+    });
     let stream = StreamInfo {
         index: 0,
         codec: CodecId::Mp3,
         time_base: Rational::new(1, h.sample_rate as i64),
         duration: Some(total),
         bits: None,
-        extradata: Vec::new(),
+        extradata,
         lead_in: 0,
         params: StreamParams::Audio { sample_rate: h.sample_rate, channels: h.channels() },
     };
@@ -157,6 +196,25 @@ mod tests {
             pts.push(p.pts);
         }
         assert_eq!(pts, vec![0, 1152, 2304, 3456]);
+    }
+
+    #[test]
+    fn a_lame_tag_gives_the_decoder_its_trim() {
+        let mut info = frame(false, 0);
+        info[36..40].copy_from_slice(b"Info");
+        info[40..44].copy_from_slice(&1u32.to_be_bytes()); // flags: frame count only
+        info[44..48].copy_from_slice(&3u32.to_be_bytes());
+        info[48..57].copy_from_slice(b"LAME3.100");
+        // delay 576 (0x240) and padding 1000 (0x3E8): 0x24 0x03 0xE8; they follow 12 more bytes
+        info[69..72].copy_from_slice(&[0x24, 0x03, 0xE8]);
+        let mut file = info;
+        for _ in 0..3 {
+            file.extend(frame(false, 1));
+        }
+        let d = open(Cursor::new(file)).unwrap();
+        let x = &d.streams()[0].extradata;
+        let (start, end) = (u32::from_le_bytes(x[..4].try_into().unwrap()), u32::from_le_bytes(x[4..].try_into().unwrap()));
+        assert_eq!((start, end), (576 + 529, 3 * 1152 - (1000 - 529)));
     }
 
     #[test]
