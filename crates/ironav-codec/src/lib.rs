@@ -44,7 +44,7 @@ pub fn implemented() -> Vec<CodecImpl> {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-opus" });
             }
             if c == CodecId::Vorbis {
-                return Some(CodecImpl { codec: c, decode: true, encode: false, implementation: "ironav-vorbis" });
+                return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-vorbis" });
             }
             let implementation = if c.sample_format().is_some() {
                 "ironav-pcm"
@@ -201,7 +201,11 @@ pub fn new_encoder(codec: CodecId, params: &StreamParams, bits: Option<u8>) -> R
 
 /// The bit rates, in kbit/s, a lossy audio encoder here accepts; `None` for codecs that have no bit rate.
 pub fn audio_bitrate_range(codec: CodecId) -> Option<(u32, u32)> {
-    (codec == CodecId::Opus).then_some((6, 510))
+    match codec {
+        CodecId::Opus => Some((6, 510)),
+        CodecId::Vorbis => Some((16, 500)),
+        _ => None,
+    }
 }
 
 /// Like `new_encoder`, with a target bit rate for the codecs that take one (`audio_bitrate_range`).
@@ -212,6 +216,10 @@ pub fn new_encoder_with(codec: CodecId, params: &StreamParams, bits: Option<u8>,
         (CodecId::Opus, StreamParams::Audio { sample_rate, channels }) => {
             let bitrate = bitrate_kbps.map_or(opus::OpusEncoder::default_bitrate(*channels as usize), |k| k * 1000);
             Ok(Box::new(opus::OpusEncoder::new(*sample_rate, *channels as usize, bitrate)?))
+        }
+        (CodecId::Vorbis, StreamParams::Audio { sample_rate, channels }) => {
+            let bitrate = bitrate_kbps.map_or(vorbis::VorbisEncoder::default_bitrate(*channels as usize), |k| k * 1000);
+            Ok(Box::new(vorbis::VorbisEncoder::new(*sample_rate, *channels as usize, bitrate)?))
         }
         (CodecId::RawVideo, StreamParams::Video { .. }) => Ok(Box::new(rawvideo::RawVideoEncoder)),
         (c, p) if c.media_type() != p.media_type() => Err(Error::invalid_arg(format!(
@@ -229,6 +237,7 @@ pub fn new_encoder_with(codec: CodecId, params: &StreamParams, bits: Option<u8>,
 pub fn encoder_extradata(codec: CodecId, params: &StreamParams) -> Vec<u8> {
     match (codec, params) {
         (CodecId::Opus, StreamParams::Audio { channels, .. }) => opus::opus_head(*channels as usize),
+        (CodecId::Vorbis, StreamParams::Audio { sample_rate, channels }) => vorbis::encoder_headers(*sample_rate, *channels as usize),
         _ => Vec::new(),
     }
 }

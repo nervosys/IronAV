@@ -265,7 +265,7 @@ Opus is read from Matroska/WebM (`.mka`, `.webm`) and from Ogg (`.opus`, `.ogg`)
 half a second whose granule positions follow RFC 7845 (the packets' durations, pre-skip included, add up to the last one's, so
 the stream ends where it should). FLAC is written in Ogg too (`--acodec flac -o out.oga`, native mapping): STREAMINFO in the first
 page is rewritten when the stream ends, so it carries the real length and frame sizes. Encoded and re-decoded it is bit-exact,
-and FFmpeg reads the same file bit-exact. Vorbis is written in Ogg when copied from Ogg or Matroska (there is no Vorbis encoder): pages are stamped from each packet's
+and FFmpeg reads the same file bit-exact. Vorbis is written in Ogg, copied from Ogg or Matroska or encoded (see "Vorbis encoder"): pages are stamped from each packet's
 window size, an Ogg source keeps its exact length (FFmpeg decodes the copy sample for sample), and a Matroska source ends up to a
 window (48 samples in the test file) long, because Matroska does not record where the audio stops.
 
@@ -314,11 +314,29 @@ reproduces the old behaviour, and with it the FFmpeg-encoder test file matches b
 
 Not covered: **floor type 0** (obsolete; a stream that uses it is refused) and streams with more than 8 channels. The Ogg
 granule position of the last page trims the end; a stream that begins mid-way (a first granule above zero) is not shifted. Chained or multiplexed Ogg streams: only the first Vorbis stream is
-read. Mid-stream changes of the headers are not followed. There is no Vorbis encoder. Decoding 120 s of 44.1 kHz stereo to WAV takes about 0.25 to 0.29 s end to end
+read. Mid-stream changes of the headers are not followed. Decoding 120 s of 44.1 kHz stereo to WAV takes about 0.25 to 0.29 s end to end
 inside IronAV's own timing, of which the decoder alone is about 0.15 s (it was about 0.25 s: the inverse transform now runs a
 radix-2 butterfly with no generic loop, the transform's output is mirrored with slice copies, and the overlap-add runs in
 segments instead of deciding per sample). FFmpeg's decoder alone ran the same file in 0.08 to 0.19 s through PyAV, so the two are
 now close. This decoder is scalar `f32`; codebook lookups use a 10-bit table, longer codes walk a tree.
+
+
+### Vorbis encoder
+
+`--acodec vorbis` (`--abitrate 16` to `500`, default 64 per channel and 2 channels at most) writes Vorbis I into Ogg or Matroska/WebM:
+2048-sample blocks only, floor 1 with 24 posts, residue type 1 coded with four lattice codebooks (values to +-1, 3, 7 and 31, chosen
+per 16-value partition), and square-polar coupling for stereo. The headers are written by hand and parsed back by our own decoder, and
+the floor curve the encoder divides by is the one it gets by decoding its own floor bits, so the two cannot drift apart. A feedback loop
+on the quantiser's step holds the bit rate (the first packets search for the right step first). The step follows the local spectrum level only
+partway (exponent 0.6), so noise is shaped but not hidden: there is no psychoacoustic model. No block switching (an attack spreads its noise
+over a 46 ms window), no noise substitution, no floor 0, no more than two channels, and the code books are fixed, not trained: on
+Gaussian noise it lands about 4 dB under the rate-distortion bound.
+
+FFmpeg (through PyAV) decodes the output and our decoder agrees with it to one least-significant bit on stereo and mono streams. Lengths
+are exact in Ogg (the last packet's duration is trimmed); in Matroska the end is up to a block (1024 samples) late, since the container holds no
+end position. On a 4 s stereo test signal (two tones and a little noise) 128 kb/s gives 19 dB SNR, 320 kb/s 28 dB. A 120 s MP3 becomes 128 kb/s
+Vorbis in about 2 s (roughly 55 times real time). One trap found on the way: a coupled pair whose magnitude is exactly zero and whose angle
+is not is decoded differently by the specification and by some FFmpeg builds, so the encoder never sends one.
 
 ## MP3
 

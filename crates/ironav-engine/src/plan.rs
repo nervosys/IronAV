@@ -209,7 +209,7 @@ pub fn plan(job: &Job) -> Result<Plan> {
                 } else {
                     format!("{} has no bit rate to set", to.name())
                 })
-                .hint("audio bitrate_kbps applies to opus"));
+                .hint("audio bitrate_kbps applies to opus and vorbis"));
             };
             let k = opts.bitrate_kbps.unwrap_or(0);
             if !(lo..=hi).contains(&k) {

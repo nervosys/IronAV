@@ -9,7 +9,10 @@
 //!
 //! Not handled: floor type 0 (obsolete, refused when the setup header names it) and streams whose parameters change mid-way.
 
+mod enc;
 mod tables;
+
+pub use enc::{headers as encoder_headers, VorbisEncoder};
 
 use crate::opus::mdct::Dct4;
 use ironav_core::{AudioFrame, Decoder, Error, ErrorCode, Frame, Packet, Result, StreamParams};

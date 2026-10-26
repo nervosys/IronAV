@@ -1207,3 +1207,54 @@ fn opus_from_44k_resamples_by_itself() {
     run(&by_hand, &mut |_| {}).unwrap();
     assert_eq!(std::fs::read(dir.join("auto.opus")).unwrap(), std::fs::read(dir.join("hand.opus")).unwrap());
 }
+
+/// Vorbis encoding: a WAV becomes Ogg or Matroska Vorbis of exactly its length (Ogg), the bit rate
+/// steers the size, and our own decoder gets back something close to the input.
+#[test]
+fn vorbis_encoder_output_decodes_close_to_its_input() {
+    let dir = scratch("vorbis-enc");
+    let n = 44_100 * 3 + 321;
+    let samples: Vec<i16> = (0..n * 2)
+        .map(|i| {
+            let (t, c) = ((i / 2) as f64 / 44_100.0, (i % 2) as f64);
+            (9000.0 * (2.0 * std::f64::consts::PI * (440.0 + 110.0 * c) * t).sin() + 3000.0 * (2.0 * std::f64::consts::PI * 2500.0 * t).sin()) as i16
+        })
+        .collect();
+    let wav = dir.join("in.wav");
+    write_wav(&wav, &samples, 2, 44_100);
+    let mut sizes = Vec::new();
+    for (ext, kbps) in [("ogg", 64u32), ("ogg", 192), ("mka", 192)] {
+        let out = dir.join(format!("out{kbps}.{ext}"));
+        let mut j = job(&wav, &out);
+        j.audio.codec = Some("vorbis".into());
+        j.audio.bitrate_kbps = Some(kbps);
+        run(&j, &mut |_| {}).unwrap();
+        let back = dir.join(format!("back{kbps}.{ext}.wav"));
+        let mut j = job(&out, &back);
+        j.audio.codec = Some("pcm_s16le".into());
+        run(&j, &mut |_| {}).unwrap();
+        let got = pcm(&back);
+        if ext == "ogg" {
+            assert_eq!(got.len() / 4, n, "{ext} {kbps}: an exact length");
+        } else {
+            assert!(got.len() / 4 >= n && got.len() / 4 < n + 2048, "{ext} {kbps}: {} frames", got.len() / 4);
+        }
+        let snr = snr_db(&pcm(&wav), &got[..pcm(&wav).len()]);
+        assert!(snr > if kbps == 64 { 12.0 } else { 20.0 }, "{ext} {kbps}: {snr:.1} dB");
+        if ext == "ogg" {
+            sizes.push(std::fs::metadata(&out).unwrap().len());
+        }
+    }
+    assert!(sizes[0] < sizes[1] * 2 / 3, "a lower bit rate makes a smaller file: {sizes:?}");
+
+    // three or more channels are refused with a reason
+    let six = dir.join("six.wav");
+    write_wav(&six, &vec![0i16; 6 * 4410], 6, 44_100);
+    let e = plan(&{
+        let mut j = job(&six, &dir.join("six.ogg"));
+        j.audio.codec = Some("vorbis".into());
+        j
+    })
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::UnsupportedCodec, "{e:?}");
+}
