@@ -5,6 +5,7 @@ pub(crate) mod flac;
 mod mkv;
 mod mp4;
 mod mp4demux;
+mod ogg;
 mod wav;
 mod y4m;
 
@@ -79,6 +80,15 @@ pub static FORMATS: &[FormatSpec] = &[
         codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Av1, CodecId::Vp8, CodecId::Vp9, CodecId::Aac, CodecId::Mp3, CodecId::Opus, CodecId::Vorbis, CodecId::Flac],
     },
     FormatSpec {
+        name: "ogg",
+        extensions: &["ogg", "opus", "oga"],
+        description: "Ogg (read-only): Opus audio only; Vorbis, FLAC and Theora in Ogg are refused",
+        media: MediaType::Audio,
+        demux: true,
+        mux: false,
+        codecs: &[CodecId::Opus],
+    },
+    FormatSpec {
         name: "h264",
         extensions: &["h264", "264"],
         description: "Raw H.264 Annex B elementary stream (write-only)",
@@ -131,6 +141,8 @@ pub fn open_demuxer(path: &Path) -> Result<Box<dyn Demuxer>> {
     } else if mkv::looks_like_mkv(magic) {
         // Matroska does its own buffering: it seeks over every frame while indexing.
         Ok(Box::new(mkv::open(f.into_inner())?))
+    } else if ogg::looks_like_ogg(magic) {
+        Ok(Box::new(ogg::open(f)?))
     } else if magic.starts_with(b"YUV4MPEG2") {
         Ok(Box::new(y4m::Y4mDemuxer::open(f)?))
     } else {

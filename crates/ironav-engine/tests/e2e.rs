@@ -658,11 +658,11 @@ fn aac_matches_ffmpeg(scratch_name: &str, file: &str) {
 /// Decode an Opus file and compare it with FFmpeg's native decoder (pre-skip removed in both; ours
 /// keeps the encoder's trailing padding, which FFmpeg trims). Returns the SNR in dB and the worst
 /// difference in LSB.
-fn opus_vs_ffmpeg(file: &str) -> (f64, i32) {
-    let dir = scratch(&format!("opus-{file}"));
+fn opus_vs_ffmpeg(file: &str, ext: &str) -> (f64, i32) {
+    let dir = scratch(&format!("opus-{file}-{ext}"));
     let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
     let out = dir.join("out.wav");
-    let mut j = job(&data.join(format!("{file}.mka")), &out);
+    let mut j = job(&data.join(format!("{file}.{ext}")), &out);
     j.audio.codec = Some("pcm_s16le".into());
     run(&j, &mut |_| {}).unwrap();
     let s16 = |b: Vec<u8>| -> Vec<i32> { b.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as i32).collect() };
@@ -678,9 +678,18 @@ fn opus_vs_ffmpeg(file: &str) -> (f64, i32) {
     (10.0 * (sig / err.max(1e-9)).log10(), worst)
 }
 
+/// The same packets in an Ogg file decode to the same samples as in Matroska.
+#[test]
+fn ogg_opus_decodes_like_the_same_packets_in_matroska() {
+    let (snr, worst) = opus_vs_ffmpeg("opus_celt_stereo", "opus");
+    assert!(worst <= 3, "largest difference from FFmpeg is {worst} LSB (SNR {snr:.1} dB)");
+    let (snr, _) = opus_vs_ffmpeg("opus_silk_mono", "opus");
+    assert!(snr > 35.0, "SNR against FFmpeg is only {snr:.1} dB");
+}
+
 #[test]
 fn celt_opus_decodes_to_what_ffmpeg_decodes() {
-    let (snr, worst) = opus_vs_ffmpeg("opus_celt_stereo");
+    let (snr, worst) = opus_vs_ffmpeg("opus_celt_stereo", "mka");
     assert!(worst <= 3, "largest difference from FFmpeg is {worst} LSB (SNR {snr:.1} dB)");
 }
 
@@ -689,7 +698,7 @@ fn celt_opus_decodes_to_what_ffmpeg_decodes() {
 #[test]
 fn silk_and_hybrid_opus_decode_close_to_what_ffmpeg_decodes() {
     for file in ["opus_silk_mono", "opus_hybrid_stereo"] {
-        let (snr, _) = opus_vs_ffmpeg(file);
+        let (snr, _) = opus_vs_ffmpeg(file, "mka");
         assert!(snr > 35.0, "{file}: SNR against FFmpeg is only {snr:.1} dB");
     }
 }

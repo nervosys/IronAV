@@ -255,7 +255,7 @@ Not covered: multichannel Opus (channel-mapping families 1 and 255 are refused),
 empty frame decodes to silence), and the way the reference decoder flushes its resampler when the stream switches between SILK
 and CELT, which our fixed-delay filter does not reproduce, so the few samples at such a switch can differ. The libopus encoder
 only produced streams in one mode at a time, so **mode switches within a stream were not tested**, nor were redundancy frames.
-Opus is read from Matroska/WebM (`.mka`, `.webm`); there is no Ogg Opus reader and no Opus encoder.
+Opus is read from Matroska/WebM (`.mka`, `.webm`) and from Ogg (`.opus`, `.ogg`); there is no Opus encoder. The Ogg reader (pages are checksummed; the file is read into memory, up to 1 GiB) takes only the first Opus stream: Vorbis, FLAC and Theora in Ogg are refused with a message naming the codec, and chained streams after the first are ignored. The final page's granule position is not used, so the last packet's padding is not trimmed. Tested on libopus files remuxed to Ogg (identical samples to the Matroska copies); multi-page packets are covered by a synthetic unit test only.
 
 ## Performance
 
