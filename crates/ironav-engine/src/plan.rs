@@ -197,7 +197,12 @@ pub fn plan(job: &Job) -> Result<Plan> {
             }
         }
 
-        let action = if to == s.codec && chain.is_empty() { Action::Copy } else { Action::Transcode };
+        // asking for a bit rate from a codec that has one means re-encoding, not copying
+        let rate_wanted = media == MediaType::Audio && opts.bitrate_kbps.is_some() && audio_bitrate_range(to).is_some();
+        let action = if to == s.codec && chain.is_empty() && !rate_wanted { Action::Copy } else { Action::Transcode };
+        if rate_wanted && to == s.codec && chain.is_empty() {
+            warnings.push(format!("{at}: bitrate_kbps was set, so the {} stream is re-encoded instead of copied", to.name()));
+        }
         if media == MediaType::Audio && opts.qp.is_some() {
             return Err(Error::invalid_arg("qp applies to video streams only"));
         }

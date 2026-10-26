@@ -1360,3 +1360,21 @@ fn mp3_encoder_output_decodes_close_to_its_input() {
     let p = plan(&j).unwrap();
     assert!(p.warnings.iter().any(|w| w.contains("resampled from 22050 Hz to 32000 Hz")), "{:?}", p.warnings);
 }
+
+/// A bit rate asked of the codec the stream already has means re-encoding, with a warning saying so.
+#[test]
+fn a_bitrate_on_the_same_lossy_codec_reencodes() {
+    let dir = scratch("reencode");
+    let wav = dir.join("in.wav");
+    write_wav(&wav, &vec![0i16; 44_100 * 2], 2, 44_100);
+    let mp3 = dir.join("a.mp3");
+    let mut j = job(&wav, &mp3);
+    j.audio.codec = Some("mp3".into());
+    run(&j, &mut |_| {}).unwrap();
+    let mut j = job(&mp3, &dir.join("b.mp3"));
+    j.audio.bitrate_kbps = Some(96);
+    let p = plan(&j).unwrap();
+    assert!(p.warnings.iter().any(|w| w.contains("re-encoded instead of copied")), "{:?}", p.warnings);
+    run(&j, &mut |_| {}).unwrap();
+    assert!(std::fs::metadata(dir.join("b.mp3")).unwrap().len() < std::fs::metadata(&mp3).unwrap().len());
+}

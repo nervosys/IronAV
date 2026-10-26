@@ -392,7 +392,7 @@ An `.mp3` file starts with an Info frame holding the frame count and size and a 
 and know its length; the tag carries the `Lavc` prefix because FFmpeg only reads the delay behind `LAME`, `Lavf` or `Lavc`. FFmpeg (through
 PyAV) decodes the files and trims them to exactly the input's length. On a 4 s stereo test signal (two tones and a little noise) 64 kb/s
 gives 16 dB SNR, 128 kb/s 23 dB and 320 kb/s 28 dB (libmp3lame at 128 kb/s: 21 dB, though it aims at hearing, not SNR). A 120 s stereo file
-becomes 160 kb/s MP3 in about 2 s. Converting an MP3 to MP3 is a copy; decode to WAV first, or add a filter, to re-encode.
+becomes 160 kb/s MP3 in about 2 s. Converting an MP3 to MP3 is a copy unless a bit rate is given, which re-encodes it (with a warning); the same holds for the other lossy codecs.
 
 ## Matroska output
 
