@@ -397,8 +397,12 @@ the standard's: polyphase analysis, a 36-point MDCT, the aliasing butterflies, t
 level partway (exponent 0.6) with a low-pass that depends on the bit rate. The Huffman table of each of the three regions, the region
 split and the count1 table are chosen for the fewest bits. Constant bit rate with a real bit reservoir: a frame's data may start in the
 unused tail of the frames before it, so a packet is emitted only once later frames have filled it. Stereo is joint, coded as left/right or
-mid/side per frame. There is no psychoacoustic model and no look-ahead, so the reservoir only smooths; no window switching (an attack spreads
-its noise over 1152 samples), no intensity stereo, no scalefactor reuse, no MPEG-2/2.5 rates.
+mid/side per frame. **Block switching**: a granule whose subband energy jumps (8x the mean of the four slots before it) is coded as three 12-point
+short blocks, with start and stop windows around it, which costs one granule of look-ahead; both channels share the block type. On a noise
+burst over a quiet tone the error before the attack fell by 5x (mono) and 16x (stereo) (tests), and FFmpeg decodes a file with four such
+attacks to the same samples as ours (115 dB). The detector is a simple energy rule that has not been tuned on music, and short blocks use
+neither mixed blocks nor subblock gain. There is no psychoacoustic model, so the reservoir only smooths; no intensity stereo, no
+scalefactor reuse, no MPEG-2/2.5 rates.
 
 An `.mp3` file starts with an Info frame holding the frame count and size and a tag with the delay and padding, so players can play it gapless
 and know its length; the tag carries the `Lavc` prefix because FFmpeg only reads the delay behind `LAME`, `Lavf` or `Lavc`. FFmpeg (through

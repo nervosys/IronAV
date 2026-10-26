@@ -1,6 +1,6 @@
-//! An MPEG-1 Layer III encoder: 32, 44.1 and 48 kHz, mono or stereo, constant bit rate, long blocks
-//! only. The chain is the standard's: a 32-band polyphase analysis, a 36-point MDCT per subband, the
-//! aliasing butterflies, then a quantiser whose step follows each scalefactor band's level only
+//! An MPEG-1 Layer III encoder: 32, 44.1 and 48 kHz, mono or stereo, constant bit rate. The chain is
+//! the standard's: a 32-band polyphase analysis, a 36-point MDCT per subband (three 12-point ones in a
+//! short block), the aliasing butterflies (long blocks), then a quantiser whose step follows each scalefactor band's level only
 //! partway (`SHAPING`, as in the AAC and Vorbis encoders: noise is shaped, not hidden, since there is
 //! no psychoacoustic model). The Huffman table of each region, the region split and the count1 table
 //! are chosen for the fewest bits, and a bisection on the step holds the frame to its bit budget.
@@ -11,8 +11,11 @@
 //! The reservoir is steered toward a fixed level, so frames spend what they have; there is no
 //! look-ahead for hard frames.
 //!
-//! Not done: window switching (an attack spreads its noise over a 1152-sample frame), intensity
-//! stereo, scalefactor reuse between granules, MPEG-2/2.5 sampling rates.
+//! Attacks switch a granule to short blocks, with start and stop windows around it (a granule of
+//! look-ahead tells the one before). Both channels share the block type, as mid/side needs.
+//!
+//! Not done: mixed blocks, intensity stereo, scalefactor reuse between granules, subblock gain,
+//! MPEG-2/2.5 sampling rates.
 
 use super::tables::*;
 use super::{statics, Header};
@@ -51,6 +54,8 @@ struct Tables {
     big: Vec<Code>,
     /// cos(π/72 (2i+19)(2k+1)), indexed `[k][i]`.
     mdct: Vec<[f64; 36]>,
+    /// cos(π/24 (2i+7)(2k+1)), indexed `[k][i]`: the short transform.
+    mdct12: Vec<[f64; 12]>,
     /// (2k+1)(i-16)π/64 matrixing of the analysis filterbank, `[k][i]`.
     matrix: Vec<[f64; 64]>,
     /// The analysis window: the synthesis window over 32.
@@ -78,10 +83,11 @@ fn tables() -> &'static Tables {
             big.push(c);
         }
         let mdct = (0..18).map(|k| std::array::from_fn(|i| (PI / 72.0 * (2 * i + 19) as f64 * (2 * k + 1) as f64).cos())).collect();
+        let mdct12 = (0..6).map(|k| std::array::from_fn(|i| (PI / 24.0 * (2 * i + 7) as f64 * (2 * k + 1) as f64).cos())).collect();
         let matrix = (0..32).map(|k| std::array::from_fn(|i| ((2 * k + 1) as f64 * (i as f64 - 16.0) * PI / 64.0).cos())).collect();
         let s = statics();
         let window = std::array::from_fn(|i| s.window[i] as f64 / 32.0);
-        Tables { big, mdct, matrix, window }
+        Tables { big, mdct, mdct12, matrix, window }
     })
 }
 
@@ -124,6 +130,25 @@ impl BitWriter {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Kind {
+    Long,
+    Start,
+    Short,
+    Stop,
+}
+
+impl Kind {
+    fn block_type(self) -> u32 {
+        match self {
+            Kind::Long => 0,
+            Kind::Start => 1,
+            Kind::Short => 2,
+            Kind::Stop => 3,
+        }
+    }
+}
+
 // ---- analysis ----------------------------------------------------------------------------------
 
 /// The polyphase analysis filterbank of one channel.
@@ -157,15 +182,16 @@ struct Analysis {
 /// What the MDCT must multiply by for the decoder to give back what went in (the decoder's inverse
 /// transform has no scale of its own).
 const MDCT_SCALE: f64 = 1.0 / 9.0;
+/// The same for the 12-point transform (4 / n).
+const MDCT_SCALE_SHORT: f64 = 1.0 / 3.0;
 
 impl Analysis {
     fn new() -> Self {
         Analysis { poly: Polyphase { x: [0.0; 512] }, prev: vec![[0.0; 18]; 32] }
     }
 
-    fn granule(&mut self, pcm: &[f32]) -> [f32; GRANULE] {
-        let t = tables();
-        let s = statics();
+    /// The subband samples of a granule of PCM, `[subband][slot]`, with the odd-slot inversion applied.
+    fn subbands(&mut self, pcm: &[f32]) -> Vec<[f64; 18]> {
         let mut cur = vec![[0.0f64; 18]; 32];
         for slot in 0..18 {
             let sb = self.poly.push(&pcm[slot * 32..slot * 32 + 32]);
@@ -174,39 +200,85 @@ impl Analysis {
                 cur[k][slot] = if k & 1 == 1 && slot & 1 == 1 { -sb[k] } else { sb[k] };
             }
         }
+        cur
+    }
+
+    /// The 576 lines of a granule's subband samples (with the previous granule's, called in order) for
+    /// a block of the given kind. A short block's lines are left in the decoder's order after its
+    /// reordering: `[subband * 18 + 3 * line + window]`.
+    fn granule(&mut self, cur: Vec<[f64; 18]>, kind: Kind) -> [f32; GRANULE] {
+        let t = tables();
+        let s = statics();
         let mut xr = [0.0f64; GRANULE];
         for sb in 0..32 {
             if cur[sb].iter().chain(&self.prev[sb]).all(|&v| v == 0.0) {
                 continue;
             }
-            let mut z = [0.0f64; 36];
-            for i in 0..18 {
-                z[i] = self.prev[sb][i] * s.win[0][i] as f64;
-                z[18 + i] = cur[sb][i] * s.win[0][18 + i] as f64;
-            }
-            for k in 0..18 {
-                xr[18 * sb + k] = t.mdct[k].iter().zip(&z).map(|(a, b)| a * b).sum::<f64>() * MDCT_SCALE;
+            if kind == Kind::Short {
+                let mut z = [0.0f64; 36];
+                z[..18].copy_from_slice(&self.prev[sb]);
+                z[18..].copy_from_slice(&cur[sb]);
+                for w in 0..3 {
+                    for k in 0..6 {
+                        let acc: f64 = (0..12).map(|i| z[6 + 6 * w + i] * s.win_short[i] as f64 * t.mdct12[k][i]).sum();
+                        xr[18 * sb + 3 * k + w] = acc * MDCT_SCALE_SHORT;
+                    }
+                }
+            } else {
+                let win = &s.win[kind.block_type() as usize];
+                let mut z = [0.0f64; 36];
+                for i in 0..18 {
+                    z[i] = self.prev[sb][i] * win[i] as f64;
+                    z[18 + i] = cur[sb][i] * win[18 + i] as f64;
+                }
+                for k in 0..18 {
+                    xr[18 * sb + k] = t.mdct[k].iter().zip(&z).map(|(a, b)| a * b).sum::<f64>() * MDCT_SCALE;
+                }
             }
         }
         self.prev = cur;
-        // the aliasing butterflies: the decoder rotates (a, b) by (cs, ca); this is the inverse
-        for sb in 1..32 {
-            let base = 18 * sb;
-            for i in 0..8 {
-                let (a, b) = (xr[base - 1 - i], xr[base + i]);
-                xr[base - 1 - i] = a * s.cs[i] + b * s.ca[i];
-                xr[base + i] = b * s.cs[i] - a * s.ca[i];
+        if kind != Kind::Short {
+            // the aliasing butterflies: the decoder rotates (a, b) by (cs, ca); this is the inverse
+            for sb in 1..32 {
+                let base = 18 * sb;
+                for i in 0..8 {
+                    let (a, b) = (xr[base - 1 - i], xr[base + i]);
+                    xr[base - 1 - i] = a * s.cs[i] + b * s.ca[i];
+                    xr[base + i] = b * s.cs[i] - a * s.ca[i];
+                }
             }
         }
         xr.map(|v| v as f32)
     }
 }
 
+/// Where in a granule's subband samples (summed over channels, `slots` of them) an attack starts:
+/// a slot whose energy above the lowest subbands is much more than the few before it. `history` holds
+/// those few and is updated.
+fn find_attack(chans: &[Vec<[f64; 18]>], history: &mut [f64; 4]) -> Option<usize> {
+    let mut found = None;
+    for slot in 0..18 {
+        let e: f64 = chans.iter().map(|c| c[3..].iter().map(|sb| sb[slot] * sb[slot]).sum::<f64>()).sum();
+        let mean = history.iter().sum::<f64>() / 4.0;
+        if found.is_none() && e > ATTACK_FLOOR && e > ATTACK_RATIO * mean + 1e-9 {
+            found = Some(slot);
+        }
+        history.copy_within(1..4, 0);
+        history[3] = e;
+    }
+    found
+}
+
+const ATTACK_FLOOR: f64 = 1e-3;
+const ATTACK_RATIO: f64 = 8.0;
+
 // ---- coding one granule of one channel -----------------------------------------------------------
 
 struct Coded {
+    kind: Kind,
     q: [i32; GRANULE],
-    sf: [u8; 21],
+    /// Scalefactors: 21 bands, or for a short block 12 bands of three windows each.
+    sf: [u8; 36],
     global_gain: i32,
     compress: usize,
     /// Pairs in the big-value region and quadruples in the count1 region.
@@ -314,27 +386,46 @@ fn band_bounds(rate_index: usize) -> Vec<usize> {
     v
 }
 
+/// Offsets of the short bands in the order they are coded: for each of the 13 bands, its three
+/// windows one after another (40 values).
+fn short_bounds(rate_index: usize) -> Vec<usize> {
+    let mut v = vec![0usize];
+    let mut start = 0;
+    for &len in &BAND_SIZE_SHORT[rate_index] {
+        let len = len as usize;
+        for w in 0..3 {
+            v.push(3 * start + (w + 1) * len);
+        }
+        start += len;
+    }
+    v
+}
+
 fn pow34(v: f64) -> f64 {
     (v * v.sqrt()).sqrt()
 }
 
-/// Quantise a spectrum with the desired step of each of the 22 bands, and find the cheapest way to
-/// write it.
-fn code_unit(xr: &[f32; GRANULE], bounds: &[usize], steps: &[f64; 22]) -> Coded {
+/// Quantise a spectrum with the desired step of each band, and find the cheapest way to write it.
+/// `bounds` are the band offsets in coded order; `steps` has one entry per band.
+fn code_unit(xr: &[f32; GRANULE], kind: Kind, bounds: &[usize], steps: &[f64]) -> Coded {
+    let short = kind == Kind::Short;
+    let nb = bounds.len() - 1;
+    // bands with a scalefactor, and how many of them use the first (wider) length field
+    let (nsf, split) = if short { (36, 18) } else { (21, 11) };
     // exponent of each band's step in quarter octaves
     let want: Vec<i32> = steps.iter().map(|&s| (s.max(1e-30).log2() * 4.0).round() as i32).collect();
-    let mut top = want[..21].iter().copied().max().unwrap_or(0);
-    if xr[bounds[21]..].iter().any(|&v| v != 0.0) {
-        // band 21 has no scalefactor of its own: it takes the global step
-        top = top.min(want[21] + 12);
+    let mut top = want[..nsf].iter().copied().max().unwrap_or(0);
+    if xr[bounds[nsf]..].iter().any(|&v| v != 0.0) {
+        // the last band has no scalefactor of its own: it takes the global step
+        top = top.min(want[nsf..nb].iter().copied().min().unwrap_or(0) + 12);
     }
     let global_gain = (top + 210).clamp(0, 255);
     let base = global_gain - 210;
     let mut q = [0i32; GRANULE];
-    let mut sf = [0u8; 21];
-    for b in 0..22 {
-        let max_sf = if b < 11 { 15 } else { 7 };
-        let s = if b < 21 { ((base - want[b] + 1).div_euclid(2)).clamp(0, max_sf) } else { 0 };
+    let mut sf = [0u8; 36];
+    for b in 0..nb {
+        let max_sf = if b < split { 15 } else { 7 };
+        let s = if b < nsf { ((base - want[b] + 1).div_euclid(2)).clamp(0, max_sf) } else { 0 };
         let e = base - 2 * s;
         let inv = (-(e as f64) / 4.0).exp2();
         let mut any = false;
@@ -344,18 +435,18 @@ fn code_unit(xr: &[f32; GRANULE], bounds: &[usize], steps: &[f64; 22]) -> Coded 
             q[k] = if xr[k] < 0.0 { -m } else { m };
             any |= m != 0;
         }
-        if b < 21 {
+        if b < nsf {
             // a band that codes as zeros may as well take the cheapest scalefactor
             sf[b] = if any { s as u8 } else { 0 };
         }
     }
     // the cheapest scalefactor_compress that can hold them
-    let (m1, m2) = (sf[..11].iter().copied().max().unwrap_or(0) as u32, sf[11..].iter().copied().max().unwrap_or(0) as u32);
+    let (m1, m2) = (sf[..split].iter().copied().max().unwrap_or(0) as u32, sf[split..nsf].iter().copied().max().unwrap_or(0) as u32);
     let compress = (0..16)
         .filter(|&c| (1u32 << SLEN[0][c]) > m1 && (1u32 << SLEN[1][c]) > m2)
-        .min_by_key(|&c| 11 * SLEN[0][c] as usize + 10 * SLEN[1][c] as usize)
+        .min_by_key(|&c| split * SLEN[0][c] as usize + (nsf - split) * SLEN[1][c] as usize)
         .unwrap_or(15);
-    let part2 = 11 * SLEN[0][compress] as usize + 10 * SLEN[1][compress] as usize;
+    let part2 = split * SLEN[0][compress] as usize + (nsf - split) * SLEN[1][compress] as usize;
 
     // the big-value / count1 / zero partition
     let nz_end = q.iter().rposition(|&v| v != 0).map_or(0, |p| p + 1);
@@ -371,22 +462,30 @@ fn code_unit(xr: &[f32; GRANULE], bounds: &[usize], steps: &[f64; 22]) -> Coded 
     }
 
     // region split and tables
-    let costs = BandCosts::new(&q, bounds, big);
-    let nb = bounds[1..].iter().position(|&b| b >= 2 * big).map_or(22, |p| p + 1).min(22);
-    let nb = if big == 0 { 0 } else { nb };
     let (mut best, mut r0, mut r1, mut sel) = (u32::MAX, 0, 0, [0usize; 3]);
-    for a in 0..16 {
-        let e0 = (a + 1).min(nb);
-        let (c0, s0) = costs.best(0, e0);
-        for b in 0..8 {
-            let e1 = (a + b + 2).min(nb);
-            let (c1, s1) = costs.best(e0, e1);
-            let (c2, s2) = costs.best(e1, nb);
-            let c = c0 + c1 + c2;
-            if c < best {
-                (best, r0, r1, sel) = (c, a, b, [s0, s1, s2]);
+    if kind == Kind::Long {
+        let costs = BandCosts::new(&q, bounds, big);
+        let nbands = bounds[1..].iter().position(|&b| b >= 2 * big).map_or(22, |p| p + 1).min(22);
+        let nbands = if big == 0 { 0 } else { nbands };
+        for a in 0..16 {
+            let e0 = (a + 1).min(nbands);
+            let (c0, s0) = costs.best(0, e0);
+            for b in 0..8 {
+                let e1 = (a + b + 2).min(nbands);
+                let (c1, s1) = costs.best(e0, e1);
+                let (c2, s2) = costs.best(e1, nbands);
+                let c = c0 + c1 + c2;
+                if c < best {
+                    (best, r0, r1, sel) = (c, a, b, [s0, s1, s2]);
+                }
             }
         }
+    } else {
+        // blocks with a window-switching flag have two regions, split after 36 lines
+        let costs = BandCosts::new(&q, &[0, REGION_SPLIT, GRANULE], big);
+        let (c0, s0) = costs.best(0, 1);
+        let (c1, s1) = costs.best(1, 2);
+        (best, sel) = (c0 + c1, [s0, s1, 0]);
     }
     if best == u32::MAX {
         best = 0;
@@ -406,16 +505,24 @@ fn code_unit(xr: &[f32; GRANULE], bounds: &[usize], steps: &[f64; 22]) -> Coded 
     let cb = 4 * quads as u32;
     let count1_table = (cb < ca) as usize;
     let part3 = best as usize + nzq as usize + if count1_table == 1 { cb } else { ca } as usize;
-    Coded { q, sf, global_gain, compress, big, quads, r0, r1, sel, count1_table, part2, part3 }
+    Coded { kind, q, sf, global_gain, compress, big, quads, r0, r1, sel, count1_table, part2, part3 }
 }
+
+/// Where the second Huffman region starts in a block with the window-switching flag.
+const REGION_SPLIT: usize = 36;
 
 fn write_unit(w: &mut BitWriter, c: &Coded, bounds: &[usize]) {
     let t = tables();
-    for (b, &s) in c.sf.iter().enumerate() {
-        w.put(s as u32, SLEN[(b >= 11) as usize][c.compress] as u32);
+    let (nsf, split) = if c.kind == Kind::Short { (36, 18) } else { (21, 11) };
+    for (b, &s) in c.sf[..nsf].iter().enumerate() {
+        w.put(s as u32, SLEN[(b >= split) as usize][c.compress] as u32);
     }
-    let end = |bands: usize| bounds[bands.min(22)].min(2 * c.big);
-    let edges = [0, end(c.r0 + 1), end(c.r0 + c.r1 + 2), 2 * c.big];
+    let edges = if c.kind == Kind::Long {
+        let end = |bands: usize| bounds[bands.min(22)].min(2 * c.big);
+        [0, end(c.r0 + 1), end(c.r0 + c.r1 + 2), 2 * c.big]
+    } else {
+        [0, REGION_SPLIT.min(2 * c.big), 2 * c.big, 2 * c.big]
+    };
     for r in 0..3 {
         let [table, linbits] = HUFF_DATA[c.sel[r]];
         let (table, linbits) = (table as usize, linbits as u32);
@@ -469,12 +576,23 @@ pub struct Mp3Encoder {
     bitrate: u32,
     bitrate_index: usize,
     bounds: Vec<usize>,
+    bounds_short: Vec<usize>,
     /// First coefficient beyond the low-pass.
     cutoff: usize,
     ana: Vec<Analysis>,
     buf: Vec<Vec<f32>>,
     /// Spectra of the granules waiting for their frame's second granule: `[granule][channel]`.
     queue: Vec<Vec<[f32; GRANULE]>>,
+    queue_kinds: Vec<Kind>,
+    /// The last granule's subband samples per channel and whether its block is short, waiting for the
+    /// next granule to say whether a start window is needed.
+    held: Option<(Vec<Vec<[f64; 18]>>, bool)>,
+    /// The next granule must be short (an attack late in the last one).
+    carry_short: bool,
+    prev_short: bool,
+    history: [f64; 4],
+    switching: bool,
+    short_granules: u64,
     gain_db: f64,
     /// Fractional bytes carried to decide which frames take a padding byte.
     slot_acc: u32,
@@ -511,10 +629,18 @@ impl Mp3Encoder {
             bitrate: kbps,
             bitrate_index,
             bounds: band_bounds(rate_index),
+            bounds_short: short_bounds(rate_index),
             cutoff: cutoff.min(GRANULE),
             ana: (0..channels).map(|_| Analysis::new()).collect(),
             buf: vec![Vec::new(); channels],
             queue: Vec::new(),
+            queue_kinds: Vec::new(),
+            held: None,
+            carry_short: false,
+            prev_short: false,
+            history: [0.0; 4],
+            switching: true,
+            short_granules: 0,
             gain_db: 6.0,
             slot_acc: 0,
             stream: Vec::new(),
@@ -538,13 +664,42 @@ impl Mp3Encoder {
     }
 
     /// The desired quantiser step of each band, from the band's level and the spectrum's overall level.
-    fn steps(&self, spec: &[f32; GRANULE], common: f64, gain_db: f64) -> [f64; 22] {
+    fn steps(&self, spec: &[f32; GRANULE], bounds: &[usize], common: f64, gain_db: f64) -> Vec<f64> {
         let g = 10f64.powf(gain_db / 20.0);
-        std::array::from_fn(|b| {
-            let band = &spec[self.bounds[b]..self.bounds[b + 1]];
-            let rms = (band.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / band.len() as f64).sqrt();
-            rms.max(1e-9).powf(SHAPING) * common.powf(1.0 - SHAPING) * g
-        })
+        (0..bounds.len() - 1)
+            .map(|b| {
+                let band = &spec[bounds[b]..bounds[b + 1]];
+                let rms = (band.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / band.len() as f64).sqrt();
+                rms.max(1e-9).powf(SHAPING) * common.powf(1.0 - SHAPING) * g
+            })
+            .collect()
+    }
+
+    fn bounds_of(&self, kind: Kind) -> &[usize] {
+        if kind == Kind::Short { &self.bounds_short } else { &self.bounds }
+    }
+
+    /// Put a spectrum from the analysis into the order it is coded in, with the low-pass applied. A
+    /// short block's lines go band by band, window by window.
+    fn prepare(&self, xr: &[f32; GRANULE], kind: Kind) -> [f32; GRANULE] {
+        let mut x = *xr;
+        x[self.cutoff..].fill(0.0);
+        if kind != Kind::Short {
+            return x;
+        }
+        let mut out = [0.0f32; GRANULE];
+        let mut start = 0;
+        for &len in &BAND_SIZE_SHORT[self.rate_index] {
+            let len = len as usize;
+            for w in 0..3 {
+                for j in 0..len {
+                    let f = start + j;
+                    out[3 * start + w * len + j] = x[18 * (f / 6) + 3 * (f % 6) + w];
+                }
+            }
+            start += len;
+        }
+        out
     }
 
     fn level(spec: &[f32; GRANULE]) -> f64 {
@@ -552,13 +707,14 @@ impl Mp3Encoder {
     }
 
     /// Code every granule and channel of a frame with one step setting.
-    fn code_all(&self, spec: &[Vec<[f32; GRANULE]>], commons: &[f64], gain_db: f64) -> Vec<Coded> {
+    fn code_all(&self, spec: &[Vec<[f32; GRANULE]>], kinds: &[Kind], commons: &[f64], gain_db: f64) -> Vec<Coded> {
         let mut out = Vec::new();
         for (gr, chans) in spec.iter().enumerate() {
             for (ch, s) in chans.iter().enumerate() {
                 let mut gain = gain_db;
+                let bounds = self.bounds_of(kinds[gr]);
                 loop {
-                    let c = code_unit(s, &self.bounds, &self.steps(s, commons[gr], gain));
+                    let c = code_unit(s, kinds[gr], bounds, &self.steps(s, bounds, commons[gr], gain));
                     if c.bits() <= MAX_PART23 || gain > gain_db + 60.0 {
                         out.push(c);
                         break;
@@ -571,13 +727,8 @@ impl Mp3Encoder {
         out
     }
 
-    fn encode_frame(&mut self, mut spec: Vec<Vec<[f32; GRANULE]>>) {
+    fn encode_frame(&mut self, mut spec: Vec<Vec<[f32; GRANULE]>>, kinds: Vec<Kind>) {
         let nch = self.channels;
-        for chans in &mut spec {
-            for s in chans.iter_mut() {
-                s[self.cutoff..].fill(0.0);
-            }
-        }
         // the common level of each granule, before any mid/side
         let mut commons: Vec<f64> = spec.iter().map(|c| (c.iter().map(|s| Self::level(s).powi(2)).sum::<f64>() / nch as f64).sqrt()).collect();
         let mut ms = false;
@@ -589,8 +740,9 @@ impl Mp3Encoder {
                 let mid: [f32; GRANULE] = std::array::from_fn(|i| (c[0][i] + c[1][i]) * r);
                 let side: [f32; GRANULE] = std::array::from_fn(|i| (c[0][i] - c[1][i]) * r);
                 for (a, b) in [(&c[0], 0), (&c[1], 1), (&mid, 2), (&side, 3)].map(|(s, k)| (s, k)) {
-                    let st = self.steps(a, commons[gr], 0.0);
-                    let total: f64 = (0..22).map(|k| cost(&a[self.bounds[k]..self.bounds[k + 1]], st[k])).sum();
+                    let bounds = self.bounds_of(kinds[gr]);
+                    let st = self.steps(a, bounds, commons[gr], 0.0);
+                    let total: f64 = (0..bounds.len() - 1).map(|k| cost(&a[bounds[k]..bounds[k + 1]], st[k])).sum();
                     if b < 2 { lr += total } else { m_s += total }
                 }
             }
@@ -617,21 +769,21 @@ impl Mp3Encoder {
 
         let fits = |units: &[Coded]| units.iter().map(|c| c.bits()).sum::<usize>() <= budget;
         let (mut lo, mut hi) = (self.gain_db - 8.0, self.gain_db + 8.0);
-        let mut best = self.code_all(&spec, &commons, hi);
+        let mut best = self.code_all(&spec, &kinds, &commons, hi);
         while !fits(&best) && hi < 140.0 {
             lo = hi;
             hi += 12.0;
-            best = self.code_all(&spec, &commons, hi);
+            best = self.code_all(&spec, &kinds, &commons, hi);
         }
         if fits(&best) {
-            let first = self.code_all(&spec, &commons, lo);
+            let first = self.code_all(&spec, &kinds, &commons, lo);
             if fits(&first) {
                 best = first;
                 hi = lo;
             } else {
                 for _ in 0..6 {
                     let mid = (lo + hi) / 2.0;
-                    let c = self.code_all(&spec, &commons, mid);
+                    let c = self.code_all(&spec, &kinds, &commons, mid);
                     if fits(&c) {
                         hi = mid;
                         best = c;
@@ -646,7 +798,7 @@ impl Mp3Encoder {
         // assemble the frame
         let mut main = BitWriter::default();
         for c in &best {
-            write_unit(&mut main, c, &self.bounds);
+            write_unit(&mut main, c, self.bounds_of(c.kind));
         }
         let main = main.finish();
         let data_len = main.len();
@@ -663,12 +815,21 @@ impl Mp3Encoder {
                 side.put(c.big as u32, 9);
                 side.put(c.global_gain as u32, 8);
                 side.put(c.compress as u32, 4);
-                side.put(0, 1); // no window switching
-                for s in c.sel {
-                    side.put(s as u32, 5);
+                if c.kind == Kind::Long {
+                    side.put(0, 1); // no window switching
+                    for s in c.sel {
+                        side.put(s as u32, 5);
+                    }
+                    side.put(c.r0 as u32, 4);
+                    side.put(c.r1 as u32, 3);
+                } else {
+                    side.put(1, 1);
+                    side.put(c.kind.block_type(), 2);
+                    side.put(0, 1); // not mixed
+                    side.put(c.sel[0] as u32, 5);
+                    side.put(c.sel[1] as u32, 5);
+                    side.put(0, 9); // no subblock gain
                 }
-                side.put(c.r0 as u32, 4);
-                side.put(c.r1 as u32, 3);
                 side.put(0, 1); // preflag
                 side.put(0, 1); // scalefac_scale
                 side.put(c.count1_table as u32, 1);
@@ -728,12 +889,41 @@ impl Mp3Encoder {
         }
     }
 
+    /// Take a granule of PCM. Its predecessor's block is transformed now, since whether that one ends
+    /// in a start window depends on this one.
     fn granule(&mut self, pcm: Vec<Vec<f32>>) {
-        let spectra: Vec<[f32; GRANULE]> = pcm.iter().enumerate().map(|(c, p)| self.ana[c].granule(p)).collect();
-        self.queue.push(spectra);
-        if self.queue.len() == 2 {
-            let spec = std::mem::take(&mut self.queue);
-            self.encode_frame(spec);
+        let chans: Vec<Vec<[f64; 18]>> = pcm.iter().enumerate().map(|(c, p)| self.ana[c].subbands(p)).collect();
+        let attack = if self.switching { find_attack(&chans, &mut self.history) } else { None };
+        // an attack in the first half of the granule belongs to its block, a later one to the next
+        let short_now = std::mem::replace(&mut self.carry_short, attack.map_or(false, |s| s >= 9)) || attack.map_or(false, |s| s < 9);
+        if let Some((prev, prev_short)) = self.held.replace((chans, short_now)) {
+            let short = prev_short || (self.prev_short && short_now);
+            let kind = if short {
+                Kind::Short
+            } else if short_now {
+                Kind::Start
+            } else if self.prev_short {
+                Kind::Stop
+            } else {
+                Kind::Long
+            };
+            self.prev_short = short;
+            self.short_granules += short as u64;
+            let spectra: Vec<[f32; GRANULE]> = prev
+                .into_iter()
+                .enumerate()
+                .map(|(c, sb)| {
+                    let xr = self.ana[c].granule(sb, kind);
+                    self.prepare(&xr, kind)
+                })
+                .collect();
+            self.queue.push(spectra);
+            self.queue_kinds.push(kind);
+            if self.queue.len() == 2 {
+                let spec = std::mem::take(&mut self.queue);
+                let kinds = std::mem::take(&mut self.queue_kinds);
+                self.encode_frame(spec, kinds);
+            }
         }
     }
 }
@@ -810,14 +1000,18 @@ mod tests {
     fn analysis_and_the_decoders_synthesis_give_back_the_input() {
         let s = statics();
         let n = 12;
+        // long, then an attack's start, short, short and stop windows, then long again
+        let kinds = [Kind::Long, Kind::Long, Kind::Start, Kind::Short, Kind::Short, Kind::Stop, Kind::Long, Kind::Long, Kind::Start, Kind::Short, Kind::Stop, Kind::Long];
         let input: Vec<f32> = (0..n * GRANULE).map(|i| ((i * 7919) % 2000) as f32 / 2000.0 - 0.5 + 0.3 * (i as f32 * 0.05).sin()).collect();
         let mut ana = Analysis::new();
         let (mut overlap, mut v, mut off) = ([[0.0f32; 18]; 32], [0.0f32; 1024], 0usize);
         let mut out = Vec::new();
         for g in 0..n {
-            let xr = ana.granule(&input[g * GRANULE..(g + 1) * GRANULE]);
+            let sb = ana.subbands(&input[g * GRANULE..(g + 1) * GRANULE]);
+            let xr = ana.granule(sb, kinds[g]);
             let mut gr = Granule::default();
             gr.xr = xr.iter().map(|&v| v as f64).collect();
+            gr.block_type = kinds[g].block_type() as u8;
             super::super::antialias(s, &mut gr);
             let mut pcm = [0.0f32; GRANULE];
             granule_pcm(s, &gr, &mut overlap, &mut v, &mut off, &mut pcm);
@@ -918,5 +1112,61 @@ mod tests {
         assert!(Mp3Encoder::new(22050, 2, 128_000).is_err());
         assert!(Mp3Encoder::new(44100, 6, 128_000).is_err());
         assert_eq!(Mp3Encoder::snap(130), 128);
+    }
+
+    /// Error in the samples before an attack, with block switching on or off, and how many granules
+    /// it made short.
+    fn pre_echo(switching: bool, channels: usize) -> (f64, u64, f64) {
+        let rate = 44100u32;
+        let n = 40_000usize;
+        let attack = 20_000usize;
+        let make = |t: usize, c: usize| {
+            let tone = 0.05 * (2.0 * PI * 440.0 * t as f64 / 44100.0 + c as f64).sin();
+            let burst = if (attack..attack + 300).contains(&t) { 0.8 * ((((t * 2654435761 + c) % 65536) as f64 / 32768.0) - 1.0) } else { 0.0 };
+            tone + burst
+        };
+        let input: Vec<f64> = (0..n * channels).map(|i| make(i / channels, i % channels)).collect();
+        let mut enc = Mp3Encoder::new(rate, channels, 128_000).unwrap();
+        enc.switching = switching;
+        let mut packets = Vec::new();
+        for chunk in input.chunks(1000 * channels) {
+            packets.extend(enc.encode(&Frame::Audio(AudioFrame { sample_rate: rate, channels: channels as u16, pts: 0, samples: chunk.to_vec() })).unwrap());
+        }
+        packets.extend(enc.flush().unwrap());
+        let mut dec = Mp3Decoder::new(&StreamParams::Audio { sample_rate: rate, channels: channels as u16 }).unwrap();
+        let mut out = Vec::new();
+        for p in &packets {
+            for f in dec.decode(p).unwrap() {
+                if let Frame::Audio(a) = f {
+                    out.extend(a.samples);
+                }
+            }
+        }
+        let skip = LEAD_IN as usize * channels;
+        // the last 150 samples are the filter bank's own spread, which no block type removes
+        let err: f64 = (attack - 900..attack - 150).flat_map(|t| (0..channels).map(move |c| (t, c))).map(|(t, c)| (input[t * channels + c] - out[skip + t * channels + c]).powi(2)).sum();
+        (err, enc.short_granules, snr(&input, &out, channels))
+    }
+
+    #[test]
+    fn an_attack_gets_short_blocks_and_less_pre_echo() {
+        for channels in [1usize, 2] {
+            let (long_err, long_short, _) = pre_echo(false, channels);
+            let (sw_err, sw_short, sw_snr) = pre_echo(true, channels);
+            eprintln!("{channels} ch: pre-echo error {long_err:.4} (long only) vs {sw_err:.4} ({sw_short} short granules, {sw_snr:.1} dB)");
+            assert_eq!(long_short, 0);
+            assert!(sw_short >= 1);
+            assert!(sw_err < long_err * 0.3, "{channels} ch: {sw_err} vs {long_err}");
+        }
+    }
+
+    #[test]
+    fn steady_music_stays_in_long_blocks() {
+        let mut enc = Mp3Encoder::new(44100, 2, 128_000).unwrap();
+        for chunk in (0..44100 * 2).map(|i| music(i / 2, i % 2)).collect::<Vec<_>>().chunks(2000) {
+            enc.encode(&Frame::Audio(AudioFrame { sample_rate: 44100, channels: 2, pts: 0, samples: chunk.to_vec() })).unwrap();
+        }
+        // the onset from silence is the one attack
+        assert!(enc.short_granules <= 1, "{} short granules", enc.short_granules);
     }
 }
