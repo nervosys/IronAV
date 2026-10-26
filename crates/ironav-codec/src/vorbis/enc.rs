@@ -1,5 +1,6 @@
-//! A Vorbis I encoder: one long block size (2048), floor 1 with 24 posts, residue type 1 coded with
-//! a two-dimensional lattice codebook, square-polar channel coupling for stereo, mono or stereo only.
+//! A Vorbis I encoder: two block sizes (2048 and 256), floor 1 with 24 posts (12 for the short
+//! blocks), residue type 1 coded with a two-dimensional lattice codebook, square-polar channel
+//! coupling for stereo, mono or stereo only.
 //!
 //! The headers are written by hand and then read back with the decoder's own parser, so the
 //! decoder's idea of every table (codebooks, floor curve) is the one the encoder uses: the floor
@@ -7,9 +8,10 @@
 //! because the encoder decodes its own floor bits to get it.
 //!
 //! Rate control is a feedback loop on the floor level: a higher floor shrinks the residue, which
-//! costs fewer bits and leaves more noise. There is no block switching, so an attack spreads its
-//! noise over a 46 ms window, and no psychoacoustic model: the noise follows the signal's own
-//! spectral envelope.
+//! costs fewer bits and leaves more noise. Blocks are long unless an attack lies in the window the
+//! next long block would have: then short blocks (256 samples, hop 128) run until it is clear. The
+//! choice is made one block ahead, since a long block next to a short one has a short slope on that
+//! side. There is no psychoacoustic model: the noise follows the signal's own spectral envelope.
 
 use super::{ilog, join_headers, slope, Bits, Setup};
 use crate::opus::mdct::Dct4;
@@ -17,6 +19,8 @@ use ironav_core::{Encoder, Error, ErrorCode, Frame, Packet, Result};
 
 const N: usize = 2048;
 const HALF: usize = N / 2;
+const SHORT_N: usize = 256;
+const SHORT_HALF: usize = SHORT_N / 2;
 /// Floor 1: values run 0..RANGE, each step is MULT table steps (about 1.1 dB).
 const RANGE: i32 = 128;
 const MULT: usize = 2;
@@ -38,6 +42,13 @@ fn side(l: i32) -> usize {
     (2 * l + 1) as usize
 }
 const POSTS: [i32; 24] = [3, 6, 10, 15, 21, 28, 37, 48, 62, 80, 102, 130, 165, 210, 265, 330, 410, 500, 600, 700, 800, 900, 970, 1005];
+const POSTS_SHORT: [i32; 12] = [3, 6, 10, 15, 21, 28, 37, 48, 62, 80, 102, 118];
+const RANGE_BITS_SHORT: u32 = 7;
+/// An attack is a 128-sample piece of the signal whose squared first difference sums to more than
+/// this and to more than `ATTACK_RATIO` times the mean of the four pieces before it.
+const ATTACK_FLOOR: f64 = 0.02;
+const ATTACK_RATIO: f64 = 8.0;
+const CHUNK: i64 = 128;
 
 // ---- bit writing and prefix codes ----------------------------------------------------------------
 
@@ -208,57 +219,64 @@ pub fn headers(rate: u32, channels: usize) -> Vec<u8> {
     }
     w.put(0, 6); // one time-domain transform, the only one
     w.put(0, 16);
-    w.put(0, 6); // one floor
-    w.put(1, 16);
-    w.put(POSTS.len() as u32, 5);
-    for _ in POSTS {
-        w.put(0, 4); // every partition is class 0
+    w.put(1, 6); // two floors: long blocks, then short ones
+    for (posts, bits) in [(&POSTS[..], RANGE_BITS), (&POSTS_SHORT[..], RANGE_BITS_SHORT)] {
+        w.put(1, 16);
+        w.put(posts.len() as u32, 5);
+        for _ in posts {
+            w.put(0, 4); // every partition is class 0
+        }
+        w.put(0, 3); // class 0 has dimension 1 …
+        w.put(0, 2); // … no subclasses …
+        w.put(1, 8); // … and its values come from codebook 0
+        w.put((MULT - 1) as u32, 2);
+        w.put(bits, 4);
+        for x in bisection_order(posts, 1 << bits) {
+            w.put(x as u32, bits);
+        }
     }
-    w.put(0, 3); // class 0 has dimension 1 …
-    w.put(0, 2); // … no subclasses …
-    w.put(1, 8); // … and its values come from codebook 0
-    w.put((MULT - 1) as u32, 2);
-    w.put(RANGE_BITS, 4);
-    for x in bisection_order() {
-        w.put(x as u32, RANGE_BITS);
-    }
-    w.put(0, 6); // one residue
-    w.put(1, 16);
-    w.put(0, 24);
-    w.put(HALF as u32, 24);
-    w.put(PSIZE as u32 - 1, 24);
-    w.put(CLASSES as u32 - 1, 6);
-    w.put(1, 8); // class words from codebook 1
-    w.put(0, 3); // class 0: nothing coded
-    w.put(0, 1);
-    for k in 0..LATTICES.len() {
-        w.put(1, 3); // classes 1 to 4: one pass each …
+    w.put(1, 6); // two residues
+    for end in [HALF, SHORT_HALF] {
+        w.put(1, 16);
+        w.put(0, 24);
+        w.put(end as u32, 24);
+        w.put(PSIZE as u32 - 1, 24);
+        w.put(CLASSES as u32 - 1, 6);
+        w.put(1, 8); // class words from codebook 1
+        w.put(0, 3); // class 0: nothing coded
         w.put(0, 1);
-        let _ = k;
+        for _ in 0..LATTICES.len() {
+            w.put(1, 3); // classes 1 to 4: one pass each …
+            w.put(0, 1);
+        }
+        for k in 0..LATTICES.len() {
+            w.put(2 + k as u32, 8); // … with a lattice codebook
+        }
     }
-    for k in 0..LATTICES.len() {
-        w.put(2 + k as u32, 8); // … with a lattice codebook
+    w.put(1, 6); // two mappings: long, short
+    for m in 0..2u32 {
+        w.put(0, 16);
+        w.put(0, 1); // one submap
+        if channels == 2 {
+            w.put(1, 1);
+            w.put(0, 8); // one coupling step: channel 0 is the magnitude, 1 the angle
+            w.put(0, 1);
+            w.put(1, 1);
+        } else {
+            w.put(0, 1);
+        }
+        w.put(0, 2);
+        w.put(0, 8);
+        w.put(m, 8); // the floor and the residue of this size
+        w.put(m, 8);
     }
-    w.put(0, 6); // one mapping
-    w.put(0, 16);
-    w.put(0, 1); // one submap
-    if channels == 2 {
-        w.put(1, 1);
-        w.put(0, 8); // one coupling step: channel 0 is the magnitude, 1 the angle
-        w.put(0, 1);
-        w.put(1, 1);
-    } else {
-        w.put(0, 1);
+    w.put(1, 6); // two modes: long, short
+    for m in 0..2u32 {
+        w.put(1 - m, 1);
+        w.put(0, 16);
+        w.put(0, 16);
+        w.put(m, 8);
     }
-    w.put(0, 2);
-    w.put(0, 8);
-    w.put(0, 8);
-    w.put(0, 8);
-    w.put(0, 6); // one mode: long blocks
-    w.put(1, 1);
-    w.put(0, 16);
-    w.put(0, 16);
-    w.put(0, 8);
     w.put(1, 1); // framing
     setup.extend(w.finish());
     join_headers([&id, &comment, &setup])
@@ -266,11 +284,11 @@ pub fn headers(rate: u32, channels: usize) -> Vec<u8> {
 
 /// The posts in the order they are coded: each one's neighbours are already known and near, so the
 /// prediction from them is good.
-fn bisection_order() -> Vec<i32> {
-    let mut todo: std::collections::VecDeque<(i32, i32)> = [(0, RANGE_X)].into();
+fn bisection_order(posts: &[i32], range_x: i32) -> Vec<i32> {
+    let mut todo: std::collections::VecDeque<(i32, i32)> = [(0, range_x)].into();
     let mut out = Vec::new();
     while let Some((lo, hi)) = todo.pop_front() {
-        let inside: Vec<i32> = POSTS.iter().copied().filter(|&p| p > lo && p < hi).collect();
+        let inside: Vec<i32> = posts.iter().copied().filter(|&p| p > lo && p < hi).collect();
         if inside.is_empty() {
             continue;
         }
@@ -282,27 +300,37 @@ fn bisection_order() -> Vec<i32> {
     }
     out
 }
-const RANGE_X: i32 = 1 << RANGE_BITS;
 
 // ---- the encoder ---------------------------------------------------------------------------------
 
 pub struct VorbisEncoder {
     channels: usize,
     setup: Setup,
-    dct: Dct4,
-    window: Vec<f32>,
+    dct_long: Dct4,
+    dct_short: Dct4,
+    slope_long: Vec<f32>,
+    slope_short: Vec<f32>,
     ybook: Huff,
     classbook: Huff,
     vq: Vec<Huff>,
-    /// Posts as (x, index in the floor's own list), ascending by x, plus the coded order's list.
-    xs: Vec<i32>,
-    /// Bits a packet should take, and the floor level (dB above the signal's own envelope) that is steering to it.
-    target_bits: f64,
+    /// Each floor's posts: the long floor's, then the short one's.
+    xs: [Vec<i32>; 2],
+    /// Bits per input sample the stream should take, and the floor level (dB above the signal's own
+    /// envelope) that is steering to it.
+    bits_per_sample: f64,
     gain_db: f64,
-    /// Unconsumed samples per channel, starting at the next block.
+    /// Unconsumed samples per channel, starting at time `base`.
     buf: Vec<Vec<f32>>,
+    base: i64,
+    /// The block waiting for its successor's size: its size and the time of its centre.
+    cur: Option<(usize, i64)>,
+    last_center: i64,
+    /// Size of the block sent last.
+    prev_size: usize,
     packets: u64,
     input: u64,
+    switching: bool,
+    short_blocks: u64,
 }
 
 impl VorbisEncoder {
@@ -318,26 +346,29 @@ impl VorbisEncoder {
         let lens = code_lengths();
         let mut lens = lens.into_iter();
         let (y, c) = (lens.next().unwrap(), lens.next().unwrap());
-        let mut window = vec![0f32; N];
-        for (i, s) in slope(HALF).into_iter().enumerate() {
-            window[i] = s;
-            window[N - 1 - i] = s;
-        }
-        let xs = setup.floors[0].xs.clone();
+        let xs = [setup.floors[0].xs.clone(), setup.floors[1].xs.clone()];
         Ok(Self {
             channels,
             setup,
-            dct: Dct4::new(HALF),
-            window,
+            dct_long: Dct4::new(HALF),
+            dct_short: Dct4::new(SHORT_HALF),
+            slope_long: slope(HALF),
+            slope_short: slope(SHORT_HALF),
             ybook: Huff::new(y),
             classbook: Huff::new(c),
             vq: lens.map(Huff::new).collect(),
             xs,
-            target_bits: bitrate as f64 * HALF as f64 / sample_rate as f64,
+            bits_per_sample: bitrate as f64 / sample_rate as f64,
             gain_db: 6.0,
             buf: vec![vec![0.0; HALF]; channels],
+            base: -(HALF as i64),
+            cur: None,
+            last_center: 0,
             packets: 0,
+            prev_size: N,
             input: 0,
+            switching: true,
+            short_blocks: 0,
         })
     }
 
@@ -345,37 +376,74 @@ impl VorbisEncoder {
         64_000 * channels as u32
     }
 
-    /// The MDCT of one block (`N` samples): window, fold, DCT-IV.
-    fn forward(&mut self, x: &[f32], out: &mut [f32]) {
-        let q = HALF / 2;
-        let y: Vec<f32> = x.iter().zip(&self.window).map(|(a, w)| a * w).collect();
-        let mut c = vec![0f32; HALF];
+    /// The window of a block of `n` samples after one of `prev_n` and before one of `next_n`: each
+    /// side's slope is as long as the smaller of the two blocks allows.
+    fn window(&self, n: usize, prev_n: usize, next_n: usize) -> Vec<f32> {
+        let half = n / 2;
+        let mut w = vec![0f32; n];
+        for (side, other) in [(0, prev_n), (1, next_n)] {
+            let len = n.min(other) / 2;
+            let lead = (half - len) / 2;
+            let slope = if len == HALF { &self.slope_long } else { &self.slope_short };
+            for i in 0..half {
+                let v = if i < lead {
+                    0.0
+                } else if i < lead + len {
+                    slope[i - lead]
+                } else {
+                    1.0
+                };
+                if side == 0 {
+                    w[i] = v;
+                } else {
+                    w[n - 1 - i] = v;
+                }
+            }
+        }
+        w
+    }
+
+    /// The MDCT of one block (`n` samples): window, fold, DCT-IV.
+    fn forward(&mut self, x: &[f32], window: &[f32], out: &mut [f32]) {
+        let n = x.len();
+        let half = n / 2;
+        let q = half / 2;
+        let y: Vec<f32> = x.iter().zip(window).map(|(a, w)| a * w).collect();
+        let mut c = vec![0f32; half];
         for i in 0..q {
             c[q + i] += y[i];
-            c[i] -= y[q + HALF + i];
+            c[i] -= y[q + half + i];
         }
-        for i in 0..HALF {
-            c[HALF - 1 - i] -= y[q + i];
+        for i in 0..half {
+            c[half - 1 - i] -= y[q + i];
         }
-        self.dct.run(&c, 1, out);
+        if n == N {
+            self.dct_long.run(&c, 1, out);
+        } else {
+            self.dct_short.run(&c, 1, out);
+        }
+        // the scale that makes the decoder's transform invert this one
+        let scale = 4.0 / n as f32;
         for v in out.iter_mut() {
-            *v *= FORWARD_SCALE;
+            *v *= scale;
         }
     }
 
     /// Floor values for one channel's spectrum: the level of the local envelope, raised by the gain.
-    fn floor_targets(&self, c: &[f32]) -> Vec<i32> {
+    fn floor_targets(&self, c: &[f32], fi: usize) -> Vec<i32> {
         let g = 10f64.powf(self.gain_db / 20.0);
+        let half = c.len();
+        let xs = &self.xs[fi];
         // the step follows the local level only partway (see SHAPING): the rest is a level common to the whole block
         let alpha = SHAPING;
         let common = (c.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / c.len() as f64).sqrt().max(1e-9);
-        let mut sorted: Vec<(i32, usize)> = self.xs.iter().copied().enumerate().map(|(i, x)| (x, i)).collect();
+        let mut sorted: Vec<(i32, usize)> = xs.iter().copied().enumerate().map(|(i, x)| (x, i)).collect();
         sorted.sort();
-        let mut t = vec![0i32; self.xs.len()];
+        let mut t = vec![0i32; xs.len()];
         for (k, &(x, idx)) in sorted.iter().enumerate() {
             let lo = if k == 0 { 0 } else { (sorted[k - 1].0 + x) / 2 };
-            let hi = if k + 1 == sorted.len() { HALF as i32 } else { (x + sorted[k + 1].0 + 1) / 2 };
-            let band = &c[lo as usize..(hi as usize).clamp(lo as usize + 1, HALF)];
+            let hi = if k + 1 == sorted.len() { half as i32 } else { (x + sorted[k + 1].0 + 1) / 2 };
+            let band = &c[lo as usize..(hi as usize).clamp(lo as usize + 1, half)];
             let rms = (band.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / band.len() as f64).sqrt();
             // a lone peak must still fit the lattice: the level is never under peak / LEVELS
             let peak = band.iter().fold(0f32, |m, v| m.max(v.abs())) as f64;
@@ -396,8 +464,8 @@ impl VorbisEncoder {
     }
 
     /// The (value, bits) pairs that code `targets` as a floor, and the values the decoder will end up with.
-    fn floor_symbols(&self, targets: &[i32]) -> Vec<(u32, u32)> {
-        let f = &self.setup.floors[0];
+    fn floor_symbols(&self, targets: &[i32], fi: usize) -> Vec<(u32, u32)> {
+        let f = &self.setup.floors[fi];
         let n = f.xs.len();
         let rb = ilog(RANGE as u32 - 1);
         let mut fin = vec![0i32; n];
@@ -431,40 +499,50 @@ impl VorbisEncoder {
         sym
     }
 
-    fn encode_block(&mut self, blocks: &[Vec<f32>], adapt: bool) -> Vec<u8> {
+    /// One block of `n` samples per channel, between blocks of `prev_n` and `next_n`; `hop` is how many
+    /// samples of audio the packet adds, which sets its share of the bit budget.
+    fn encode_block(&mut self, blocks: &[Vec<f32>], n: usize, prev_n: usize, next_n: usize, hop: usize, adapt: bool) -> Vec<u8> {
         let ch = self.channels;
+        let long = n == N;
+        let half = n / 2;
+        let fi = if long { 0 } else { 1 };
         let mut w = BitWriter::default();
         w.put(0, 1); // an audio packet
-        w.put(3, 2); // a long block between long blocks (the mode needs no bits: there is one)
+        w.put(!long as u32, 1); // the mode: 0 long, 1 short
+        if long {
+            w.put((prev_n == N) as u32, 1);
+            w.put((next_n == N) as u32, 1);
+        }
 
-        let mut spec = vec![vec![0f32; HALF]; ch];
+        let window = self.window(n, prev_n, next_n);
+        let mut spec = vec![vec![0f32; half]; ch];
         for (c, b) in blocks.iter().enumerate() {
-            let mut out = vec![0f32; HALF];
-            self.forward(b, &mut out);
+            let mut out = vec![0f32; half];
+            self.forward(b, &window, &mut out);
             spec[c] = out;
         }
-        let mut res = vec![vec![0f32; HALF]; ch];
+        let mut res = vec![vec![0f32; half]; ch];
         for c in 0..ch {
-            let mut targets = self.floor_targets(&spec[c]);
+            let mut targets = self.floor_targets(&spec[c], fi);
             let mut sym;
-            let mut curve = vec![0f32; HALF];
+            let mut curve = vec![0f32; half];
             // the curve runs straight between posts, so it can dip under a peak that sits between two:
             // raise the posts around any bin the lattice could not reach, and look again
             for pass in 0..6 {
-                sym = self.floor_symbols(&targets);
+                sym = self.floor_symbols(&targets, fi);
                 let mut fw = BitWriter::default();
                 for &(v, b) in &sym {
                     fw.put(v, b);
                 }
                 let bytes = fw.finish();
-                self.setup.floors[0].decode(&self.setup.books, &mut Bits::new(&bytes), &mut curve);
+                self.setup.floors[fi].decode(&self.setup.books, &mut Bits::new(&bytes), &mut curve);
                 let mut raised = false;
-                for k in 0..HALF {
+                for k in 0..half {
                     let ratio = spec[c][k].abs() / curve[k];
                     if ratio > LEVELS as f32 - 0.5 {
                         let steps = ((ratio / (LEVELS as f32 - 0.5)).log10() * 20.0 / 1.1).ceil() as i32 + 1;
-                        let hi = self.xs.iter().enumerate().filter(|&(_, &x)| x > k as i32).min_by_key(|&(_, &x)| x).map(|(i, _)| i);
-                        let lo = self.xs.iter().enumerate().filter(|&(_, &x)| x <= k as i32).max_by_key(|&(_, &x)| x).map(|(i, _)| i);
+                        let hi = self.xs[fi].iter().enumerate().filter(|&(_, &x)| x > k as i32).min_by_key(|&(_, &x)| x).map(|(i, _)| i);
+                        let lo = self.xs[fi].iter().enumerate().filter(|&(_, &x)| x <= k as i32).max_by_key(|&(_, &x)| x).map(|(i, _)| i);
                         for i in [lo, hi].into_iter().flatten() {
                             targets[i] = (targets[i] + steps).min(RANGE - 1);
                         }
@@ -478,7 +556,7 @@ impl VorbisEncoder {
                     break;
                 }
             }
-            for k in 0..HALF {
+            for k in 0..half {
                 res[c][k] = spec[c][k] / curve[k];
             }
         }
@@ -513,7 +591,7 @@ impl VorbisEncoder {
                 }
             }
         }
-        let parts = HALF / PSIZE;
+        let parts = half / PSIZE;
         let class: Vec<Vec<usize>> = q
             .iter()
             .map(|v| {
@@ -548,39 +626,110 @@ impl VorbisEncoder {
             return bytes;
         }
         // steer the floor level toward the bit budget
-        let err = (bytes.len() as f64 * 8.0 / self.target_bits).ln();
+        let err = (bytes.len() as f64 * 8.0 / (self.bits_per_sample * hop as f64)).ln();
         self.gain_db = (self.gain_db + (err * 4.0).clamp(-1.5, 1.5)).clamp(-24.0, 40.0);
         bytes
     }
 
-    fn emit(&mut self, out: &mut Vec<Packet>, duration: i64) {
-        let blocks: Vec<Vec<f32>> = self.buf.iter().map(|b| b[..N].to_vec()).collect();
-        if self.packets < 2 && blocks.iter().any(|b| b.iter().any(|&v| v != 0.0)) {
-            // the start has no history for the rate loop to follow: find the gain that meets the budget
-            let (mut lo, mut hi) = (-24.0f64, 40.0f64);
-            for _ in 0..7 {
-                self.gain_db = (lo + hi) / 2.0;
-                if self.encode_block(&blocks, false).len() as f64 * 8.0 > self.target_bits {
-                    lo = self.gain_db;
-                } else {
-                    hi = self.gain_db;
+    /// Whether an attack starts in `lo..hi` (times in input samples): a 128-sample piece whose squared
+    /// first difference is large and far above the pieces before it.
+    fn attack_between(&self, lo: i64, hi: i64) -> bool {
+        let energy = |start: i64| -> f64 {
+            self.buf
+                .iter()
+                .map(|b| {
+                    (start..start + CHUNK)
+                        .map(|t| {
+                            let at = |t: i64| b.get((t - self.base) as usize).copied().filter(|_| t >= self.base).unwrap_or(0.0);
+                            ((at(t) - at(t - 1)) as f64).powi(2)
+                        })
+                        .sum::<f64>()
+                })
+                .sum()
+        };
+        let mut start = lo.div_euclid(CHUNK) * CHUNK;
+        while start < hi {
+            let e = energy(start);
+            if e > ATTACK_FLOOR {
+                let mean = (1..=4).map(|j| energy(start - j * CHUNK)).sum::<f64>() / 4.0;
+                if e > ATTACK_RATIO * mean + 1e-9 {
+                    return true;
                 }
             }
-            self.gain_db = hi;
+            start += CHUNK;
         }
-        let data = self.encode_block(&blocks, true);
-        // the first packet decodes to nothing; the second to the first HALF samples
-        let pts = self.packets.saturating_sub(1) as i64 * HALF as i64;
-        out.push(Packet { stream: 0, pts, duration, data });
-        self.packets += 1;
-        for b in self.buf.iter_mut() {
-            b.drain(..HALF);
+        false
+    }
+
+    /// Encode every block whose successor's size can be decided; with `last` the input is over and
+    /// the tail is padded with silence until a block reaches its end.
+    fn pump(&mut self, out: &mut Vec<Packet>, last: bool) {
+        loop {
+            let (n, center) = *self.cur.get_or_insert((N, 0));
+            // where the next block would be centred were it long, and what that needs of the buffer
+            let c_long = center + (n / 4) as i64 + (N / 4) as i64;
+            let need = c_long + HALF as i64;
+            let have = self.base + self.buf[0].len() as i64;
+            if have < need {
+                if !last {
+                    return;
+                }
+                for b in self.buf.iter_mut() {
+                    b.resize((need - self.base) as usize, 0.0);
+                }
+            }
+            let next_n = if self.switching && self.attack_between(c_long - 896, c_long + 896) { SHORT_N } else { N };
+            let next_center = center + (n / 4 + next_n / 4) as i64;
+            let prev_n = if self.packets == 0 { n } else { self.prev_n() };
+            let start = center - (n / 2) as i64;
+            let blocks: Vec<Vec<f32>> = self.buf.iter().map(|b| b[(start - self.base) as usize..(start - self.base) as usize + n].to_vec()).collect();
+            let hop = if self.packets == 0 { n / 2 } else { (center - self.last_center) as usize };
+            if self.packets < 2 && blocks.iter().any(|b| b.iter().any(|&v| v != 0.0)) {
+                // the start has no history for the rate loop to follow: find the gain that meets the budget
+                let (mut lo, mut hi) = (-24.0f64, 40.0f64);
+                for _ in 0..7 {
+                    self.gain_db = (lo + hi) / 2.0;
+                    if self.encode_block(&blocks, n, prev_n, next_n, hop, false).len() as f64 * 8.0 > self.bits_per_sample * hop as f64 {
+                        lo = self.gain_db;
+                    } else {
+                        hi = self.gain_db;
+                    }
+                }
+                self.gain_db = hi;
+            }
+            let data = self.encode_block(&blocks, n, prev_n, next_n, hop, true);
+            self.short_blocks += (n == SHORT_N) as u64;
+            // the first packet decodes to nothing; each later one to the audio from the last centre to this one
+            let finished = last && center >= self.input as i64 && self.packets > 0;
+            let (pts, duration) = if self.packets == 0 {
+                (0, 0)
+            } else if finished {
+                (self.last_center, self.input as i64 - self.last_center)
+            } else {
+                (self.last_center, center - self.last_center)
+            };
+            out.push(Packet { stream: 0, pts, duration, data });
+            self.packets += 1;
+            self.last_center = center;
+            self.prev_size = n;
+            self.cur = Some((next_n, next_center));
+            // samples before the next block (and the few before it, which the attack test looks at) are done with
+            let keep_from = next_center - (next_n / 2) as i64 - 640;
+            let drop = ((keep_from - self.base).max(0) as usize).min(self.buf[0].len());
+            for b in self.buf.iter_mut() {
+                b.drain(..drop);
+            }
+            self.base += drop as i64;
+            if finished {
+                return;
+            }
         }
     }
-}
 
-/// Maps the spectrum to the scale the floor table expects, and is the inverse of the decoder's transform.
-const FORWARD_SCALE: f32 = 1.0 / 512.0;
+    fn prev_n(&self) -> usize {
+        self.prev_size
+    }
+}
 
 impl Encoder for VorbisEncoder {
     fn encode(&mut self, frame: &Frame) -> Result<Vec<Packet>> {
@@ -598,10 +747,7 @@ impl Encoder for VorbisEncoder {
         }
         self.input += n as u64;
         let mut out = Vec::new();
-        while self.buf[0].len() >= N {
-            let d = if self.packets == 0 { 0 } else { HALF as i64 };
-            self.emit(&mut out, d);
-        }
+        self.pump(&mut out, false);
         Ok(out)
     }
 
@@ -610,24 +756,7 @@ impl Encoder for VorbisEncoder {
         if self.input == 0 {
             return Ok(out);
         }
-        // one packet more than the blocks of HALF samples the input fills: the first decodes to nothing
-        let wanted = (self.input as usize).div_ceil(HALF) as u64 + 1;
-        while self.packets < wanted {
-            while self.buf[0].len() < N {
-                for b in self.buf.iter_mut() {
-                    b.push(0.0);
-                }
-            }
-            let last = self.packets + 1 == wanted;
-            let d = if self.packets == 0 {
-                0
-            } else if last {
-                (self.input as usize - (wanted as usize - 2) * HALF) as i64
-            } else {
-                HALF as i64
-            };
-            self.emit(&mut out, d);
-        }
+        self.pump(&mut out, true);
         Ok(out)
     }
 }
@@ -738,13 +867,15 @@ mod tests {
 
     #[test]
     fn the_forward_transform_is_inverted_by_the_decoders() {
-        let mut e = VorbisEncoder::new(44_100, 1, 64_000).unwrap();
+        let e = VorbisEncoder::new(44_100, 1, 64_000).unwrap();
         let x: Vec<f32> = (0..HALF * 6).map(|i| ((i * 7919) % 1000) as f32 / 500.0 - 1.0 + (i as f32 * 0.05).sin()).collect();
         let mut d = Dct4::new(HALF);
         let mut rec = vec![0f32; x.len() + N];
         for j in 0..5 {
             let mut c = vec![0f32; HALF];
-            e.forward(&x[j * HALF..j * HALF + N], &mut c);
+            let window = e.window(N, N, N);
+            let mut e = VorbisEncoder::new(44_100, 1, 64_000).unwrap();
+            e.forward(&x[j * HALF..j * HALF + N], &window, &mut c);
             let mut t = vec![0f32; HALF];
             d.run(&c, 1, &mut t);
             let q = HALF / 2;
@@ -757,7 +888,7 @@ mod tests {
                 *o = -v;
             }
             for i in 0..N {
-                rec[j * HALF + i] += y[i] * e.window[i];
+                rec[j * HALF + i] += y[i] * e.window(N, N, N)[i];
             }
         }
         for i in HALF..HALF * 5 {
@@ -832,5 +963,60 @@ mod tests {
         // no input, no packets
         let mut e = VorbisEncoder::new(44_100, 2, 128_000).unwrap();
         assert!(e.flush().unwrap().is_empty());
+    }
+
+    /// Error in the samples before an attack with switching on or off, how many short blocks it made,
+    /// and the whole stream's SNR.
+    fn pre_echo(switching: bool, channels: usize) -> (f64, u64, f64) {
+        let n = 40_000usize;
+        let attack = 20_000usize;
+        let make = |t: usize, c: usize| {
+            let tone = 0.05 * (2.0 * std::f64::consts::PI * 440.0 * t as f64 / 44_100.0 + c as f64).sin();
+            let burst = if (attack..attack + 300).contains(&t) { 0.8 * ((((t * 2654435761 + c) % 65536) as f64 / 32768.0) - 1.0) } else { 0.0 };
+            tone + burst
+        };
+        let input: Vec<f64> = (0..n * channels).map(|i| make(i / channels, i % channels)).collect();
+        let mut enc = VorbisEncoder::new(44_100, channels, 96_000).unwrap();
+        enc.switching = switching;
+        let mut packets = Vec::new();
+        for chunk in input.chunks(1000 * channels) {
+            packets.extend(enc.encode(&Frame::Audio(AudioFrame { sample_rate: 44_100, channels: channels as u16, pts: 0, samples: chunk.to_vec() })).unwrap());
+        }
+        packets.extend(enc.flush().unwrap());
+        assert_eq!(packets.iter().map(|p| p.duration).sum::<i64>() as usize, n);
+        let params = StreamParams::Audio { sample_rate: 44_100, channels: channels as u16 };
+        let mut dec = VorbisDecoder::new(&headers(44_100, channels), &params).unwrap();
+        let mut out = Vec::new();
+        for p in &packets {
+            for f in dec.decode(p).unwrap() {
+                let Frame::Audio(a) = f else { panic!() };
+                out.extend(a.samples);
+            }
+        }
+        // the last 150 samples before the attack are the short window's own reach
+        let err: f64 = (attack - 900..attack - 150).flat_map(|t| (0..channels).map(move |c| (t, c))).map(|(t, c)| (input[t * channels + c] - out[t * channels + c]).powi(2)).sum();
+        (err, enc.short_blocks, snr(&input, &out[..input.len()]))
+    }
+
+    #[test]
+    fn an_attack_gets_short_blocks_and_less_pre_echo() {
+        for channels in [1usize, 2] {
+            let (long_err, long_short, _) = pre_echo(false, channels);
+            let (sw_err, sw_short, sw_snr) = pre_echo(true, channels);
+            eprintln!("{channels} ch: pre-echo error {long_err:.4} (long only) vs {sw_err:.4} ({sw_short} short blocks, {sw_snr:.1} dB)");
+            assert_eq!(long_short, 0);
+            assert!(sw_short >= 1);
+            assert!(sw_err < long_err * 0.5, "{channels} ch: {sw_err} vs {long_err}");
+        }
+    }
+
+    #[test]
+    fn steady_music_stays_in_long_blocks() {
+        let mut enc = VorbisEncoder::new(44_100, 2, 128_000).unwrap();
+        let samples: Vec<f64> = (0..44_100 * 4).map(|i| music(i / 2, i % 2)).collect();
+        for chunk in samples.chunks(2000) {
+            enc.encode(&Frame::Audio(AudioFrame { sample_rate: 44_100, channels: 2, pts: 0, samples: chunk.to_vec() })).unwrap();
+        }
+        assert!(enc.short_blocks <= 1, "{} short blocks", enc.short_blocks);
     }
 }

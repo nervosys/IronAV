@@ -352,12 +352,15 @@ now close. This decoder is scalar `f32`; codebook lookups use a 10-bit table, lo
 ### Vorbis encoder
 
 `--acodec vorbis` (`--abitrate 16` to `500`, default 64 per channel and 2 channels at most) writes Vorbis I into Ogg or Matroska/WebM:
-2048-sample blocks only, floor 1 with 24 posts, residue type 1 coded with four lattice codebooks (values to +-1, 3, 7 and 31, chosen
+2048-sample blocks, and 256-sample ones around attacks, floor 1 with 24 posts (12 for the short blocks), residue type 1 coded with four lattice codebooks (values to +-1, 3, 7 and 31, chosen
 per 16-value partition), and square-polar coupling for stereo. The headers are written by hand and parsed back by our own decoder, and
 the floor curve the encoder divides by is the one it gets by decoding its own floor bits, so the two cannot drift apart. A feedback loop
 on the quantiser's step holds the bit rate (the first packets search for the right step first). The step follows the local spectrum level only
-partway (exponent 0.6), so noise is shaped but not hidden: there is no psychoacoustic model. No block switching (an attack spreads its noise
-over a 46 ms window), no noise substitution, no floor 0, no more than two channels, and the code books are fixed, not trained: on
+partway (exponent 0.6), so noise is shaped but not hidden: there is no psychoacoustic model. **Block switching**: when 128 samples of the signal's first difference carry 8x the energy of the four before them inside the window
+the next long block would have, short blocks run until the attack is clear; the decision is one block ahead, because a long block next to a
+short one has a short slope on that side. On a noise burst over a quiet tone the error before the attack fell 60x (mono) and 2.4x
+(stereo) (test), and FFmpeg decodes the Ogg and Matroska files to the same samples as ours (137 dB). The
+detector is a simple energy rule, untuned on music. No noise substitution, no floor 0, no more than two channels, and the code books are fixed, not trained: on
 Gaussian noise it lands about 4 dB under the rate-distortion bound.
 
 FFmpeg (through PyAV) decodes the output and our decoder agrees with it to one least-significant bit on stereo and mono streams. Lengths
