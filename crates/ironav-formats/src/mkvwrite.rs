@@ -1,4 +1,4 @@
-//! Matroska writer (`.mkv`, `.mka`): H.264 or HEVC video and AAC, FLAC, MP3, Opus or Vorbis audio,
+//! Matroska writer (`.mkv`, `.mka`, and `.webm` for Opus or Vorbis audio): H.264 or HEVC video and AAC, FLAC, MP3, Opus or Vorbis audio,
 //! at most one stream of each kind.
 //!
 //! Layout: EBML header, Segment (its size patched at the end), Info, Tracks, Clusters, Cues. The
@@ -93,10 +93,21 @@ pub struct MatroskaWriter {
     /// (time ms, track number, cluster offset from the segment data)
     cues: Vec<(i64, usize, u64)>,
     end_ms: i64,
+    /// WebM holds only Opus and Vorbis audio here (no VP8/VP9/AV1 video is written yet).
+    webm: bool,
 }
 
 impl MatroskaWriter {
     pub fn new(out: Box<dyn WriteSeek>) -> Self {
+        Self::with_doc_type(out, false)
+    }
+
+    /// A writer for `webm` (the same file with the document type `webm` and only the codecs WebM allows).
+    pub fn webm(out: Box<dyn WriteSeek>) -> Self {
+        Self::with_doc_type(out, true)
+    }
+
+    fn with_doc_type(out: Box<dyn WriteSeek>, webm: bool) -> Self {
         Self {
             out,
             tracks: Vec::new(),
@@ -109,6 +120,7 @@ impl MatroskaWriter {
             cluster: None,
             cues: Vec::new(),
             end_ms: 0,
+            webm,
         }
     }
 
@@ -153,7 +165,7 @@ impl MatroskaWriter {
         ebml.extend(uint(0x42F7, 1)); // EBMLReadVersion
         ebml.extend(uint(0x42F2, 4)); // EBMLMaxIDLength
         ebml.extend(uint(0x42F3, 8)); // EBMLMaxSizeLength
-        ebml.extend(string(0x4282, "matroska"));
+        ebml.extend(string(0x4282, if self.webm { "webm" } else { "matroska" }));
         ebml.extend(uint(0x4287, 4)); // DocTypeVersion
         ebml.extend(uint(0x4285, 2)); // DocTypeReadVersion
         self.out.write_all(&el(0x1A45_DFA3, &ebml))?;
@@ -316,6 +328,11 @@ impl Muxer for MatroskaWriter {
             let media = s.params.media_type();
             if streams[..i].iter().any(|o| o.params.media_type() == media) {
                 return Err(Error::invalid_arg(format!("this Matroska writer holds at most one {media:?} stream")));
+            }
+            if self.webm && !matches!(s.codec, CodecId::Opus | CodecId::Vorbis) {
+                return Err(Error::new(ErrorCode::UnsupportedCodec, format!("WebM holds VP8, VP9, AV1, Opus and Vorbis; this writer can write only Opus and Vorbis, not {}", s.codec.name()))
+                    .hint("write .mkv for other codecs")
+                    .alternatives(["opus", "vorbis"]));
             }
             let video = match (&s.params, s.codec) {
                 (StreamParams::Video { .. }, CodecId::H264 | CodecId::Hevc) => true,

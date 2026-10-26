@@ -916,3 +916,26 @@ fn audio_copied_into_matroska_keeps_its_packets() {
     run(&j, &mut |_| {}).unwrap();
     assert!(pcm(&dir.join("flac.wav")) == std::fs::read(data.join("flac_in_ogg.expect.s16")).unwrap(), "FLAC through Matroska is not the source PCM");
 }
+
+/// WebM output: Opus and Vorbis audio only, with the `webm` document type; anything else is refused
+/// with the codecs that would fit.
+#[test]
+fn webm_holds_opus_and_vorbis_only() {
+    let dir = scratch("webm");
+    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    for file in ["opus_celt_stereo.opus", "vorbis_stereo.ogg"] {
+        let out = dir.join(format!("{file}.webm"));
+        run(&job(&data.join(file), &out), &mut |_| {}).unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        assert!(bytes[..64].windows(4).any(|w| w == b"webm"), "{file}: document type");
+        let mut d = ironav_formats::open_demuxer(&out).unwrap();
+        let mut n = 0;
+        while d.read_packet().unwrap().is_some() {
+            n += 1;
+        }
+        assert!(n > 20, "{file}: {n} packets");
+    }
+    let e = run(&job(&data.join("aac_stereo_tools.m4a"), &dir.join("x.webm")), &mut |_| {}).unwrap_err();
+    assert_eq!(e.code, ironav_core::ErrorCode::UnsupportedCodec);
+    assert!(e.alternatives.iter().any(|a| a == "opus"));
+}

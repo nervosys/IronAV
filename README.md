@@ -316,8 +316,10 @@ encoder, with and without the AAC audio in `.mkv`: FFmpeg opens every file, the 
 FFmpeg decodes all 50 frames of each video. IronAV's own tests copy audio through and compare every packet's bytes and the codec
 configuration, and decode FLAC through Matroska to the PCM it was made from.
 
-Not done: no SeekHead, tags, chapters or attachments; no WebM (the file is `matroska`, so `.webm` is not an output
-extension); PCM, VP8/VP9/AV1 and more than one stream per kind are refused; an MP3's gapless trim (from its LAME tag) is not
+`.webm` is written for Opus or Vorbis audio only (document type `webm`; FFmpeg opens both and decodes them); WebM's video
+codecs, VP8, VP9 and AV1, have no encoder here.
+
+Not done: no SeekHead, tags, chapters or attachments; PCM, VP8/VP9/AV1 and more than one stream per kind are refused; an MP3's gapless trim (from its LAME tag) is not
 carried over and the Opus pre-skip is carried only as the OpusHead plus CodecDelay. I did not test B-frame video, because the
 encoder here does not produce it.
 
