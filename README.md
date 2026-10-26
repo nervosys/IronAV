@@ -278,9 +278,11 @@ reproduces the old behaviour, and with it the FFmpeg-encoder test file matches b
 
 Not covered: **floor type 0** (obsolete; a stream that uses it is refused) and streams with more than 8 channels. The Ogg
 granule position of the last page trims the end; a stream that begins mid-way (a first granule above zero) is not shifted. Chained or multiplexed Ogg streams: only the first Vorbis stream is
-read. Mid-stream changes of the headers are not followed. There is no Vorbis encoder. Decoding 120 s of 44.1 kHz stereo to WAV takes 0.25 to 0.31 s inside IronAV's own timing (roughly 400x real time), while
-FFmpeg's decoder alone ran the same file in 0.08 to 0.19 s through PyAV; FFmpeg is still faster here by roughly 1.5 to 3x. This
-decoder is scalar `f32`; codebook lookups use a 10-bit table, longer codes walk a tree.
+read. Mid-stream changes of the headers are not followed. There is no Vorbis encoder. Decoding 120 s of 44.1 kHz stereo to WAV takes about 0.25 to 0.29 s end to end
+inside IronAV's own timing, of which the decoder alone is about 0.15 s (it was about 0.25 s: the inverse transform now runs a
+radix-2 butterfly with no generic loop, the transform's output is mirrored with slice copies, and the overlap-add runs in
+segments instead of deciding per sample). FFmpeg's decoder alone ran the same file in 0.08 to 0.19 s through PyAV, so the two are
+now close. This decoder is scalar `f32`; codebook lookups use a 10-bit table, longer codes walk a tree.
 
 ## MP3
 
@@ -299,10 +301,11 @@ bit-reservoir data is missing (the first frames after a seek) decodes to silence
 are applied: the reader hands the decoder where the audio starts and ends (delay plus the decoder's 529 samples at the start,
 padding less 529 at the end), and on the three LAME fixtures the output has exactly FFmpeg's length and samples. An MP3 in
 Matroska has no tag and is not trimmed. There is no MP3 encoder. Decoding 120 s of 44.1 kHz stereo (a dense, noisy test signal) to WAV
-takes 0.24 to 0.28 s end to end by IronAV's own timing (about 450x real time; it was 0.65 to 0.8 s before the frame index stopped
-seeking per frame, the synthesis filterbank used a fast DCT and the IMDCT its symmetry). Of that, the decoder alone is about 0.16 s;
-FFmpeg's decoder alone ran the same file in 0.065 s through PyAV, so it is still about 2.5x faster. The decoder is scalar `f64`
-without SIMD; the noisy machine makes these figures good to perhaps 20 %.
+takes 0.17 to 0.18 s end to end by IronAV's own timing (about 700x real time; it was 0.65 to 0.8 s before the frame index stopped
+seeking per frame, the synthesis filterbank used a fast DCT and the IMDCT its symmetry, and both ran in `f32` compiled for AVX2 and
+FMA, chosen at run time when the CPU has them). Of that, the decoder alone is about 0.10 s; FFmpeg's decoder alone ran the same
+file in 0.065 s through PyAV, so it is still about 1.6x faster. The Huffman decoding is the largest remaining part. The noisy
+machine makes these figures good to perhaps 20 %.
 
 ## Matroska output
 

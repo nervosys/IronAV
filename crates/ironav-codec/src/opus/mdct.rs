@@ -47,10 +47,27 @@ impl Fft {
         }
         let p = self.factors[f];
         let m = n / p;
-        for r in 0..p {
-            self.rec(&input[r * stride..], stride * p, m, &mut out[r * m..(r + 1) * m], f + 1);
+        if m == 1 {
+            for r in 0..p {
+                out[r] = input[r * stride];
+            }
+        } else {
+            for r in 0..p {
+                self.rec(&input[r * stride..], stride * p, m, &mut out[r * m..(r + 1) * m], f + 1);
+            }
         }
         let step = self.m / n; // W_n^t = tw[t * step]
+        if p == 2 {
+            // the radix-2 butterfly, which is all a power-of-two transform (Vorbis) uses
+            let (lo, hi) = out.split_at_mut(m);
+            for k in 0..m {
+                let t = mul(hi[k], self.tw[k * step]);
+                let a = lo[k];
+                lo[k] = [a[0] + t[0], a[1] + t[1]];
+                hi[k] = [a[0] - t[0], a[1] - t[1]];
+            }
+            return;
+        }
         let pstep = self.m / p; // W_p^t = tw[t * pstep]
         let mut y = [[0f32; 2]; 5];
         for k in 0..m {

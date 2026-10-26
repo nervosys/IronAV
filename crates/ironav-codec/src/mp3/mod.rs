@@ -201,15 +201,17 @@ struct Statics {
     /// 2^(e/4) for e in -512..64, offset by 512.
     exp2q: Vec<f64>,
     /// cos(π/72 (2i+19)(2k+1)).
-    imdct36: Vec<[f64; 18]>,
+    /// The long transform's outputs 0..9 and 18..27 (the rest mirror them), indexed by input k.
+    i36lo: Vec<[f32; 9]>,
+    i36hi: Vec<[f32; 9]>,
     /// cos(π/24 (2i+7)(2k+1)).
-    imdct12: Vec<[f64; 6]>,
+    imdct12: Vec<[f32; 6]>,
     /// Block-type windows for the long transform.
-    win: [[f64; 36]; 4],
-    win_short: [f64; 12],
+    win: [[f32; 36]; 4],
+    win_short: [f32; 12],
     /// Twiddles of the fast DCT-II, `lee[log2(n)][k] = 1 / (2 cos(π(2k+1)/2n))`.
-    lee: [[f64; 16]; 6],
-    window: [f64; 512],
+    lee: [[f32; 16]; 6],
+    window: [f32; 512],
     cs: [f64; 8],
     ca: [f64; 8],
 }
@@ -248,8 +250,10 @@ fn statics() -> &'static Statics {
         });
         let pow43 = (0..8206 + 16).map(|i| (i as f64).powf(4.0 / 3.0)).collect();
         let exp2q = (-512..64).map(|e| (e as f64 / 4.0).exp2()).collect();
-        let imdct36 = (0..36).map(|i| std::array::from_fn(|k| (PI / 72.0 * (2 * i + 19) as f64 * (2 * k + 1) as f64).cos())).collect();
-        let imdct12 = (0..12).map(|i| std::array::from_fn(|k| (PI / 24.0 * (2 * i + 7) as f64 * (2 * k + 1) as f64).cos())).collect();
+        let c36 = |i: usize, k: usize| (PI / 72.0 * (2 * i + 19) as f64 * (2 * k + 1) as f64).cos() as f32;
+        let i36lo = (0..18).map(|k| std::array::from_fn(|n| c36(n, k))).collect();
+        let i36hi = (0..18).map(|k| std::array::from_fn(|n| c36(18 + n, k))).collect();
+        let imdct12 = (0..12).map(|i| std::array::from_fn(|k| (PI / 24.0 * (2 * i + 7) as f64 * (2 * k + 1) as f64).cos() as f32)).collect();
         let mut win = [[0.0; 36]; 4];
         for i in 0..36 {
             let s = (PI / 36.0 * (i as f64 + 0.5)).sin();
@@ -280,7 +284,21 @@ fn statics() -> &'static Statics {
         let ci = [-0.6, -0.535, -0.33, -0.185, -0.095, -0.041, -0.0142, -0.0037];
         let cs = ci.map(|c: f64| 1.0 / (1.0 + c * c).sqrt());
         let ca = std::array::from_fn(|i| ci[i] * cs[i]);
-        Statics { big, quad, pow43, exp2q, imdct36, imdct12, win, win_short, lee, window, cs, ca }
+        Statics {
+            big,
+            quad,
+            pow43,
+            exp2q,
+            i36lo,
+            i36hi,
+            imdct12,
+            win: win.map(|w| w.map(|v| v as f32)),
+            win_short: win_short.map(|v| v as f32),
+            lee: lee.map(|r| r.map(|v| v as f32)),
+            window: window.map(|v| v as f32),
+            cs,
+            ca,
+        }
     })
 }
 
@@ -364,9 +382,9 @@ pub struct Mp3Decoder {
     channels: u16,
     reservoir: Vec<u8>,
     /// Overlap from the previous granule's IMDCT: [channel][subband][18].
-    overlap: Vec<[[f64; 18]; 32]>,
+    overlap: Vec<[[f32; 18]; 32]>,
     /// Polyphase synthesis history.
-    v: Vec<[f64; 1024]>,
+    v: Vec<[f32; 1024]>,
     v_off: Vec<usize>,
     granules: Vec<[Granule; 2]>,
 }
@@ -530,15 +548,10 @@ impl Mp3Decoder {
                 let g = &mut self.granules[ch][gr];
                 reorder_block(&h, g);
                 antialias(s, g);
-                let mut sb = [[0.0f64; 32]; 18];
-                imdct(s, g, &mut self.overlap[ch], &mut sb);
-                for t in 0..18 {
-                    let mut pcm = [0.0f64; 32];
-                    synth(s, &mut self.v[ch], &mut self.v_off[ch], &sb[t], &mut pcm);
-                    let base = (gr * 18 + t) * 32;
-                    for (i, &x) in pcm.iter().enumerate() {
-                        out[(base + i) * nch + ch] = x;
-                    }
+                let mut pcm = [0.0f32; 576];
+                granule_pcm(s, g, &mut self.overlap[ch], &mut self.v[ch], &mut self.v_off[ch], &mut pcm);
+                for (i, &x) in pcm.iter().enumerate() {
+                    out[(gr * 576 + i) * nch + ch] = x as f64;
                 }
             }
         }
@@ -884,10 +897,14 @@ fn antialias(s: &Statics, g: &mut Granule) {
 
 /// Inverse MDCT with windowing and overlap-add; `out[t][sb]` receives the 18 time samples of each
 /// subband (with the odd samples of odd subbands inverted).
-fn imdct(s: &Statics, g: &Granule, overlap: &mut [[f64; 18]; 32], out: &mut [[f64; 32]; 18]) {
+#[inline(always)]
+fn imdct(s: &Statics, g: &Granule, overlap: &mut [[f32; 18]; 32], out: &mut [[f32; 32]; 18]) {
     for sb in 0..32 {
-        let x = &g.xr[18 * sb..18 * sb + 18];
-        let mut z = [0.0f64; 36];
+        let mut x = [0.0f32; 18];
+        for k in 0..18 {
+            x[k] = g.xr[18 * sb + k] as f32;
+        }
+        let mut z = [0.0f32; 36];
         // most encoders leave the top subbands empty
         let silent = x.iter().all(|&v| v == 0.0);
         let short = g.block_type == 2 && !(g.switch_point && sb < 2);
@@ -904,18 +921,21 @@ fn imdct(s: &Statics, g: &Granule, overlap: &mut [[f64; 18]; 32], out: &mut [[f6
             }
         } else {
             let win = &s.win[if g.switch_point && sb < 2 { 0 } else { g.block_type as usize }];
-            // the 36 outputs mirror each other: y[17 - n] = -y[n] and y[35 - n] = y[18 + n]
-            for n in 0..9 {
-                let (mut lo, mut hi) = (0.0, 0.0);
-                let (cl, ch) = (&s.imdct36[n], &s.imdct36[18 + n]);
-                for k in 0..18 {
-                    lo += x[k] * cl[k];
-                    hi += x[k] * ch[k];
+            // the 36 outputs mirror each other: y[17 - n] = -y[n] and y[35 - n] = y[18 + n];
+            // input-major, so the loop over n is a plain element-wise multiply-add
+            let (mut lo, mut hi) = ([0.0f32; 9], [0.0f32; 9]);
+            for k in 0..18 {
+                let (cl, ch, xk) = (&s.i36lo[k], &s.i36hi[k], x[k]);
+                for n in 0..9 {
+                    lo[n] += xk * cl[n];
+                    hi[n] += xk * ch[n];
                 }
-                z[n] = lo * win[n];
-                z[17 - n] = -lo * win[17 - n];
-                z[18 + n] = hi * win[18 + n];
-                z[35 - n] = hi * win[35 - n];
+            }
+            for n in 0..9 {
+                z[n] = lo[n] * win[n];
+                z[17 - n] = -lo[n] * win[17 - n];
+                z[18 + n] = hi[n] * win[18 + n];
+                z[35 - n] = hi[n] * win[35 - n];
             }
         }
         for t in 0..18 {
@@ -928,21 +948,21 @@ fn imdct(s: &Statics, g: &Granule, overlap: &mut [[f64; 18]; 32], out: &mut [[f6
 
 /// DCT-II of a power-of-two length, `out[n] = sum_k x[k] cos(π n (2k+1) / 2N)`, by Lee's recursion
 /// (N log N operations instead of N²). One function per length keeps every array its exact size.
-fn dct1(x: &[f64; 1], _: &[[f64; 16]; 6]) -> [f64; 1] {
+fn dct1(x: &[f32; 1], _: &[[f32; 16]; 6]) -> [f32; 1] {
     *x
 }
 
 macro_rules! lee {
     ($name:ident, $sub:ident, $n:literal, $h:literal, $lg:literal) => {
-        fn $name(x: &[f64; $n], lee: &[[f64; 16]; 6]) -> [f64; $n] {
+        fn $name(x: &[f32; $n], lee: &[[f32; 16]; 6]) -> [f32; $n] {
             let tw = &lee[$lg];
-            let (mut a, mut b) = ([0.0f64; $h], [0.0f64; $h]);
+            let (mut a, mut b) = ([0.0f32; $h], [0.0f32; $h]);
             for k in 0..$h {
                 a[k] = x[k] + x[$n - 1 - k];
                 b[k] = (x[k] - x[$n - 1 - k]) * tw[k];
             }
             let (ea, eb) = ($sub(&a, lee), $sub(&b, lee));
-            let mut o = [0.0f64; $n];
+            let mut o = [0.0f32; $n];
             for i in 0..$h {
                 o[2 * i] = ea[i];
                 o[2 * i + 1] = eb[i] + if i + 1 < $h { eb[i + 1] } else { 0.0 };
@@ -958,7 +978,8 @@ lee!(dct16, dct8, 16, 8, 4);
 lee!(dct32, dct16, 32, 16, 5);
 
 /// One step of the polyphase synthesis filterbank: 32 subband samples in, 32 PCM samples out.
-fn synth(s: &Statics, v: &mut [f64; 1024], off: &mut usize, sb: &[f64; 32], out: &mut [f64; 32]) {
+#[inline(always)]
+fn synth(s: &Statics, v: &mut [f32; 1024], off: &mut usize, sb: &[f32; 32], out: &mut [f32; 32]) {
     *off = (*off + 1024 - 64) & 1023;
     // V[i] = sum_k cos((16+i)(2k+1)pi/64) S[k] needs only d[n] = sum_k cos(n(2k+1)pi/64) S[k], n < 32:
     // the cosine is symmetric about n = 32 (where it is 0) and antisymmetric about n = 64.
@@ -985,6 +1006,34 @@ fn synth(s: &Statics, v: &mut [f64; 1024], off: &mut usize, sb: &[f64; 32], out:
     }
 }
 
+/// The 576 PCM samples of one granule and channel: IMDCT, overlap-add and synthesis. The same code
+/// is also compiled for AVX2 + FMA, which is used when the CPU has them.
+#[inline(always)]
+fn granule_pcm_impl(s: &Statics, g: &Granule, overlap: &mut [[f32; 18]; 32], v: &mut [f32; 1024], off: &mut usize, pcm: &mut [f32; 576]) {
+    let mut sb = [[0.0f32; 32]; 18];
+    imdct(s, g, overlap, &mut sb);
+    for t in 0..18 {
+        let mut o = [0.0f32; 32];
+        synth(s, v, off, &sb[t], &mut o);
+        pcm[t * 32..t * 32 + 32].copy_from_slice(&o);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn granule_pcm_avx2(s: &Statics, g: &Granule, overlap: &mut [[f32; 18]; 32], v: &mut [f32; 1024], off: &mut usize, pcm: &mut [f32; 576]) {
+    granule_pcm_impl(s, g, overlap, v, off, pcm)
+}
+
+fn granule_pcm(s: &Statics, g: &Granule, overlap: &mut [[f32; 18]; 32], v: &mut [f32; 1024], off: &mut usize, pcm: &mut [f32; 576]) {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        // SAFETY: the CPU has the features the function is compiled for
+        return unsafe { granule_pcm_avx2(s, g, overlap, v, off, pcm) };
+    }
+    granule_pcm_impl(s, g, overlap, v, off, pcm)
+}
+
 impl Decoder for Mp3Decoder {
     fn decode(&mut self, p: &Packet) -> Result<Vec<Frame>> {
         match self.decode_frame(p) {
@@ -1009,10 +1058,11 @@ mod tests {
     fn the_fast_dct_matches_the_definition() {
         let s = statics();
         let x: Vec<f64> = (0..32).map(|i| ((i * 7 + 3) % 11) as f64 - 5.0 + 0.37 * i as f64).collect();
-        let fast = dct32(x.as_slice().try_into().unwrap(), &s.lee);
+        let x32: Vec<f32> = x.iter().map(|&v| v as f32).collect();
+        let fast = dct32(x32.as_slice().try_into().unwrap(), &s.lee);
         for n in 0..32 {
             let direct: f64 = (0..32).map(|k| x[k] * ((n * (2 * k + 1)) as f64 * PI / 64.0).cos()).sum();
-            assert!((fast[n] - direct).abs() < 1e-9, "n={n}: {} against {direct}", fast[n]);
+            assert!((fast[n] as f64 - direct).abs() < 1e-3, "n={n}: {} against {direct}", fast[n]);
         }
     }
 }

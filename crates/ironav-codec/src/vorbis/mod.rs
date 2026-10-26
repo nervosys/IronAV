@@ -917,7 +917,7 @@ impl VorbisDecoder {
 
         let mdct = &mut self.mdct[mode.long as usize];
         let mut c = vec![0f32; half];
-        (0..ch)
+        let r = (0..ch)
             .map(|j| {
                 let mut y = vec![0f32; n];
                 if unused[j] {
@@ -928,18 +928,17 @@ impl VorbisDecoder {
                 }
                 mdct.run(&spec[j], 1, &mut c);
                 let q = half / 2;
-                for (i, o) in y.iter_mut().enumerate() {
-                    *o = if i < q {
-                        c[i + q]
-                    } else if i < half + q {
-                        -c[half + q - 1 - i]
-                    } else {
-                        -c[i - half - q]
-                    };
+                y[..q].copy_from_slice(&c[q..half]);
+                for (o, &v) in y[q..q + half].iter_mut().zip(c.iter().rev()) {
+                    *o = -v;
+                }
+                for (o, &v) in y[q + half..].iter_mut().zip(&c[..q]) {
+                    *o = -v;
                 }
                 y
             })
-            .collect()
+            .collect::<Vec<_>>();
+        r
     }
 }
 
@@ -969,22 +968,32 @@ impl Decoder for VorbisDecoder {
             let mut pcm = vec![0f64; count * ch];
             for (j, y) in ys.iter().enumerate() {
                 let dst = ORDER[ch - 1].iter().position(|&o| o == j).unwrap_or(j);
-                for a in 0..count {
-                    let mut v = 0f32;
-                    if a < np / 2 {
-                        // the previous block's falling edge: 1, then the slope reversed, then 0
-                        let lead = (np / 2 - ls) / 2;
-                        let w = if a < lead { 1.0 } else if a < lead + ls { sl[ls - 1 - (a - lead)] } else { 0.0 };
-                        v += p.tail[j][a] * w;
-                    }
-                    // the current block's left half starts (n - np) / 4 samples before `a`
-                    let bi = a as isize + (n as isize - np as isize) / 4;
-                    if bi >= 0 && (bi as usize) < n / 2 {
-                        let bi = bi as usize;
-                        let lead = (n / 2 - ls) / 2;
-                        let w = if bi < lead { 0.0 } else if bi < lead + ls { sl[bi - lead] } else { 1.0 };
-                        v += y[bi] * w;
-                    }
+                let mut buf = vec![0f32; count];
+                // the previous block's falling edge: 1, then the slope reversed, then 0
+                let lead = (np / 2 - ls) / 2;
+                let ones = lead.min(count);
+                buf[..ones].copy_from_slice(&p.tail[j][..ones]);
+                for a in lead..(lead + ls).min(count) {
+                    buf[a] = p.tail[j][a] * sl[ls - 1 - (a - lead)];
+                }
+                // the current block's left half starts (n - np) / 4 samples before `a`: 0, then the
+                // slope, then 1
+                let shift = (n as isize - np as isize) / 4;
+                let lead_c = (n / 2 - ls) / 2;
+                let within = |blo: usize, bhi: usize| -> (usize, usize) {
+                    let lo = (blo as isize).max(shift);
+                    let hi = (bhi as isize).min(count as isize + shift).max(lo);
+                    (lo as usize, hi as usize)
+                };
+                let (lo, hi) = within(lead_c, lead_c + ls);
+                for bi in lo..hi {
+                    buf[(bi as isize - shift) as usize] += y[bi] * sl[bi - lead_c];
+                }
+                let (lo, hi) = within(lead_c + ls, n / 2);
+                for bi in lo..hi {
+                    buf[(bi as isize - shift) as usize] += y[bi];
+                }
+                for (a, &v) in buf.iter().enumerate() {
                     pcm[a * ch + dst] = (v as f64).clamp(-1.0, 1.0);
                 }
             }

@@ -1,4 +1,4 @@
-//! Timing of the MP3 path: `IRONAV_MP3=path cargo test --release -p ironav-engine --test mp3_perf -- --ignored --nocapture`.
+//! Timing of the MP3 path (any audio file works): `IRONAV_MP3=path cargo test --release -p ironav-engine --test mp3_perf -- --ignored --nocapture`.
 
 use std::time::Instant;
 
