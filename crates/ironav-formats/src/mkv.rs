@@ -52,6 +52,7 @@ const SIMPLE_BLOCK: u32 = 0xA3;
 const BLOCK_GROUP: u32 = 0xA0;
 const BLOCK: u32 = 0xA1;
 const BLOCK_DURATION: u32 = 0x9B;
+const DISCARD_PADDING: u32 = 0x75A2;
 const REFERENCE_BLOCK: u32 = 0xFB;
 
 /// Sanity cap on the Tracks element we are willing to hold in memory.
@@ -81,6 +82,8 @@ struct Frame {
     /// Index within a laced block.
     lace: u32,
     duration: Option<i64>,
+    /// Nanoseconds at the end of the frame that the decoder's output should not include.
+    discard: i64,
     /// The first bytes of the frame (Opus gives its length in the first one).
     head: [u8; 2],
 }
@@ -284,6 +287,7 @@ impl<R: Read + Seek> Scan<R> {
                 BLOCK_GROUP => {
                     let mut range = 0..0;
                     let mut duration = None;
+                    let mut discard = 0i64;
                     let mut referenced = false;
                     while self.pos < body_end {
                         let Some(gid) = self.id()? else { break };
@@ -295,6 +299,13 @@ impl<R: Read + Seek> Scan<R> {
                         match gid {
                             BLOCK => range = self.block(gsize, false, tc)?,
                             BLOCK_DURATION => duration = Some(self.uint(gsize)? as i64),
+                            DISCARD_PADDING => {
+                                let v = self.uint(gsize)?;
+                                // signed; a negative value trims the start, which the pre-skip covers
+                                if gsize > 0 && gsize <= 8 && v < 1u64 << (8 * gsize - 1) {
+                                    discard = v as i64;
+                                }
+                            }
                             REFERENCE_BLOCK => {
                                 referenced = true;
                                 self.skip_to(gend)?;
@@ -307,6 +318,7 @@ impl<R: Read + Seek> Scan<R> {
                         f.key = !referenced;
                         if single {
                             f.duration = duration;
+                            f.discard = discard;
                         }
                     }
                 }
@@ -383,7 +395,7 @@ impl<R: Read + Seek> Scan<R> {
                     *h = self.need()?;
                 }
             }
-            self.frames.push(Frame { track, tc, key, offset, size, lace: lace as u32, duration: None, head });
+            self.frames.push(Frame { track, tc, key, offset, size, lace: lace as u32, duration: None, discard: 0, head });
             offset += s;
         }
         self.skip_to(end)?;
@@ -643,7 +655,8 @@ fn build_track(t: &MkTrack, index: usize, frames: &[&Frame], scale: u64, samples
                     let len = if opus {
                         // a block's frames share one TOC byte, and so one length
                         let n = ironav_codec::opus::packet_samples(&f.head[..f.size.min(2) as usize]).unwrap_or(960);
-                        if f.size == 0 { 960 } else { n as u32 }
+                        let n = if f.size == 0 { 960 } else { n as u32 };
+                        n.saturating_sub((f.discard as i128 * 48_000 / 1_000_000_000) as u32)
                     } else {
                         len
                     };

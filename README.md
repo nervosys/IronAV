@@ -286,9 +286,8 @@ Checked: FFmpeg (through PyAV) opens the Matroska files and decodes them; our de
 rate as it should (a tone-and-noise test signal, mono: 10 dB at 16 kb/s, 22 dB at 64, 29 at 128, 39 at 256). This is a first encoder, not libopus: there
 is **no transient detection** (so an attack spreads its quantisation noise before it), no short blocks, no pitch pre-filter,
 no band boosts or tuned allocation trim, and no variable bit rate or SILK/hybrid modes, so at the same size it will sound
-worse than libopus. The end of a stream is exact in Ogg (the last page's granule position says where the audio ends; FFmpeg decodes our
-`.opus` to exactly the source's length) but not in Matroska (the file decodes to up to one 20 ms frame too much, since this
-writer has no `DiscardPadding`). Not compared with libopus for quality: I have no libopus encoder to run.
+worse than libopus. The end of a stream is exact in Ogg (the last page's granule position) and in Matroska/WebM (the last block carries a
+`DiscardPadding`, which our reader honours); FFmpeg decodes both to exactly the source's length. Not compared with libopus for quality: I have no libopus encoder to run.
 
 ## Vorbis
 

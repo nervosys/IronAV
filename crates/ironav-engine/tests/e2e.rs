@@ -985,7 +985,7 @@ fn opus_encoder_output_decodes_close_to_its_input() {
             run(&j, &mut |_| {}).unwrap();
             let got = pcm(&back);
             let frames = got.len() / 2 / channels as usize;
-            assert!((n..n + 2000).contains(&frames), "{ext} {channels}ch: {frames} frames for {n}");
+            assert_eq!(frames, n, "{ext} {channels}ch: an exact length");
             let snr = snr_db(&pcm(&wav), &got);
             assert!(snr > 20.0, "{ext} {channels}ch: {snr:.1} dB");
         }

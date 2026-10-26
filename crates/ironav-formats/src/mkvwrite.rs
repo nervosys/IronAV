@@ -84,6 +84,8 @@ pub struct MatroskaWriter {
     out: Box<dyn WriteSeek>,
     tracks: Vec<Track>,
     held: Vec<Packet>,
+    /// The last Opus packet, written at the end so it can carry its padding.
+    opus_last: Option<Packet>,
     started: bool,
     segment_data: u64,
     segment_size_at: u64,
@@ -112,6 +114,7 @@ impl MatroskaWriter {
             out,
             tracks: Vec::new(),
             held: Vec::new(),
+            opus_last: None,
             started: false,
             segment_data: 0,
             segment_size_at: 0,
@@ -265,7 +268,7 @@ impl MatroskaWriter {
         Ok(())
     }
 
-    fn write_block(&mut self, p: &Packet, sample: Vec<u8>, key: bool) -> Result<()> {
+    fn write_block(&mut self, p: &Packet, sample: Vec<u8>, key: bool, discard_ns: Option<i64>) -> Result<()> {
         let t = p.stream;
         let ms = self.ms(t, p.pts).max(0);
         let video = self.tracks[t].video;
@@ -290,7 +293,15 @@ impl MatroskaWriter {
         b.extend(((ms - c.tc) as i16).to_be_bytes());
         b.push(if key { 0x80 } else { 0 });
         b.extend_from_slice(&sample);
-        c.body.extend(el(0xA3, &b));
+        match discard_ns {
+            // the last Opus packet decodes to more than the stream holds: say how much to drop
+            Some(ns) => {
+                let mut g = el(0xA1, &b);
+                g.extend(el(0x75A2, &ns.to_be_bytes()));
+                c.body.extend(el(0xA0, &g));
+            }
+            None => c.body.extend(el(0xA3, &b)),
+        }
         Ok(())
     }
 
@@ -308,7 +319,14 @@ impl MatroskaWriter {
         if !self.tracks[t].video && self.tracks[t].stream.codec == CodecId::Flac {
             self.tracks[t].flac.record(p);
         }
-        self.write_block(p, sample, key)
+        if !self.tracks[t].video && self.tracks[t].stream.codec == CodecId::Opus {
+            // the last packet is held back: it may carry the end padding
+            if let Some(prev) = self.opus_last.replace(p.clone()) {
+                return self.write_block(&prev, prev.data.clone(), true, None);
+            }
+            return Ok(());
+        }
+        self.write_block(p, sample, key, None)
     }
 
     fn flush_held(&mut self) -> Result<()> {
@@ -392,6 +410,15 @@ impl Muxer for MatroskaWriter {
             }
             self.start()?;
             self.flush_held()?;
+        }
+        if let Some(last) = self.opus_last.take() {
+            let t = last.stream;
+            let tb = self.tracks[t].stream.time_base;
+            let have = ironav_codec::opus::packet_samples(&last.data).unwrap_or(0) as i128;
+            let kept = if last.duration > 0 { last.duration as i128 * 48_000 * tb.num as i128 / tb.den as i128 } else { have };
+            let pad = (have - kept).max(0) as i64 * 1_000_000_000 / 48_000;
+            let d = (pad > 0).then_some(pad);
+            self.write_block(&last, last.data.clone(), true, d)?;
         }
         self.close_cluster()?;
 
