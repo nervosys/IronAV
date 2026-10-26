@@ -1,10 +1,13 @@
 //! AAC-LC decoder (ISO/IEC 14496-3): single and paired channel elements, M/S and intensity
-//! stereo, PNS, TNS, pulses, all window shapes and sequences. Not decoded: SBR/PS (HE-AAC),
-//! Main-profile prediction, LTP, coupling channels, 960-sample frames and gain control; streams
-//! that need them are refused with an error rather than decoded wrongly.
+//! stereo, PNS, TNS, pulses, all window shapes and sequences, and SBR (HE-AAC v1) when the
+//! AudioSpecificConfig announces it. Not decoded: parametric stereo (HE-AAC v2), implicit SBR
+//! signalling, Main-profile prediction, LTP, coupling channels, 960-sample frames and gain control;
+//! streams that need them are refused with an error rather than decoded wrongly.
 
 mod enc;
 mod imdct;
+mod sbr;
+mod sbr_tables;
 mod tables;
 
 pub use enc::{audio_specific_config, AacEncoder, PRIMING};
@@ -249,21 +252,32 @@ struct ChannelState {
 struct Config {
     sfi: usize,
     channels: u16,
+    /// Output rate (doubled by SBR).
     sample_rate: u32,
+    /// Whether SBR doubles the rate; the core codec then runs at `sample_rate / 2`.
+    sbr: bool,
     /// Output channel for the n-th channel decoded in a frame.
     map: &'static [usize],
 }
 
 fn parse_asc(asc: &[u8], declared_rate: u32, declared_channels: u16) -> Result<Config> {
     let mut b = Bits::new(asc);
-    let mut aot = b.read(5);
-    if aot == 31 {
-        aot = 32 + b.read(6);
+    let read_aot = |b: &mut Bits| {
+        let aot = b.read(5);
+        if aot == 31 { 32 + b.read(6) } else { aot }
+    };
+    let read_rate = |b: &mut Bits| -> u32 {
+        let i = b.read(4) as usize;
+        if i == 15 { b.read(24) } else { SAMPLE_RATES.get(i).copied().unwrap_or(0) }
+    };
+    let mut aot = read_aot(&mut b);
+    if aot == 29 {
+        return Err(unsupported("HE-AAC v2 (parametric stereo) is not decoded"));
     }
-    if aot == 5 || aot == 29 {
-        return Err(unsupported("HE-AAC (SBR/PS) is not decoded"));
-    }
-    if aot != 1 && aot != 2 {
+    // SBR announced up front: the core's rate and channels come first, then the output rate
+    let mut sbr = aot == 5;
+    let mut ext_rate = 0;
+    if aot != 5 && aot != 1 && aot != 2 {
         return Err(unsupported(format!("audio object type {aot}")));
     }
     let mut sfi = b.read(4) as usize;
@@ -277,6 +291,13 @@ fn parse_asc(asc: &[u8], declared_rate: u32, declared_channels: u16) -> Result<C
         return Err(bad("reserved sampling frequency index"));
     }
     let channel_config = b.read(4) as usize;
+    if sbr {
+        ext_rate = read_rate(&mut b);
+        aot = read_aot(&mut b);
+        if aot != 1 && aot != 2 {
+            return Err(unsupported(format!("audio object type {aot} under SBR")));
+        }
+    }
     if b.flag() {
         return Err(unsupported("960-sample frames"));
     }
@@ -290,9 +311,16 @@ fn parse_asc(asc: &[u8], declared_rate: u32, declared_channels: u16) -> Result<C
     // Backward-compatible signalling of SBR / PS after the GA specific config.
     if b.left() >= 16 && b.peek(11) == 0x2b7 {
         b.skip(11);
-        let ext_aot = b.read(5);
+        let ext_aot = read_aot(&mut b);
         if ext_aot == 5 && b.flag() {
-            return Err(unsupported("HE-AAC (SBR) is not decoded"));
+            sbr = true;
+            ext_rate = read_rate(&mut b);
+            if b.left() >= 12 && b.peek(11) == 0x548 {
+                b.skip(11);
+                if b.flag() {
+                    return Err(unsupported("HE-AAC v2 (parametric stereo) is not decoded"));
+                }
+            }
         }
     }
     let (channels, map): (u16, &'static [usize]) = match channel_config {
@@ -308,11 +336,17 @@ fn parse_asc(asc: &[u8], declared_rate: u32, declared_channels: u16) -> Result<C
     if declared_channels != 0 && declared_channels != channels {
         return Err(bad(format!("the stream says {declared_channels} channels but its AudioSpecificConfig says {channels}")));
     }
-    let sample_rate = if rate != 0 { rate } else { SAMPLE_RATES[sfi] };
+    let mut sample_rate = if rate != 0 { rate } else { SAMPLE_RATES[sfi] };
+    if sbr {
+        if ext_rate != 2 * sample_rate {
+            return Err(unsupported(format!("SBR from {sample_rate} Hz to {ext_rate} Hz (only a doubling is decoded)")));
+        }
+        sample_rate = ext_rate;
+    }
     if declared_rate != 0 && declared_rate != sample_rate {
         // The container's rate field is only a hint (HE-AAC doubles it); the config is authoritative.
     }
-    Ok(Config { sfi, channels, sample_rate, map })
+    Ok(Config { sfi, channels, sample_rate, sbr, map })
 }
 
 pub struct AacDecoder {
@@ -323,6 +357,8 @@ pub struct AacDecoder {
     y: Vec<f32>,
     state: Vec<ChannelState>,
     random: u32,
+    /// One SBR decoder per single or paired channel element of a frame, in order.
+    sbr: Vec<sbr::Sbr>,
 }
 
 impl AacDecoder {
@@ -336,7 +372,7 @@ impl AacDecoder {
         }
         let cfg = parse_asc(extradata, *sample_rate, *channels)?;
         let state = (0..cfg.channels).map(|_| ChannelState { saved: vec![0.0; 1024], prev_kbd: false }).collect();
-        Ok(Self { cfg, long: Imdct::new(1024), short: Imdct::new(128), z: vec![0.0; 2048], y: vec![0.0; 2048], state, random: 0x1f2e3d4c })
+        Ok(Self { cfg, long: Imdct::new(1024), short: Imdct::new(128), z: vec![0.0; 2048], y: vec![0.0; 2048], state, random: 0x1f2e3d4c, sbr: Vec::new() })
     }
 
     fn ics_info(&self, br: &mut Bits) -> Result<IcsInfo> {
@@ -771,12 +807,15 @@ impl AacDecoder {
         let mut out = vec![vec![0f32; 1024]; n_out];
         let mut br = Bits::new(data);
         let mut next = 0usize; // channels decoded so far
+        // (element type, first channel, channel count) of each element, for SBR
+        let mut elems: Vec<(u8, usize, usize)> = Vec::new();
         loop {
             let id = br.read(3);
             match id {
                 0 | 3 => {
                     br.read(4);
                     let mut ch = self.ics(&mut br, None)?;
+                    elems.push((0, next, 1));
                     self.finish_channel(&mut ch, &mut next, &mut out)?;
                 }
                 1 => {
@@ -805,6 +844,7 @@ impl AacDecoder {
                         a = self.ics(&mut br, None)?;
                         b = self.ics(&mut br, None)?;
                     }
+                    elems.push((1, next, 2));
                     self.finish_channel(&mut a, &mut next, &mut out)?;
                     self.finish_channel(&mut b, &mut next, &mut out)?;
                 }
@@ -848,16 +888,48 @@ impl AacDecoder {
                     if cnt == 15 {
                         cnt += br.read(8) as usize - 1;
                     }
-                    if cnt > 0 && matches!(br.peek(4), 0xD | 0xE) {
-                        return Err(unsupported("HE-AAC (SBR) is not decoded"));
+                    let end = br.pos + cnt * 8;
+                    let ext = br.peek(4);
+                    if cnt > 0 && matches!(ext, 0xD | 0xE) {
+                        if !self.cfg.sbr {
+                            return Err(unsupported("HE-AAC with implicit SBR signalling is not decoded"));
+                        }
+                        if let Some(&(kind, ..)) = elems.last() {
+                            let at = elems.len() - 1;
+                            while self.sbr.len() <= at {
+                                self.sbr.push(sbr::Sbr::new(self.cfg.sample_rate / 2));
+                            }
+                            br.skip(4);
+                            self.sbr[at].decode_extension(&mut br, ext == 0xE, cnt, kind);
+                        }
                     }
-                    br.skip(cnt as u32 * 8);
+                    br.pos = end;
                 }
                 _ => break,
             }
             br.check()?;
         }
+        if self.cfg.sbr {
+            return Ok(self.apply_sbr(&elems, out));
+        }
         Ok(out)
+    }
+
+    /// Rebuild the upper band of every channel element: 1024 samples per channel in, 2048 out.
+    fn apply_sbr(&mut self, elems: &[(u8, usize, usize)], core: Vec<Vec<f32>>) -> Vec<Vec<f32>> {
+        let mut out = vec![vec![0f32; 2048]; core.len()];
+        for (at, &(kind, first, n)) in elems.iter().enumerate() {
+            while self.sbr.len() <= at {
+                self.sbr.push(sbr::Sbr::new(self.cfg.sample_rate / 2));
+            }
+            let idx: Vec<usize> = (first..first + n).filter_map(|i| self.cfg.map.get(i).copied()).collect();
+            let planes: Vec<&[f32]> = idx.iter().map(|&i| core[i].as_slice()).collect();
+            let res = self.sbr[at].apply(kind, &planes);
+            for (j, &i) in idx.iter().enumerate() {
+                out[i] = res[j].clone();
+            }
+        }
+        out
     }
 
     fn finish_channel(&mut self, ch: &mut Channel, next: &mut usize, out: &mut [Vec<f32>]) -> Result<()> {
@@ -880,7 +952,7 @@ impl Decoder for AacDecoder {
     fn decode(&mut self, packet: &Packet) -> Result<Vec<Frame>> {
         let planes = self.decode_frame(&packet.data)?;
         let channels = planes.len();
-        let mut samples = vec![0f64; 1024 * channels];
+        let mut samples = vec![0f64; planes[0].len() * channels];
         for (c, plane) in planes.iter().enumerate() {
             for (i, &s) in plane.iter().enumerate() {
                 samples[i * channels + c] = s as f64;
@@ -929,6 +1001,10 @@ mod tests {
     fn parses_a_common_config() {
         let cfg = parse_asc(&[0x12, 0x10], 44100, 2).unwrap();
         assert_eq!((cfg.sfi, cfg.channels, cfg.sample_rate), (4, 2, 44100));
-        assert!(parse_asc(&[0x2b, 0x11, 0x88, 0x00], 0, 0).is_err(), "SBR object type is refused");
+        // HE-AAC v1: explicit SBR signalling, 22.05 kHz core, 44.1 kHz output
+        let he = parse_asc(&[0x2b, 0x92, 0x08], 0, 0).unwrap();
+        assert!(he.sbr);
+        assert_eq!((he.channels, he.sample_rate), (2, 44100));
+        assert!(parse_asc(&[0xeb, 0x92, 0x08], 0, 0).is_err(), "HE-AAC v2 (parametric stereo) is refused");
     }
 }

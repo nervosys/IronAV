@@ -230,7 +230,15 @@ to within float rounding of FFmpeg's output (about 136 dB SNR). Short windows, T
 confirmed to occur in those streams; **the pulse tool did not occur in any of them, so that path is untested**, and
 every stream came from one encoder. One of them is committed with FFmpeg's decode as a regression test.
 
-Not decoded, and refused with an explanation rather than decoded wrongly: HE-AAC (SBR/PS), AAC Main prediction, LTP,
+**HE-AAC v1 (SBR)** is decoded when the AudioSpecificConfig announces it (explicit signalling): the spectral band replication
+tables come from FFmpeg's `aacsbrdata.h` by `tools/gen_sbr_tables.py`, and the rest is written from the specification and
+FFmpeg's float decoder. It was checked on one stream, Nero's encoder (a 44.1 kHz stereo `ct_nero-heaac.mp4` from the FFmpeg
+sample archive, 22.05 kHz core), which decodes to within float rounding of FFmpeg's output (131 dB SNR). **That one file is
+all the testing the SBR path has had**: it is not committed, mono SBR, coupled channels, the harmonic and short-envelope
+paths, and cores other than 22.05 kHz are unchecked, and the committed test only checks the filter bank on a tone.
+
+Not decoded, and refused with an explanation rather than decoded wrongly: HE-AAC v2 (parametric stereo) and SBR that is only
+signalled implicitly in the stream, AAC Main prediction, LTP,
 coupling channel elements, 960-sample frames, gain control, and channel layouts given by a program config element.
 AAC comes from MP4/M4A, Matroska and raw `.aac` (ADTS) files; the ADTS reader strips each frame's header, builds the AudioSpecificConfig from it, and decodes to the same samples as the MP4 copy of the same audio (checked on the one fixture, remuxed by FFmpeg). ADTS frames with several raw data blocks and channel configuration 0 are not read, and nothing is trimmed at the start (as with FFmpeg).
 On a 5-minute stereo 44.1 kHz file the decoder takes roughly 0.3-0.5 s (FFmpeg's: about 0.11 s) on a noisy machine, so it
