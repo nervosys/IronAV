@@ -255,7 +255,34 @@ Not covered: multichannel Opus (channel-mapping families 1 and 255 are refused),
 empty frame decodes to silence), and the way the reference decoder flushes its resampler when the stream switches between SILK
 and CELT, which our fixed-delay filter does not reproduce, so the few samples at such a switch can differ. The libopus encoder
 only produced streams in one mode at a time, so **mode switches within a stream were not tested**, nor were redundancy frames.
-Opus is read from Matroska/WebM (`.mka`, `.webm`) and from Ogg (`.opus`, `.ogg`); there is no Opus encoder. The Ogg reader (pages are checksummed; the file is read into memory, up to 1 GiB) takes only the first Opus stream: Vorbis, FLAC and Theora in Ogg are refused with a message naming the codec, and chained streams after the first are ignored. The final page's granule position is not used, so the last packet's padding is not trimmed. Tested on libopus files remuxed to Ogg (identical samples to the Matroska copies); multi-page packets are covered by a synthetic unit test only.
+Opus is read from Matroska/WebM (`.mka`, `.webm`) and from Ogg (`.opus`, `.ogg`); there is no Opus encoder. The Ogg reader (pages are checksummed; the file is read into memory, up to 1 GiB) takes only the first Opus or Vorbis stream: FLAC and Theora in Ogg are refused with a message naming the codec, and chained streams after the first are ignored. The final page's granule position is not used, so the last packet's padding is not trimmed. Tested on libopus files remuxed to Ogg (identical samples to the Matroska copies); multi-page packets are covered by a synthetic unit test only.
+
+## Vorbis
+
+Vorbis I is decoded (floor type 1; residue types 0, 1 and 2; any channel count up to 8 in the standard layouts, reordered to
+the usual WAV/FFmpeg order) from Ogg (`.ogg`, `.oga`) and from Matroska/WebM. The setup-header, floor, residue and overlap
+logic follow FFmpeg's decoder and the floor 1 gain table comes from it (`tools/gen_vorbis_tables.py`); the inverse MDCT reuses
+the FFT code of the Opus decoder, and the window is computed from its definition.
+
+Checked against FFmpeg's decoder on twelve libvorbis files (mono, stereo and 3 to 7 channels; 8, 22.05, 44.1 and 48 kHz;
+several qualities; long and short blocks and the windows between them): **136 dB SNR**, largest sample difference 2.4e-7 of
+full scale (single-precision rounding). The same packets in Matroska decode identically. Fuzzed with 400 damaged and truncated
+files: no panics. Output is limited to [-1, 1] like every other IronAV decoder, so the overshoot a lossy stream can have
+is clipped where FFmpeg's float output keeps it.
+
+**One deliberate difference.** FFmpeg's SSE code for inverse channel coupling, until a fix in May 2026, treated a magnitude of
+exactly zero as positive; the specification, libvorbis and the C code (and FFmpeg now) do not. FFmpeg's own Vorbis encoder
+produces such values often, so a decode of its streams by an older FFmpeg differs from ours in the sign of the angle channel on
+those spectral lines (35 dB SNR on the test file); libvorbis streams did not hit it. `VorbisDecoder::legacy_zero_coupling(true)`
+reproduces the old behaviour, and with it the FFmpeg-encoder test file matches bit for bit.
+
+Not covered: **floor type 0** (obsolete; a stream that uses it is refused) and streams with more than 8 channels. The Ogg
+granule position is not used, so the final block's padding is not trimmed (our output runs up to about one block longer than
+FFmpeg's) and a stream that begins mid-way is not shifted. Chained or multiplexed Ogg streams: only the first Vorbis stream is
+read. Mid-stream changes of the headers are not followed. There is no Vorbis encoder. Decoding 120 s of 44.1 kHz stereo to WAV
+takes 0.34 to 0.48 s inside IronAV's own timing (roughly 250 to 350x real time), while FFmpeg's decoder alone ran the same file
+in 0.08 to 0.19 s through PyAV; FFmpeg is faster here by roughly 2 to 4x, and this decoder is scalar `f32` with a bit-at-a-time
+Huffman walk.
 
 ## MP3
 

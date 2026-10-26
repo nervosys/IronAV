@@ -92,7 +92,7 @@ pub static FORMATS: &[FormatSpec] = &[
     FormatSpec {
         name: "ogg",
         extensions: &["ogg", "opus", "oga"],
-        description: "Ogg (read-only): Opus audio only; Vorbis, FLAC and Theora in Ogg are refused",
+        description: "Ogg (read-only): Opus and Vorbis audio; FLAC and Theora in Ogg are refused",
         media: MediaType::Audio,
         demux: true,
         mux: false,

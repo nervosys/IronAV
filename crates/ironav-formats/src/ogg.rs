@@ -1,16 +1,17 @@
-//! Ogg reader (Opus only).
+//! Ogg reader (Opus and Vorbis).
 //!
 //! The file is read whole and its pages are unwrapped into one buffer of packet bytes, so a packet
 //! that continues over a page boundary is contiguous again. The packets are then handed to the MP4
 //! reader's machinery (`Mp4Demuxer::from_parts`) over that buffer, which reads, interleaves and
 //! seeks them.
 //!
-//! Timing comes from the packets themselves (each Opus packet knows its length), starting at zero:
-//! the decoder drops the pre-skip announced by `OpusHead`. The granule position of the last page,
-//! which would trim the final packet's padding, is not used.
+//! Timing comes from the packets themselves (an Opus packet knows its length; a Vorbis packet's
+//! block size follows from its mode, see `PacketTimer`), starting at zero: the Opus decoder drops
+//! the pre-skip announced by `OpusHead`. The granule position of the last page, which would trim
+//! the final packet's padding, is not used.
 //!
-//! Not handled: Vorbis, FLAC and other codecs in Ogg (refused), chained streams (only the first
-//! Opus stream is read) and files too big to hold in memory (refused above 1 GiB).
+//! Not handled: FLAC and other codecs in Ogg (refused), chained streams (only the first Opus or
+//! Vorbis stream is read) and files too big to hold in memory (refused above 1 GiB).
 
 use crate::mp4demux::{Config, Mp4Demuxer, Sample, TrackInfo};
 use ironav_core::{CodecId, Error, ErrorCode, Rational, Result, StreamInfo, StreamParams};
@@ -53,10 +54,11 @@ pub fn open<R: Read>(mut r: R) -> Result<Mp4Demuxer<Cursor<Vec<u8>>>> {
     }
 
     let mut data: Vec<u8> = Vec::new(); // unwrapped packet bytes
-    let mut serial: Option<u32> = None; // the Opus stream being read
+    let mut serial: Option<u32> = None; // the Opus or Vorbis stream being read
+    let mut vorbis = false;
     let mut ignored: Vec<u32> = Vec::new();
-    let mut head: Option<(u64, usize)> = None; // OpusHead
-    let mut packets: Vec<(u64, usize)> = Vec::new(); // audio packets (after OpusTags)
+    let mut headers: Vec<(u64, usize)> = Vec::new(); // OpusHead and OpusTags, or Vorbis's three headers
+    let mut packets: Vec<(u64, usize)> = Vec::new(); // audio packets
     let mut seen = 0usize; // packets of the stream so far
     let mut start = 0usize; // where the packet being assembled begins in `data`
     let mut unsupported: Option<String> = None;
@@ -87,12 +89,13 @@ pub fn open<R: Read>(mut r: R) -> Result<Mp4Demuxer<Cursor<Vec<u8>>>> {
         at = end;
 
         if flags & 0x02 != 0 && serial.is_none() {
-            // a new stream begins: take it if it is Opus
+            // a new stream begins: take it if it is Opus or Vorbis
             let first = &page[27 + nseg..];
-            if first.starts_with(b"OpusHead") {
+            if first.starts_with(b"OpusHead") || first.starts_with(b"\x01vorbis") {
                 serial = Some(ser);
+                vorbis = first[0] == 1;
             } else if unsupported.is_none() {
-                let name = [(&b"\x01vorbis"[..], "Vorbis"), (&b"\x7fFLAC"[..], "FLAC"), (&b"Speex"[..], "Speex"), (&b"\x80theora"[..], "Theora")]
+                let name = [(&b"\x7fFLAC"[..], "FLAC"), (&b"Speex"[..], "Speex"), (&b"\x80theora"[..], "Theora")]
                     .iter()
                     .find(|(m, _)| first.starts_with(m))
                     .map_or("an unrecognised codec", |(_, n)| n);
@@ -117,10 +120,10 @@ pub fn open<R: Read>(mut r: R) -> Result<Mp4Demuxer<Cursor<Vec<u8>>>> {
             p += s as usize;
             if s < 255 {
                 let pkt = (start as u64, data.len() - start);
-                match seen {
-                    0 => head = Some(pkt),
-                    1 => {} // OpusTags
-                    _ => packets.push(pkt),
+                if seen < if vorbis { 3 } else { 2 } {
+                    headers.push(pkt);
+                } else {
+                    packets.push(pkt);
                 }
                 seen += 1;
                 start = data.len();
@@ -128,37 +131,62 @@ pub fn open<R: Read>(mut r: R) -> Result<Mp4Demuxer<Cursor<Vec<u8>>>> {
         }
     }
 
-    let Some((hoff, hlen)) = head else {
+    if headers.is_empty() {
         return Err(match unsupported {
-            Some(n) => Error::new(ErrorCode::UnsupportedCodec, format!("Ogg: the file holds {n}; only Opus in Ogg is read so far")),
-            None => bad("no Opus stream found"),
+            Some(n) => Error::new(ErrorCode::UnsupportedCodec, format!("Ogg: the file holds {n}; only Opus and Vorbis in Ogg are read so far")),
+            None => bad("no Opus or Vorbis stream found"),
         });
-    };
-    let hd = &data[hoff as usize..hoff as usize + hlen];
-    if hd.len() < 19 || hd[8] >> 4 != 0 {
-        return Err(bad("OpusHead is too short or has an unknown version"));
     }
-    let channels = hd[9] as u16;
-    let extradata = hd.to_vec();
-
+    let hdr = |i: usize| -> Result<&[u8]> {
+        let &(off, len) = headers.get(i).ok_or_else(|| bad("the stream ends inside its headers"))?;
+        Ok(&data[off as usize..off as usize + len])
+    };
     let mut samples = Vec::with_capacity(packets.len());
     let mut pts = 0i64;
-    for &(off, size) in &packets {
-        let h = &data[off as usize..off as usize + size.min(2)];
-        let len = if size == 0 { 960 } else { ironav_codec::opus::packet_samples(h).unwrap_or(960) as u32 };
-        samples.push(Sample { stream: 0, sync: true, offset: off, size: size as u32, dts: pts, cts_offset: 0, duration: len });
-        pts += len as i64;
+    let stream;
+    if vorbis {
+        let extradata = ironav_codec::vorbis::join_headers([hdr(0)?, hdr(1)?, hdr(2)?]);
+        let (channels, rate) = ironav_codec::vorbis::PacketTimer::channels_and_rate(&extradata)?;
+        let mut timer = ironav_codec::vorbis::PacketTimer::new(&extradata)?;
+        for &(off, size) in &packets {
+            let len = timer.next(&data[off as usize..off as usize + size]);
+            samples.push(Sample { stream: 0, sync: true, offset: off, size: size as u32, dts: pts, cts_offset: 0, duration: len });
+            pts += len as i64;
+        }
+        stream = StreamInfo {
+            index: 0,
+            codec: CodecId::Vorbis,
+            time_base: Rational::new(1, rate as i64),
+            duration: Some(pts),
+            bits: None,
+            extradata,
+            lead_in: 0,
+            params: StreamParams::Audio { sample_rate: rate, channels },
+        };
+    } else {
+        let hd = hdr(0)?;
+        if hd.len() < 19 || hd[8] >> 4 != 0 {
+            return Err(bad("OpusHead is too short or has an unknown version"));
+        }
+        let channels = hd[9] as u16;
+        let extradata = hd.to_vec();
+        for &(off, size) in &packets {
+            let h = &data[off as usize..off as usize + size.min(2)];
+            let len = if size == 0 { 960 } else { ironav_codec::opus::packet_samples(h).unwrap_or(960) as u32 };
+            samples.push(Sample { stream: 0, sync: true, offset: off, size: size as u32, dts: pts, cts_offset: 0, duration: len });
+            pts += len as i64;
+        }
+        stream = StreamInfo {
+            index: 0,
+            codec: CodecId::Opus,
+            time_base: Rational::new(1, 48_000),
+            duration: Some(pts),
+            bits: None,
+            extradata,
+            lead_in: 0,
+            params: StreamParams::Audio { sample_rate: 48_000, channels },
+        };
     }
-    let stream = StreamInfo {
-        index: 0,
-        codec: CodecId::Opus,
-        time_base: Rational::new(1, 48_000),
-        duration: Some(pts),
-        bits: None,
-        extradata,
-        lead_in: 0,
-        params: StreamParams::Audio { sample_rate: 48_000, channels },
-    };
     let track = TrackInfo { stream, config: Config { prefix: Vec::new(), nal_length: 0, bits: 8 }, convert: false };
     Ok(Mp4Demuxer::from_parts(Cursor::new(data), "ogg", vec![track], samples))
 }
@@ -237,12 +265,12 @@ mod tests {
     }
 
     #[test]
-    fn refuses_vorbis_and_bad_checksums() {
-        let mut v = b"\x01vorbis".to_vec();
+    fn refuses_flac_and_bad_checksums() {
+        let mut v = b"\x7fFLAC".to_vec();
         v.extend([0; 20]);
         let f = page(0x02, 0, 1, 0, &[&v], false);
         let e = open(&f[..]).err().unwrap();
-        assert!(e.message.contains("Vorbis"), "{}", e.message);
+        assert!(e.message.contains("FLAC"), "{}", e.message);
 
         let mut f = page(0x02, 0, 7, 0, &[&opus_head()], false);
         let n = f.len();

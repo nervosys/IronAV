@@ -775,3 +775,72 @@ fn matroska_with_b_frames_copies_into_mp4_unchanged() {
     let shown: Vec<f64> = from.iter().filter(|p| p.0 == 0).map(|p| p.1).collect();
     assert!(shown.windows(2).any(|w| w[1] < w[0]), "the fixture is meant to have reordered frames");
 }
+
+/// Decode a Vorbis file and compare it with FFmpeg's output, which is trimmed at the end by the Ogg
+/// granule position where ours is not. `legacy` selects the older FFmpeg's reading of inverse channel
+/// coupling (see `VorbisDecoder::legacy_zero_coupling`), which is the one the fixtures were made with.
+fn vorbis_vs_ffmpeg(file: &str, ext: &str, legacy: bool) -> (f64, i32) {
+    use ironav_core::{Decoder, Frame};
+    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    let mut d = ironav_formats::open_demuxer(&data.join(format!("{file}.{ext}"))).unwrap();
+    let info = d.streams()[0].clone();
+    assert_eq!(info.codec, ironav_core::CodecId::Vorbis);
+    let params = info.params.clone();
+    let mut dec: Box<dyn Decoder> = if legacy {
+        Box::new(ironav_codec::vorbis::VorbisDecoder::new(&info.extradata, &params).unwrap().legacy_zero_coupling(true))
+    } else {
+        ironav_codec::new_decoder_for(&info).unwrap()
+    };
+    let mut got = Vec::new();
+    while let Some(p) = d.read_packet().unwrap() {
+        for f in dec.decode(&p).unwrap() {
+            if let Frame::Audio(a) = f {
+                got.extend(a.samples.iter().map(|&s| (s * 32768.0).round().clamp(-32768.0, 32767.0) as i32));
+            }
+        }
+    }
+    let want: Vec<i32> = std::fs::read(data.join(format!("{file}.ffmpeg.s16"))).unwrap().chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as i32).collect();
+    assert!(got.len() >= want.len(), "{} samples against {}", got.len(), want.len());
+    let (mut sig, mut err, mut worst) = (0f64, 0f64, 0);
+    for (a, b) in got.iter().zip(&want) {
+        sig += (*b as f64).powi(2);
+        err += ((a - b) as f64).powi(2);
+        worst = worst.max((a - b).abs());
+    }
+    (10.0 * (sig / err.max(1e-9)).log10(), worst)
+}
+
+/// libvorbis streams (long and short blocks and the windows between them, mono, stereo and 5.1 with
+/// their channel coupling and residue types) decode to what FFmpeg decodes, to a rounding step.
+#[test]
+fn vorbis_decodes_to_what_ffmpeg_decodes() {
+    for (file, ext) in [("vorbis_stereo", "ogg"), ("vorbis_stereo", "mka"), ("vorbis_mono_8k", "ogg"), ("vorbis_5_1", "ogg")] {
+        let (snr, worst) = vorbis_vs_ffmpeg(file, ext, false);
+        assert!(worst <= 1 && snr > 80.0, "{file}.{ext}: largest difference from FFmpeg is {worst} LSB (SNR {snr:.1} dB)");
+    }
+}
+
+/// FFmpeg's own Vorbis encoder makes streams in which the magnitude channel is often exactly zero where
+/// the angle channel is not. The FFmpeg the fixture was decoded with then took the angle's sign the
+/// other way from the specification: matched with the legacy switch the output is identical, and
+/// without it only those spectral lines differ.
+#[test]
+fn vorbis_follows_the_specification_where_old_ffmpeg_did_not() {
+    let (snr, worst) = vorbis_vs_ffmpeg("vorbis_ffmpeg_encoder", "ogg", true);
+    assert!(worst <= 1 && snr > 80.0, "largest difference from the older FFmpeg is {worst} LSB (SNR {snr:.1} dB)");
+    let (snr, _) = vorbis_vs_ffmpeg("vorbis_ffmpeg_encoder", "ogg", false);
+    assert!(snr > 25.0 && snr < 60.0, "SNR against the older FFmpeg is {snr:.1} dB");
+}
+
+/// The whole path, through the engine: Ogg Vorbis to WAV.
+#[test]
+fn vorbis_converts_to_wav() {
+    let dir = scratch("vorbis-wav");
+    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    let out = dir.join("out.wav");
+    let mut j = job(&data.join("vorbis_5_1.ogg"), &out);
+    j.audio.codec = Some("pcm_s16le".into());
+    run(&j, &mut |_| {}).unwrap();
+    let bytes = pcm(&out);
+    assert!(bytes.len() >= 35280 * 6 * 2, "only {} bytes of audio", bytes.len());
+}

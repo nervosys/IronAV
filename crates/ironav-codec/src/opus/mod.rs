@@ -7,7 +7,7 @@
 //! Channel-mapping family 0 only: one stream of one or two channels.
 
 mod celt;
-mod mdct;
+pub(crate) mod mdct;
 mod rc;
 mod silk;
 mod tables;

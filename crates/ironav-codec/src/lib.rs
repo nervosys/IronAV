@@ -8,6 +8,7 @@ pub mod flac;
 mod filters;
 pub mod mp3;
 pub mod opus;
+pub mod vorbis;
 mod pcm;
 mod pixconv;
 mod rawvideo;
@@ -40,6 +41,9 @@ pub fn implemented() -> Vec<CodecImpl> {
             }
             if c == CodecId::Opus {
                 return Some(CodecImpl { codec: c, decode: true, encode: false, implementation: "ironav-opus" });
+            }
+            if c == CodecId::Vorbis {
+                return Some(CodecImpl { codec: c, decode: true, encode: false, implementation: "ironav-vorbis" });
             }
             let implementation = if c.sample_format().is_some() {
                 "ironav-pcm"
@@ -76,6 +80,7 @@ pub fn new_decoder_for(s: &ironav_core::StreamInfo) -> Result<Box<dyn Decoder>> 
         CodecId::Aac => Ok(Box::new(aac::AacDecoder::new(&s.extradata, &s.params)?)),
         CodecId::Mp3 => Ok(Box::new(mp3::Mp3Decoder::new(&s.params)?)),
         CodecId::Opus => Ok(Box::new(opus::OpusDecoder::new(&s.extradata, &s.params)?)),
+        CodecId::Vorbis => Ok(Box::new(vorbis::VorbisDecoder::new(&s.extradata, &s.params)?)),
         _ => new_decoder(s.codec, &s.params, s.bits),
     }
 }

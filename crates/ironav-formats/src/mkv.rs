@@ -555,6 +555,9 @@ fn frame_rate(fps: f64) -> Rational {
 
 /// Samples per frame of codecs whose frames all have the same length, when it can be told.
 fn audio_frame_len(t: &MkTrack, codec: CodecId) -> Option<u32> {
+    if codec == CodecId::Vorbis {
+        return None; // block sizes vary: the container's timestamps are all there is
+    }
     if t.default_ns > 0 {
         let n = (t.default_ns as f64 * t.rate / 1e9).round();
         if n >= 1.0 && n < 1e6 {
@@ -623,7 +626,7 @@ fn build_track(t: &MkTrack, index: usize, frames: &[&Frame], scale: u64, samples
         convert = false;
         let rate = t.rate.round() as u32;
         bits = t.bits;
-        if codec == CodecId::Aac || codec == CodecId::Opus || codec == CodecId::Mp3 {
+        if matches!(codec, CodecId::Aac | CodecId::Opus | CodecId::Mp3 | CodecId::Vorbis) {
             extradata = t.private.clone();
             bits = None;
         }
