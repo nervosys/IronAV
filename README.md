@@ -257,6 +257,24 @@ and CELT, which our fixed-delay filter does not reproduce, so the few samples at
 only produced streams in one mode at a time, so **mode switches within a stream were not tested**, nor were redundancy frames.
 Opus is read from Matroska/WebM (`.mka`, `.webm`) and from Ogg (`.opus`, `.ogg`); there is no Opus encoder. The Ogg reader (pages are checksummed; the file is read into memory, up to 1 GiB) takes only the first Opus stream: Vorbis, FLAC and Theora in Ogg are refused with a message naming the codec, and chained streams after the first are ignored. The final page's granule position is not used, so the last packet's padding is not trimmed. Tested on libopus files remuxed to Ogg (identical samples to the Matroska copies); multi-page packets are covered by a synthetic unit test only.
 
+## MP3
+
+MPEG-1, MPEG-2 and MPEG-2.5 Layer III are decoded (mono, stereo, joint stereo with mid/side), from `.mp3` files (ID3v2 tags
+skipped, a leading Xing/Info frame not played) and from Matroska. The Huffman and band tables and the scale-factor, stereo and
+short-block handling follow FFmpeg's decoder; the filterbank is written from the standard's definitions in `f64`.
+
+Checked against FFmpeg's `mp3float` decoder on twelve LAME-encoded files (44.1, 48, 32, 22.05, 24, 16, 11.025 and 8 kHz;
+mono and stereo; 16 to 320 kb/s, CBR and VBR; long, start, short and stop blocks): **116 to 124 dB SNR**, largest sample
+difference about 3e-6 of full scale. The same frames in Matroska decode identically. Fuzzed with 120 damaged and truncated
+files: no panics.
+
+Not covered, and not tested because the encoder used never produced them: **mixed blocks, intensity stereo, CRC-protected
+frames and the 8 kHz mixed-block tables** are ported from FFmpeg but unverified. Layers I and II are refused. A frame whose
+bit-reservoir data is missing (the first frames after a seek) decodes to silence. The LAME tag's encoder delay and padding are
+not used, so decoded audio starts with the encoder's delay (1105 samples is what FFmpeg trims) and ends with its padding. There
+is no MP3 encoder. Decoding 120 s of 44.1 kHz stereo to WAV takes about 0.8 s end to end here (roughly 150x real time; noisy
+machine, `f64` throughout, no SIMD); that is a figure for this code, not a comparison with FFmpeg, which I did not time.
+
 ## Performance
 
 Stages run on separate threads with bounded queues, packets are moved not copied, and the MCP/GUI processes stay

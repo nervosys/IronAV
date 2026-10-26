@@ -4,6 +4,7 @@ mod annexb;
 pub(crate) mod flac;
 mod mkv;
 mod mp4;
+mod mp3;
 mod mp4demux;
 mod ogg;
 mod wav;
@@ -80,6 +81,15 @@ pub static FORMATS: &[FormatSpec] = &[
         codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Av1, CodecId::Vp8, CodecId::Vp9, CodecId::Aac, CodecId::Mp3, CodecId::Opus, CodecId::Vorbis, CodecId::Flac],
     },
     FormatSpec {
+        name: "mp3",
+        extensions: &["mp3"],
+        description: "MP3 (MPEG-1/2/2.5 Layer III) files, read-only; ID3 tags are skipped and a Xing/Info frame is not played",
+        media: MediaType::Audio,
+        demux: true,
+        mux: false,
+        codecs: &[CodecId::Mp3],
+    },
+    FormatSpec {
         name: "ogg",
         extensions: &["ogg", "opus", "oga"],
         description: "Ogg (read-only): Opus audio only; Vorbis, FLAC and Theora in Ogg are refused",
@@ -132,9 +142,20 @@ pub fn open_demuxer(path: &Path) -> Result<Box<dyn Demuxer>> {
     let n = f.read(&mut magic)?;
     f.seek(SeekFrom::Start(0))?;
     let magic = &magic[..n];
+    // an ID3v2 tag fronts FLAC files as well as MP3 files: look at what follows it
+    let behind_id3 = if magic.starts_with(b"ID3") && magic.len() >= 10 {
+        let size = magic[6..10].iter().fold(0u64, |a, &b| (a << 7) | (b & 0x7F) as u64);
+        let mut next = [0u8; 4];
+        f.seek(SeekFrom::Start(10 + size + if magic[5] & 0x10 != 0 { 10 } else { 0 }))?;
+        let got = f.read(&mut next)?;
+        f.seek(SeekFrom::Start(0))?;
+        Some(next[..got].to_vec())
+    } else {
+        None
+    };
     if magic.len() >= 12 && &magic[..4] == b"RIFF" && &magic[8..12] == b"WAVE" {
         Ok(Box::new(wav::WavDemuxer::open(f)?))
-    } else if flac::looks_like_flac(magic) {
+    } else if flac::looks_like_flac(magic) && behind_id3.as_ref().map_or(true, |b| b.starts_with(b"fLaC")) {
         Ok(Box::new(flac::FlacDemuxer::open(f)?))
     } else if mp4demux::looks_like_mp4(magic) {
         Ok(Box::new(mp4demux::Mp4Demuxer::open(f)?))
@@ -143,6 +164,8 @@ pub fn open_demuxer(path: &Path) -> Result<Box<dyn Demuxer>> {
         Ok(Box::new(mkv::open(f.into_inner())?))
     } else if ogg::looks_like_ogg(magic) {
         Ok(Box::new(ogg::open(f)?))
+    } else if mp3::looks_like_mp3(magic) {
+        Ok(Box::new(mp3::open(f)?))
     } else if magic.starts_with(b"YUV4MPEG2") {
         Ok(Box::new(y4m::Y4mDemuxer::open(f)?))
     } else {

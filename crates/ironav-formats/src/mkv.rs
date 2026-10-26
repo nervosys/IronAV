@@ -623,7 +623,7 @@ fn build_track(t: &MkTrack, index: usize, frames: &[&Frame], scale: u64, samples
         convert = false;
         let rate = t.rate.round() as u32;
         bits = t.bits;
-        if codec == CodecId::Aac || codec == CodecId::Opus {
+        if codec == CodecId::Aac || codec == CodecId::Opus || codec == CodecId::Mp3 {
             extradata = t.private.clone();
             bits = None;
         }

@@ -678,6 +678,41 @@ fn opus_vs_ffmpeg(file: &str, ext: &str) -> (f64, i32) {
     (10.0 * (sig / err.max(1e-9)).log10(), worst)
 }
 
+/// Decode an MP3 file and compare it with FFmpeg's `mp3float` output, which starts 1105 samples in
+/// (576 of the decoder's delay and 529 more, as FFmpeg's MP3 reader trims a LAME stream) and is
+/// trimmed at the end too.
+fn mp3_vs_ffmpeg(file: &str, ext: &str, channels: usize) -> (f64, i32) {
+    let dir = scratch(&format!("mp3-{file}-{ext}"));
+    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    let out = dir.join("out.wav");
+    let mut j = job(&data.join(format!("{file}.{ext}")), &out);
+    j.audio.codec = Some("pcm_s16le".into());
+    run(&j, &mut |_| {}).unwrap();
+    let s16 = |b: Vec<u8>| -> Vec<i32> { b.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as i32).collect() };
+    let got = s16(pcm(&out));
+    let want = s16(std::fs::read(data.join(format!("{file}.ffmpeg.s16"))).unwrap());
+    let got = &got[1105 * channels..];
+    assert!(got.len() >= want.len(), "{} samples against {}", got.len(), want.len());
+    let (mut sig, mut err, mut worst) = (0f64, 0f64, 0);
+    for (a, b) in got.iter().zip(&want) {
+        sig += (*b as f64).powi(2);
+        err += ((a - b) as f64).powi(2);
+        worst = worst.max((a - b).abs());
+    }
+    (10.0 * (sig / err.max(1e-9)).log10(), worst)
+}
+
+/// MPEG-1, MPEG-2 and MPEG-2.5 files from LAME: long, start, short and stop blocks, and joint
+/// stereo with and without mid/side. The difference from FFmpeg is rounding to 16 bits.
+#[test]
+fn mp3_decodes_to_what_ffmpeg_decodes() {
+    // the first file also as the same frames in Matroska
+    for (file, ext, ch) in [("mp3_mpeg1_stereo", "mp3", 2), ("mp3_mpeg1_stereo", "mka", 2), ("mp3_mpeg2_mono", "mp3", 1), ("mp3_mpeg25_mono", "mp3", 1)] {
+        let (snr, worst) = mp3_vs_ffmpeg(file, ext, ch);
+        assert!(worst <= 1 && snr > 80.0, "{file}.{ext}: largest difference from FFmpeg is {worst} LSB (SNR {snr:.1} dB)");
+    }
+}
+
 /// The same packets in an Ogg file decode to the same samples as in Matroska.
 #[test]
 fn ogg_opus_decodes_like_the_same_packets_in_matroska() {
