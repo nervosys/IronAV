@@ -1108,8 +1108,8 @@ fn ogg_opus_output_copies_and_encodes() {
     assert!(snr_db(&pcm(&wav), &got) > 20.0);
 
     let e = plan(&{
-        let mut j = job(&data.join("vorbis_stereo.ogg"), &dir.join("v.opus"));
-        j.audio.codec = Some("vorbis".into());
+        let mut j = job(&data.join("mp3_mpeg1_stereo.mp3"), &dir.join("v.opus"));
+        j.audio.codec = Some("copy".into());
         j
     })
     .unwrap_err();
