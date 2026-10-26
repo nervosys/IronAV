@@ -1,4 +1,4 @@
-//! Ogg writer for Opus (RFC 7845) and FLAC (the native mapping): the headers, then the packets in
+//! Ogg writer for Opus (RFC 7845), Vorbis and FLAC (the native mapping): the headers, then the packets in
 //! pages of about half a second, each stamped with the number of samples decoded once its last
 //! packet has been (Opus: at 48 kHz, the pre-skip included). The final page's stamp is what lets
 //! a player cut the padding off the end, so the last packet's duration decides where Opus ends.
@@ -35,11 +35,15 @@ pub struct OggWriter {
     rate: i64,
     /// FLAC: (rate, channels, bits), the running totals, and the first page as written.
     flac: Option<((u32, u16, u8), FlacStats, Vec<u8>)>,
+    /// Vorbis: sizes each packet's window, to stamp the pages.
+    vorbis: Option<ironav_codec::vorbis::PacketTimer>,
+    /// Samples the last packet's own duration cuts off its window's count (the end of the stream).
+    last_trim: i64,
 }
 
 impl OggWriter {
     pub fn new(out: Box<dyn WriteSeek>) -> Self {
-        Self { out, seq: 0, time_base: (1, 48_000), granule: 0, pending: Vec::new(), pending_segments: 0, pending_samples: 0, started: false, rate: 48_000, flac: None }
+        Self { out, seq: 0, time_base: (1, 48_000), granule: 0, pending: Vec::new(), pending_segments: 0, pending_samples: 0, started: false, rate: 48_000, flac: None, vorbis: None, last_trim: 0 }
     }
 
     fn build_page(&self, kind: u8, granule: i64, packets: &[Vec<u8>]) -> Vec<u8> {
@@ -92,14 +96,29 @@ impl Muxer for OggWriter {
         let [s] = streams else {
             return Err(Error::invalid_arg("Ogg holds exactly one audio stream here"));
         };
-        if !matches!(s.codec, CodecId::Opus | CodecId::Flac) || !matches!(s.params, StreamParams::Audio { .. }) {
-            return Err(Error::new(ErrorCode::UnsupportedCodec, format!("this Ogg writer holds Opus and FLAC, not {}", s.codec.name())).alternatives(["opus", "flac"]));
+        if !matches!(s.codec, CodecId::Opus | CodecId::Flac | CodecId::Vorbis) || !matches!(s.params, StreamParams::Audio { .. }) {
+            return Err(Error::new(ErrorCode::UnsupportedCodec, format!("this Ogg writer holds Opus, Vorbis and FLAC, not {}", s.codec.name())).alternatives(["opus", "vorbis", "flac"]));
         }
         if s.time_base.num <= 0 || s.time_base.den <= 0 {
             return Err(Error::invalid_arg("a stream has no time base"));
         }
         self.time_base = (s.time_base.num, s.time_base.den);
         let vendor = b"IronAV";
+        if s.codec == CodecId::Vorbis {
+            let [id, comment, setup] = ironav_codec::vorbis::split_headers(&s.extradata)?;
+            if comment.len() + setup.len() > (PAGE_SEGMENTS - 1) * 255 {
+                return Err(Error::invalid_input("the Vorbis setup header is too large for one Ogg page"));
+            }
+            self.rate = match &s.params {
+                StreamParams::Audio { sample_rate, .. } => *sample_rate as i64,
+                _ => 48_000,
+            };
+            self.vorbis = Some(ironav_codec::vorbis::PacketTimer::new(&s.extradata)?);
+            self.page(HEADER_BOS, 0, &[id.to_vec()])?;
+            self.page(0, 0, &[comment.to_vec(), setup.to_vec()])?;
+            self.started = true;
+            return Ok(());
+        }
         if s.codec == CodecId::Flac {
             let (rate, channels, bits) = flac_audio_params(s)?;
             self.rate = rate as i64;
@@ -141,7 +160,15 @@ impl Muxer for OggWriter {
             return Err(Error::new(ErrorCode::Internal, "packet before the header"));
         }
         // the duration in 48 kHz samples; the packet itself knows when the container does not
-        let samples = if p.duration > 0 {
+        let samples = if let Some(t) = self.vorbis.as_mut() {
+            // a Vorbis packet's window decides how much it adds; a shorter duration is the stream's end (only
+            // trusted when counted in samples: Matroska's millisecond ticks are too coarse for it)
+            let n = t.next(&p.data) as i64;
+            let exact = self.time_base.0 == 1 && self.time_base.1 == self.rate;
+            let cut = if p.duration > 0 && exact { (p.duration as i128 * self.rate as i128 * self.time_base.0 as i128 / self.time_base.1 as i128) as i64 } else { n };
+            self.last_trim = (n - cut).max(0);
+            n
+        } else if p.duration > 0 {
             (p.duration as i128 * self.rate as i128 * self.time_base.0 as i128 / self.time_base.1 as i128) as i64
         } else {
             ironav_codec::opus::packet_samples(&p.data).unwrap_or(960) as i64
@@ -167,6 +194,7 @@ impl Muxer for OggWriter {
             // no audio at all: the stream still needs its last page
             self.page(HEADER_EOS, self.granule, &[])?;
         } else {
+            self.pending_samples -= self.last_trim;
             self.flush_page(true)?;
         }
         if let Some(((rate, channels, bits), stats, mut first)) = self.flac.take() {

@@ -1152,3 +1152,39 @@ fn ogg_flac_output_is_lossless_and_copies() {
     }
     assert!(b.read_packet().unwrap().is_none());
 }
+
+/// Vorbis can be copied into Ogg from Ogg or Matroska: the packets and the stream length survive.
+#[test]
+fn ogg_vorbis_output_copies_packets_and_length() {
+    let dir = scratch("ogg-vorbis");
+    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    for file in ["vorbis_stereo.mka", "vorbis_5_1.ogg", "vorbis_mono_8k.ogg"] {
+        let src = data.join(file);
+        let out = dir.join(format!("{file}.copy.ogg"));
+        run(&job(&src, &out), &mut |_| {}).unwrap();
+        let (mut a, mut b) = (ironav_formats::open_demuxer(&src).unwrap(), ironav_formats::open_demuxer(&out).unwrap());
+        assert_eq!(b.format_name(), "ogg");
+        assert_eq!(a.streams()[0].extradata, b.streams()[0].extradata, "{file}: headers");
+        let (mut n, mut ta, mut tb) = (0, 0i64, 0i64);
+        while let Some(pa) = a.read_packet().unwrap() {
+            let pb = b.read_packet().unwrap().unwrap_or_else(|| panic!("{file}: ends early at {n}"));
+            assert_eq!(pa.data, pb.data, "{file}: packet {n}");
+            ta += pa.duration;
+            tb += pb.duration;
+            n += 1;
+        }
+        assert!(b.read_packet().unwrap().is_none());
+        if file.ends_with(".ogg") {
+            assert_eq!(ta, tb, "{file}: an Ogg source is copied to the sample");
+        }
+        let secs = |t: i64, d: &dyn ironav_core::Demuxer| t as f64 * d.streams()[0].time_base.as_f64();
+        assert!((secs(ta, &*a) - secs(tb, &*b)).abs() < 0.03, "{file}: stream length {ta} vs {tb}");
+        let (wa, wb) = (dir.join(format!("{file}.a.wav")), dir.join(format!("{file}.b.wav")));
+        for (i, o) in [(&src, &wa), (&out, &wb)] {
+            let mut j = job(i, o);
+            j.audio.codec = Some("pcm_s16le".into());
+            run(&j, &mut |_| {}).unwrap();
+        }
+        assert_eq!(pcm(&wa), pcm(&wb), "{file}: decoded audio");
+    }
+}

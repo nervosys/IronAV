@@ -113,11 +113,11 @@ pub static FORMATS: &[FormatSpec] = &[
     FormatSpec {
         name: "ogg",
         extensions: &["ogg", "opus", "oga"],
-        description: "Ogg: read Opus, Vorbis and FLAC audio (Speex and Theora are refused); write Opus and FLAC (copied or encoded)",
+        description: "Ogg: read Opus, Vorbis and FLAC audio (Speex and Theora are refused); write Opus, Vorbis (copied) and FLAC",
         media: MediaType::Audio,
         demux: true,
         mux: true,
-        codecs: &[CodecId::Opus, CodecId::Flac],
+        codecs: &[CodecId::Opus, CodecId::Vorbis, CodecId::Flac],
     },
     FormatSpec {
         name: "h264",
