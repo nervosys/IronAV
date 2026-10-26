@@ -8,7 +8,7 @@ use super::rc::{ilog, Coder, RangeDecoder};
 
 pub(super) mod enc;
 use super::tables::*;
-use ironav_core::{Error, ErrorCode, Result};
+use ironav_core::{Error, Result};
 
 pub const MAX_BANDS: usize = 21;
 const SHORT_BLOCK: usize = 120;
@@ -463,7 +463,7 @@ impl<R: Coder> Bands<'_, R> {
         let mut cm = 0u32;
 
         if n == 1 {
-            let mut do_one = |x0: &mut f32, this: &mut Self| {
+            let do_one = |x0: &mut f32, this: &mut Self| {
                 let mut sign = 0;
                 if this.p.remaining2 >= 1 << 3 {
                     sign = this.rc.raw(1, (*x0 < 0.0) as u32);

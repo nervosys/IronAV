@@ -219,3 +219,75 @@ mod sweep {
         }
     }
 }
+
+#[cfg(test)]
+mod stress {
+    use super::*;
+    use ironav_core::{AudioFrame, Decoder, StreamParams};
+
+    fn encode_all(channels: usize, bitrate: u32, input: &[f64]) -> Vec<Packet> {
+        let mut enc = OpusEncoder::new(48_000, channels, bitrate).unwrap();
+        let mut packets = Vec::new();
+        for chunk in input.chunks(777 * channels) {
+            let f = Frame::Audio(AudioFrame { sample_rate: 48_000, channels: channels as u16, pts: 0, samples: chunk.to_vec() });
+            packets.extend(enc.encode(&f).unwrap());
+        }
+        packets.extend(enc.flush().unwrap());
+        packets
+    }
+
+    fn decode_all(channels: usize, packets: &[Packet]) -> usize {
+        let params = StreamParams::Audio { sample_rate: 48_000, channels: channels as u16 };
+        let mut dec = super::super::OpusDecoder::new(&opus_head(channels), &params).unwrap();
+        let mut n = 0;
+        for p in packets {
+            for f in dec.decode(p).unwrap() {
+                let Frame::Audio(a) = f else { panic!() };
+                assert!(a.samples.iter().all(|v| v.is_finite() && v.abs() <= 1.0 + 1e-6), "samples out of range");
+                n += a.samples.len() / channels;
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn extreme_signals_and_rates_never_overflow_a_packet() {
+        let mut s = 99u32;
+        let mut rnd = || {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            (s >> 8) as f64 / (1 << 23) as f64 - 1.0
+        };
+        let n = 48_000 / 2;
+        for channels in [1usize, 2] {
+            let noise: Vec<f64> = (0..n * channels).map(|_| rnd()).collect();
+            let square: Vec<f64> = (0..n * channels).map(|i| if (i / channels / 50) % 2 == 0 { 1.0 } else { -1.0 }).collect();
+            let clicks: Vec<f64> = (0..n * channels).map(|i| if (i / channels) % 4801 == 0 { 1.0 } else { 0.0 }).collect();
+            let quiet: Vec<f64> = (0..n * channels).map(|_| rnd() * 1e-6).collect();
+            let silence = vec![0.0; n * channels];
+            for (name, sig) in [("noise", &noise), ("square", &square), ("clicks", &clicks), ("quiet", &quiet), ("silence", &silence)] {
+                for bitrate in [6_000u32, 8_000, 16_000, 64_000, 256_000, 510_000] {
+                    let packets = encode_all(channels, bitrate, sig);
+                    let got = decode_all(channels, &packets);
+                    assert!(got >= n, "{name} {channels}ch {bitrate}: {got} samples");
+                    if name == "silence" {
+                        assert!(packets.iter().all(|p| p.data.len() == 3), "silence is three bytes a frame");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tiny_inputs() {
+        for len in [0usize, 1, 2, 119, 120, 121, 959, 960, 961] {
+            let sig: Vec<f64> = (0..len).map(|i| (i as f64 * 0.3).sin() * 0.5).collect();
+            let packets = encode_all(1, 64_000, &sig);
+            if len == 0 {
+                assert!(packets.is_empty());
+                continue;
+            }
+            let got = decode_all(1, &packets);
+            assert!(got >= len && got < len + 960, "{len}: {got}");
+        }
+    }
+}
