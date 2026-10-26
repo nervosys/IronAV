@@ -862,3 +862,16 @@ fn vorbis_converts_to_wav() {
     let bytes = pcm(&out);
     assert!(bytes.len() >= 35280 * 6 * 2, "only {} bytes of audio", bytes.len());
 }
+
+/// FLAC in Ogg (made by FFmpeg's Ogg muxer from 16-bit stereo PCM): lossless, so the decoded audio is
+/// the PCM it was made from, sample for sample.
+#[test]
+fn flac_in_ogg_decodes_to_the_original_pcm() {
+    let dir = scratch("flac-in-ogg");
+    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    let out = dir.join("out.wav");
+    let mut j = job(&data.join("flac_in_ogg.ogg"), &out);
+    j.audio.codec = Some("pcm_s16le".into());
+    run(&j, &mut |_| {}).unwrap();
+    assert!(pcm(&out) == std::fs::read(data.join("flac_in_ogg.expect.s16")).unwrap(), "decoded audio differs from the source PCM");
+}

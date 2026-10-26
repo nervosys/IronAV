@@ -1,4 +1,4 @@
-//! Ogg reader (Opus and Vorbis).
+//! Ogg reader (Opus, Vorbis and FLAC).
 //!
 //! The file is read whole and its pages are unwrapped into one buffer of packet bytes, so a packet
 //! that continues over a page boundary is contiguous again. The packets are then handed to the MP4
@@ -10,8 +10,11 @@
 //! the pre-skip announced by `OpusHead`. The granule position of the last page, which gives the
 //! true length, shortens the last packet (see `trim_end`); the decoders cut their output to it.
 //!
-//! Not handled: FLAC and other codecs in Ogg (refused), chained streams (only the first Opus or
-//! Vorbis stream is read) and files too big to hold in memory (refused above 1 GiB).
+//! FLAC in Ogg is the native-FLAC mapping: one FLAC frame per packet, durations from the frame
+//! headers, no end trim (a FLAC frame is exact).
+//!
+//! Not handled: Speex, Theora and other codecs in Ogg (refused), chained streams (only the first
+//! Opus, Vorbis or FLAC stream is read) and files too big to hold in memory (refused above 1 GiB).
 
 use crate::mp4demux::{Config, Mp4Demuxer, Sample, TrackInfo};
 use ironav_core::{CodecId, Error, ErrorCode, Rational, Result, StreamInfo, StreamParams};
@@ -70,6 +73,7 @@ pub fn open<R: Read>(mut r: R) -> Result<Mp4Demuxer<Cursor<Vec<u8>>>> {
     let mut data: Vec<u8> = Vec::new(); // unwrapped packet bytes
     let mut serial: Option<u32> = None; // the Opus or Vorbis stream being read
     let mut vorbis = false;
+    let mut flac = false;
     let mut ignored: Vec<u32> = Vec::new();
     let mut headers: Vec<(u64, usize)> = Vec::new(); // OpusHead and OpusTags, or Vorbis's three headers
     let mut packets: Vec<(u64, usize)> = Vec::new(); // audio packets
@@ -106,11 +110,12 @@ pub fn open<R: Read>(mut r: R) -> Result<Mp4Demuxer<Cursor<Vec<u8>>>> {
         if flags & 0x02 != 0 && serial.is_none() {
             // a new stream begins: take it if it is Opus or Vorbis
             let first = &page[27 + nseg..];
-            if first.starts_with(b"OpusHead") || first.starts_with(b"\x01vorbis") {
+            if first.starts_with(b"OpusHead") || first.starts_with(b"\x01vorbis") || first.starts_with(b"\x7fFLAC") {
                 serial = Some(ser);
                 vorbis = first[0] == 1;
+                flac = first[0] == 0x7F;
             } else if unsupported.is_none() {
-                let name = [(&b"\x7fFLAC"[..], "FLAC"), (&b"Speex"[..], "Speex"), (&b"\x80theora"[..], "Theora")]
+                let name = [(&b"Speex"[..], "Speex"), (&b"\x80theora"[..], "Theora")]
                     .iter()
                     .find(|(m, _)| first.starts_with(m))
                     .map_or("an unrecognised codec", |(_, n)| n);
@@ -138,7 +143,10 @@ pub fn open<R: Read>(mut r: R) -> Result<Mp4Demuxer<Cursor<Vec<u8>>>> {
             p += s as usize;
             if s < 255 {
                 let pkt = (start as u64, data.len() - start);
-                if seen < if vorbis { 3 } else { 2 } {
+                let body = &data[start..];
+                // FLAC's metadata packets never start with a frame sync code
+                let header = if flac { seen == 0 || body.len() < 2 || body[0] != 0xFF || body[1] & 0xFE != 0xF8 } else { seen < if vorbis { 3 } else { 2 } };
+                if header {
                     headers.push(pkt);
                 } else {
                     packets.push(pkt);
@@ -151,7 +159,7 @@ pub fn open<R: Read>(mut r: R) -> Result<Mp4Demuxer<Cursor<Vec<u8>>>> {
 
     if headers.is_empty() {
         return Err(match unsupported {
-            Some(n) => Error::new(ErrorCode::UnsupportedCodec, format!("Ogg: the file holds {n}; only Opus and Vorbis in Ogg are read so far")),
+            Some(n) => Error::new(ErrorCode::UnsupportedCodec, format!("Ogg: the file holds {n}; only Opus, Vorbis and FLAC in Ogg are read so far")),
             None => bad("no Opus or Vorbis stream found"),
         });
     }
@@ -162,7 +170,36 @@ pub fn open<R: Read>(mut r: R) -> Result<Mp4Demuxer<Cursor<Vec<u8>>>> {
     let mut samples = Vec::with_capacity(packets.len());
     let mut pts = 0i64;
     let stream;
-    if vorbis {
+    if flac {
+        let hd = hdr(0)?;
+        // 0x7F "FLAC", version (2), header count (2), "fLaC", a metadata block header (4), STREAMINFO (34)
+        if hd.len() < 51 || &hd[9..13] != b"fLaC" || hd[5] != 1 {
+            return Err(bad("the FLAC mapping header is too short or has an unknown version"));
+        }
+        let b = &hd[17..51];
+        let packed = u64::from_be_bytes(b[10..18].try_into().unwrap());
+        let (rate, channels, bits) = ((packed >> 44) as u32, ((packed >> 41) & 7) as u16 + 1, ((packed >> 36) & 31) as u8 + 1);
+        if rate == 0 {
+            return Err(bad("STREAMINFO has a zero sample rate"));
+        }
+        let max_block = u16::from_be_bytes([b[2], b[3]]) as u32;
+        for &(off, size) in &packets {
+            let frame = &data[off as usize..off as usize + size];
+            let len = ironav_codec::flac::header::parse_header(frame).map_or(max_block, |h| h.block_size);
+            samples.push(Sample { stream: 0, sync: true, offset: off, size: size as u32, dts: pts, cts_offset: 0, duration: len });
+            pts += len as i64;
+        }
+        stream = StreamInfo {
+            index: 0,
+            codec: CodecId::Flac,
+            time_base: Rational::new(1, rate as i64),
+            duration: Some(pts),
+            bits: Some(bits),
+            extradata: Vec::new(),
+            lead_in: 0,
+            params: StreamParams::Audio { sample_rate: rate, channels },
+        };
+    } else if vorbis {
         let extradata = ironav_codec::vorbis::join_headers([hdr(0)?, hdr(1)?, hdr(2)?]);
         let (channels, rate) = ironav_codec::vorbis::PacketTimer::channels_and_rate(&extradata)?;
         let mut timer = ironav_codec::vorbis::PacketTimer::new(&extradata)?;
@@ -285,12 +322,12 @@ mod tests {
     }
 
     #[test]
-    fn refuses_flac_and_bad_checksums() {
-        let mut v = b"\x7fFLAC".to_vec();
+    fn refuses_speex_and_bad_checksums() {
+        let mut v = b"Speex   ".to_vec();
         v.extend([0; 20]);
         let f = page(0x02, 0, 1, 0, &[&v], false);
         let e = open(&f[..]).err().unwrap();
-        assert!(e.message.contains("FLAC"), "{}", e.message);
+        assert!(e.message.contains("Speex"), "{}", e.message);
 
         let mut f = page(0x02, 0, 7, 0, &[&opus_head()], false);
         let n = f.len();
