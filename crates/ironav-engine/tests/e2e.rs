@@ -1056,3 +1056,62 @@ fn resample_feeds_opus_and_bitrate_sets_the_size() {
     j.audio.bitrate_kbps = Some(900);
     assert_eq!(plan(&j).unwrap_err().code, ErrorCode::InvalidArgument);
 }
+
+/// Ogg Opus output: packets copied from a Matroska or Ogg file arrive unchanged and end where the
+/// source ended, an encode to `.opus` decodes close to its input, and other codecs are refused.
+#[test]
+fn ogg_opus_output_copies_and_encodes() {
+    let dir = scratch("ogg-out");
+    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    for file in ["opus_celt_stereo.opus", "opus_celt_stereo.opus.mka"] {
+        let src = if file.ends_with(".mka") {
+            let mka = dir.join(file);
+            run(&job(&data.join("opus_celt_stereo.opus"), &mka), &mut |_| {}).unwrap();
+            mka
+        } else {
+            data.join(file)
+        };
+        let out = dir.join(format!("{file}.copy.opus"));
+        run(&job(&src, &out), &mut |_| {}).unwrap();
+        let mut a = ironav_formats::open_demuxer(&src).unwrap();
+        let mut b = ironav_formats::open_demuxer(&out).unwrap();
+        assert_eq!(b.format_name(), "ogg");
+        assert_eq!(a.streams()[0].extradata[..19], b.streams()[0].extradata[..19], "{file}: OpusHead");
+        let (mut n, mut total_a, mut total_b) = (0, 0i64, 0i64);
+        while let Some(pa) = a.read_packet().unwrap() {
+            let pb = b.read_packet().unwrap().unwrap_or_else(|| panic!("{file}: the copy ends early at packet {n}"));
+            assert_eq!(pa.data, pb.data, "{file}: packet {n}");
+            total_a += pa.duration;
+            total_b += pb.duration;
+            n += 1;
+        }
+        assert!(b.read_packet().unwrap().is_none(), "{file}: the copy has extra packets");
+        assert_eq!(total_a, total_b, "{file}: stream length");
+    }
+
+    // an encode to .opus: the length is exact, because the last page says where the audio ends
+    let n = 48_000 * 2 + 777;
+    let samples: Vec<i16> = (0..n).map(|i| (14000.0 * (2.0 * std::f64::consts::PI * 523.0 * i as f64 / 48_000.0).sin()) as i16).collect();
+    let wav = dir.join("in.wav");
+    write_wav(&wav, &samples, 1, 48_000);
+    let out = dir.join("enc.opus");
+    let mut j = job(&wav, &out);
+    j.audio.codec = Some("opus".into());
+    run(&j, &mut |_| {}).unwrap();
+    assert!(std::fs::read(&out).unwrap().starts_with(b"OggS"));
+    let back = dir.join("enc.wav");
+    let mut j = job(&out, &back);
+    j.audio.codec = Some("pcm_s16le".into());
+    run(&j, &mut |_| {}).unwrap();
+    let got = pcm(&back);
+    assert_eq!(got.len() / 2, n, "an exact length");
+    assert!(snr_db(&pcm(&wav), &got) > 20.0);
+
+    let e = plan(&{
+        let mut j = job(&data.join("vorbis_stereo.ogg"), &dir.join("v.opus"));
+        j.audio.codec = Some("vorbis".into());
+        j
+    })
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::UnsupportedCodec);
+}

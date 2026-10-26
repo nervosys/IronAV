@@ -32,7 +32,7 @@ pub fn looks_like_ogg(magic: &[u8]) -> bool {
 }
 
 /// Ogg's CRC-32: polynomial 0x04C11DB7, not reflected, zero initial value, no final xor.
-fn crc(data: &[u8]) -> u32 {
+pub(crate) fn crc(data: &[u8]) -> u32 {
     static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
     let t = TABLE.get_or_init(|| {
         let mut t = [0u32; 256];

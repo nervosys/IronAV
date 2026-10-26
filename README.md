@@ -259,10 +259,16 @@ only produced streams in one mode at a time, so **mode switches within a stream 
 Opus is read from Matroska/WebM (`.mka`, `.webm`) and from Ogg (`.opus`, `.ogg`); for writing see "Opus encoder" below. The Ogg reader (pages are checksummed; the file is read into memory, up to 1 GiB) takes only the first Opus, Vorbis or FLAC stream: Speex and Theora in Ogg are refused with a message naming the codec, and chained streams after the first are ignored. The final page's granule position shortens the last packet, so the output ends where the file says (for Opus the length is the granule minus the pre-skip). Tested on libopus files remuxed to Ogg (identical samples to the Matroska copies); multi-page packets are covered by a synthetic unit test only. FLAC in Ogg (the native-FLAC mapping, as FFmpeg's muxer writes it) decodes bit for bit to the PCM it was made from.
 
 
+### Ogg Opus output
+
+`.opus` (and `.ogg`/`.oga`) is written for Opus, copied from any file that holds it or encoded: `OpusHead`, `OpusTags`, then pages of about
+half a second whose granule positions follow RFC 7845 (the packets' durations, pre-skip included, add up to the last one's, so
+the stream ends where it should). Other codecs in Ogg (Vorbis, FLAC) can be read but not written.
+
 ### Opus encoder
 
 `--acodec opus` writes CELT-mode Opus: 48 kHz mono or stereo, 20 ms frames, constant bit rate (64 kb/s per channel; the
-planner refuses other sample rates, naming the way out), into `.mka`, `.mkv` and `.webm` with the `OpusHead` and the
+planner refuses other sample rates, naming the way out), into `.opus` (Ogg), `.mka`, `.mkv` and `.webm` with the `OpusHead` and the
 pre-skip. It is written against the decoder: the bit allocation and the band quantiser are the decoder's own code, made
 generic over a `Coder` trait so that one body of code reads or writes a frame and the two cannot disagree, and what the
 encoder adds is the forward MDCT (checked to invert the decoder's synthesis), the band energies and their coarse/fine
@@ -280,8 +286,9 @@ Checked: FFmpeg (through PyAV) opens the Matroska files and decodes them; our de
 rate as it should (a tone-and-noise test signal, mono: 10 dB at 16 kb/s, 22 dB at 64, 29 at 128, 39 at 256). This is a first encoder, not libopus: there
 is **no transient detection** (so an attack spreads its quantisation noise before it), no short blocks, no pitch pre-filter,
 no band boosts or tuned allocation trim, and no variable bit rate or SILK/hybrid modes, so at the same size it will sound
-worse than libopus. The end of a stream is not trimmed in Matroska (the file decodes to up to one 20 ms frame too much,
-since this writer has no `DiscardPadding`). Not compared with libopus for quality: I have no libopus encoder to run.
+worse than libopus. The end of a stream is exact in Ogg (the last page's granule position says where the audio ends; FFmpeg decodes our
+`.opus` to exactly the source's length) but not in Matroska (the file decodes to up to one 20 ms frame too much, since this
+writer has no `DiscardPadding`). Not compared with libopus for quality: I have no libopus encoder to run.
 
 ## Vorbis
 
