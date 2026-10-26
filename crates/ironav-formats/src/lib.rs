@@ -67,8 +67,8 @@ pub static FORMATS: &[FormatSpec] = &[
     },
     FormatSpec {
         name: "mp4",
-        extensions: &["mp4", "m4v"],
-        description: "MP4 (ISO BMFF) with H.264 or HEVC video and optionally FLAC audio, or AAC audio copied from another file. Read as well as written; written with the index first (fast-start); fragmented files (moof) are read but never written",
+        extensions: &["mp4", "m4a", "m4v"],
+        description: "MP4 (ISO BMFF) with H.264 or HEVC video and optionally FLAC audio, or AAC audio (copied or encoded). Read as well as written; written with the index first (fast-start); fragmented files (moof) are read but never written",
         media: MediaType::Video,
         demux: true,
         mux: true,
@@ -104,10 +104,10 @@ pub static FORMATS: &[FormatSpec] = &[
     FormatSpec {
         name: "aac",
         extensions: &["aac", "adts"],
-        description: "Raw AAC in ADTS (read-only); ID3 tags are skipped",
+        description: "Raw AAC in ADTS; ID3 tags are skipped when reading",
         media: MediaType::Audio,
         demux: true,
-        mux: false,
+        mux: true,
         codecs: &[CodecId::Aac],
     },
     FormatSpec {
@@ -210,6 +210,7 @@ pub fn create_muxer(path: &Path, format: &str) -> Result<Box<dyn Muxer>> {
         "y4m" => Ok(Box::new(y4m::Y4mMuxer::new(out))),
         "flac" => Ok(Box::new(flac::FlacMuxer::new(out))),
         "mp4" => Ok(Box::new(mp4::Mp4Muxer::with_faststart(out, path))),
+        "aac" => Ok(Box::new(adts::AdtsMuxer::new(out))),
         "mkv" => Ok(Box::new(mkvwrite::MatroskaWriter::new(out))),
         "ogg" => Ok(Box::new(oggwrite::OggWriter::new(out))),
         "webm" => Ok(Box::new(mkvwrite::MatroskaWriter::webm(out))),

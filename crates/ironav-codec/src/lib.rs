@@ -35,7 +35,7 @@ pub fn implemented() -> Vec<CodecImpl> {
         .iter()
         .filter_map(|&c| {
             if c == CodecId::Aac {
-                return Some(CodecImpl { codec: c, decode: true, encode: false, implementation: "ironav-aac" });
+                return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-aac" });
             }
             if c == CodecId::Mp3 {
                 return Some(CodecImpl { codec: c, decode: true, encode: false, implementation: "ironav-mp3" });
@@ -78,7 +78,12 @@ fn unsupported(codec: CodecId, what: &str) -> Error {
 /// A decoder for a stream, including the codec configuration (AAC's AudioSpecificConfig) it carries.
 pub fn new_decoder_for(s: &ironav_core::StreamInfo) -> Result<Box<dyn Decoder>> {
     match s.codec {
-        CodecId::Aac => Ok(Box::new(aac::AacDecoder::new(&s.extradata, &s.params)?)),
+        CodecId::Aac => {
+            let d: Box<dyn Decoder> = Box::new(aac::AacDecoder::new(&s.extradata, &s.params)?);
+            // an MP4 edit list that starts after the encoder's priming samples says where the audio begins
+            let in_samples = matches!(s.params, StreamParams::Audio { sample_rate, .. } if s.time_base.num == 1 && s.time_base.den == sample_rate as i64);
+            Ok(if s.lead_in > 0 && in_samples { Box::new(Gapless { inner: d, start: s.lead_in as u64, end: u64::MAX, pos: 0 }) } else { d })
+        }
         CodecId::Mp3 => {
             let d: Box<dyn Decoder> = Box::new(mp3::Mp3Decoder::new(&s.params)?);
             // extradata from the MP3 reader: where the LAME tag says the audio starts and ends
@@ -204,6 +209,7 @@ pub fn audio_bitrate_range(codec: CodecId) -> Option<(u32, u32)> {
     match codec {
         CodecId::Opus => Some((6, 510)),
         CodecId::Vorbis => Some((16, 500)),
+        CodecId::Aac => Some((8, 512)),
         _ => None,
     }
 }
@@ -220,6 +226,10 @@ pub fn new_encoder_with(codec: CodecId, params: &StreamParams, bits: Option<u8>,
         (CodecId::Vorbis, StreamParams::Audio { sample_rate, channels }) => {
             let bitrate = bitrate_kbps.map_or(vorbis::VorbisEncoder::default_bitrate(*channels as usize), |k| k * 1000);
             Ok(Box::new(vorbis::VorbisEncoder::new(*sample_rate, *channels as usize, bitrate)?))
+        }
+        (CodecId::Aac, StreamParams::Audio { sample_rate, channels }) => {
+            let bitrate = bitrate_kbps.map_or(aac::AacEncoder::default_bitrate(*channels as usize), |k| k * 1000);
+            Ok(Box::new(aac::AacEncoder::new(*sample_rate, *channels as usize, bitrate)?))
         }
         (CodecId::RawVideo, StreamParams::Video { .. }) => Ok(Box::new(rawvideo::RawVideoEncoder)),
         (c, p) if c.media_type() != p.media_type() => Err(Error::invalid_arg(format!(
@@ -238,8 +248,15 @@ pub fn encoder_extradata(codec: CodecId, params: &StreamParams) -> Vec<u8> {
     match (codec, params) {
         (CodecId::Opus, StreamParams::Audio { channels, .. }) => opus::opus_head(*channels as usize),
         (CodecId::Vorbis, StreamParams::Audio { sample_rate, channels }) => vorbis::encoder_headers(*sample_rate, *channels as usize),
+        (CodecId::Aac, StreamParams::Audio { sample_rate, channels }) => aac::audio_specific_config(*sample_rate, *channels as usize),
         _ => Vec::new(),
     }
+}
+
+/// Samples a decoder outputs ahead of the first input sample for a stream from this crate's encoder
+/// (containers record it so players can skip it).
+pub fn encoder_lead_in(codec: CodecId) -> i64 {
+    if codec == CodecId::Aac { aac::PRIMING } else { 0 }
 }
 
 pub fn media_type_of(params: &StreamParams) -> MediaType {

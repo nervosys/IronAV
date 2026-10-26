@@ -121,6 +121,8 @@ struct Track {
     asc: Vec<u8>,
     /// Time skipped at the start of the stream (in `time_base` units), written as an edit list.
     lead_in: i64,
+    /// The stream's declared length (in `time_base` units), which ends the edit list of an audio track.
+    declared: Option<i64>,
 }
 
 impl Track {
@@ -327,7 +329,10 @@ impl Track {
         if !self.is_video() && self.lead_in > 0 {
             let lead = self.media_time(self.lead_in) as u64;
             let lead_ms = lead * 1000 / self.timescale as u64;
-            let mut elst = u32s(&[1, self.movie_ms().saturating_sub(lead_ms) as u32, lead as u32]);
+            // the audio ends where the stream says, not at the end of the last (padded) frame
+            let shown = self.movie_ms().saturating_sub(lead_ms);
+            let shown = self.declared.filter(|&d| d > 0).map_or(shown, |d| shown.min(self.media_time(d) as u64 * 1000 / self.timescale as u64));
+            let mut elst = u32s(&[1, shown as u32, lead as u32]);
             elst.extend_from_slice(&0x0001_0000u32.to_be_bytes());
             edts = bx(b"edts", &full(b"elst", 0, 0, &elst));
         }
@@ -608,6 +613,7 @@ impl Muxer for Mp4Muxer {
                 flac: FlacStats::new(),
                 asc: s.extradata.clone(),
                 lead_in: s.lead_in.max(0),
+                declared: s.duration,
             });
         }
 

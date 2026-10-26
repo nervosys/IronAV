@@ -11,7 +11,8 @@
 //! dropped). No encoder detects HE-AAC here either: an SBR stream decodes as its core.
 
 use crate::mp4demux::{Config, Mp4Demuxer, Sample, TrackInfo};
-use ironav_core::{CodecId, Error, ErrorCode, Rational, Result, StreamInfo, StreamParams};
+use crate::WriteSeek;
+use ironav_core::{CodecId, Error, ErrorCode, Muxer, Packet, Rational, Result, StreamInfo, StreamParams};
 use std::io::{Read, Seek, SeekFrom};
 
 /// The largest file whose frames are indexed.
@@ -110,6 +111,62 @@ pub fn open<R: Read + Seek + Send>(mut r: R) -> Result<Mp4Demuxer<R>> {
     };
     let track = TrackInfo { stream, config: Config { prefix: Vec::new(), nal_length: 0, bits: 8 }, convert: false };
     Ok(Mp4Demuxer::from_parts(r, "aac", vec![track], samples))
+}
+
+/// Writes AAC access units behind ADTS headers (MPEG-4, no CRC), taking the profile, rate and channel
+/// configuration from the stream's AudioSpecificConfig.
+pub struct AdtsMuxer {
+    out: Box<dyn WriteSeek>,
+    /// The three header bytes after the sync word that do not depend on the frame's length.
+    fixed: Option<[u8; 3]>,
+}
+
+impl AdtsMuxer {
+    pub fn new(out: Box<dyn WriteSeek>) -> Self {
+        Self { out, fixed: None }
+    }
+}
+
+impl Muxer for AdtsMuxer {
+    fn write_header(&mut self, streams: &[StreamInfo]) -> Result<()> {
+        let [s] = streams else {
+            return Err(Error::invalid_arg("ADTS holds exactly one audio stream"));
+        };
+        if s.codec != CodecId::Aac {
+            return Err(Error::new(ErrorCode::UnsupportedCodec, format!("ADTS can only hold AAC, not {}", s.codec.name())).alternatives(["aac"]));
+        }
+        let [a, b, ..] = s.extradata[..] else {
+            return Err(Error::new(ErrorCode::UnsupportedFormat, "ADTS needs the AudioSpecificConfig").hint("encode to aac, or copy from a file that carries it"));
+        };
+        let asc = u16::from_be_bytes([a, b]);
+        let (aot, sfi, ch) = (asc >> 11, (asc >> 7) & 15, (asc >> 3) & 15);
+        if !(1..=4).contains(&aot) || sfi >= 13 || !(1..=7).contains(&ch) {
+            return Err(Error::new(ErrorCode::UnsupportedFormat, "ADTS cannot describe this AudioSpecificConfig").hint("write it to mp4 or mkv"));
+        }
+        // ID 0 (MPEG-4), layer 0, no CRC | profile (object type - 1), rate, private 0, channels (high bit) | channels (low bits), original/home/copyright 0
+        self.fixed = Some([0xF1, (((aot - 1) << 6) | (sfi << 2) | (ch >> 2)) as u8, ((ch & 3) << 6) as u8]);
+        Ok(())
+    }
+
+    fn write_packet(&mut self, p: &Packet) -> Result<()> {
+        let Some(f) = self.fixed else {
+            return Err(Error::new(ErrorCode::Internal, "packet before the header"));
+        };
+        let len = p.data.len() + 7;
+        if len >= 1 << 13 {
+            return Err(Error::invalid_input("an AAC frame is too large for an ADTS header"));
+        }
+        // frame length (13 bits), buffer fullness 0x7FF (variable rate), one raw data block
+        let h = [0xFF, f[0], f[1], f[2] | (len >> 11) as u8, (len >> 3) as u8, (((len & 7) << 5) | 0x1F) as u8, 0xFC];
+        self.out.write_all(&h)?;
+        self.out.write_all(&p.data)?;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        self.out.flush()?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

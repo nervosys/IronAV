@@ -3,8 +3,11 @@
 //! Main-profile prediction, LTP, coupling channels, 960-sample frames and gain control; streams
 //! that need them are refused with an error rather than decoded wrongly.
 
+mod enc;
 mod imdct;
 mod tables;
+
+pub use enc::{audio_specific_config, AacEncoder, PRIMING};
 
 use imdct::Imdct;
 use ironav_core::{AudioFrame, Decoder, Error, ErrorCode, Frame, Packet, Result, StreamParams};

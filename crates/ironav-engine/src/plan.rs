@@ -292,7 +292,7 @@ pub fn plan(job: &Job) -> Result<Plan> {
             duration,
             bits,
             extradata: if action == Action::Copy { s.extradata.clone() } else { ironav_codec::encoder_extradata(to, &params) },
-            lead_in: if action == Action::Copy { s.lead_in } else { 0 },
+            lead_in: if action == Action::Copy { s.lead_in } else { ironav_codec::encoder_lead_in(to) },
             params,
         });
         steps.push(Step { input_file: file, input_stream: s.index, output_stream: steps.len(), action, from_codec: s.codec, to_codec: to, filters: chain, bitrate_kbps: audio_kbps, hardware });

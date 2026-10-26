@@ -1258,3 +1258,53 @@ fn vorbis_encoder_output_decodes_close_to_its_input() {
     .unwrap_err();
     assert_eq!(e.code, ErrorCode::UnsupportedCodec, "{e:?}");
 }
+
+/// AAC encoding into MP4, ADTS and Matroska: the bit rate steers the size, our decoder gets back
+/// something close to the input, and the encoder's priming frame is skipped where the container says so
+/// (the MP4 edit list) and left where it does not (ADTS, Matroska).
+#[test]
+fn aac_encoder_output_decodes_close_to_its_input() {
+    let dir = scratch("aac-enc");
+    let n = 44_100 * 3 + 321;
+    let samples: Vec<i16> = (0..n * 2)
+        .map(|i| {
+            let (t, c) = ((i / 2) as f64 / 44_100.0, (i % 2) as f64);
+            (9000.0 * (2.0 * std::f64::consts::PI * (440.0 + 110.0 * c) * t).sin() + 3000.0 * (2.0 * std::f64::consts::PI * 2500.0 * t).sin()) as i16
+        })
+        .collect();
+    let wav = dir.join("in.wav");
+    write_wav(&wav, &samples, 2, 44_100);
+    let want = pcm(&wav);
+    let mut sizes = Vec::new();
+    for (ext, kbps, lead) in [("m4a", 48u32, 0usize), ("m4a", 160, 0), ("aac", 160, 1024), ("mka", 160, 1024)] {
+        let out = dir.join(format!("out{kbps}.{ext}"));
+        let mut j = job(&wav, &out);
+        j.audio.codec = Some("aac".into());
+        j.audio.bitrate_kbps = Some(kbps);
+        run(&j, &mut |_| {}).unwrap();
+        let back = dir.join(format!("back{kbps}.{ext}.wav"));
+        let mut j = job(&out, &back);
+        j.audio.codec = Some("pcm_s16le".into());
+        run(&j, &mut |_| {}).unwrap();
+        let got = pcm(&back);
+        let frames = got.len() / 4;
+        assert!(frames >= n + lead && frames < n + lead + 2048, "{ext} {kbps}: {frames} frames for {n}");
+        let snr = snr_db(&want, &got[lead * 4..lead * 4 + want.len()]);
+        assert!(snr > if kbps == 48 { 10.0 } else { 18.0 }, "{ext} {kbps}: {snr:.1} dB");
+        if ext == "m4a" {
+            sizes.push(std::fs::metadata(&out).unwrap().len());
+        }
+    }
+    assert!(sizes[0] < sizes[1] / 2, "a lower bit rate makes a smaller file: {sizes:?}");
+
+    // a rate with no AAC index is refused with the way out
+    let odd = dir.join("odd.wav");
+    write_wav(&odd, &vec![0i16; 4000], 1, 44_000);
+    let e = plan(&{
+        let mut j = job(&odd, &dir.join("odd.m4a"));
+        j.audio.codec = Some("aac".into());
+        j
+    })
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::UnsupportedCodec, "{e:?}");
+}

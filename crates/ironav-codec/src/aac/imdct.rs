@@ -81,6 +81,12 @@ impl Imdct {
         }
     }
 
+    /// DCT-IV of `x` (`n` values) into `out`, as `dct4` defines it (the forward MDCT's last step).
+    pub fn dct4_into(&mut self, x: &[f32], out: &mut [f32]) {
+        self.dct4(x);
+        out.copy_from_slice(&self.v);
+    }
+
     /// Inverse MDCT of `n` coefficients into `2n` samples, scaled by `scale`:
     /// `y[i] = scale * sum_k x[k] cos(pi/n (i + n/2 + 1/2)(k + 1/2))`.
     pub fn run(&mut self, x: &[f32], y: &mut [f32], scale: f32) {

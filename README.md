@@ -232,9 +232,25 @@ every stream came from one encoder. One of them is committed with FFmpeg's decod
 
 Not decoded, and refused with an explanation rather than decoded wrongly: HE-AAC (SBR/PS), AAC Main prediction, LTP,
 coupling channel elements, 960-sample frames, gain control, and channel layouts given by a program config element.
-There is no AAC encoder. AAC comes from MP4/M4A, Matroska and raw `.aac` (ADTS) files; the ADTS reader strips each frame's header, builds the AudioSpecificConfig from it, and decodes to the same samples as the MP4 copy of the same audio (checked on the one fixture, remuxed by FFmpeg). ADTS frames with several raw data blocks and channel configuration 0 are not read, and nothing is trimmed at the start (as with FFmpeg).
+AAC comes from MP4/M4A, Matroska and raw `.aac` (ADTS) files; the ADTS reader strips each frame's header, builds the AudioSpecificConfig from it, and decodes to the same samples as the MP4 copy of the same audio (checked on the one fixture, remuxed by FFmpeg). ADTS frames with several raw data blocks and channel configuration 0 are not read, and nothing is trimmed at the start (as with FFmpeg).
 On a 5-minute stereo 44.1 kHz file the decoder takes roughly 0.3-0.5 s (FFmpeg's: about 0.11 s) on a noisy machine, so it
 is a few times slower than FFmpeg's.
+
+
+### AAC encoder
+
+`--acodec aac` (`--abitrate 8` to `512`, default 64 per channel) writes AAC-LC into MP4/M4A, ADTS (`.aac`) or Matroska, mono or
+stereo at any of AAC's sampling rates (others are refused with the list). Long windows only (sine shape), the decoder's own Huffman
+and scalefactor-band tables, the cheapest of the eleven spectral codebooks chosen per band, sections merged, and mid/side per band
+where it looks cheaper. A feedback loop on the quantiser's step holds the bit rate (the first frames search for the right step), and the
+step follows each band's level partway (exponent 0.6), so noise is shaped but there is no psychoacoustic model. No window switching (an
+attack spreads its noise over 2048 samples), no TNS, PNS, intensity stereo or prediction, no bit reservoir, no more than two channels.
+
+The stream starts with one frame of priming: in MP4 an edit list says so (our reader and FFmpeg skip it), in ADTS and Matroska it
+stays as 1024 leading samples, as with most encoders. MP4's edit list also ends the audio at the input's length, but players that ignore it
+(FFmpeg does) show up to one padded frame at the end. FFmpeg (through PyAV) decodes all three containers; on a 4 s stereo test signal
+(two tones and a little noise) 128 kb/s gives 16 dB SNR and 256 kb/s 25 dB, with white noise taking its share of the bits. A 120 s MP3 becomes
+128 kb/s AAC in about 1 s.
 
 ## Opus
 
