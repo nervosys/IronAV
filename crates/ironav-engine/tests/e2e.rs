@@ -881,3 +881,38 @@ fn flac_in_ogg_decodes_to_the_original_pcm() {
     run(&j, &mut |_| {}).unwrap();
     assert!(pcm(&out) == std::fs::read(data.join("flac_in_ogg.expect.s16")).unwrap(), "decoded audio differs from the source PCM");
 }
+
+/// Copying audio into Matroska keeps every packet's bytes and the codec configuration, and the
+/// FLAC stream in it decodes to the PCM it was made from. (FFmpeg opens these files too: that was
+/// checked by hand with PyAV on AAC, Opus, Vorbis, FLAC and MP3, packet counts equal.)
+#[test]
+fn audio_copied_into_matroska_keeps_its_packets() {
+    let dir = scratch("mka-copy");
+    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    for file in ["aac_stereo_tools.m4a", "opus_celt_stereo.opus", "vorbis_stereo.ogg", "flac_in_ogg.ogg", "mp3_mpeg1_stereo.mp3"] {
+        let out = dir.join(format!("{file}.mka"));
+        run(&job(&data.join(file), &out), &mut |_| {}).unwrap();
+        let mut a = ironav_formats::open_demuxer(&data.join(file)).unwrap();
+        let mut b = ironav_formats::open_demuxer(&out).unwrap();
+        let (sa, sb) = (a.streams()[0].clone(), b.streams()[0].clone());
+        assert_eq!((sa.codec, &sa.params), (sb.codec, &sb.params), "{file}");
+        // (FLAC's configuration is rebuilt; an MP3's gapless trim has no place in Matroska and is dropped)
+        if !matches!(sa.codec, ironav_core::CodecId::Flac | ironav_core::CodecId::Mp3) {
+            assert_eq!(sa.extradata, sb.extradata, "{file}: codec configuration");
+        }
+        let mut n = 0;
+        while let Some(pa) = a.read_packet().unwrap() {
+            let pb = b.read_packet().unwrap().unwrap_or_else(|| panic!("{file}: the copy ends early at packet {n}"));
+            assert_eq!(pa.data, pb.data, "{file}: packet {n}");
+            let (ta, tb) = (pa.pts as f64 * sa.time_base.as_f64(), pb.pts as f64 * sb.time_base.as_f64());
+            assert!((ta - tb).abs() < 0.0015, "{file}: packet {n} at {ta} against {tb}");
+            n += 1;
+        }
+        assert!(b.read_packet().unwrap().is_none(), "{file}: the copy has extra packets");
+    }
+
+    let mut j = job(&dir.join("flac_in_ogg.ogg.mka"), &dir.join("flac.wav"));
+    j.audio.codec = Some("pcm_s16le".into());
+    run(&j, &mut |_| {}).unwrap();
+    assert!(pcm(&dir.join("flac.wav")) == std::fs::read(data.join("flac_in_ogg.expect.s16")).unwrap(), "FLAC through Matroska is not the source PCM");
+}

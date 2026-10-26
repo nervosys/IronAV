@@ -4,6 +4,7 @@ mod adts;
 mod annexb;
 pub(crate) mod flac;
 mod mkv;
+mod mkvwrite;
 mod mp4;
 mod mp3;
 mod mp4demux;
@@ -74,12 +75,12 @@ pub static FORMATS: &[FormatSpec] = &[
     },
     FormatSpec {
         name: "mkv",
-        extensions: &["mkv", "webm", "mka"],
-        description: "Matroska and WebM (read-only): video and audio are listed and H.264/HEVC/AAC can be copied to MP4, but nothing writes Matroska yet",
+        extensions: &["mkv", "mka"],
+        description: "Matroska: read (also WebM, with any codec the file holds) and written with H.264 or HEVC video and AAC, FLAC, MP3, Opus or Vorbis audio copied or encoded; one stream of each kind; no SeekHead",
         media: MediaType::Video,
         demux: true,
-        mux: false,
-        codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Av1, CodecId::Vp8, CodecId::Vp9, CodecId::Aac, CodecId::Mp3, CodecId::Opus, CodecId::Vorbis, CodecId::Flac],
+        mux: true,
+        codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Aac, CodecId::Mp3, CodecId::Opus, CodecId::Vorbis, CodecId::Flac],
     },
     FormatSpec {
         name: "mp3",
@@ -199,6 +200,7 @@ pub fn create_muxer(path: &Path, format: &str) -> Result<Box<dyn Muxer>> {
         "y4m" => Ok(Box::new(y4m::Y4mMuxer::new(out))),
         "flac" => Ok(Box::new(flac::FlacMuxer::new(out))),
         "mp4" => Ok(Box::new(mp4::Mp4Muxer::with_faststart(out, path))),
+        "mkv" => Ok(Box::new(mkvwrite::MatroskaWriter::new(out))),
         "h264" => Ok(Box::new(annexb::AnnexBMuxer::new(out, CodecId::H264))),
         "hevc" => Ok(Box::new(annexb::AnnexBMuxer::new(out, CodecId::Hevc))),
         _ => Err(Error::new(ErrorCode::UnsupportedFormat, format!("format '{format}' cannot be written"))),

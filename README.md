@@ -301,6 +301,23 @@ padding less 529 at the end), and on the three LAME fixtures the output has exac
 Matroska has no tag and is not trimmed. There is no MP3 encoder. Decoding 120 s of 44.1 kHz stereo to WAV takes about 0.8 s end to end here (roughly 150x real time; noisy
 machine, `f64` throughout, no SIMD); that is a figure for this code, not a comparison with FFmpeg, which I did not time.
 
+## Matroska output
+
+`.mkv` and `.mka` can be written: H.264 or HEVC video (from the hardware encoder or copied) with AAC, FLAC, MP3, Opus or Vorbis
+audio, copied or encoded, at most one stream of each kind. Timestamps are in milliseconds; clusters are gathered in memory and
+written whole, so there are no unknown-size elements, and the file ends with Cues for the video key frames (or the clusters, for
+audio only). The header is held back until every stream has delivered a packet and the video's SPS/PPS have been seen.
+
+Checked with FFmpeg (through PyAV) on AAC, Opus, Vorbis, FLAC and MP3 copied into `.mka`, and on H.264 and HEVC from the NVENC
+encoder, with and without the AAC audio in `.mkv`: FFmpeg opens every file, the audio packet counts equal the sources', and
+FFmpeg decodes all 50 frames of each video. IronAV's own tests copy audio through and compare every packet's bytes and the codec
+configuration, and decode FLAC through Matroska to the PCM it was made from.
+
+Not done: no SeekHead, tags, chapters or attachments; no WebM (the file is `matroska`, so `.webm` is not an output
+extension); PCM, VP8/VP9/AV1 and more than one stream per kind are refused; an MP3's gapless trim (from its LAME tag) is not
+carried over and the Opus pre-skip is carried only as the OpusHead plus CodecDelay. I did not test B-frame video, because the
+encoder here does not produce it.
+
 ## Performance
 
 Stages run on separate threads with bounded queues, packets are moved not copied, and the MCP/GUI processes stay

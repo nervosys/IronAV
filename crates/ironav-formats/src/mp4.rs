@@ -80,10 +80,10 @@ fn u32s(vals: &[u32]) -> Vec<u8> {
 const MATRIX: [u32; 9] = [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000];
 
 #[derive(Default)]
-struct ParamSets {
-    vps: Option<Vec<u8>>,
-    sps: Option<Vec<u8>>,
-    pps: Option<Vec<u8>>,
+pub(crate) struct ParamSets {
+    pub(crate) vps: Option<Vec<u8>>,
+    pub(crate) sps: Option<Vec<u8>>,
+    pub(crate) pps: Option<Vec<u8>>,
 }
 
 enum Kind {
@@ -204,54 +204,11 @@ impl Track {
     }
 
     fn avcc(&self, missing: &dyn Fn(&str) -> Error) -> Result<Vec<u8>> {
-        let sps = self.params.sps.as_ref().ok_or_else(|| missing("SPS"))?;
-        let pps = self.params.pps.as_ref().ok_or_else(|| missing("PPS"))?;
-        if sps.len() < 4 {
-            return Err(Error::new(ErrorCode::Internal, "H.264 SPS is too short"));
-        }
-        let mut c = vec![1, sps[1], sps[2], sps[3], 0xFC | 3, 0xE0 | 1];
-        c.extend_from_slice(&(sps.len() as u16).to_be_bytes());
-        c.extend_from_slice(sps);
-        c.push(1);
-        c.extend_from_slice(&(pps.len() as u16).to_be_bytes());
-        c.extend_from_slice(pps);
-        // High-family profiles must also state chroma format and bit depth (4:2:0, 8-bit here).
-        if matches!(sps[1], 100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134) {
-            c.extend_from_slice(&[0xFC | 1, 0xF8, 0xF8, 0]);
-        }
-        Ok(bx(b"avcC", &c))
+        Ok(bx(b"avcC", &avcc_body(&self.params, missing)?))
     }
 
     fn hvcc(&self, missing: &dyn Fn(&str) -> Error) -> Result<Vec<u8>> {
-        let sps = self.params.sps.as_ref().ok_or_else(|| missing("SPS"))?;
-        let pps = self.params.pps.as_ref().ok_or_else(|| missing("PPS"))?;
-        let vps = self.params.vps.as_ref().ok_or_else(|| missing("VPS"))?;
-        let p = unescape(sps);
-        // 2-byte NAL header, 1 byte (vps id, max sub layers, temporal-id nesting), then
-        // profile_tier_level: profile byte, 4 compat bytes, 6 constraint bytes, level.
-        if p.len() < 15 {
-            return Err(Error::new(ErrorCode::Internal, "HEVC SPS is too short"));
-        }
-        let nesting = p[2] & 1;
-        let mut c = vec![1];
-        c.extend_from_slice(&p[3..14]); // profile byte, 4 compatibility bytes, 6 constraint bytes
-        c.push(p[14]); // general_level_idc
-        c.extend_from_slice(&0xF000u16.to_be_bytes()); // min spatial segmentation
-        c.push(0xFC); // parallelism type
-        c.push(0xFC | 1); // chroma 4:2:0
-        let (luma_minus8, chroma_minus8) = hevc_bit_depths(&p).unwrap_or((0, 0));
-        c.push(0xF8 | luma_minus8); // luma bit depth - 8
-        c.push(0xF8 | chroma_minus8); // chroma bit depth - 8
-        c.extend_from_slice(&0u16.to_be_bytes()); // average frame rate: unspecified
-        c.push((1 << 3) | (nesting << 2) | 3); // 1 temporal layer, 4-byte lengths
-        c.push(3);
-        for (ty, nal) in [(32u8, vps), (33, sps), (34, pps)] {
-            c.push(0x80 | ty);
-            c.extend_from_slice(&1u16.to_be_bytes());
-            c.extend_from_slice(&(nal.len() as u16).to_be_bytes());
-            c.extend_from_slice(nal);
-        }
-        Ok(bx(b"hvcC", &c))
+        Ok(bx(b"hvcC", &hvcc_body(&self.params, missing)?))
     }
 
     /// Track duration in the movie's millisecond time scale.
@@ -389,27 +346,86 @@ impl Track {
     /// Convert one Annex B access unit to a length-prefixed sample, collecting parameter sets.
     /// Returns `None` if the packet held nothing but parameter sets and delimiters.
     fn video_sample(&mut self, data: &[u8]) -> Option<(Vec<u8>, bool)> {
-        let hevc = self.is_hevc();
-        let mut sample = Vec::with_capacity(data.len() + 16);
-        let mut key = false;
-        for nal in split_nals(data) {
-            let ty = if hevc { (nal[0] >> 1) & 0x3F } else { nal[0] & 0x1F };
-            match (hevc, ty) {
-                (false, 7) => self.params.sps = Some(nal.to_vec()),
-                (false, 8) => self.params.pps = Some(nal.to_vec()),
-                (true, 32) => self.params.vps = Some(nal.to_vec()),
-                (true, 33) => self.params.sps = Some(nal.to_vec()),
-                (true, 34) => self.params.pps = Some(nal.to_vec()),
-                (false, 9) | (true, 35) => {} // access unit delimiters carry nothing MP4 needs
-                _ => {
-                    key |= if hevc { (16..=21).contains(&ty) } else { ty == 5 };
-                    sample.extend_from_slice(&(nal.len() as u32).to_be_bytes());
-                    sample.extend_from_slice(nal);
-                }
+        annexb_sample(self.is_hevc(), &mut self.params, data)
+    }
+}
+
+/// The body of an `avcC` box (also Matroska's H.264 CodecPrivate).
+pub(crate) fn avcc_body(params: &ParamSets, missing: &dyn Fn(&str) -> Error) -> Result<Vec<u8>> {
+    let sps = params.sps.as_ref().ok_or_else(|| missing("SPS"))?;
+    let pps = params.pps.as_ref().ok_or_else(|| missing("PPS"))?;
+    if sps.len() < 4 {
+        return Err(Error::new(ErrorCode::Internal, "H.264 SPS is too short"));
+    }
+    let mut c = vec![1, sps[1], sps[2], sps[3], 0xFC | 3, 0xE0 | 1];
+    c.extend_from_slice(&(sps.len() as u16).to_be_bytes());
+    c.extend_from_slice(sps);
+    c.push(1);
+    c.extend_from_slice(&(pps.len() as u16).to_be_bytes());
+    c.extend_from_slice(pps);
+    // High-family profiles must also state chroma format and bit depth (4:2:0, 8-bit here).
+    if matches!(sps[1], 100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134) {
+        c.extend_from_slice(&[0xFC | 1, 0xF8, 0xF8, 0]);
+    }
+    Ok(c)
+}
+
+/// The body of an `hvcC` box (also Matroska's HEVC CodecPrivate).
+pub(crate) fn hvcc_body(params: &ParamSets, missing: &dyn Fn(&str) -> Error) -> Result<Vec<u8>> {
+    let sps = params.sps.as_ref().ok_or_else(|| missing("SPS"))?;
+    let pps = params.pps.as_ref().ok_or_else(|| missing("PPS"))?;
+    let vps = params.vps.as_ref().ok_or_else(|| missing("VPS"))?;
+    let p = unescape(sps);
+    // 2-byte NAL header, 1 byte (vps id, max sub layers, temporal-id nesting), then
+    // profile_tier_level: profile byte, 4 compat bytes, 6 constraint bytes, level.
+    if p.len() < 15 {
+        return Err(Error::new(ErrorCode::Internal, "HEVC SPS is too short"));
+    }
+    let nesting = p[2] & 1;
+    let mut c = vec![1];
+    c.extend_from_slice(&p[3..14]); // profile byte, 4 compatibility bytes, 6 constraint bytes
+    c.push(p[14]); // general_level_idc
+    c.extend_from_slice(&0xF000u16.to_be_bytes()); // min spatial segmentation
+    c.push(0xFC); // parallelism type
+    c.push(0xFC | 1); // chroma 4:2:0
+    let (luma_minus8, chroma_minus8) = hevc_bit_depths(&p).unwrap_or((0, 0));
+    c.push(0xF8 | luma_minus8); // luma bit depth - 8
+    c.push(0xF8 | chroma_minus8); // chroma bit depth - 8
+    c.extend_from_slice(&0u16.to_be_bytes()); // average frame rate: unspecified
+    c.push((1 << 3) | (nesting << 2) | 3); // 1 temporal layer, 4-byte lengths
+    c.push(3);
+    for (ty, nal) in [(32u8, vps), (33, sps), (34, pps)] {
+        c.push(0x80 | ty);
+        c.extend_from_slice(&1u16.to_be_bytes());
+        c.extend_from_slice(&(nal.len() as u16).to_be_bytes());
+        c.extend_from_slice(nal);
+    }
+    Ok(c)
+}
+
+
+/// Convert one Annex B access unit to a length-prefixed sample, collecting parameter sets.
+/// Returns `None` if the packet held nothing but parameter sets and delimiters.
+pub(crate) fn annexb_sample(hevc: bool, params: &mut ParamSets, data: &[u8]) -> Option<(Vec<u8>, bool)> {
+    let mut sample = Vec::with_capacity(data.len() + 16);
+    let mut key = false;
+    for nal in split_nals(data) {
+        let ty = if hevc { (nal[0] >> 1) & 0x3F } else { nal[0] & 0x1F };
+        match (hevc, ty) {
+            (false, 7) => params.sps = Some(nal.to_vec()),
+            (false, 8) => params.pps = Some(nal.to_vec()),
+            (true, 32) => params.vps = Some(nal.to_vec()),
+            (true, 33) => params.sps = Some(nal.to_vec()),
+            (true, 34) => params.pps = Some(nal.to_vec()),
+            (false, 9) | (true, 35) => {} // access unit delimiters carry nothing MP4 needs
+            _ => {
+                key |= if hevc { (16..=21).contains(&ty) } else { ty == 5 };
+                sample.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+                sample.extend_from_slice(nal);
             }
         }
-        (!sample.is_empty()).then_some((sample, key))
     }
+    (!sample.is_empty()).then_some((sample, key))
 }
 
 pub struct Mp4Muxer {
