@@ -248,7 +248,7 @@ pub fn plan(job: &Job) -> Result<Plan> {
             time_base: s.time_base,
             duration: s.duration,
             bits,
-            extradata: if action == Action::Copy { s.extradata.clone() } else { Vec::new() },
+            extradata: if action == Action::Copy { s.extradata.clone() } else { ironav_codec::encoder_extradata(to, &params) },
             lead_in: if action == Action::Copy { s.lead_in } else { 0 },
             params,
         });

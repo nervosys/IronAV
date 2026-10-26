@@ -4,7 +4,9 @@
 //! Translated from the structure of FFmpeg's native Opus decoder (`libavcodec/opus/{celt,dec_celt,pvq}.c`).
 
 use super::mdct::Dct4;
-use super::rc::{ilog, RangeDecoder};
+use super::rc::{ilog, Coder, RangeDecoder};
+
+pub(super) mod enc;
 use super::tables::*;
 use ironav_core::{Error, ErrorCode, Result};
 
@@ -126,6 +128,7 @@ pub struct Celt {
     flushed: bool,
     tmp: Vec<f32>,
     norm: Vec<f32>,
+    enc_amp: [[f32; MAX_BANDS]; 2],
 }
 
 fn renormalize(x: &mut [f32], gain: f32) {
@@ -394,17 +397,28 @@ fn cwrsi(mut n: u32, mut k: u32, mut i: u32, y: &mut [i32]) -> u64 {
 }
 
 /// State shared by the recursive band decoder.
-struct Bands<'a, 'b> {
-    rc: &'a mut RangeDecoder<'b>,
+struct Bands<'a, R: Coder> {
+    rc: &'a mut R,
     p: &'a mut Params,
     hadamard_tmp: [f32; 256],
     iy: [i32; 256],
+    /// Encoder only: the linear amplitude of the band in each channel before it was normalised.
+    amp: [f32; 2],
 }
 
-impl Bands<'_, '_> {
+impl<R: Coder> Bands<'_, R> {
     /// Decode the pulses of one band and combine them into the normalised shape; returns the collapse mask.
     fn unquant(&mut self, x: &mut [f32], n: usize, k: u32, blocks: u32, gain: f32) -> u32 {
-        let idx = self.rc.uint(pvq_v(n as u32, k));
+        if R::ENC {
+            // x holds the band's shape: rotate it the way the decoder will undo, find the closest
+            // pulse vector and code its index
+            enc::exp_rotation_fwd(x, n, blocks as usize, k, self.p.spread);
+            enc::pvq_search(&x[..n], k as usize, &mut self.iy[..n]);
+            let idx = enc::icwrs(n, &self.iy[..n]);
+            self.rc.uint(pvq_v(n as u32, k), idx);
+            return collapse_mask(&self.iy, n, blocks as usize);
+        }
+        let idx = self.rc.uint(pvq_v(n as u32, k), 0);
         let norm = cwrsi(n as u32, k, idx, &mut self.iy);
         let g = gain / (norm as f32).sqrt();
         for i in 0..n {
@@ -452,7 +466,7 @@ impl Bands<'_, '_> {
             let mut do_one = |x0: &mut f32, this: &mut Self| {
                 let mut sign = 0;
                 if this.p.remaining2 >= 1 << 3 {
-                    sign = this.rc.raw(1);
+                    sign = this.rc.raw(1, (*x0 < 0.0) as u32);
                     this.p.remaining2 -= 1 << 3;
                 }
                 *x0 = 1.0 - 2.0 * sign as f32;
@@ -541,20 +555,31 @@ impl Bands<'_, '_> {
             let pulse_cap = CELT_LOG_FREQ_RANGE[band] as i32 + duration * 8;
             let offset = (pulse_cap >> 1) - if stereo && n == 2 { QTHETA_OFFSET_TWOPHASE } else { QTHETA_OFFSET };
             let qn = if stereo && band as i32 >= self.p.intensity_stereo { 1 } else { compute_qn(n as i32, b, offset, pulse_cap, stereo) };
+            // encoder: the angle between the two halves (or channels), before it is quantised
+            let mut theta_raw = 0i32;
+            let mut want = 0u32;
+            if R::ENC {
+                let (a, c): (&[f32], &[f32]) = if mono_split { (&x[..n], &x[n..2 * n]) } else { (&x[..n], &y.as_deref().expect("stereo has a second channel")[..n]) };
+                theta_raw = enc::stereo_itheta(a, c, stereo);
+                want = ((theta_raw as i64 * qn as i64 + 8192) >> 14) as u32;
+            }
             let tell = self.rc.tell_frac();
             let mut it;
             if qn != 1 {
                 // Entropy coding of the angle: a step for stereo, uniform for a time split, triangular otherwise.
                 it = if stereo && n > 2 {
-                    self.rc.uint_step(qn as u32 / 2) as i32
+                    self.rc.uint_step(qn as u32 / 2, want) as i32
                 } else if stereo || b0 > 1 {
-                    self.rc.uint(qn as u32 + 1) as i32
+                    self.rc.uint(qn as u32 + 1, want) as i32
                 } else {
-                    self.rc.uint_tri(qn as u32) as i32
+                    self.rc.uint_tri(qn as u32, want) as i32
                 };
                 it = it * 16384 / qn;
             } else if stereo {
-                inv = if b > 2 << 3 && self.p.remaining2 > 2 << 3 { self.rc.log(2) != 0 } else { false };
+                let coded = b > 2 << 3 && self.p.remaining2 > 2 << 3;
+                // the right channel's phase is flipped when the channels are mostly out of phase
+                let flip = R::ENC && self.p.apply_phase_inv && coded && theta_raw > 8192;
+                inv = if coded { self.rc.log(2, flip as u32) != 0 } else { false };
                 inv = if self.p.apply_phase_inv { inv } else { false };
                 it = 0;
             } else {
@@ -563,6 +588,21 @@ impl Bands<'_, '_> {
             itheta = it;
             qalloc = self.rc.tell_frac() - tell;
             b -= qalloc;
+
+            // encoder: turn left/right into mid/side, or into one channel when the angle is zero
+            if R::ENC && stereo {
+                let yy = y.as_deref_mut().expect("stereo has a second channel");
+                if qn != 1 && itheta != 0 {
+                    enc::stereo_split(&mut x[..n], &mut yy[..n]);
+                } else {
+                    if inv {
+                        for v in yy[..n].iter_mut() {
+                            *v = -*v;
+                        }
+                    }
+                    enc::intensity_stereo(&mut x[..n], &yy[..n], self.amp);
+                }
+            }
 
             orig_fill = fill;
             if itheta == 0 {
@@ -603,7 +643,7 @@ impl Bands<'_, '_> {
                 let (x2, y2) = if c { (&mut *xb, &mut *xa) } else { (&mut *xa, &mut *xb) };
                 let mut sign = 0;
                 if sbits != 0 {
-                    sign = self.rc.raw(1);
+                    sign = self.rc.raw(1, (R::ENC && x2[0] * y2[1] - x2[1] * y2[0] < 0.0) as u32);
                 }
                 let sign = 1.0 - 2.0 * sign as f32;
                 // orig_fill is used so that the side can be folded even when itheta == 16384
@@ -675,7 +715,7 @@ impl Bands<'_, '_> {
                 }
             }
             // Stereo merge and inversion
-            if stereo {
+            if stereo && !R::ENC {
                 let yv = y.as_mut().unwrap();
                 if n > 2 {
                     stereo_merge(x, yv, mid, n);
@@ -796,6 +836,7 @@ impl Celt {
             flushed: false,
             tmp: vec![0.0; MAX_FRAME],
             norm: vec![0.0; 2 * 8 * 100],
+            enc_amp: [[0.0; MAX_BANDS]; 2],
         };
         c.flush();
         c
@@ -891,7 +932,7 @@ impl Celt {
         }
     }
 
-    fn decode_tf_changes(&mut self, rc: &mut RangeDecoder) {
+    fn decode_tf_changes<R: Coder>(&mut self, rc: &mut R) {
         let p = &mut self.p;
         let (mut diff, mut tf_select, mut tf_changed) = (0usize, 0usize, 0usize);
         let mut bits = if p.transient { 2 } else { 4 };
@@ -901,7 +942,7 @@ impl Celt {
         let size = p.size as usize;
         for i in p.start_band..p.end_band {
             if consumed + bits + tf_select_bit as i32 <= p.framebits {
-                diff ^= rc.log(bits as u32) as usize;
+                diff ^= rc.log(bits as u32, 0) as usize;
                 consumed = rc.tell();
                 tf_changed |= diff;
             }
@@ -909,14 +950,14 @@ impl Celt {
             bits = if p.transient { 4 } else { 5 };
         }
         if tf_select_bit && CELT_TF_SELECT[size][t][0][tf_changed] != CELT_TF_SELECT[size][t][1][tf_changed] {
-            tf_select = rc.log(1) as usize;
+            tf_select = rc.log(1, 0) as usize;
         }
         for i in p.start_band..p.end_band {
             p.tf_change[i] = CELT_TF_SELECT[size][t][tf_select][p.tf_change[i] as usize] as i32;
         }
     }
 
-    fn bitalloc(&mut self, rc: &mut RangeDecoder) {
+    fn bitalloc<R: Coder>(&mut self, rc: &mut R) {
         let f = &mut self.p;
         let ch = f.coded_channels;
         let size = f.size;
@@ -938,7 +979,7 @@ impl Celt {
 
         // Spread
         if rc.tell() + 4 <= f.framebits {
-            f.spread = rc.cdf(&CELT_MODEL_SPREAD) as i32;
+            f.spread = rc.cdf(&CELT_MODEL_SPREAD, SPREAD_NORMAL as usize) as i32;
         } else {
             f.spread = SPREAD_NORMAL;
         }
@@ -955,7 +996,7 @@ impl Celt {
             let mut b_dynalloc = dynalloc;
             quanta = (quanta << 3).min((6 << 3).max(quanta));
             while rc.tell_frac() + (b_dynalloc << 3) < tbits_8ths && boost[i] < f.caps[i] {
-                let is_boost = rc.log(b_dynalloc as u32);
+                let is_boost = rc.log(b_dynalloc as u32, 0);
                 if is_boost == 0 {
                     break;
                 }
@@ -971,7 +1012,7 @@ impl Celt {
         // Allocation trim
         f.alloc_trim = 5;
         if rc.tell_frac() + (6 << 3) <= tbits_8ths {
-            f.alloc_trim = rc.cdf(&CELT_MODEL_ALLOC_TRIM) as i32;
+            f.alloc_trim = rc.cdf(&CELT_MODEL_ALLOC_TRIM, 5) as i32;
         }
 
         // Anti-collapse bit reservation
@@ -1130,7 +1171,7 @@ impl Celt {
 
             // a "do not skip" marker is only coded if the allocation is above the chosen threshold
             if allocation >= threshold[ju].max((ch + 1) << 3) {
-                if rc.log(1) != 0 {
+                if rc.log(1, 1) != 0 {
                     break;
                 }
                 total += 1 << 3;
@@ -1153,14 +1194,14 @@ impl Celt {
         f.intensity_stereo = 0;
         f.dual_stereo = false;
         if intensitystereo_bit != 0 {
-            f.intensity_stereo = start + rc.uint((f.coded_bands + 1 - start) as u32) as i32;
+            f.intensity_stereo = start + rc.uint((f.coded_bands + 1 - start) as u32, (f.coded_bands - start) as u32) as i32;
         }
 
         // DS flag
         if f.intensity_stereo <= start {
             tbits_8ths += dualstereo_bit; // no intensity stereo means no dual stereo
         } else if dualstereo_bit != 0 {
-            f.dual_stereo = rc.log(1) != 0;
+            f.dual_stereo = rc.log(1, 0) != 0;
         }
 
         // Supply the remaining bits in this frame to lower bands
@@ -1236,7 +1277,7 @@ impl Celt {
         }
     }
 
-    fn quant_bands(&mut self, rc: &mut RangeDecoder) {
+    fn quant_bands<R: Coder>(&mut self, rc: &mut R) {
         let ch = self.p.coded_channels as usize;
         let size = self.p.size;
         let mut lowband_scratch_free = ();
@@ -1249,7 +1290,7 @@ impl Celt {
         let blocks = self.p.blocks;
         self.norm.fill(0.0);
         let [b0, b1] = &mut self.block;
-        let mut bands = Bands { rc, p: &mut self.p, hadamard_tmp: [0.0; 256], iy: [0; 256] };
+        let mut bands = Bands { rc, p: &mut self.p, hadamard_tmp: [0.0; 256], iy: [0; 256], amp: [0.0; 2] };
 
         for i in start..end {
             let mut cm = [(1u32 << blocks) - 1; 2];
@@ -1324,8 +1365,10 @@ impl Celt {
                 low1[..n].copy_from_slice(&self.norm[l..l + n]);
                 low2[..n].copy_from_slice(&self.norm[800 + l..800 + l + n]);
             }
-            let l1 = low_at.map(|_| &low1[..band_size]);
-            let l2 = low_at.map(|_| &low2[..band_size]);
+            // an encoder never resynthesises, so it has nothing to fold from
+            let l1 = if R::ENC { None } else { low_at.map(|_| &low1[..band_size]) };
+            let l2 = if R::ENC { None } else { low_at.map(|_| &low2[..band_size]) };
+            bands.amp = [self.enc_amp[0][i], self.enc_amp[1][i]];
 
             let (n1, n2) = self.norm.split_at_mut(800);
             let out1 = &mut n1[band_offset..band_offset + band_size];

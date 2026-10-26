@@ -939,3 +939,64 @@ fn webm_holds_opus_and_vorbis_only() {
     assert_eq!(e.code, ironav_core::ErrorCode::UnsupportedCodec);
     assert!(e.alternatives.iter().any(|a| a == "opus"));
 }
+
+/// The signal-to-noise ratio in dB of `got` against `want` (16-bit little-endian PCM), over the
+/// samples both have.
+fn snr_db(want: &[u8], got: &[u8]) -> f64 {
+    let s = |b: &[u8]| b.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f64).collect::<Vec<_>>();
+    let (a, b) = (s(want), s(got));
+    let (mut sig, mut err) = (0.0, 0.0);
+    for (x, y) in a.iter().zip(&b) {
+        sig += x * x;
+        err += (x - y) * (x - y);
+    }
+    10.0 * (sig / err.max(1e-9)).log10()
+}
+
+/// The Opus encoder: 48 kHz mono and stereo go into Matroska and WebM, come back out of our own
+/// decoder close to the source, and keep the source's length to within the final frame.
+#[test]
+fn opus_encoder_output_decodes_close_to_its_input() {
+    let dir = scratch("opus-enc");
+    for channels in [1u16, 2] {
+        let n = 48_000 * 3;
+        let mut samples = Vec::new();
+        for i in 0..n {
+            let t = i as f64 / 48_000.0;
+            let v = 0.35 * (2.0 * std::f64::consts::PI * 330.0 * t).sin() + 0.2 * (2.0 * std::f64::consts::PI * 1870.0 * t + 2.0 * (t * 3.0).sin()).sin();
+            samples.push((v * 20000.0) as i16);
+            if channels == 2 {
+                samples.push((0.8 * v * 20000.0 + 3000.0 * (2.0 * std::f64::consts::PI * 700.0 * t).sin()) as i16);
+            }
+        }
+        let wav = dir.join(format!("in{channels}.wav"));
+        write_wav(&wav, &samples, channels, 48_000);
+        for ext in ["mka", "webm"] {
+            let out = dir.join(format!("out{channels}.{ext}"));
+            let mut j = job(&wav, &out);
+            j.audio.codec = Some("opus".into());
+            run(&j, &mut |_| {}).unwrap();
+            let d = ironav_formats::open_demuxer(&out).unwrap();
+            assert_eq!(d.streams()[0].codec, ironav_core::CodecId::Opus);
+            assert_eq!(d.streams()[0].extradata.len(), 19, "an OpusHead");
+            let back = dir.join(format!("back{channels}.{ext}.wav"));
+            let mut j = job(&out, &back);
+            j.audio.codec = Some("pcm_s16le".into());
+            run(&j, &mut |_| {}).unwrap();
+            let got = pcm(&back);
+            let frames = got.len() / 2 / channels as usize;
+            assert!((n..n + 2000).contains(&frames), "{ext} {channels}ch: {frames} frames for {n}");
+            let snr = snr_db(&pcm(&wav), &got);
+            assert!(snr > 20.0, "{ext} {channels}ch: {snr:.1} dB");
+        }
+    }
+
+    // other sample rates are refused with the way out
+    let wav = dir.join("in44.wav");
+    write_wav(&wav, &tone(44_100), 1, 44_100);
+    let mut j = job(&wav, &dir.join("x.mka"));
+    j.audio.codec = Some("opus".into());
+    let e = plan(&j).unwrap_err();
+    assert_eq!(e.code, ErrorCode::UnsupportedCodec);
+    assert!(e.hint.as_deref().is_some_and(|h| h.contains("48000")), "{:?}", e.hint);
+}

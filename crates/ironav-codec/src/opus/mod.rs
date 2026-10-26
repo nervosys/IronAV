@@ -7,6 +7,7 @@
 //! Channel-mapping family 0 only: one stream of one or two channels.
 
 mod celt;
+mod encoder;
 pub(crate) mod mdct;
 mod rc;
 mod silk;
@@ -14,6 +15,7 @@ mod tables;
 
 use ironav_core::{AudioFrame, Decoder, Error, ErrorCode, Frame, Packet, Result, StreamParams};
 use rc::RangeDecoder;
+pub use encoder::{opus_head, OpusEncoder};
 use std::f64::consts::PI;
 use tables::CELT_WINDOW2;
 

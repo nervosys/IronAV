@@ -5,11 +5,11 @@ A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so 
 
 > **Status: foundation (v0.1).** The architecture, agent interface, ontology, hardware model, CLI, MCP server
 > and both GUIs are working and tested. The codec/container set is deliberately small so far:
-> **WAV, FLAC and Y4M containers; PCM (8/16/24/32-bit, float), FLAC and raw-video codecs, an AAC-LC decoder and an Opus decoder; `volume`, `gray`, `hflip` filters.**
+> **WAV, FLAC and Y4M containers; PCM (8/16/24/32-bit, float), FLAC and raw-video codecs, an AAC-LC decoder, an Opus decoder and an Opus (CELT) encoder; `volume`, `gray`, `hflip` filters.**
 > **H.264 and HEVC can be encoded and decoded on NVIDIA GPUs (NVENC/NVDEC)**, MP4 files can be read and written, and
 > Matroska/WebM files can be read.
 > There is no software H.264/HEVC codec, so those need an NVIDIA GPU. MP4 can carry FLAC audio next to the video, and AAC
-> audio copied from another MP4/M4A (AAC and Opus can be decoded but not encoded). AV1, writing Matroska etc. are modelled in
+> audio copied from another MP4/M4A (AAC can be decoded but not encoded; Opus can be both). AV1, writing Matroska etc. are modelled in
 > the ontology as `planned`.
 > IronAV is not yet a drop-in replacement for FFmpeg or HandBrake.
 
@@ -255,7 +255,27 @@ Not covered: multichannel Opus (channel-mapping families 1 and 255 are refused),
 empty frame decodes to silence), and the way the reference decoder flushes its resampler when the stream switches between SILK
 and CELT, which our fixed-delay filter does not reproduce, so the few samples at such a switch can differ. The libopus encoder
 only produced streams in one mode at a time, so **mode switches within a stream were not tested**, nor were redundancy frames.
-Opus is read from Matroska/WebM (`.mka`, `.webm`) and from Ogg (`.opus`, `.ogg`); there is no Opus encoder. The Ogg reader (pages are checksummed; the file is read into memory, up to 1 GiB) takes only the first Opus, Vorbis or FLAC stream: Speex and Theora in Ogg are refused with a message naming the codec, and chained streams after the first are ignored. The final page's granule position shortens the last packet, so the output ends where the file says (for Opus the length is the granule minus the pre-skip). Tested on libopus files remuxed to Ogg (identical samples to the Matroska copies); multi-page packets are covered by a synthetic unit test only. FLAC in Ogg (the native-FLAC mapping, as FFmpeg's muxer writes it) decodes bit for bit to the PCM it was made from.
+Opus is read from Matroska/WebM (`.mka`, `.webm`) and from Ogg (`.opus`, `.ogg`); for writing see "Opus encoder" below. The Ogg reader (pages are checksummed; the file is read into memory, up to 1 GiB) takes only the first Opus, Vorbis or FLAC stream: Speex and Theora in Ogg are refused with a message naming the codec, and chained streams after the first are ignored. The final page's granule position shortens the last packet, so the output ends where the file says (for Opus the length is the granule minus the pre-skip). Tested on libopus files remuxed to Ogg (identical samples to the Matroska copies); multi-page packets are covered by a synthetic unit test only. FLAC in Ogg (the native-FLAC mapping, as FFmpeg's muxer writes it) decodes bit for bit to the PCM it was made from.
+
+
+### Opus encoder
+
+`--acodec opus` writes CELT-mode Opus: 48 kHz mono or stereo, 20 ms frames, constant bit rate (64 kb/s per channel; the
+planner refuses other sample rates, naming the way out), into `.mka`, `.mkv` and `.webm` with the `OpusHead` and the
+pre-skip. It is written against the decoder: the bit allocation and the band quantiser are the decoder's own code, made
+generic over a `Coder` trait so that one body of code reads or writes a frame and the two cannot disagree, and what the
+encoder adds is the forward MDCT (checked to invert the decoder's synthesis), the band energies and their coarse/fine
+quantisation, the pulse search, and the stereo angle (mid/side with a coded angle, or one channel when the bit budget is
+small; a flipped right channel when the channels are mostly out of phase). Digital silence costs three bytes a frame.
+The range encoder is checked symbol by symbol against the decoder's, including its bit counts.
+
+Checked: FFmpeg (through PyAV) opens the Matroska files and decodes them; our decoder's output and FFmpeg's agree to
+83 dB, and both are 20.4 dB SNR against the source on a 6 s, 128 kb/s stereo test signal. Quality grows with the bit
+rate as it should (a tone-and-noise test signal, mono: 10 dB at 16 kb/s, 22 dB at 64, 29 at 128, 39 at 256). This is a first encoder, not libopus: there
+is **no transient detection** (so an attack spreads its quantisation noise before it), no short blocks, no pitch pre-filter,
+no band boosts or tuned allocation trim, and no variable bit rate or SILK/hybrid modes, so at the same size it will sound
+worse than libopus. The end of a stream is not trimmed in Matroska (the file decodes to up to one 20 ms frame too much,
+since this writer has no `DiscardPadding`). Not compared with libopus for quality: I have no libopus encoder to run.
 
 ## Vorbis
 

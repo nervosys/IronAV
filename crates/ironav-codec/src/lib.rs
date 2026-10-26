@@ -40,7 +40,7 @@ pub fn implemented() -> Vec<CodecImpl> {
                 return Some(CodecImpl { codec: c, decode: true, encode: false, implementation: "ironav-mp3" });
             }
             if c == CodecId::Opus {
-                return Some(CodecImpl { codec: c, decode: true, encode: false, implementation: "ironav-opus" });
+                return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-opus" });
             }
             if c == CodecId::Vorbis {
                 return Some(CodecImpl { codec: c, decode: true, encode: false, implementation: "ironav-vorbis" });
@@ -198,6 +198,9 @@ pub fn new_encoder(codec: CodecId, params: &StreamParams, bits: Option<u8>) -> R
     match (codec, params) {
         (c, StreamParams::Audio { .. }) if c.sample_format().is_some() => Ok(Box::new(pcm::PcmEncoder::new(c.sample_format().unwrap()))),
         (CodecId::Flac, StreamParams::Audio { sample_rate, channels }) => Ok(Box::new(flac::FlacEncoder::new(*sample_rate, *channels, bits)?)),
+        (CodecId::Opus, StreamParams::Audio { sample_rate, channels }) => {
+            Ok(Box::new(opus::OpusEncoder::new(*sample_rate, *channels as usize, opus::OpusEncoder::default_bitrate(*channels as usize))?))
+        }
         (CodecId::RawVideo, StreamParams::Video { .. }) => Ok(Box::new(rawvideo::RawVideoEncoder)),
         (c, p) if c.media_type() != p.media_type() => Err(Error::invalid_arg(format!(
             "codec {} is {:?} but the stream is {:?}",
@@ -206,6 +209,15 @@ pub fn new_encoder(codec: CodecId, params: &StreamParams, bits: Option<u8>) -> R
             p.media_type()
         ))),
         (c, _) => Err(unsupported(c, "encoder")),
+    }
+}
+
+/// The codec configuration a container needs for a stream this crate's encoder will produce
+/// (empty when the codec needs none).
+pub fn encoder_extradata(codec: CodecId, params: &StreamParams) -> Vec<u8> {
+    match (codec, params) {
+        (CodecId::Opus, StreamParams::Audio { channels, .. }) => opus::opus_head(*channels as usize),
+        _ => Vec::new(),
     }
 }
 
