@@ -279,10 +279,9 @@ reproduces the old behaviour, and with it the FFmpeg-encoder test file matches b
 Not covered: **floor type 0** (obsolete; a stream that uses it is refused) and streams with more than 8 channels. The Ogg
 granule position is not used, so the final block's padding is not trimmed (our output runs up to about one block longer than
 FFmpeg's) and a stream that begins mid-way is not shifted. Chained or multiplexed Ogg streams: only the first Vorbis stream is
-read. Mid-stream changes of the headers are not followed. There is no Vorbis encoder. Decoding 120 s of 44.1 kHz stereo to WAV
-takes 0.34 to 0.48 s inside IronAV's own timing (roughly 250 to 350x real time), while FFmpeg's decoder alone ran the same file
-in 0.08 to 0.19 s through PyAV; FFmpeg is faster here by roughly 2 to 4x, and this decoder is scalar `f32` with a bit-at-a-time
-Huffman walk.
+read. Mid-stream changes of the headers are not followed. There is no Vorbis encoder. Decoding 120 s of 44.1 kHz stereo to WAV takes 0.25 to 0.31 s inside IronAV's own timing (roughly 400x real time), while
+FFmpeg's decoder alone ran the same file in 0.08 to 0.19 s through PyAV; FFmpeg is still faster here by roughly 1.5 to 3x. This
+decoder is scalar `f32`; codebook lookups use a 10-bit table, longer codes walk a tree.
 
 ## MP3
 

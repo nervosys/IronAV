@@ -46,11 +46,26 @@ impl<'a> Bits<'a> {
         self.pos += 1;
         v as u32
     }
+    /// The next `n` (<= 16) bits without consuming them; bits past the end read as zero.
+    #[inline]
+    fn peek(&self, n: u32) -> u32 {
+        let at = self.pos >> 3;
+        let mut w = 0u32;
+        for i in 0..3 {
+            w |= (self.d.get(at + i).copied().unwrap_or(0) as u32) << (8 * i);
+        }
+        (w >> (self.pos & 7)) & ((1 << n) - 1)
+    }
     /// Bits not yet read.
     fn left(&self) -> usize {
         (self.d.len() * 8).saturating_sub(self.pos)
     }
     fn get(&mut self, n: u32) -> u32 {
+        if n <= 16 && self.left() >= n as usize {
+            let v = self.peek(n);
+            self.pos += n as usize;
+            return v;
+        }
         let mut v = 0u32;
         for i in 0..n {
             v |= self.bit() << i;
@@ -61,16 +76,32 @@ impl<'a> Bits<'a> {
 
 // ---- codebooks -----------------------------------------------------------------------------------
 
+const FAST_BITS: u32 = 10;
+
 struct Codebook {
     dim: usize,
     /// The prefix code as a tree: `nodes[i][bit]` is a child (> 0), `!entry` (< 0) or 0 (no code).
     nodes: Vec<[i32; 2]>,
+    /// Indexed by the next FAST_BITS bits (first bit lowest): `entry << 8 | length` for a code that
+    /// short, else 0 (walk the tree).
+    fast: Vec<u32>,
     /// `entries * dim` values, or empty for a book without a value lookup.
     vectors: Vec<f32>,
 }
 
 impl Codebook {
     fn read(&self, b: &mut Bits) -> Option<usize> {
+        // codes of up to FAST_BITS bits resolve with one table lookup
+        let hit = self.fast[b.peek(FAST_BITS) as usize];
+        if hit != 0 {
+            let len = (hit & 0xFF) as usize;
+            if b.left() < len {
+                b.over = true;
+                return None;
+            }
+            b.pos += len;
+            return Some((hit >> 8) as usize);
+        }
         let mut at = 0usize;
         loop {
             let next = self.nodes.get(at)?[b.bit() as usize];
@@ -196,6 +227,17 @@ fn read_codebook(b: &mut Bits) -> Result<Codebook> {
         }
     }
 
+    let mut fast = vec![0u32; 1 << FAST_BITS];
+    for p in 0..entries {
+        let len = lens[p] as u32;
+        if len == 0 || len > FAST_BITS {
+            continue;
+        }
+        for hi in 0..1u32 << (FAST_BITS - len) {
+            fast[(codes[p] | hi << len) as usize] = (p as u32) << 8 | len;
+        }
+    }
+
     let lookup = b.get(4);
     let mut vectors = Vec::new();
     match lookup {
@@ -240,7 +282,7 @@ fn read_codebook(b: &mut Bits) -> Result<Codebook> {
         }
         _ => return Err(bad("a codebook has an unknown lookup type")),
     }
-    Ok(Codebook { dim, nodes, vectors })
+    Ok(Codebook { dim, nodes, fast, vectors })
 }
 
 // ---- setup ---------------------------------------------------------------------------------------
