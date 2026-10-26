@@ -71,7 +71,7 @@ B-frames and no look-ahead, so output order equals input order and each frame yi
 ```
 ironav convert -i in.y4m -o out.h264 --vcodec h264 --qp 24        # quality-targeted (0-51, default 23)
 ironav convert -i in.y4m -o out.mp4  --vcodec hevc --vbitrate 4000   # ~4 Mbit/s, in an MP4
-ironav convert -i in.mp3 -o out.mka --acodec opus --abitrate 96 --filter resample:rate=48000   # Opus at 96 kbit/s
+ironav convert -i in.mp3 -o out.mka --acodec opus --abitrate 96   # Opus at 96 kbit/s (resampled to 48 kHz automatically)
 ```
 
 The MP4 writer is constant-frame-rate, and puts the index in front of the media data (fast-start) by copying the finished file once,
@@ -280,8 +280,8 @@ quantisation, the pulse search, and the stereo angle (mid/side with a coded angl
 small; a flipped right channel when the channels are mostly out of phase). Digital silence costs three bytes a frame.
 `--abitrate KBPS` sets the rate (6 to 510; the default is 64 per channel). The encoder takes 48 kHz only; the `resample`
 filter (a Kaiser-windowed-sinc polyphase filter for any rate ratio, phase-exact, with the cut-off at the lower Nyquist
-frequency so nothing aliases; checked on tones across 44.1/48/22.05/96/8/16 kHz) converts, and the planner tells you to
-use it. A 120 s, 44.1 kHz stereo MP3 becomes Opus at 96 kb/s in 0.58 s here (about 200 times real time, decode and
+frequency so nothing aliases; checked on tones across 44.1/48/22.05/96/8/16 kHz) converts, and the planner adds it
+by itself (with a warning) when the source is at another rate, so `--filter resample` is only needed to choose the rate for other codecs. A 120 s, 44.1 kHz stereo MP3 becomes Opus at 96 kb/s in 0.58 s here (about 200 times real time, decode and
 resampling included); FFmpeg decodes it, at 17 dB SNR against the resampled source.
 The range encoder is checked symbol by symbol against the decoder's, including its bit counts.
 

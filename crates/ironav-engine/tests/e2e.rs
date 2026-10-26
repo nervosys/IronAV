@@ -990,15 +990,6 @@ fn opus_encoder_output_decodes_close_to_its_input() {
             assert!(snr > 20.0, "{ext} {channels}ch: {snr:.1} dB");
         }
     }
-
-    // other sample rates are refused with the way out
-    let wav = dir.join("in44.wav");
-    write_wav(&wav, &tone(44_100), 1, 44_100);
-    let mut j = job(&wav, &dir.join("x.mka"));
-    j.audio.codec = Some("opus".into());
-    let e = plan(&j).unwrap_err();
-    assert_eq!(e.code, ErrorCode::UnsupportedCodec);
-    assert!(e.hint.as_deref().is_some_and(|h| h.contains("48000")), "{:?}", e.hint);
 }
 
 /// Sample-rate conversion into the Opus encoder, and the audio bit rate: 44.1 kHz audio is
@@ -1187,4 +1178,32 @@ fn ogg_vorbis_output_copies_packets_and_length() {
         }
         assert_eq!(pcm(&wa), pcm(&wb), "{file}: decoded audio");
     }
+}
+
+/// Opus from a 44.1 kHz source needs no resample filter from the caller: the plan adds one, says so,
+/// and the output is the same as with the filter given by hand.
+#[test]
+fn opus_from_44k_resamples_by_itself() {
+    let dir = scratch("opus-auto");
+    let n = 44_100 * 2;
+    let samples: Vec<i16> = (0..n).map(|i| (12000.0 * (2.0 * std::f64::consts::PI * 440.0 * i as f64 / 44_100.0).sin()) as i16).collect();
+    let wav = dir.join("in.wav");
+    write_wav(&wav, &samples, 1, 44_100);
+
+    let mut auto = job(&wav, &dir.join("auto.opus"));
+    auto.audio.codec = Some("opus".into());
+    let p = plan(&auto).unwrap();
+    assert_eq!(p.steps[0].filters.len(), 1);
+    assert_eq!(p.steps[0].filters[0].name, "resample");
+    assert!(p.warnings.iter().any(|w| w.contains("44100") && w.contains("48000")), "{:?}", p.warnings);
+    run(&auto, &mut |_| {}).unwrap();
+
+    let mut by_hand = job(&wav, &dir.join("hand.opus"));
+    by_hand.audio.codec = Some("opus".into());
+    by_hand.filters.push(FilterCall::parse_shorthand("resample:rate=48000").unwrap());
+    let p = plan(&by_hand).unwrap();
+    assert_eq!(p.steps[0].filters.len(), 1, "no second resample is added");
+    assert!(p.warnings.is_empty());
+    run(&by_hand, &mut |_| {}).unwrap();
+    assert_eq!(std::fs::read(dir.join("auto.opus")).unwrap(), std::fs::read(dir.join("hand.opus")).unwrap());
 }

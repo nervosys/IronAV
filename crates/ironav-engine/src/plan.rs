@@ -182,6 +182,21 @@ pub fn plan(job: &Job) -> Result<Plan> {
                 .alternatives(spec.codecs.iter().map(|c| c.name())));
         }
 
+        // Opus is coded at 48 kHz only: bring other rates there rather than refuse
+        if media == MediaType::Audio && to == CodecId::Opus {
+            let from = if let StreamParams::Audio { sample_rate, .. } = &params { *sample_rate } else { 0 };
+            {
+                if from != 48_000 && from > 0 {
+                    let mut args = serde_json::Map::new();
+                    args.insert("rate".into(), 48_000.into());
+                    let call = FilterCall { name: "resample".into(), args };
+                    params = build_filter(&call.name, &call.args)?.output_params(&params);
+                    warnings.push(format!("{at}: resampled from {from} Hz to 48000 Hz, the rate Opus is coded at"));
+                    chain.push(call);
+                }
+            }
+        }
+
         let action = if to == s.codec && chain.is_empty() { Action::Copy } else { Action::Transcode };
         if media == MediaType::Audio && opts.qp.is_some() {
             return Err(Error::invalid_arg("qp applies to video streams only"));
