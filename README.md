@@ -8,7 +8,7 @@ A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so 
 > **WAV, FLAC and Y4M containers; PCM (8/16/24/32-bit, float), FLAC and raw-video codecs, an AAC-LC decoder, an Opus decoder and an Opus (CELT) encoder; `volume`, `resample`, `gray`, `hflip` filters.**
 > **H.264 and HEVC can be encoded and decoded on NVIDIA GPUs (NVENC/NVDEC)**, MP4 files can be read and written, and
 > Matroska/WebM files can be read.
-> HEVC has no software codec, so it needs an NVIDIA GPU; H.264 has a software decoder for intra pictures only (see below). MP4 can carry FLAC audio next to the video, and AAC
+> HEVC has no software codec, so it needs an NVIDIA GPU; H.264 has a software decoder for progressive 8-bit 4:2:0 (see below). MP4 can carry FLAC audio next to the video, and AAC
 > audio copied from another MP4/M4A (AAC can be decoded but not encoded; Opus can be both). AV1, writing Matroska etc. are modelled in
 > the ontology as `planned`.
 > IronAV is not yet a drop-in replacement for FFmpeg or HandBrake.
@@ -369,11 +369,11 @@ end position. On a 4 s stereo test signal (two tones and a little noise) 128 kb/
 Vorbis in about 2 s (roughly 55 times real time). One trap found on the way: a coupled pair whose magnitude is exactly zero and whose angle
 is not is decoded differently by the specification and by some FFmpeg builds, so the encoder never sends one.
 
-## H.264 (software decoder, in progress)
+## H.264 (software decoder)
 
-`ironav-codec` has a software H.264 decoder written from the specification, with the constant tables read out of FFmpeg's source by `tools/gen_h264_tables.py`. So far it decodes **intra pictures only**: I slices with CAVLC or CABAC, Intra 4x4, 8x8 and 16x16 prediction, I_PCM, the 8x8 transform, scaling matrices, several slices per picture, cropping and the loop filter, for 8-bit 4:2:0 progressive video. P and B slices, interlaced coding and slice groups are refused with a clear error.
+`ironav-codec` has a software H.264 decoder written from the specification, with the constant tables read out of FFmpeg's source by `tools/gen_h264_tables.py`. It decodes **I, P and B slices** with CAVLC or CABAC: Intra 4x4, 8x8 and 16x16 prediction, I_PCM, the 8x8 transform, scaling matrices, several slices per picture, every inter partition size, quarter-sample motion compensation, several reference frames with list modification and MMCO marking, spatial and temporal direct prediction, bi-prediction with explicit and implicit weights, output reordering, cropping and the loop filter, for 8-bit 4:2:0 progressive video. Interlaced coding (field pictures, MBAFF), slice groups, constrained intra prediction in inter slices, high bit depth and 4:2:2/4:4:4 are refused with a clear error. It is correct but not fast: the CABAC engine and the interpolation are not optimised.
 
-When a GPU decoder is usable (`--hwaccel auto`) it is still chosen for H.264; the software decoder runs with `--hwaccel off` or when no GPU backend works. Nine small streams (libx264 in several configurations, plus hand-built all-I_PCM streams in CAVLC and CABAC) decode bit-for-bit like FFmpeg's decoder; 200 corrupted streams made it return errors, never panic.
+When a GPU decoder is usable (`--hwaccel auto`) it is still chosen for H.264; the software decoder runs with `--hwaccel off` or when no GPU backend works. About 40 small streams (libx264 in many configurations, with B-frames, pyramids, weighted prediction, several slices and reference frames, plus hand-built all-I_PCM streams) decode bit-for-bit like FFmpeg's decoder; hundreds of corrupted streams made it return errors, never panic.
 
 ## VP8
 

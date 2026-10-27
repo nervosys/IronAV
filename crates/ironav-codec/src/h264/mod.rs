@@ -1,9 +1,9 @@
 //! A software H.264 decoder (ITU-T H.264 / ISO 14496-10) for 8-bit 4:2:0 progressive video.
 //!
 //! Intra pictures (I slices, CAVLC and CABAC, 4x4 / 8x8 / 16x16 prediction, I_PCM, 8x8 transform,
-//! scaling matrices, multiple slices, the loop filter) and CAVLC P slices (all partition sizes,
-//! P_Skip, multiple reference frames, explicit weighted prediction) are decoded, with reference
-//! picture marking and output reordering. B slices and CABAC P slices are not here yet.
+//! scaling matrices, multiple slices, the loop filter), P slices and B slices (all partition sizes,
+//! skip and direct modes, multiple reference frames, bi-prediction, weighted prediction) are decoded
+//! with CAVLC and CABAC, with reference picture marking and output reordering.
 
 mod bits;
 mod cabac;
@@ -135,7 +135,7 @@ impl H264Decoder {
         let scale = LevelScale::new(pps);
         cur.pic.slices.push(SliceParams { disable_deblocking: hdr.disable_deblocking, alpha_offset: hdr.alpha_offset, beta_offset: hdr.beta_offset, chroma_qp_offset: pps.chroma_qp_offset });
         let id = cur.pic.slices.len() as u16;
-        let mut dec = SliceDec::new(sps, pps, &hdr, &mut cur.pic, &scale, id, rbsp, &refs)?;
+        let mut dec = SliceDec::new(sps, pps, &hdr, &mut cur.pic, &scale, id, rbsp, &refs, cur.poc)?;
         let r = dec.decode();
         cur.mbs_done = cur.pic.mbs.iter().filter(|m| m.slice != 0).count();
         cur.hdr = hdr;

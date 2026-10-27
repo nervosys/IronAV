@@ -47,6 +47,10 @@ pub struct MbInfo {
     /// Identity of the reference picture behind `ref_idx`; -1 when unused.
     pub ref_id: [[i32; 4]; 2],
     pub skip: bool,
+    /// B_Skip or B_Direct_16x16.
+    pub bdirect: bool,
+    /// 8x8 blocks predicted in direct mode (bit per block).
+    pub direct8: u8,
     /// Absolute motion vector differences (clipped) per list and 4x4 block, for CABAC contexts.
     pub mvd: [[[u8; 2]; 16]; 2],
 }
@@ -67,6 +71,8 @@ impl Default for MbInfo {
             ref_idx: [[-1; 4]; 2],
             ref_id: [[-1; 4]; 2],
             skip: false,
+            bdirect: false,
+            direct8: 0,
             mvd: [[[0; 2]; 16]; 2],
         }
     }
@@ -211,7 +217,25 @@ pub struct SliceDec<'a> {
     rd: Reader<'a>,
     refs: &'a [RefList; 2],
     /// Bit per 4x4 block (raster) of the current macroblock whose motion is already known.
-    done: u16,
+    done: [u16; 2],
+    cur_poc: i32,
+}
+
+/// Motion derived by direct prediction for a whole macroblock.
+struct Direct {
+    ref_idx: [[i8; 4]; 2],
+    mv: [[[i16; 2]; 16]; 2],
+}
+
+/// Appends the motion partitions of the 8x8 block at (x0, y0): shape 0 = 8x8, 1 = 8x4, 2 = 4x8, 3 = 4x4.
+#[allow(clippy::type_complexity)]
+fn sub_parts(v: &mut Vec<(usize, usize, usize, usize, u8, u8, bool)>, x0: usize, y0: usize, mask: u8, shape: usize) {
+    match shape {
+        0 => v.push((x0, y0, 2, 2, mask, 0, false)),
+        1 => v.extend([(x0, y0, 2, 1, mask, 0, false), (x0, y0 + 1, 2, 1, mask, 0, false)]),
+        2 => v.extend([(x0, y0, 1, 2, mask, 0, false), (x0 + 1, y0, 1, 2, mask, 0, false)]),
+        _ => v.extend((0..4).map(|j| (x0 + (j & 1), y0 + (j >> 1), 1, 1, mask, 0, false))),
+    }
 }
 
 /// z-order index of the 4x4 block at (bx, by) within a macroblock.
@@ -226,7 +250,7 @@ fn block_pos(n: usize) -> (usize, usize) {
 
 impl<'a> SliceDec<'a> {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(sps: &'a Sps, pps: &'a Pps, hdr: &'a SliceHeader, pic: &'a mut Picture, scale: &'a LevelScale, slice_id: u16, rbsp: &'a [u8], refs: &'a [RefList; 2]) -> Result<Self> {
+    pub fn new(sps: &'a Sps, pps: &'a Pps, hdr: &'a SliceHeader, pic: &'a mut Picture, scale: &'a LevelScale, slice_id: u16, rbsp: &'a [u8], refs: &'a [RefList; 2], cur_poc: i32) -> Result<Self> {
         let rd = if pps.cabac {
             // cabac_alignment_one_bit up to the next byte
             let start = hdr.data_pos.div_ceil(8);
@@ -236,7 +260,7 @@ impl<'a> SliceDec<'a> {
             r.skip(hdr.data_pos);
             Reader::Cavlc(r)
         };
-        Ok(SliceDec { sps, pps, hdr, pic, scale, slice_id, qp: hdr.qp, last_dqp: false, mbx: 0, mby: 0, cur: MbInfo::default(), rd, refs, done: 0 })
+        Ok(SliceDec { sps, pps, hdr, pic, scale, slice_id, qp: hdr.qp, last_dqp: false, mbx: 0, mby: 0, cur: MbInfo::default(), rd, refs, done: [0; 2], cur_poc })
     }
 
     fn start_mb(&mut self, addr: usize) -> Result<()> {
@@ -246,7 +270,7 @@ impl<'a> SliceDec<'a> {
         self.mbx = addr % self.pic.mb_w;
         self.mby = addr / self.pic.mb_w;
         self.cur = MbInfo { slice: self.slice_id, ..MbInfo::default() };
-        self.done = 0;
+        self.done = [0; 2];
         Ok(())
     }
 
@@ -258,9 +282,6 @@ impl<'a> SliceDec<'a> {
     pub fn decode(&mut self) -> Result<()> {
         let inter_slice = self.hdr.slice_type != SliceType::I;
         if inter_slice {
-            if self.hdr.slice_type == SliceType::B {
-                return Err(unsupported("H.264 B slices are not supported yet"));
-            }
             if self.pps.constrained_intra_pred {
                 return Err(unsupported("H.264 constrained intra prediction in P slices is not supported yet"));
             }
@@ -350,11 +371,12 @@ impl<'a> SliceDec<'a> {
 
     fn decode_mb(&mut self) -> Result<()> {
         let mut mb_type = self.read_mb_type()?;
-        if self.hdr.slice_type == SliceType::P {
-            if mb_type < 5 {
+        if self.hdr.slice_type != SliceType::I {
+            let off = if self.hdr.slice_type == SliceType::P { 5 } else { 23 };
+            if mb_type < off {
                 return self.decode_inter_mb(mb_type);
             }
-            mb_type -= 5;
+            mb_type -= off;
         }
         if mb_type == 25 {
             return self.decode_pcm();
@@ -409,6 +431,9 @@ impl<'a> SliceDec<'a> {
             (la && self.left().kind != Kind::I4x4 && self.left().kind != Kind::I8x8, ta && self.top().kind != Kind::I4x4 && self.top().kind != Kind::I8x8)
         };
         let p_slice = self.hdr.slice_type == SliceType::P;
+        if self.hdr.slice_type == SliceType::B && matches!(self.rd, Reader::Cabac(_)) {
+            return Ok(self.cabac_b_mb_type());
+        }
         match &mut self.rd {
             Reader::Cavlc(r) => r.ue(),
             Reader::Cabac(c) if p_slice => {
@@ -638,7 +663,7 @@ impl<'a> SliceDec<'a> {
             (_, true, false) => return None,
             (_, _, true) => (0, -1, x, 3),
             _ => {
-                if self.done & (1 << (y * 4 + x)) == 0 {
+                if self.done[l] & (1 << (y * 4 + x)) == 0 {
                     return None;
                 }
                 let b8 = ((y >> 1) * 2 + (x >> 1)) as usize;
@@ -707,7 +732,15 @@ impl<'a> SliceDec<'a> {
         for y in by..by + h {
             for x in bx..bx + w {
                 self.cur.mv[l][y * 4 + x] = mv;
-                self.done |= 1 << (y * 4 + x);
+                self.done[l] |= 1 << (y * 4 + x);
+            }
+        }
+    }
+
+    fn mark_done(&mut self, l: usize, bx: usize, by: usize, w: usize, h: usize) {
+        for y in by..by + h {
+            for x in bx..bx + w {
+                self.done[l] |= 1 << (y * 4 + x);
             }
         }
     }
@@ -737,17 +770,155 @@ impl<'a> SliceDec<'a> {
         Ok(())
     }
 
+    // ---- direct prediction (8.4.1.2) ---------------------------------------------------------------
+
+    /// Motion of the co-located block in RefPicList1[0] for the 4x4 block (bx, by):
+    /// (reference index in the co-located picture's own list, vector, id of the picture it names).
+    fn col_block(&self, bx: usize, by: usize) -> Result<Option<(i8, [i16; 2], i32)>> {
+        let Some(Some(e)) = self.refs[1].first() else {
+            return Err(Error::invalid_input("H.264 direct prediction needs a picture in reference list 1"));
+        };
+        let m = match e.pic.mbs.get(self.idx()) {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+        let (cx, cy) = if self.sps.direct_8x8_inference { ((bx >> 1) * 3, (by >> 1) * 3) } else { (bx, by) };
+        if m.kind != Kind::Inter {
+            return Ok(None);
+        }
+        let b8 = (cy >> 1) * 2 + (cx >> 1);
+        for l in 0..2 {
+            if m.ref_idx[l][b8] >= 0 {
+                return Ok(Some((m.ref_idx[l][b8], m.mv[l][cy * 4 + cx], m.ref_id[l][b8])));
+            }
+        }
+        Ok(None)
+    }
+
+    fn direct(&self) -> Result<Direct> {
+        if self.hdr.direct_spatial_mv_pred {
+            self.direct_spatial()
+        } else {
+            self.direct_temporal()
+        }
+    }
+
+    fn direct_spatial(&self) -> Result<Direct> {
+        let mut refs = [-1i8; 2];
+        for (l, rf) in refs.iter_mut().enumerate() {
+            let a = self.nb_motion(l, -1, 0);
+            let b = self.nb_motion(l, 0, -1);
+            let c = self.nb_motion(l, 4, -1).or_else(|| self.nb_motion(l, -1, -1));
+            let r = |n: Option<(i8, [i16; 2])>| n.map_or(-1, |v| v.0);
+            let minpos = |x: i8, y: i8| if x >= 0 && y >= 0 { x.min(y) } else { x.max(y) };
+            *rf = minpos(r(a), minpos(r(b), r(c)));
+        }
+        let mut d = Direct { ref_idx: [[-1; 4]; 2], mv: [[[0; 2]; 16]; 2] };
+        if refs[0] < 0 && refs[1] < 0 {
+            d.ref_idx = [[0; 4]; 2];
+            // still need the co-located picture to exist for a conforming stream
+            return Ok(d);
+        }
+        for l in 0..2 {
+            if refs[l] >= 0 {
+                d.ref_idx[l] = [refs[l]; 4];
+                let mv = self.pred_mv(l, 0, 0, 4, 0, refs[l]);
+                d.mv[l] = [mv; 16];
+            }
+        }
+        let l1_short = matches!(self.refs[1].first(), Some(Some(e)) if !e.long);
+        if l1_short {
+            for by in 0..4 {
+                for bx in 0..4 {
+                    if let Some((r, mv, _)) = self.col_block(bx, by)? {
+                        if r == 0 && mv[0].abs() <= 1 && mv[1].abs() <= 1 {
+                            for l in 0..2 {
+                                if refs[l] == 0 {
+                                    d.mv[l][by * 4 + bx] = [0, 0];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(d)
+    }
+
+    fn direct_temporal(&self) -> Result<Direct> {
+        let Some(Some(e1)) = self.refs[1].first() else {
+            return Err(Error::invalid_input("H.264 direct prediction needs a picture in reference list 1"));
+        };
+        let mut d = Direct { ref_idx: [[0; 4]; 2], mv: [[[0; 2]; 16]; 2] };
+        for i8 in 0..4usize {
+            let (bx0, by0) = ((i8 & 1) * 2, (i8 >> 1) * 2);
+            let col = self.col_block(bx0, by0)?;
+            let ref0 = match col {
+                Some((_, _, id)) => match self.refs[0].iter().position(|r| matches!(r, Some(e) if e.pic.id == id)) {
+                    Some(p) => p,
+                    None => return Err(Error::invalid_input("H.264 temporal direct prediction names a picture that is not in reference list 0")),
+                },
+                None => 0,
+            };
+            let Some(Some(e0)) = self.refs[0].get(ref0) else {
+                return Err(Error::invalid_input("H.264 temporal direct prediction needs a picture in reference list 0"));
+            };
+            d.ref_idx[0][i8] = ref0 as i8;
+            d.ref_idx[1][i8] = 0;
+            let tb = (self.cur_poc - e0.pic.poc).clamp(-128, 127);
+            let td = (e1.pic.poc - e0.pic.poc).clamp(-128, 127);
+            for j in 0..4usize {
+                let (bx, by) = (bx0 + (j & 1), by0 + (j >> 1));
+                let mvcol = match self.col_block(bx, by)? {
+                    Some((_, mv, _)) => mv,
+                    None => [0, 0],
+                };
+                let (m0, m1) = if e0.long || td == 0 {
+                    (mvcol, [0, 0])
+                } else {
+                    let tx = (16384 + (td / 2).abs()) / td;
+                    let dsf = ((tb * tx + 32) >> 6).clamp(-1024, 1023);
+                    let s = |v: i16| ((dsf * v as i32 + 128) >> 8) as i16;
+                    let m0 = [s(mvcol[0]), s(mvcol[1])];
+                    (m0, [m0[0].wrapping_sub(mvcol[0]), m0[1].wrapping_sub(mvcol[1])])
+                };
+                d.mv[0][by * 4 + bx] = m0;
+                d.mv[1][by * 4 + bx] = m1;
+            }
+        }
+        Ok(d)
+    }
+
+    /// Copies the derived direct motion of the 8x8 blocks in `mask` into the macroblock.
+    fn put_direct(&mut self, d: &Direct, mask: u8) {
+        for i8 in 0..4usize {
+            if mask & (1 << i8) == 0 {
+                continue;
+            }
+            let (bx0, by0) = ((i8 & 1) * 2, (i8 >> 1) * 2);
+            for l in 0..2 {
+                self.cur.ref_idx[l][i8] = d.ref_idx[l][i8];
+                for j in 0..4usize {
+                    let i = (by0 + (j >> 1)) * 4 + bx0 + (j & 1);
+                    self.cur.mv[l][i] = if d.ref_idx[l][i8] >= 0 { d.mv[l][i] } else { [0, 0] };
+                }
+            }
+        }
+    }
+
+    // ---- CABAC syntax elements of inter macroblocks --------------------------------------------------
+
     fn read_skip_flag(&mut self) -> bool {
         let a = self.avail_left() && !self.left().skip;
         let b = self.avail_top() && !self.top().skip;
+        let base = if self.hdr.slice_type == SliceType::B { 24 } else { 11 };
         let Reader::Cabac(c) = &mut self.rd else { unreachable!() };
-        c.decision(11 + a as usize + b as usize) == 1
+        c.decision(base + a as usize + b as usize) == 1
     }
 
-    /// Whether the 8x8 block at (bx, by) in 4x4 units next to the current partition has a
-    /// reference index above zero (CABAC ref_idx context).
-    fn nb_ref_gt0(&self, x: i32, y: i32) -> bool {
-        let w = self.pic.mb_w;
+    /// Whether the neighbouring partition at (x, y) (4x4 units, outside or inside the current
+    /// macroblock) uses a reference index above zero in list `l` (CABAC ref_idx context).
+    fn nb_ref_gt0(&self, l: usize, x: i32, y: i32) -> bool {
         let (m, bx, by) = if x < 0 {
             if !self.avail_left() {
                 return false;
@@ -759,14 +930,14 @@ impl<'a> SliceDec<'a> {
             }
             (self.top(), x, 3)
         } else {
-            let _ = w;
             (&self.cur, x, y)
         };
-        m.kind == Kind::Inter && !m.skip && m.ref_idx[0][((by >> 1) * 2 + (bx >> 1)) as usize] > 0
+        let b8 = ((by >> 1) * 2 + (bx >> 1)) as usize;
+        m.kind == Kind::Inter && m.direct8 & (1 << b8) == 0 && m.ref_idx[l][b8] > 0
     }
 
     /// Sum of the absolute mvd values of the neighbours (CABAC mvd context).
-    fn nb_mvd(&self, x: i32, y: i32, comp: usize) -> u32 {
+    fn nb_mvd(&self, l: usize, x: i32, y: i32, comp: usize) -> u32 {
         let (m, bx, by) = if x < 0 {
             if !self.avail_left() {
                 return 0;
@@ -780,15 +951,12 @@ impl<'a> SliceDec<'a> {
         } else {
             (&self.cur, x, y)
         };
-        m.mvd[0][(by * 4 + bx) as usize][comp] as u32
+        m.mvd[l][(by * 4 + bx) as usize][comp] as u32
     }
 
-    fn cabac_ref_idx(&mut self, bx: usize, by: usize, max: u32) -> Result<i8> {
-        if max == 0 {
-            return Ok(0);
-        }
-        let a = self.nb_ref_gt0(bx as i32 - 1, by as i32);
-        let b = self.nb_ref_gt0(bx as i32, by as i32 - 1);
+    fn cabac_ref_idx(&mut self, l: usize, bx: usize, by: usize, max: u32) -> Result<i8> {
+        let a = self.nb_ref_gt0(l, bx as i32 - 1, by as i32);
+        let b = self.nb_ref_gt0(l, bx as i32, by as i32 - 1);
         let Reader::Cabac(c) = &mut self.rd else { unreachable!() };
         let mut v = 0u32;
         let mut ctx = 54 + a as usize + 2 * b as usize;
@@ -799,14 +967,11 @@ impl<'a> SliceDec<'a> {
                 return Err(Error::invalid_input("H.264 reference index is out of range"));
             }
         }
-        if v > max {
-            return Err(Error::invalid_input("H.264 reference index is out of range"));
-        }
         Ok(v as i8)
     }
 
-    fn cabac_mvd_comp(&mut self, bx: usize, by: usize, comp: usize) -> Result<i32> {
-        let sum = self.nb_mvd(bx as i32 - 1, by as i32, comp) + self.nb_mvd(bx as i32, by as i32 - 1, comp);
+    fn cabac_mvd_comp(&mut self, l: usize, bx: usize, by: usize, comp: usize) -> Result<i32> {
+        let sum = self.nb_mvd(l, bx as i32 - 1, by as i32, comp) + self.nb_mvd(l, bx as i32, by as i32 - 1, comp);
         let base = if comp == 0 { 40 } else { 47 };
         let Reader::Cabac(c) = &mut self.rd else { unreachable!() };
         let inc = if sum < 3 {
@@ -844,27 +1009,96 @@ impl<'a> SliceDec<'a> {
         Ok(if c.bypass() == 1 { -v } else { v })
     }
 
+    /// B-slice macroblock type bins (9.3.2.5); returns the CAVLC numbering (23 and up: intra).
+    fn cabac_b_mb_type(&mut self) -> u32 {
+        let a = self.avail_left() && !self.left().bdirect;
+        let b = self.avail_top() && !self.top().bdirect;
+        let Reader::Cabac(c) = &mut self.rd else { unreachable!() };
+        if c.decision(27 + a as usize + b as usize) == 0 {
+            return 0;
+        }
+        if c.decision(27 + 3) == 0 {
+            return 1 + c.decision(27 + 5);
+        }
+        let mut bits = c.decision(27 + 4) << 3;
+        bits |= c.decision(27 + 5) << 2;
+        bits |= c.decision(27 + 5) << 1;
+        bits |= c.decision(27 + 5);
+        match bits {
+            0..=7 => bits + 3,
+            13 => {
+                // intra macroblock type with the suffix contexts
+                if c.decision(32) == 0 {
+                    return 23;
+                }
+                if c.terminate() == 1 {
+                    return 23 + 25;
+                }
+                let mut t = 1;
+                t += 12 * c.decision(32 + 1);
+                if c.decision(32 + 2) == 1 {
+                    t += 4 + 4 * c.decision(32 + 2);
+                }
+                t += 2 * c.decision(32 + 3);
+                t += c.decision(32 + 3);
+                23 + t
+            }
+            14 => 11,
+            15 => 22,
+            _ => ((bits << 1) | c.decision(27 + 5)) - 4,
+        }
+    }
+
+    fn cabac_b_sub_type(&mut self) -> u32 {
+        let Reader::Cabac(c) = &mut self.rd else { unreachable!() };
+        if c.decision(36) == 0 {
+            return 0;
+        }
+        if c.decision(37) == 0 {
+            return 1 + c.decision(39);
+        }
+        let mut t = 3;
+        if c.decision(38) == 1 {
+            if c.decision(39) == 1 {
+                return 11 + c.decision(39);
+            }
+            t += 4;
+        }
+        t += 2 * c.decision(39);
+        t += c.decision(39);
+        t
+    }
+
+    // ---- inter macroblock syntax ---------------------------------------------------------------------
+
     fn decode_skip(&mut self) -> Result<()> {
         self.cur.kind = Kind::Inter;
         self.cur.skip = true;
         self.last_dqp = false;
-        // P_Skip motion (8.4.1.1)
-        let a = self.nb_motion(0, -1, 0);
-        let b = self.nb_motion(0, 0, -1);
-        let still = |n: Option<(i8, [i16; 2])>| n.is_some_and(|v| v.0 == 0 && v.1 == [0, 0]);
-        let mv = if a.is_none() || b.is_none() || still(a) || still(b) { [0, 0] } else { self.pred_mv(0, 0, 0, 4, 0, 0) };
-        self.set_ref(0, 0, 0, 4, 4, 0);
-        self.set_motion(0, 0, 0, 4, 4, mv);
+        if self.hdr.slice_type == SliceType::B {
+            self.cur.bdirect = true;
+            self.cur.direct8 = 0xF;
+            let d = self.direct()?;
+            self.put_direct(&d, 0xF);
+        } else {
+            // P_Skip motion (8.4.1.1)
+            let a = self.nb_motion(0, -1, 0);
+            let b = self.nb_motion(0, 0, -1);
+            let still = |n: Option<(i8, [i16; 2])>| n.is_some_and(|v| v.0 == 0 && v.1 == [0, 0]);
+            let mv = if a.is_none() || b.is_none() || still(a) || still(b) { [0, 0] } else { self.pred_mv(0, 0, 0, 4, 0, 0) };
+            self.set_ref(0, 0, 0, 4, 4, 0);
+            self.set_motion(0, 0, 0, 4, 4, mv);
+        }
         self.resolve_refs()?;
         self.mc_mb()
     }
 
-    fn read_ref_idx(&mut self, bx: usize, by: usize, max: u32) -> Result<i8> {
+    fn read_ref_idx(&mut self, l: usize, bx: usize, by: usize, max: u32) -> Result<i8> {
         if max == 0 {
             return Ok(0);
         }
         if matches!(self.rd, Reader::Cabac(_)) {
-            return self.cabac_ref_idx(bx, by, max);
+            return self.cabac_ref_idx(l, bx, by, max);
         }
         let Reader::Cavlc(r) = &mut self.rd else { unreachable!() };
         let v = r.te(max)?;
@@ -874,100 +1108,170 @@ impl<'a> SliceDec<'a> {
         Ok(v as i8)
     }
 
-    fn read_mvd(&mut self, bx: usize, by: usize) -> Result<[i32; 2]> {
+    fn read_mvd(&mut self, l: usize, bx: usize, by: usize) -> Result<[i32; 2]> {
         if let Reader::Cavlc(r) = &mut self.rd {
             return Ok([r.se()?, r.se()?]);
         }
-        Ok([self.cabac_mvd_comp(bx, by, 0)?, self.cabac_mvd_comp(bx, by, 1)?])
+        Ok([self.cabac_mvd_comp(l, bx, by, 0)?, self.cabac_mvd_comp(l, bx, by, 1)?])
     }
 
-    fn read_partition_mv(&mut self, bx: usize, by: usize, w: usize, h: usize, dir: u8) -> Result<()> {
-        let refi = self.cur.ref_idx[0][(by >> 1) * 2 + (bx >> 1)];
-        let p = self.pred_mv(0, bx as i32, by as i32, w as i32, dir, refi);
-        let d = self.read_mvd(bx, by)?;
+    fn read_partition_mv(&mut self, l: usize, bx: usize, by: usize, w: usize, h: usize, dir: u8) -> Result<()> {
+        let refi = self.cur.ref_idx[l][(by >> 1) * 2 + (bx >> 1)];
+        let p = self.pred_mv(l, bx as i32, by as i32, w as i32, dir, refi);
+        let d = self.read_mvd(l, bx, by)?;
         let clip = |v: i32| v.unsigned_abs().min(64) as u8;
         for y in by..by + h {
             for x in bx..bx + w {
-                self.cur.mvd[0][y * 4 + x] = [clip(d[0]), clip(d[1])];
+                self.cur.mvd[l][y * 4 + x] = [clip(d[0]), clip(d[1])];
             }
         }
         let mv = [(p[0] as i32 + d[0]) as i16, (p[1] as i32 + d[1]) as i16];
-        self.set_motion(0, bx, by, w, h, mv);
+        self.set_motion(l, bx, by, w, h, mv);
         Ok(())
+    }
+
+    fn read_sub_type(&mut self, b: bool) -> Result<u32> {
+        let t = if b && matches!(self.rd, Reader::Cabac(_)) {
+            self.cabac_b_sub_type()
+        } else {
+            self.sub_type_basic()?
+        };
+        if t > if b { 12 } else { 3 } {
+            return Err(Error::invalid_input("H.264 sub-macroblock type is out of range"));
+        }
+        Ok(t)
+    }
+
+    fn sub_type_basic(&mut self) -> Result<u32> {
+        let t = match &mut self.rd {
+            Reader::Cavlc(r) => r.ue()?,
+            Reader::Cabac(c) => {
+                if c.decision(21) == 1 {
+                    0
+                } else if c.decision(22) == 0 {
+                    1
+                } else if c.decision(23) == 1 {
+                    2
+                } else {
+                    3
+                }
+            }
+        };
+        Ok(t)
     }
 
     fn decode_inter_mb(&mut self, t: u32) -> Result<()> {
         self.cur.kind = Kind::Inter;
-        let max_ref = self.hdr.num_ref_idx_active[0].saturating_sub(1);
-        let mut all_8x8 = true;
-        match t {
-            0 => {
-                let r = self.read_ref_idx(0, 0, max_ref)?;
-                self.set_ref(0, 0, 0, 4, 4, r);
-                self.read_partition_mv(0, 0, 4, 4, 0)?;
-            }
-            1 => {
-                let r0 = self.read_ref_idx(0, 0, max_ref)?;
-                self.set_ref(0, 0, 0, 4, 2, r0);
-                let r1 = self.read_ref_idx(0, 2, max_ref)?;
-                self.set_ref(0, 0, 2, 4, 2, r1);
-                self.read_partition_mv(0, 0, 4, 2, 1)?;
-                self.read_partition_mv(0, 2, 4, 2, 1)?;
-            }
-            2 => {
-                let r0 = self.read_ref_idx(0, 0, max_ref)?;
-                self.set_ref(0, 0, 0, 2, 4, r0);
-                let r1 = self.read_ref_idx(2, 0, max_ref)?;
-                self.set_ref(0, 2, 0, 2, 4, r1);
-                self.read_partition_mv(0, 0, 2, 4, 2)?;
-                self.read_partition_mv(2, 0, 2, 4, 2)?;
-            }
-            _ => {
-                let mut sub = [0u32; 4];
-                for s in sub.iter_mut() {
-                    *s = match &mut self.rd {
-                        Reader::Cavlc(r) => r.ue()?,
-                        Reader::Cabac(c) => {
-                            if c.decision(21) == 1 {
-                                0
-                            } else if c.decision(22) == 0 {
-                                1
-                            } else if c.decision(23) == 1 {
-                                2
-                            } else {
-                                3
-                            }
-                        }
-                    };
-                    if *s > 3 {
-                        return Err(Error::invalid_input("H.264 sub-macroblock type is out of range"));
+        let b = self.hdr.slice_type == SliceType::B;
+        let maxr = [self.hdr.num_ref_idx_active[0].saturating_sub(1), self.hdr.num_ref_idx_active[1].saturating_sub(1)];
+        // (bx, by, w, h, list mask) where bit 0 is list 0 and bit 1 list 1
+        let mut ref_parts: Vec<(usize, usize, usize, usize, u8)> = Vec::new();
+        // (bx, by, w, h, list mask, prediction direction, direct)
+        let mut mv_parts: Vec<(usize, usize, usize, usize, u8, u8, bool)> = Vec::new();
+        let mut direct_mask = 0u8;
+        let mut sub8_ok = true;
+        let mut ref0 = false;
+        if !b {
+            match t {
+                0 => {
+                    ref_parts.push((0, 0, 4, 4, 1));
+                    mv_parts.push((0, 0, 4, 4, 1, 0, false));
+                }
+                1 => {
+                    ref_parts.extend([(0, 0, 4, 2, 1), (0, 2, 4, 2, 1)]);
+                    mv_parts.extend([(0, 0, 4, 2, 1, 1, false), (0, 2, 4, 2, 1, 1, false)]);
+                }
+                2 => {
+                    ref_parts.extend([(0, 0, 2, 4, 1), (2, 0, 2, 4, 1)]);
+                    mv_parts.extend([(0, 0, 2, 4, 1, 2, false), (2, 0, 2, 4, 1, 2, false)]);
+                }
+                _ => {
+                    ref0 = t == 4;
+                    let mut sub = [0u32; 4];
+                    for s in sub.iter_mut() {
+                        *s = self.read_sub_type(false)?;
+                        sub8_ok &= *s == 0;
                     }
-                    if *s != 0 {
-                        all_8x8 = false;
+                    for (i, &s) in sub.iter().enumerate() {
+                        let (x0, y0) = ((i & 1) * 2, (i >> 1) * 2);
+                        ref_parts.push((x0, y0, 2, 2, 1));
+                        sub_parts(&mut mv_parts, x0, y0, 1, s as usize);
                     }
                 }
-                for i in 0..4usize {
-                    let r = if t == 4 { 0 } else { self.read_ref_idx((i & 1) * 2, (i >> 1) * 2, max_ref)? };
-                    self.set_ref(0, (i & 1) * 2, (i >> 1) * 2, 2, 2, r);
+            }
+        } else if t == 0 {
+            direct_mask = 0xF;
+            self.cur.bdirect = true;
+        } else if t <= 3 {
+            ref_parts.push((0, 0, 4, 4, t as u8));
+            mv_parts.push((0, 0, 4, 4, t as u8, 0, false));
+        } else if t < 22 {
+            let idx = t - 4;
+            let masks: [(u8, u8); 9] = [(1, 1), (2, 2), (1, 2), (2, 1), (1, 3), (2, 3), (3, 1), (3, 2), (3, 3)];
+            let (m0, m1) = masks[(idx / 2) as usize];
+            if idx % 2 == 0 {
+                ref_parts.extend([(0, 0, 4, 2, m0), (0, 2, 4, 2, m1)]);
+                mv_parts.extend([(0, 0, 4, 2, m0, 1, false), (0, 2, 4, 2, m1, 1, false)]);
+            } else {
+                ref_parts.extend([(0, 0, 2, 4, m0), (2, 0, 2, 4, m1)]);
+                mv_parts.extend([(0, 0, 2, 4, m0, 2, false), (2, 0, 2, 4, m1, 2, false)]);
+            }
+        } else if t == 22 {
+            let mut sub = [0u32; 4];
+            for s in sub.iter_mut() {
+                *s = self.read_sub_type(true)?;
+            }
+            for (i, &s) in sub.iter().enumerate() {
+                let (x0, y0) = ((i & 1) * 2, (i >> 1) * 2);
+                if s == 0 {
+                    direct_mask |= 1 << i;
+                    mv_parts.push((x0, y0, 2, 2, 0, 0, true));
+                    continue;
                 }
-                for (i, &s) in sub.iter().enumerate() {
-                    let (x0, y0) = ((i & 1) * 2, (i >> 1) * 2);
-                    match s {
-                        0 => self.read_partition_mv(x0, y0, 2, 2, 0)?,
-                        1 => {
-                            self.read_partition_mv(x0, y0, 2, 1, 0)?;
-                            self.read_partition_mv(x0, y0 + 1, 2, 1, 0)?;
-                        }
-                        2 => {
-                            self.read_partition_mv(x0, y0, 1, 2, 0)?;
-                            self.read_partition_mv(x0 + 1, y0, 1, 2, 0)?;
-                        }
-                        _ => {
-                            for j in 0..4 {
-                                self.read_partition_mv(x0 + (j & 1), y0 + (j >> 1), 1, 1, 0)?;
-                            }
-                        }
-                    }
+                // (list mask, partition shape: 0 = 8x8, 1 = 8x4, 2 = 4x8, 3 = 4x4)
+                let (mask, shape) = match s {
+                    1..=3 => (s as u8, 0),
+                    4 => (1, 1),
+                    5 => (1, 2),
+                    6 => (2, 1),
+                    7 => (2, 2),
+                    8 => (3, 1),
+                    9 => (3, 2),
+                    10 => (1, 3),
+                    11 => (2, 3),
+                    _ => (3, 3),
+                };
+                sub8_ok &= shape == 0;
+                ref_parts.push((x0, y0, 2, 2, mask));
+                sub_parts(&mut mv_parts, x0, y0, mask, shape);
+            }
+        } else {
+            return Err(Error::invalid_input("H.264 B macroblock type is out of range"));
+        }
+        // direct motion first: later partitions may predict from the earlier direct ones
+        self.cur.direct8 = direct_mask;
+        if direct_mask != 0 {
+            let d = self.direct()?;
+            self.put_direct(&d, direct_mask);
+        }
+        for l in 0..2usize {
+            for &(bx, by, w, h, mask) in &ref_parts {
+                if mask & (1 << l) == 0 {
+                    continue;
+                }
+                let r = if ref0 { 0 } else { self.read_ref_idx(l, bx, by, maxr[l])? };
+                self.set_ref(l, bx, by, w, h, r);
+            }
+        }
+        for l in 0..2usize {
+            self.done[l] = 0;
+            for &(bx, by, w, h, mask, dir, direct) in &mv_parts {
+                if direct {
+                    self.mark_done(l, bx, by, w, h);
+                } else if mask & (1 << l) != 0 {
+                    self.read_partition_mv(l, bx, by, w, h, dir)?;
+                } else {
+                    self.set_motion(l, bx, by, w, h, [0, 0]);
                 }
             }
         }
@@ -982,7 +1286,8 @@ impl<'a> SliceDec<'a> {
             self.read_cbp()?
         };
         self.cur.cbp = cbp as u8;
-        if cbp & 15 != 0 && self.pps.transform_8x8 && all_8x8 {
+        let direct_ok = direct_mask == 0 || self.sps.direct_8x8_inference;
+        if cbp & 15 != 0 && self.pps.transform_8x8 && sub8_ok && direct_ok {
             self.cur.t8x8 = self.read_t8x8_flag()?;
         }
         let mut res = Res::new();
@@ -1002,10 +1307,12 @@ impl<'a> SliceDec<'a> {
     /// Motion-compensated prediction of the whole macroblock, written into the picture.
     fn mc_mb(&mut self) -> Result<()> {
         let uniform = |this: &Self, bx: usize, by: usize, n: usize| {
-            let first = this.cur.mv[0][by * 4 + bx];
-            (0..n).all(|dy| (0..n).all(|dx| this.cur.mv[0][(by + dy) * 4 + bx + dx] == first))
+            (0..2).all(|l| {
+                let first = this.cur.mv[l][by * 4 + bx];
+                (0..n).all(|dy| (0..n).all(|dx| this.cur.mv[l][(by + dy) * 4 + bx + dx] == first))
+            })
         };
-        let same_ref = self.cur.ref_idx[0].iter().all(|&r| r == self.cur.ref_idx[0][0]);
+        let same_ref = (0..2).all(|l| self.cur.ref_idx[l].iter().all(|&r| r == self.cur.ref_idx[l][0]));
         if same_ref && uniform(self, 0, 0, 4) {
             return self.mc_block(0, 0, 4, 4);
         }
@@ -1022,39 +1329,106 @@ impl<'a> SliceDec<'a> {
         Ok(())
     }
 
-    /// Predicts a block of `w` x `h` 4x4 units at (bx, by) from list 0.
+    /// Predicts a block of `w` x `h` 4x4 units at (bx, by) from one or both lists.
     fn mc_block(&mut self, bx: usize, by: usize, w: usize, h: usize) -> Result<()> {
         let b8 = (by >> 1) * 2 + (bx >> 1);
-        let r = self.cur.ref_idx[0][b8];
-        let entry = match self.refs[0].get(r.max(0) as usize) {
-            Some(Some(e)) if r >= 0 => e.pic.clone(),
-            _ => return Err(Error::invalid_input("H.264 macroblock refers to a reference picture that is not available")),
-        };
-        let mv = self.cur.mv[0][by * 4 + bx];
         let (pw, ph) = (self.pic.mb_w * 16, self.pic.mb_h * 16);
         let (x, y) = ((self.mbx * 16 + bx * 4) as i32, (self.mby * 16 + by * 4) as i32);
         let (bw, bh) = (w * 4, h * 4);
-        let wt = self.hdr.weights.as_ref().map(|wt| (wt, wt.entries[0].get(r as usize).copied()));
-        let mut out = [0u8; 256];
-        inter::luma_mc(&entry.planes[0], pw, ph, x, y, mv[0] as i32, mv[1] as i32, bw, bh, &mut out);
-        if let Some((wt, Some(e))) = wt {
-            inter::weight_uni(&mut out[..bw * bh], wt.luma_log2_denom, e[0], e[1]);
+        let (cw, ch) = (bw / 2, bh / 2);
+        let (cpw, cph) = (pw / 2, ph / 2);
+        let mut luma = [[0u8; 256]; 2];
+        let mut chroma = [[[0u8; 64]; 2]; 2];
+        let mut used = [false; 2];
+        let mut pics: [Option<(std::sync::Arc<super::dpb::DecodedPic>, bool)>; 2] = [None, None];
+        for l in 0..2usize {
+            let r = self.cur.ref_idx[l][b8];
+            if r < 0 {
+                continue;
+            }
+            let entry = match self.refs[l].get(r as usize) {
+                Some(Some(e)) => e.clone(),
+                _ => return Err(Error::invalid_input("H.264 macroblock refers to a reference picture that is not available")),
+            };
+            let mv = self.cur.mv[l][by * 4 + bx];
+            inter::luma_mc(&entry.pic.planes[0], pw, ph, x, y, mv[0] as i32, mv[1] as i32, bw, bh, &mut luma[l]);
+            for c in 0..2usize {
+                inter::chroma_mc(&entry.pic.planes[1 + c], cpw, cph, x / 2, y / 2, mv[0] as i32, mv[1] as i32, cw, ch, &mut chroma[l][c]);
+            }
+            used[l] = true;
+            pics[l] = Some((entry.pic.clone(), entry.long));
+        }
+        if !used[0] && !used[1] {
+            return Err(Error::invalid_input("H.264 inter macroblock uses no reference picture"));
+        }
+        let (r0, r1) = (self.cur.ref_idx[0][b8].max(0) as usize, self.cur.ref_idx[1][b8].max(0) as usize);
+        let explicit = self.hdr.weights.as_ref();
+        if used[0] && used[1] {
+            // weights as (log2 denominator, w0, w1, offset) for luma and each chroma plane
+            let mut wts: Option<[(u32, i32, i32, i32); 3]> = None;
+            if let Some(wt) = explicit {
+                let (e0, e1) = (wt.entries[0].get(r0).copied(), wt.entries[1].get(r1).copied());
+                if let (Some(e0), Some(e1)) = (e0, e1) {
+                    wts = Some([
+                        (wt.luma_log2_denom, e0[0], e1[0], (e0[1] + e1[1] + 1) >> 1),
+                        (wt.chroma_log2_denom, e0[2], e1[2], (e0[3] + e1[3] + 1) >> 1),
+                        (wt.chroma_log2_denom, e0[4], e1[4], (e0[5] + e1[5] + 1) >> 1),
+                    ]);
+                }
+            } else if self.pps.weighted_bipred_idc == 2 {
+                let (p0, l0) = pics[0].as_ref().map(|p| (p.0.poc, p.1)).unwrap();
+                let (p1, l1) = pics[1].as_ref().map(|p| (p.0.poc, p.1)).unwrap();
+                let (mut w0, mut w1) = (32, 32);
+                let tb = (self.cur_poc - p0).clamp(-128, 127);
+                let td = (p1 - p0).clamp(-128, 127);
+                if td != 0 && !l0 && !l1 {
+                    let tx = (16384 + (td / 2).abs()) / td;
+                    let dsf = ((tb * tx + 32) >> 6).clamp(-1024, 1023);
+                    if (-64..=128).contains(&(dsf >> 2)) {
+                        w1 = dsf >> 2;
+                        w0 = 64 - w1;
+                    }
+                }
+                wts = Some([(5, w0, w1, 0); 3]);
+            }
+            let (l0, l1) = luma.split_at_mut(1);
+            let (a, bb) = (&mut l0[0][..bw * bh], &l1[0][..bw * bh]);
+            match wts {
+                Some(wt) => inter::weight_bi(a, bb, wt[0].0, wt[0].1, wt[0].2, wt[0].3),
+                None => inter::average(a, bb),
+            }
+            for c in 0..2usize {
+                let (c0, c1) = chroma.split_at_mut(1);
+                let (a, bb) = (&mut c0[0][c][..cw * ch], &c1[0][c][..cw * ch]);
+                match wts {
+                    Some(wt) => inter::weight_bi(a, bb, wt[1 + c].0, wt[1 + c].1, wt[1 + c].2, wt[1 + c].3),
+                    None => inter::average(a, bb),
+                }
+            }
+        } else {
+            let l = if used[0] { 0 } else { 1 };
+            let r = if l == 0 { r0 } else { r1 };
+            if let Some(wt) = explicit {
+                if let Some(e) = wt.entries[l].get(r) {
+                    inter::weight_uni(&mut luma[l][..bw * bh], wt.luma_log2_denom, e[0], e[1]);
+                    for c in 0..2usize {
+                        inter::weight_uni(&mut chroma[l][c][..cw * ch], wt.chroma_log2_denom, e[2 + 2 * c], e[3 + 2 * c]);
+                    }
+                }
+            }
+            if l == 1 {
+                luma[0] = luma[1];
+                chroma[0] = chroma[1];
+            }
         }
         for row in 0..bh {
             let o = (y as usize + row) * pw + x as usize;
-            self.pic.planes[0][o..o + bw].copy_from_slice(&out[row * bw..row * bw + bw]);
+            self.pic.planes[0][o..o + bw].copy_from_slice(&luma[0][row * bw..row * bw + bw]);
         }
-        let (cw, ch) = (bw / 2, bh / 2);
-        let (cpw, cph) = (pw / 2, ph / 2);
         for c in 0..2usize {
-            let mut co = [0u8; 64];
-            inter::chroma_mc(&entry.planes[1 + c], cpw, cph, x / 2, y / 2, mv[0] as i32, mv[1] as i32, cw, ch, &mut co);
-            if let Some((wt, Some(e))) = wt {
-                inter::weight_uni(&mut co[..cw * ch], wt.chroma_log2_denom, e[2 + 2 * c], e[3 + 2 * c]);
-            }
             for row in 0..ch {
                 let o = (y as usize / 2 + row) * cpw + x as usize / 2;
-                self.pic.planes[1 + c][o..o + cw].copy_from_slice(&co[row * cw..row * cw + cw]);
+                self.pic.planes[1 + c][o..o + cw].copy_from_slice(&chroma[0][c][row * cw..row * cw + cw]);
             }
         }
         Ok(())
