@@ -1378,3 +1378,45 @@ fn a_bitrate_on_the_same_lossy_codec_reencodes() {
     run(&j, &mut |_| {}).unwrap();
     assert!(std::fs::metadata(dir.join("b.mp3")).unwrap().len() < std::fs::metadata(&mp3).unwrap().len());
 }
+
+// ---- VP8 -------------------------------------------------------------------------------
+
+fn fnv64(b: &[u8]) -> u64 {
+    b.iter().fold(0xcbf29ce484222325u64, |h, &x| (h ^ x as u64).wrapping_mul(0x100000001b3))
+}
+
+/// Decodes a libvpx-encoded WebM file and compares every frame, bit for bit, with FFmpeg's decode
+/// (stored as one FNV-1a hash per frame).
+fn vp8_matches_ffmpeg(name: &str) {
+    let dir = scratch(name);
+    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    let out = dir.join("out.y4m");
+    let mut j = job(&data.join(format!("{name}.webm")), &out);
+    j.hwaccel = "off".into();
+    j.video.codec = Some("rawvideo".into());
+    run(&j, &mut |_| {}).unwrap();
+    let want: Vec<u64> = std::fs::read_to_string(data.join(format!("{name}.ffmpeg.fnv"))).unwrap().lines().map(|l| u64::from_str_radix(l, 16).unwrap()).collect();
+    let got: Vec<u64> = y4m_frames(&out).iter().map(|f| fnv64(f)).collect();
+    assert_eq!(got.len(), want.len(), "frame count");
+    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+        assert_eq!(g, w, "frame {i} differs from FFmpeg's decode");
+    }
+}
+
+/// Intra, inter, golden/altref references, split motion vectors and the six-tap filter.
+#[test]
+fn vp8_inter_frames_decode_to_what_ffmpeg_decodes() {
+    vp8_matches_ffmpeg("vp8_inter");
+}
+
+/// Segment-based quantisers and filter levels, and probabilities that are not carried forward.
+#[test]
+fn vp8_segments_decode_to_what_ffmpeg_decodes() {
+    vp8_matches_ffmpeg("vp8_segments");
+}
+
+/// Profile 3: bilinear full-pixel chroma, the simple loop filter and several token partitions.
+#[test]
+fn vp8_bilinear_profile_decodes_to_what_ffmpeg_decodes() {
+    vp8_matches_ffmpeg("vp8_bilinear");
+}
