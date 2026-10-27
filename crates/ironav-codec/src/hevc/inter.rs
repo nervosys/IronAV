@@ -525,65 +525,93 @@ impl<'a> Dec<'a> {
     }
 }
 
-/// Luma sample interpolation (8.5.3.3.3.1): 14-bit intermediate samples for a `bw` x `bh` block.
+/// Separable interpolation shared by luma (8 taps) and chroma (4 taps): 14-bit intermediate samples for
+/// a `bw` x `bh` block whose integer position is (`ix`, `iy`). The reference block with its filter margins
+/// is copied once (clamping at the picture edges), so the filters index without bounds logic.
+#[allow(clippy::too_many_arguments)]
+fn interpolate<const T: usize>(src: &[u16], pw: usize, ph: usize, ix: i32, iy: i32, cx: Option<&[i8; T]>, cy: Option<&[i8; T]>, bw: usize, bh: usize, bd: u32, out: &mut [i16]) {
+    let before = (T / 2 - 1) as i32;
+    let (pwid, phgt) = (bw + T - 1, bh + T - 1);
+    let mut pad = [0u16; 71 * 71];
+    let (x0, y0) = (ix - before, iy - before);
+    let inside_x = x0 >= 0 && x0 as usize + pwid <= pw;
+    for r in 0..phgt {
+        let sy = (y0 + r as i32).clamp(0, ph as i32 - 1) as usize;
+        let row = &src[sy * pw..sy * pw + pw];
+        let dst = &mut pad[r * pwid..r * pwid + pwid];
+        if inside_x {
+            dst.copy_from_slice(&row[x0 as usize..x0 as usize + pwid]);
+        } else {
+            for (c, d) in dst.iter_mut().enumerate() {
+                *d = row[(x0 + c as i32).clamp(0, pw as i32 - 1) as usize];
+            }
+        }
+    }
+    let b = before as usize;
+    let shift1 = (bd as i32 - 8).min(4);
+    let shift3 = 14 - bd as i32;
+    match (cx, cy) {
+        (None, None) => {
+            for y in 0..bh {
+                for x in 0..bw {
+                    out[y * bw + x] = ((pad[(y + b) * pwid + x + b] as i32) << shift3) as i16;
+                }
+            }
+        }
+        (Some(cx), None) => {
+            for y in 0..bh {
+                let row = &pad[(y + b) * pwid..(y + b + 1) * pwid];
+                for x in 0..bw {
+                    let mut s = 0;
+                    for k in 0..T {
+                        s += cx[k] as i32 * row[x + k] as i32;
+                    }
+                    out[y * bw + x] = (s >> shift1) as i16;
+                }
+            }
+        }
+        (None, Some(cy)) => {
+            for y in 0..bh {
+                for x in 0..bw {
+                    let mut s = 0;
+                    for k in 0..T {
+                        s += cy[k] as i32 * pad[(y + k) * pwid + x + b] as i32;
+                    }
+                    out[y * bw + x] = (s >> shift1) as i16;
+                }
+            }
+        }
+        (Some(cx), Some(cy)) => {
+            let mut tmp = [0i32; 71 * 64];
+            for y in 0..phgt {
+                let row = &pad[y * pwid..(y + 1) * pwid];
+                for x in 0..bw {
+                    let mut s = 0;
+                    for k in 0..T {
+                        s += cx[k] as i32 * row[x + k] as i32;
+                    }
+                    tmp[y * bw + x] = s >> shift1;
+                }
+            }
+            for y in 0..bh {
+                for x in 0..bw {
+                    let mut s = 0;
+                    for k in 0..T {
+                        s += cy[k] as i32 * tmp[(y + k) * bw + x];
+                    }
+                    out[y * bw + x] = (s >> 6) as i16;
+                }
+            }
+        }
+    }
+}
+
+/// Luma sample interpolation (8.5.3.3.3.1).
 #[allow(clippy::too_many_arguments)]
 fn luma_mc(src: &[u16], pw: usize, ph: usize, bx: i32, by: i32, mv: [i16; 2], bw: usize, bh: usize, bd: u32, out: &mut [i16]) {
     let (fx, fy) = ((mv[0] & 3) as usize, (mv[1] & 3) as usize);
     let (ix, iy) = (bx + (mv[0] >> 2) as i32, by + (mv[1] >> 2) as i32);
-    let shift1 = (bd as i32 - 8).min(4);
-    let shift3 = 14 - bd as i32;
-    let px = |x: i32, y: i32| -> i32 { src[y.clamp(0, ph as i32 - 1) as usize * pw + x.clamp(0, pw as i32 - 1) as usize] as i32 };
-    if fx == 0 && fy == 0 {
-        for y in 0..bh {
-            for x in 0..bw {
-                out[y * bw + x] = (px(ix + x as i32, iy + y as i32) << shift3) as i16;
-            }
-        }
-        return;
-    }
-    let cx = &QPEL_FILTERS[fx];
-    let cy = &QPEL_FILTERS[fy];
-    if fy == 0 {
-        for y in 0..bh {
-            for x in 0..bw {
-                let mut s = 0;
-                for k in 0..8 {
-                    s += cx[k] as i32 * px(ix + x as i32 + k as i32 - 3, iy + y as i32);
-                }
-                out[y * bw + x] = (s >> shift1) as i16;
-            }
-        }
-    } else if fx == 0 {
-        for y in 0..bh {
-            for x in 0..bw {
-                let mut s = 0;
-                for k in 0..8 {
-                    s += cy[k] as i32 * px(ix + x as i32, iy + y as i32 + k as i32 - 3);
-                }
-                out[y * bw + x] = (s >> shift1) as i16;
-            }
-        }
-    } else {
-        let mut tmp = vec![0i32; bw * (bh + 7)];
-        for y in 0..bh + 7 {
-            for x in 0..bw {
-                let mut s = 0;
-                for k in 0..8 {
-                    s += cx[k] as i32 * px(ix + x as i32 + k as i32 - 3, iy + y as i32 - 3);
-                }
-                tmp[y * bw + x] = s >> shift1;
-            }
-        }
-        for y in 0..bh {
-            for x in 0..bw {
-                let mut s = 0;
-                for k in 0..8 {
-                    s += cy[k] as i32 * tmp[(y + k) * bw + x];
-                }
-                out[y * bw + x] = (s >> 6) as i16;
-            }
-        }
-    }
+    interpolate::<8>(src, pw, ph, ix, iy, if fx != 0 { Some(&QPEL_FILTERS[fx]) } else { None }, if fy != 0 { Some(&QPEL_FILTERS[fy]) } else { None }, bw, bh, bd, out);
 }
 
 /// Chroma sample interpolation for 4:2:0 (8.5.3.3.3.2).
@@ -591,58 +619,5 @@ fn luma_mc(src: &[u16], pw: usize, ph: usize, bx: i32, by: i32, mv: [i16; 2], bw
 fn chroma_mc(src: &[u16], pw: usize, ph: usize, bx: i32, by: i32, mv: [i16; 2], bw: usize, bh: usize, bd: u32, out: &mut [i16]) {
     let (fx, fy) = ((mv[0] & 7) as usize, (mv[1] & 7) as usize);
     let (ix, iy) = (bx + (mv[0] >> 3) as i32, by + (mv[1] >> 3) as i32);
-    let shift1 = (bd as i32 - 8).min(4);
-    let shift3 = 14 - bd as i32;
-    let px = |x: i32, y: i32| -> i32 { src[y.clamp(0, ph as i32 - 1) as usize * pw + x.clamp(0, pw as i32 - 1) as usize] as i32 };
-    if fx == 0 && fy == 0 {
-        for y in 0..bh {
-            for x in 0..bw {
-                out[y * bw + x] = (px(ix + x as i32, iy + y as i32) << shift3) as i16;
-            }
-        }
-        return;
-    }
-    let cx = &EPEL_FILTERS[fx];
-    let cy = &EPEL_FILTERS[fy];
-    if fy == 0 {
-        for y in 0..bh {
-            for x in 0..bw {
-                let mut s = 0;
-                for k in 0..4 {
-                    s += cx[k] as i32 * px(ix + x as i32 + k as i32 - 1, iy + y as i32);
-                }
-                out[y * bw + x] = (s >> shift1) as i16;
-            }
-        }
-    } else if fx == 0 {
-        for y in 0..bh {
-            for x in 0..bw {
-                let mut s = 0;
-                for k in 0..4 {
-                    s += cy[k] as i32 * px(ix + x as i32, iy + y as i32 + k as i32 - 1);
-                }
-                out[y * bw + x] = (s >> shift1) as i16;
-            }
-        }
-    } else {
-        let mut tmp = vec![0i32; bw * (bh + 3)];
-        for y in 0..bh + 3 {
-            for x in 0..bw {
-                let mut s = 0;
-                for k in 0..4 {
-                    s += cx[k] as i32 * px(ix + x as i32 + k as i32 - 1, iy + y as i32 - 1);
-                }
-                tmp[y * bw + x] = s >> shift1;
-            }
-        }
-        for y in 0..bh {
-            for x in 0..bw {
-                let mut s = 0;
-                for k in 0..4 {
-                    s += cy[k] as i32 * tmp[(y + k) * bw + x];
-                }
-                out[y * bw + x] = (s >> 6) as i16;
-            }
-        }
-    }
+    interpolate::<4>(src, pw, ph, ix, iy, if fx != 0 { Some(&EPEL_FILTERS[fx]) } else { None }, if fy != 0 { Some(&EPEL_FILTERS[fy]) } else { None }, bw, bh, bd, out);
 }
