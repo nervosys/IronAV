@@ -534,13 +534,12 @@ fn mp4_decodes_on_the_gpu_or_fails_precisely() {
         return;
     }
 
-    // With hardware off there is no H.264 decoder at all, and the error says how to recover.
+    // With hardware off the software decoder is planned instead of the GPU's.
     let mut off = job(&mp4, &back);
     off.video.codec = Some("rawvideo".into());
     off.hwaccel = "off".into();
-    let e = plan(&off).unwrap_err();
-    assert_eq!(e.code, ErrorCode::HardwareUnavailable);
-    assert!(e.hint.as_deref().unwrap_or("").contains("auto"), "{:?}", e.hint);
+    let p = plan(&off).unwrap();
+    assert!(p.steps[0].hardware.iter().all(|h| h.direction != ironav_hwaccel::Direction::Decode));
 
     let mut j = job(&mp4, &back);
     j.video.codec = Some("rawvideo".into());
@@ -1485,6 +1484,27 @@ fn mjpeg_in_matroska_roundtrips() {
     for (x, y) in a.iter().zip(&b) {
         let mse = x.iter().zip(y).map(|(&p, &q)| (p as f64 - q as f64).powi(2)).sum::<f64>() / x.len() as f64;
         assert!(10.0 * (255.0f64 * 255.0 / mse.max(1e-9)).log10() > 32.0, "frame too far from the source");
+    }
+}
+
+// ---- H.264 -------------------------------------------------------------------------------
+
+/// Software H.264 decoding of intra pictures is bit-exact with FFmpeg's decoder (libx264 streams
+/// with CAVLC and CABAC, 8x8 transform, slices, scaling matrices, cropping, and hand-built I_PCM).
+#[test]
+fn h264_intra_decodes_to_what_ffmpeg_decodes() {
+    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    for name in ["i_cavlc", "i_cabac", "i_high8", "i_high8_cavlc", "i_slices", "i_cqm", "i_crop", "pcm_cavlc", "pcm_cabac"] {
+        let dir = scratch(&format!("h264-{name}"));
+        let out = dir.join("out.y4m");
+        let mut j = job(&data.join(format!("h264_{name}.mp4")), &out);
+        j.hwaccel = "off".into();
+        j.video.codec = Some("rawvideo".into());
+        run(&j, &mut |_| {}).unwrap();
+        let got: Vec<u8> = y4m_frames_any(&out).concat();
+        let want = std::fs::read(data.join(format!("h264_{name}.ffmpeg.yuv"))).unwrap();
+        assert_eq!(got.len(), want.len(), "{name}: size");
+        assert!(got == want, "{name}: pixels differ from FFmpeg's");
     }
 }
 

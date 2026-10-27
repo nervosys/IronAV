@@ -244,11 +244,18 @@ pub fn plan(job: &Job) -> Result<Plan> {
         if action == Action::Transcode {
             // Hardware decode is used only for codecs with no software decoder (H.264, HEVC);
             // asking for it otherwise would make `require` fail for no reason.
-            if ironav_codec::is_implemented(s.codec, false) || !provider_codecs(Direction::Decode).contains(&s.codec) {
+            // H.264 has a software decoder but the GPU's is much faster, so hardware goes first
+            // when the policy allows it and the software decoder is the fallback.
+            let soft = ironav_codec::is_implemented(s.codec, false);
+            let hw_capable = provider_codecs(Direction::Decode).contains(&s.codec);
+            let hw_first = soft && ironav_codec::prefers_hardware_decode(s.codec) && !matches!(policy, HwPolicy::Off | HwPolicy::Require(_) | HwPolicy::RequireAny);
+            if (soft && !hw_first) || !hw_capable {
                 ironav_codec::new_decoder_for(s)?;
             } else {
                 let sel = select(s.codec, Direction::Decode, policy, &probes)?;
-                if sel.chosen.is_none() {
+                if sel.chosen.is_none() && soft {
+                    ironav_codec::new_decoder_for(s)?;
+                } else if sel.chosen.is_none() {
                     let why = sel.considered.iter().map(|c| format!("{}: {}", c.backend.name(), c.reason)).collect::<Vec<_>>().join("; ");
                     return Err(Error::new(
                         ErrorCode::HardwareUnavailable,
@@ -260,11 +267,13 @@ pub fn plan(job: &Job) -> Result<Plan> {
                         "run `ironav hw probe`; NVDEC needs an NVIDIA GPU with a driver that supports it"
                     }));
                 }
-                #[cfg(any(windows, target_os = "linux"))]
-                ironav_hwaccel::nvdec::accepts(&s.params).map_err(|m| {
-                    Error::new(ErrorCode::UnsupportedCodec, m).hint("only 8-bit and 10-bit 4:2:0 H.264/HEVC can be decoded so far")
-                })?;
-                hardware.push(sel);
+                if sel.chosen.is_some() {
+                    #[cfg(any(windows, target_os = "linux"))]
+                    ironav_hwaccel::nvdec::accepts(&s.params).map_err(|m| {
+                        Error::new(ErrorCode::UnsupportedCodec, m).hint("only 8-bit and 10-bit 4:2:0 H.264/HEVC can be decoded so far")
+                    })?;
+                    hardware.push(sel);
+                }
             }
             let hw_encodable = provider_codecs(Direction::Encode).contains(&to);
             if media == MediaType::Video || hw_encodable || matches!(policy, HwPolicy::RequireAny | HwPolicy::Require(_)) {

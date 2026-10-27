@@ -5,6 +5,7 @@
 
 pub mod aac;
 pub mod flac;
+pub mod h264;
 pub mod jpeg;
 mod filters;
 pub mod mp3;
@@ -32,6 +33,11 @@ pub struct CodecImpl {
     pub implementation: &'static str,
 }
 
+/// Whether a GPU decoder, when one is usable, should be chosen over the software decoder.
+pub fn prefers_hardware_decode(c: CodecId) -> bool {
+    c == CodecId::H264
+}
+
 pub fn implemented() -> Vec<CodecImpl> {
     CodecId::ALL
         .iter()
@@ -50,6 +56,9 @@ pub fn implemented() -> Vec<CodecImpl> {
             }
             if c == CodecId::Mjpeg {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-jpeg" });
+            }
+            if c == CodecId::H264 {
+                return Some(CodecImpl { codec: c, decode: true, encode: false, implementation: "ironav-h264" });
             }
             if c == CodecId::Vp8 {
                 return Some(CodecImpl { codec: c, decode: true, encode: false, implementation: "ironav-vp8" });
@@ -103,6 +112,7 @@ pub fn new_decoder_for(s: &ironav_core::StreamInfo) -> Result<Box<dyn Decoder>> 
         CodecId::Opus => Ok(trimmed(s, Box::new(opus::OpusDecoder::new(&s.extradata, &s.params)?))),
         CodecId::Vorbis => Ok(trimmed(s, Box::new(vorbis::VorbisDecoder::new(&s.extradata, &s.params)?))),
         CodecId::Vp8 => Ok(Box::new(vp8::Vp8Decoder::new())),
+        CodecId::H264 => Ok(Box::new(h264::H264Decoder::new())),
         CodecId::Mjpeg => Ok(Box::new(jpeg::JpegDecoder::new())),
         _ => new_decoder(s.codec, &s.params, s.bits),
     }

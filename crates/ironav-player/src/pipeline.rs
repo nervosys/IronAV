@@ -23,13 +23,15 @@ const VIDEO_BYTES_AHEAD: usize = 256 << 20;
 
 /// A decoder for the video stream: software if one exists, otherwise a GPU decoder.
 pub fn open_video_decoder(s: &StreamInfo, hwaccel: &str) -> Result<(Box<dyn Decoder>, &'static str)> {
-    if is_implemented(s.codec, false) {
+    let soft = is_implemented(s.codec, false);
+    let policy = HwPolicy::parse(hwaccel)?;
+    if soft && (!ironav_codec::prefers_hardware_decode(s.codec) || matches!(policy, HwPolicy::Off)) {
         return Ok((ironav_codec::new_decoder_for(s)?, "software"));
     }
-    let policy = HwPolicy::parse(hwaccel)?;
     let sel = select(s.codec, Direction::Decode, policy, &probe_all())?;
     match sel.chosen {
         Some(backend) => Ok((new_video_decoder(backend, s.codec, &s.params)?, backend.name())),
+        None if soft && !matches!(policy, HwPolicy::Require(_) | HwPolicy::RequireAny) => Ok((ironav_codec::new_decoder_for(s)?, "software")),
         None => {
             let why = sel.considered.iter().map(|c| format!("{}: {}", c.backend.name(), c.reason)).collect::<Vec<_>>().join("; ");
             Err(Error::new(ErrorCode::HardwareUnavailable, format!("{} needs a hardware decoder and none is usable ({why})", s.codec.name()))
