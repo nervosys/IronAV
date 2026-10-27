@@ -9,7 +9,7 @@ use super::inter;
 use super::intra::*;
 use super::ps::{Pps, SliceHeader, SliceType, Sps, ZIGZAG4};
 use super::tables::*;
-use ironav_core::{Error, ErrorCode, Result};
+use ironav_core::{Error, Result};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Kind {
@@ -175,10 +175,6 @@ pub fn chroma_qp(qp: i32, offset: i32) -> i32 {
     } else {
         CHROMA_QP[(qpi - 30) as usize] as i32
     }
-}
-
-fn unsupported(msg: &str) -> Error {
-    Error::new(ErrorCode::UnsupportedCodec, msg.to_string())
 }
 
 /// Coefficients of one macroblock, as coded levels at raster positions within each block.

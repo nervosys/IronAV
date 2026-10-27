@@ -133,6 +133,7 @@ impl<'a> BitReader<'a> {
         }
     }
 
+    #[allow(dead_code)]
     pub fn byte_aligned(&self) -> bool {
         self.pos & 7 == 0
     }
@@ -155,6 +156,7 @@ impl<'a> BitReader<'a> {
         self.pos < stop
     }
 
+    #[allow(dead_code)]
     pub fn data(&self) -> &'a [u8] {
         self.d
     }

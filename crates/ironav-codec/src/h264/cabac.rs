@@ -114,6 +114,7 @@ impl<'a> Cabac<'a> {
         self.init_engine();
     }
 
+    #[allow(dead_code)]
     pub fn bit_pos(&self) -> usize {
         self.pos
     }

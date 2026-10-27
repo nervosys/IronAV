@@ -13,6 +13,7 @@ pub const ZIGZAG4: [u8; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14,
 
 #[derive(Clone)]
 pub struct Sps {
+    #[allow(dead_code)]
     pub profile_idc: u8,
     pub level_idc: u8,
     pub id: u32,
@@ -32,10 +33,12 @@ pub struct Sps {
     pub offset_for_top_to_bottom_field: i32,
     pub offset_for_ref_frame: Vec<i32>,
     pub max_num_ref_frames: u32,
+    #[allow(dead_code)]
     pub gaps_allowed: bool,
     pub mb_width: usize,
     pub mb_height: usize,
     pub frame_mbs_only: bool,
+    #[allow(dead_code)]
     pub mb_adaptive_frame_field: bool,
     pub direct_8x8_inference: bool,
     /// Cropping rectangle in luma samples: left, right, top, bottom.
