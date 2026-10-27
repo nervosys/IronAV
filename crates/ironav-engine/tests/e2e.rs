@@ -1549,12 +1549,12 @@ fn h264_high10_decodes_to_what_ffmpeg_decodes() {
     }
 }
 
-/// 8-bit 4:4:4, 4:2:2 and monochrome H.264 (I, P and B slices, CAVLC and CABAC) are bit-exact with
+/// 8-bit 4:4:4, 4:2:2 and monochrome H.264, including lossless (transform bypass) streams (I, P and B slices, CAVLC and CABAC) are bit-exact with
 /// FFmpeg's decoder; monochrome comes out as gray, and neither can go to the GPU.
 #[test]
 fn h264_444_422_and_monochrome_decode_to_what_ffmpeg_decodes() {
     let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
-    for (name, hw) in [("y422_i", "off"), ("y422_p", "off"), ("y422_b", "off"), ("y422_cavlc", "off"), ("y422_b", "auto"), ("y400_i", "off"), ("y400_p", "off"), ("y400_b", "off"), ("y400_b", "auto"), ("y444_i_cavlc", "off"), ("y444_i_cabac", "off"), ("y444_p", "off"), ("y444_b", "off"), ("y444_b_cavlc", "off"), ("y444_b", "auto")] {
+    for (name, hw) in [("y422_i", "off"), ("y422_p", "off"), ("y422_b", "off"), ("y422_cavlc", "off"), ("y422_b", "auto"), ("y400_i", "off"), ("y400_p", "off"), ("y400_b", "off"), ("y400_b", "auto"), ("y444_i_cavlc", "off"), ("y444_i_cabac", "off"), ("y444_p", "off"), ("y444_b", "off"), ("y444_b_cavlc", "off"), ("y444_b", "auto"), ("lossless_444_i", "off"), ("lossless_444_b", "off"), ("lossless_420_i", "off"), ("lossless_422_p", "off")] {
         let dir = scratch(&format!("h264-{name}-{hw}"));
         let out = dir.join("out.y4m");
         let mut j = job(&data.join(format!("h264_{name}.mp4")), &out);

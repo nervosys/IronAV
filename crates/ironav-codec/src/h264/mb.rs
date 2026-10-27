@@ -48,6 +48,8 @@ pub struct MbInfo {
     /// Identity of the reference picture behind `ref_idx`; -1 when unused.
     pub ref_id: [[i32; 4]; 2],
     pub skip: bool,
+    /// Samples the loop filter must leave alone: I_PCM and lossless (transform bypass) macroblocks.
+    pub keep: bool,
     /// B_Skip or B_Direct_16x16.
     pub bdirect: bool,
     /// 8x8 blocks predicted in direct mode (bit per block).
@@ -72,6 +74,7 @@ impl Default for MbInfo {
             ref_idx: [[-1; 4]; 2],
             ref_id: [[-1; 4]; 2],
             skip: false,
+            keep: false,
             bdirect: false,
             direct8: 0,
             mvd: [[[0; 2]; 16]; 2],
@@ -207,6 +210,33 @@ impl Res {
     }
 }
 
+/// Intra residual DPCM of lossless coding (8.5.15): residuals accumulate along the prediction direction.
+fn dpcm(r: &mut [i32], w: usize, h: usize, hor: bool) {
+    if hor {
+        for y in 0..h {
+            for x in 1..w {
+                r[y * w + x] += r[y * w + x - 1];
+            }
+        }
+    } else {
+        for y in 1..h {
+            for x in 0..w {
+                r[y * w + x] += r[(y - 1) * w + x];
+            }
+        }
+    }
+}
+
+/// Adds a `w` x `h` residual to the samples at the start of `buf`.
+fn add_residual(buf: &mut [u16], stride: usize, w: usize, h: usize, r: &[i32], maxv: i32) {
+    for y in 0..h {
+        for x in 0..w {
+            let v = buf[y * stride + x] as i32 + r[y * w + x];
+            buf[y * stride + x] = v.clamp(0, maxv) as u16;
+        }
+    }
+}
+
 enum Reader<'a> {
     Cavlc(BitReader<'a>),
     Cabac(Cabac<'a>),
@@ -290,6 +320,7 @@ impl<'a> SliceDec<'a> {
 
     fn finish_mb(&mut self, addr: usize) {
         self.cur.qp = if self.cur.kind == Kind::IPcm { 0 } else { self.qp as i8 };
+        self.cur.keep = self.cur.kind == Kind::IPcm || self.bypass();
         self.pic.mbs[addr] = self.cur;
     }
 
@@ -1498,6 +1529,10 @@ impl<'a> SliceDec<'a> {
     }
 
     fn add_inter_residual_comp(&mut self, res: &Res, c: usize) {
+        if self.bypass() {
+            self.add_inter_residual_bypass(res, c);
+            return;
+        }
         let qp = self.comp_qp(c);
         let ls = self.stride(c);
         let (x0, y0) = (self.mbx * 16, self.mby * 16);
@@ -1951,7 +1986,125 @@ impl<'a> SliceDec<'a> {
         self.reconstruct_chroma(res)
     }
 
+    /// Lossless coding: qpprime_y_zero_transform_bypass_flag with QP'Y equal to 0.
+    fn bypass(&self) -> bool {
+        self.sps.transform_bypass && self.qp + self.qp_off == 0
+    }
+
+    /// `reconstruct_comp` for a lossless macroblock: levels are residual samples, with DPCM along
+    /// horizontal and vertical intra prediction.
+    fn reconstruct_comp_bypass(&mut self, res: &Res, i16_mode: u8, c: usize) -> Result<()> {
+        let (mbx, mby) = (self.mbx, self.mby);
+        let (la, ta, tla) = (self.avail_left_i(), self.avail_top_i(), self.avail_topleft_i());
+        let ls = self.stride(c);
+        match self.cur.kind {
+            Kind::I16x16 => {
+                if (i16_mode == 0 && !ta) || (i16_mode == 1 && !la) || (i16_mode == 3 && !(ta && la && tla)) {
+                    return Err(Error::invalid_input("H.264 Intra16x16 prediction uses neighbours that are not available"));
+                }
+                let (x0, y0) = (mbx * 16, mby * 16);
+                let mut top = [0i32; 16];
+                let mut left = [0i32; 16];
+                if ta {
+                    for (i, t) in top.iter_mut().enumerate() {
+                        *t = self.pix(c, x0 + i, y0 - 1);
+                    }
+                }
+                if la {
+                    for (j, l) in left.iter_mut().enumerate() {
+                        *l = self.pix(c, x0 - 1, y0 + j);
+                    }
+                }
+                let tl = if tla { self.pix(c, x0 - 1, y0 - 1) } else { 0 };
+                let mut pred = [0u16; 256];
+                predict_16x16(i16_mode, &top, &left, tl, ta, la, &mut pred, self.bd);
+                for y in 0..16 {
+                    self.pic.planes[c][(y0 + y) * ls + x0..(y0 + y) * ls + x0 + 16].copy_from_slice(&pred[y * 16..y * 16 + 16]);
+                }
+                let mut r = [0i32; 256];
+                for b in 0..16 {
+                    let (bx, by) = (b % 4, b / 4);
+                    for k in 0..16 {
+                        r[(by * 4 + k / 4) * 16 + bx * 4 + k % 4] = if k == 0 { res.dc[c][b] } else { res.luma[c][b * 16 + k] };
+                    }
+                }
+                if i16_mode < 2 {
+                    dpcm(&mut r, 16, 16, i16_mode == 1);
+                }
+                add_residual(&mut self.pic.planes[c][y0 * ls + x0..], ls, 16, 16, &r, self.maxv);
+            }
+            Kind::I4x4 => {
+                for n in 0..16 {
+                    let (bx, by) = block_pos(n);
+                    let mode = self.cur.ipm[by * 4 + bx];
+                    let e = self.edges_4x4(c, bx, by);
+                    check_mode(mode, &e)?;
+                    let mut pred = [0u16; 16];
+                    predict_nxn(4, mode, &e, &mut pred, self.bd);
+                    let (x, y) = (mbx * 16 + bx * 4, mby * 16 + by * 4);
+                    for r in 0..4 {
+                        self.pic.planes[c][(y + r) * ls + x..(y + r) * ls + x + 4].copy_from_slice(&pred[r * 4..r * 4 + 4]);
+                    }
+                    let mut r = [0i32; 16];
+                    r.copy_from_slice(&res.luma[c][(by * 4 + bx) * 16..(by * 4 + bx) * 16 + 16]);
+                    if mode < 2 {
+                        dpcm(&mut r, 4, 4, mode == H_PRED);
+                    }
+                    add_residual(&mut self.pic.planes[c][y * ls + x..], ls, 4, 4, &r, self.maxv);
+                }
+            }
+            Kind::I8x8 => {
+                for i8 in 0..4 {
+                    let (bx, by) = ((i8 & 1) * 2, (i8 >> 1) * 2);
+                    let mode = self.cur.ipm[by * 4 + bx];
+                    let mut e = self.edges_8x8(c, i8);
+                    check_mode(mode, &e)?;
+                    filter_8x8_edges(&mut e);
+                    let mut pred = [0u16; 64];
+                    predict_nxn(8, mode, &e, &mut pred, self.bd);
+                    let (x, y) = (mbx * 16 + bx * 4, mby * 16 + by * 4);
+                    for r in 0..8 {
+                        self.pic.planes[c][(y + r) * ls + x..(y + r) * ls + x + 8].copy_from_slice(&pred[r * 8..r * 8 + 8]);
+                    }
+                    let mut r = [0i32; 64];
+                    r.copy_from_slice(&res.luma[c][i8 * 64..i8 * 64 + 64]);
+                    if mode < 2 {
+                        dpcm(&mut r, 8, 8, mode == H_PRED);
+                    }
+                    add_residual(&mut self.pic.planes[c][y * ls + x..], ls, 8, 8, &r, self.maxv);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Residual of an inter macroblock in lossless coding.
+    fn add_inter_residual_bypass(&mut self, res: &Res, c: usize) {
+        let ls = self.stride(c);
+        let (x0, y0) = (self.mbx * 16, self.mby * 16);
+        let cbp = self.cur.cbp as u32;
+        if self.cur.t8x8 {
+            for i8 in 0..4usize {
+                if cbp & (1 << i8) != 0 {
+                    let (x, y) = (x0 + (i8 & 1) * 8, y0 + (i8 >> 1) * 8);
+                    add_residual(&mut self.pic.planes[c][y * ls + x..], ls, 8, 8, &res.luma[c][i8 * 64..i8 * 64 + 64], self.maxv);
+                }
+            }
+        } else {
+            for b in 0..16usize {
+                if cbp & (1 << ((b / 8) * 2 + (b % 4) / 2)) != 0 {
+                    let (x, y) = (x0 + (b % 4) * 4, y0 + (b / 4) * 4);
+                    add_residual(&mut self.pic.planes[c][y * ls + x..], ls, 4, 4, &res.luma[c][b * 16..b * 16 + 16], self.maxv);
+                }
+            }
+        }
+    }
+
     fn reconstruct_comp(&mut self, res: &Res, i16_mode: u8, c: usize) -> Result<()> {
+        if self.bypass() {
+            return self.reconstruct_comp_bypass(res, i16_mode, c);
+        }
         let qp = self.comp_qp(c);
         let (mbx, mby) = (self.mbx, self.mby);
         let (la, ta, tla) = (self.avail_left_i(), self.avail_top_i(), self.avail_topleft_i());
@@ -2098,6 +2251,32 @@ impl<'a> SliceDec<'a> {
             }
             let list = if inter { 4 + comp } else { 1 + comp };
             if chroma_cbp == 0 {
+                continue;
+            }
+            if self.bypass() {
+                // levels are residual samples; the DC levels sit at the first position of each block
+                let c = &res.cdc[comp];
+                let mut dc = [0i32; 8];
+                if chh == 8 {
+                    dc[..4].copy_from_slice(&c[..4]);
+                } else {
+                    let m = [[c[0], c[2]], [c[1], c[5]], [c[3], c[6]], [c[4], c[7]]];
+                    for r in 0..4 {
+                        dc[2 * r] = m[r][0];
+                        dc[2 * r + 1] = m[r][1];
+                    }
+                }
+                let mut r = [0i32; 128];
+                for blk in 0..chh / 2 {
+                    let (bx, by) = (blk & 1, blk >> 1);
+                    for k in 0..16 {
+                        r[(by * 4 + k / 4) * 8 + bx * 4 + k % 4] = if k == 0 { dc[blk] } else { res.cac[comp * 8 + blk][k] };
+                    }
+                }
+                if !inter && (mode == 1 || mode == 2) {
+                    dpcm(&mut r, 8, chh, mode == 1);
+                }
+                add_residual(&mut self.pic.planes[plane][y0 * cs + x0..], cs, 8, chh, &r, self.maxv);
                 continue;
             }
             let qpc = chroma_qp(self.qp, self.pps.chroma_qp_offset[comp], self.bd) + self.qp_off;

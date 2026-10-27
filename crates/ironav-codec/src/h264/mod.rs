@@ -143,9 +143,6 @@ impl H264Decoder {
         if sps.chroma_format_idc >= 2 && sps.bit_depth_luma != 8 {
             return Err(unsupported("this H.264 decoder handles 4:2:2 and 4:4:4 video with 8 bits per sample only"));
         }
-        if sps.transform_bypass {
-            return Err(unsupported("H.264 lossless transform bypass is not supported"));
-        }
         let starts_new = match &self.cur {
             Some(c) => Self::new_picture(&c.hdr, &hdr),
             None => true,

@@ -82,7 +82,7 @@ exact 8.000 s duration, all frames decoded, and seeking lands on the right keyfr
 
 `ironav probe`, `convert` and the other tools read MP4 (regular files with the index anywhere, and fragmented files). H.264/HEVC video is decoded by NVDEC through the driver's `nvcuvid` library, loaded at run time like NVENC;
 the output is cropped to the display size and returned as planar `yuv420p` in display order, so B-frame streams work.
-8-bit and 10-bit 4:2:0, 8-bit 4:2:2 (`yuv422p`), 8-bit 4:4:4 (`yuv444p`, not the lossless transform-bypass mode) and monochrome (8-bit comes back as `gray`) are accepted (10-bit 4:2:0 comes back as `yuv420p10le`); 10-bit 4:2:2 and 4:4:4, lossless 4:4:4, interlaced and 12-bit are refused with a clear error. The GPU cannot take 4:2:2, 4:4:4 or monochrome, so those use the software decoder even with `--hwaccel auto`.
+8-bit and 10-bit 4:2:0, 8-bit 4:2:2 (`yuv422p`), 8-bit 4:4:4 (`yuv444p`, including the lossless transform-bypass mode) and monochrome (8-bit comes back as `gray`) are accepted (10-bit 4:2:0 comes back as `yuv420p10le`); 10-bit 4:2:2 and 4:4:4, interlaced and 12-bit are refused with a clear error. The GPU cannot take 4:2:2, 4:4:4 or monochrome, so those use the software decoder even with `--hwaccel auto`.
 10-bit HEVC decoding was compared with FFmpeg's software decoder on a 60-frame 720p Main 10 clip: every sample of every
 frame is identical. 10-bit H.264 (High 10) and 10-bit encoding of H.264 are not offered (consumer NVENC cannot encode it).
 
