@@ -1,6 +1,5 @@
-//! Baseline JPEG (ITU T.81, sequential Huffman, 8-bit): a decoder for gray, 4:2:0, 4:2:2 and
-//! 4:4:4 images with restart intervals, and an encoder for the same layouts. Progressive,
-//! arithmetic-coded, 12-bit and lossless files are refused by name.
+//! JPEG (ITU T.81, Huffman, 8-bit): a decoder for gray, 4:2:0, 4:2:2 and 4:4:4 images, sequential
+//! or progressive, with restart intervals, and a baseline encoder for the same layouts. Arithmetic-coded, 12-bit and lossless files are refused by name.
 
 mod tables;
 
@@ -303,6 +302,7 @@ struct Frame0 {
     width: usize,
     height: usize,
     comps: Vec<Comp>,
+    progressive: bool,
 }
 
 impl Frame0 {
@@ -329,6 +329,45 @@ impl Frame0 {
 
 fn be16(d: &[u8], at: usize) -> Result<usize> {
     d.get(at..at + 2).map(|b| u16::from_be_bytes([b[0], b[1]]) as usize).ok_or_else(|| Error::invalid_input("JPEG ends inside a marker segment"))
+}
+
+fn read_dqt(seg: &[u8], qt: &mut [[u16; 64]; 4]) -> Result<()> {
+    let mut p = 0;
+    while p < seg.len() {
+        let (prec, id) = (seg[p] >> 4, (seg[p] & 15) as usize);
+        p += 1;
+        if id > 3 {
+            return Err(Error::invalid_input("JPEG quantisation table id is out of range"));
+        }
+        for k in 0..64 {
+            let v = if prec == 0 { *seg.get(p).ok_or_else(|| Error::invalid_input("JPEG DQT is truncated"))? as u16 } else { be16(seg, p)? as u16 };
+            p += if prec == 0 { 1 } else { 2 };
+            qt[id][k] = v;
+        }
+    }
+    Ok(())
+}
+
+fn read_dht(seg: &[u8], dc: &mut [Option<Huff>; 4], ac: &mut [Option<Huff>; 4]) -> Result<()> {
+    let mut p = 0;
+    while p + 17 <= seg.len() {
+        let (class, id) = (seg[p] >> 4, (seg[p] & 15) as usize);
+        let mut bits = [0u8; 16];
+        bits.copy_from_slice(&seg[p + 1..p + 17]);
+        let n: usize = bits.iter().map(|&b| b as usize).sum();
+        let vals = seg.get(p + 17..p + 17 + n).ok_or_else(|| Error::invalid_input("JPEG DHT is truncated"))?;
+        if id > 3 {
+            return Err(Error::invalid_input("JPEG Huffman table id is out of range"));
+        }
+        let h = Huff::new(&bits, vals)?;
+        if class == 0 {
+            dc[id] = Some(h);
+        } else {
+            ac[id] = Some(h);
+        }
+        p += 17 + n;
+    }
+    Ok(())
 }
 
 /// Reads the dimensions and layout of a JPEG without decoding it.
@@ -370,49 +409,19 @@ fn parse_headers(d: &[u8]) -> Result<Headers> {
         let len = be16(d, pos)?;
         let seg = d.get(pos + 2..pos + len).ok_or_else(|| Error::invalid_input("JPEG marker segment is truncated"))?;
         match m {
-            0xDB => {
-                let mut p = 0;
-                while p < seg.len() {
-                    let (prec, id) = (seg[p] >> 4, (seg[p] & 15) as usize);
-                    p += 1;
-                    if id > 3 {
-                        return Err(Error::invalid_input("JPEG quantisation table id is out of range"));
-                    }
-                    for k in 0..64 {
-                        let v = if prec == 0 { *seg.get(p).ok_or_else(|| Error::invalid_input("JPEG DQT is truncated"))? as u16 } else { be16(seg, p)? as u16 };
-                        p += if prec == 0 { 1 } else { 2 };
-                        qt[id][k] = v;
-                    }
-                }
-            }
-            0xC4 => {
-                let mut p = 0;
-                while p + 17 <= seg.len() {
-                    let (class, id) = (seg[p] >> 4, (seg[p] & 15) as usize);
-                    let mut bits = [0u8; 16];
-                    bits.copy_from_slice(&seg[p + 1..p + 17]);
-                    let n: usize = bits.iter().map(|&b| b as usize).sum();
-                    let vals = seg.get(p + 17..p + 17 + n).ok_or_else(|| Error::invalid_input("JPEG DHT is truncated"))?;
-                    if id > 3 {
-                        return Err(Error::invalid_input("JPEG Huffman table id is out of range"));
-                    }
-                    let h = Huff::new(&bits, vals)?;
-                    if class == 0 {
-                        dc[id] = Some(h);
-                    } else {
-                        ac[id] = Some(h);
-                    }
-                    p += 17 + n;
-                }
-            }
+            0xDB => read_dqt(seg, &mut qt)?,
+            0xC4 => read_dht(seg, &mut dc, &mut ac)?,
             0xDD => restart = be16(seg, 0)?,
-            0xC0 | 0xC1 => {
+            0xC0..=0xC2 => {
                 if seg.len() < 6 || seg[0] != 8 {
                     return Err(unsupported(format!("JPEG sample precision {} is not supported (8 bit is)", seg.first().copied().unwrap_or(0))));
                 }
                 let (h, w, n) = (be16(seg, 1)?, be16(seg, 3)?, seg[5] as usize);
                 if w == 0 || h == 0 || !(n == 1 || n == 3) || seg.len() < 6 + 3 * n {
                     return Err(unsupported(format!("JPEG frame of {w}x{h} with {n} components is not supported (1 or 3 components, non-zero size)")));
+                }
+                if w * h > 1 << 28 {
+                    return Err(unsupported(format!("JPEG frame of {w}x{h} is larger than the 268 megapixels this decoder accepts")));
                 }
                 let comps = (0..n)
                     .map(|i| {
@@ -423,9 +432,8 @@ fn parse_headers(d: &[u8]) -> Result<Headers> {
                 if comps.iter().any(|c| c.h == 0 || c.v == 0 || c.h > 4 || c.v > 4) {
                     return Err(Error::invalid_input("JPEG sampling factor is out of range"));
                 }
-                frame = Some(Frame0 { width: w, height: h, comps });
+                frame = Some(Frame0 { width: w, height: h, comps, progressive: m == 0xC2 });
             }
-            0xC2 => return Err(unsupported("progressive JPEG is not supported yet".into())),
             0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF => return Err(unsupported(format!("JPEG coding process SOF{} (lossless, hierarchical or arithmetic) is not supported", m - 0xC0))),
             0xDA => {
                 let f = frame.ok_or_else(|| Error::invalid_input("JPEG scan comes before its frame header"))?;
@@ -435,6 +443,24 @@ fn parse_headers(d: &[u8]) -> Result<Headers> {
         }
         pos += len;
     }
+}
+
+/// Crops the padded component planes to the picture.
+fn finish(f: &Frame0, pix_fmt: PixelFormat, pts: i64) -> VideoFrame {
+    let layout = pix_fmt.planes(f.width, f.height);
+    let planes = f
+        .comps
+        .iter()
+        .zip(&layout)
+        .map(|(c, &(w, h, _))| {
+            let mut out = Vec::with_capacity(w * h);
+            for r in 0..h {
+                out.extend_from_slice(&c.plane[r * c.stride..r * c.stride + w]);
+            }
+            out
+        })
+        .collect();
+    VideoFrame { width: f.width as u32, height: f.height as u32, pix_fmt, pts, planes }
 }
 
 pub struct JpegDecoder;
@@ -447,6 +473,9 @@ impl JpegDecoder {
     fn decode_image(&self, d: &[u8], pts: i64) -> Result<VideoFrame> {
         let (mut f, qt, dc, ac, mut restart, mut sos) = parse_headers(d)?;
         let pix_fmt = f.pix_fmt()?;
+        if f.progressive {
+            return self.decode_progressive(d, f, pix_fmt, pts);
+        }
         let (hmax, vmax) = (f.hmax(), f.vmax());
         let (mcux, mcuy) = (f.width.div_ceil(8 * hmax), f.height.div_ceil(8 * vmax));
         for c in &mut f.comps {
@@ -623,20 +652,217 @@ impl JpegDecoder {
         if done.iter().any(|d| !d) {
             return Err(Error::invalid_input("JPEG ends before every component was coded"));
         }
-        let layout = pix_fmt.planes(f.width, f.height);
-        let planes = f
-            .comps
-            .iter()
-            .zip(&layout)
-            .map(|(c, &(w, h, _))| {
-                let mut out = Vec::with_capacity(w * h);
-                for r in 0..h {
-                    out.extend_from_slice(&c.plane[r * c.stride..r * c.stride + w]);
+        Ok(finish(&f, pix_fmt, pts))
+    }
+
+    /// Progressive (SOF2) decoding: every scan adds bits to coefficient buffers kept in zigzag
+    /// order, and the inverse DCT runs once at the end.
+    fn decode_progressive(&self, d: &[u8], mut f: Frame0, pix_fmt: PixelFormat, pts: i64) -> Result<VideoFrame> {
+        if f.width * f.height > 1 << 26 {
+            return Err(unsupported(format!("progressive JPEG of {}x{} is larger than the 67 megapixels this decoder accepts (it keeps every coefficient in memory)", f.width, f.height)));
+        }
+        let (hmax, vmax) = (f.hmax(), f.vmax());
+        let (mcux, mcuy) = (f.width.div_ceil(8 * hmax), f.height.div_ceil(8 * vmax));
+        // blocks per row and column as stored (padded to whole MCUs)
+        let store: Vec<(usize, usize)> = f.comps.iter().map(|c| (mcux * c.h, mcuy * c.v)).collect();
+        let mut coefs: Vec<Vec<[i32; 64]>> = store.iter().map(|&(w, h)| vec![[0i32; 64]; w * h]).collect();
+        let mut qts = [[0u16; 64]; 4];
+        let mut dcs: [Option<Huff>; 4] = Default::default();
+        let mut acs: [Option<Huff>; 4] = Default::default();
+        let mut restart = 0usize;
+        let mut scans = 0;
+        let mut pos = 2;
+        'markers: loop {
+            while pos < d.len() && d[pos] != 0xFF {
+                pos += 1;
+            }
+            while pos < d.len() && d[pos] == 0xFF {
+                pos += 1;
+            }
+            let Some(&m) = d.get(pos) else { break };
+            pos += 1;
+            if m == 0 || m == 0xD8 || m == 0x01 || (0xD0..=0xD7).contains(&m) {
+                continue;
+            }
+            if m == 0xD9 {
+                break;
+            }
+            let len = be16(d, pos)?;
+            let seg = d.get(pos + 2..pos + len).ok_or_else(|| Error::invalid_input("JPEG marker segment is truncated"))?;
+            match m {
+                0xDB => read_dqt(seg, &mut qts)?,
+                0xC4 => read_dht(seg, &mut dcs, &mut acs)?,
+                0xDD => restart = be16(seg, 0)?,
+                0xDA => {
+                    let ns = *seg.first().ok_or_else(|| Error::invalid_input("JPEG scan header is empty"))? as usize;
+                    if ns == 0 || ns > f.comps.len() || seg.len() < 1 + 2 * ns + 3 {
+                        return Err(Error::invalid_input("JPEG scan header is inconsistent"));
+                    }
+                    let mut order = Vec::new();
+                    let mut tables = Vec::new();
+                    for i in 0..ns {
+                        let (cid, t) = (seg[1 + 2 * i], seg[2 + 2 * i]);
+                        let ci = f.comps.iter().position(|c| c.id == cid).ok_or_else(|| Error::invalid_input("JPEG scan names an unknown component"))?;
+                        order.push(ci);
+                        tables.push(((t >> 4) as usize & 3, (t & 15) as usize & 3));
+                    }
+                    let (ss, se, a) = (seg[1 + 2 * ns] as usize, seg[2 + 2 * ns] as usize, seg[3 + 2 * ns]);
+                    let (ah, al) = ((a >> 4) as u32, (a & 15) as u32);
+                    if ss > se || se > 63 || al > 13 || (ss == 0 && se != 0) || (ss > 0 && ns != 1) {
+                        return Err(Error::invalid_input("JPEG progressive scan parameters are inconsistent"));
+                    }
+                    let mut bits = Bits::new(d, pos + len);
+                    let single = ns == 1;
+                    let (bw, bh) = if single {
+                        let c = &f.comps[order[0]];
+                        ((f.width * c.h).div_ceil(hmax).div_ceil(8), (f.height * c.v).div_ceil(vmax).div_ceil(8))
+                    } else {
+                        (mcux, mcuy)
+                    };
+                    let mut pred = vec![0i32; f.comps.len()];
+                    let mut eobrun = 0u32;
+                    let mut since = 0usize;
+                    for by in 0..bh {
+                        for bx in 0..bw {
+                            if restart > 0 && since == restart {
+                                bits.restart()?;
+                                pred.iter_mut().for_each(|p| *p = 0);
+                                eobrun = 0;
+                                since = 0;
+                            }
+                            since += 1;
+                            for (oi, &ci) in order.iter().enumerate() {
+                                let (ch, cv) = if single { (1, 1) } else { (f.comps[ci].h, f.comps[ci].v) };
+                                for v in 0..cv {
+                                    for h in 0..ch {
+                                        let (x, y) = if single { (bx, by) } else { (bx * ch + h, by * cv + v) };
+                                        if x >= store[ci].0 || y >= store[ci].1 {
+                                            continue;
+                                        }
+                                        let blk = &mut coefs[ci][y * store[ci].0 + x];
+                                        let (td, ta) = tables[oi];
+                                        if ss == 0 {
+                                            if ah == 0 {
+                                                let dct = dcs[td].as_ref().ok_or_else(|| Error::invalid_input("JPEG uses a DC Huffman table it never defined"))?;
+                                                let t = bits.symbol(dct)? as u32;
+                                                if t > 11 {
+                                                    return Err(Error::invalid_input("JPEG DC category is out of range"));
+                                                }
+                                                pred[ci] = pred[ci].wrapping_add(extend(bits.bits(t), t));
+                                                blk[0] = pred[ci].wrapping_shl(al);
+                                            } else if bits.bits(1) == 1 {
+                                                blk[0] |= 1 << al;
+                                            }
+                                            continue;
+                                        }
+                                        let act = acs[ta].as_ref().ok_or_else(|| Error::invalid_input("JPEG uses an AC Huffman table it never defined"))?;
+                                        if ah == 0 {
+                                            if eobrun > 0 {
+                                                eobrun -= 1;
+                                                continue;
+                                            }
+                                            let mut k = ss;
+                                            while k <= se {
+                                                let rs = bits.symbol(act)?;
+                                                let (r, s) = ((rs >> 4) as usize, (rs & 15) as u32);
+                                                if s != 0 {
+                                                    k += r;
+                                                    if k > se {
+                                                        return Err(Error::invalid_input("JPEG coefficient run goes past the band"));
+                                                    }
+                                                    blk[k] = extend(bits.bits(s), s).wrapping_shl(al);
+                                                    k += 1;
+                                                } else if r == 15 {
+                                                    k += 16;
+                                                } else {
+                                                    eobrun = (1u32 << r) + if r > 0 { bits.bits(r as u32) as u32 } else { 0 } - 1;
+                                                    break;
+                                                }
+                                            }
+                                        } else {
+                                            let (p1, m1) = (1i32 << al, -1i32 << al);
+                                            let mut k = ss;
+                                            if eobrun == 0 {
+                                                while k <= se {
+                                                    let rs = bits.symbol(act)?;
+                                                    let (mut r, s) = ((rs >> 4) as i32, rs & 15);
+                                                    let mut newval = 0;
+                                                    if s != 0 {
+                                                        newval = if bits.bits(1) == 1 { p1 } else { m1 };
+                                                    } else if r != 15 {
+                                                        eobrun = (1u32 << r) + if r > 0 { bits.bits(r as u32) as u32 } else { 0 };
+                                                        break;
+                                                    }
+                                                    // step over the nonzero coefficients (refining each) and `r` zeros
+                                                    while k <= se {
+                                                        let c = &mut blk[k];
+                                                        if *c != 0 {
+                                                            if bits.bits(1) == 1 && *c & p1 == 0 {
+                                                                *c = c.wrapping_add(if *c >= 0 { p1 } else { m1 });
+                                                            }
+                                                        } else {
+                                                            r -= 1;
+                                                            if r < 0 {
+                                                                break;
+                                                            }
+                                                        }
+                                                        k += 1;
+                                                    }
+                                                    if newval != 0 && k <= se {
+                                                        blk[k] = newval;
+                                                    }
+                                                    k += 1;
+                                                }
+                                            }
+                                            if eobrun > 0 {
+                                                while k <= se {
+                                                    let c = &mut blk[k];
+                                                    if *c != 0 && bits.bits(1) == 1 && *c & p1 == 0 {
+                                                        *c = c.wrapping_add(if *c >= 0 { p1 } else { m1 });
+                                                    }
+                                                    k += 1;
+                                                }
+                                                eobrun -= 1;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    scans += 1;
+                    pos = bits.pos;
+                    continue 'markers;
                 }
-                out
-            })
-            .collect();
-        Ok(VideoFrame { width: f.width as u32, height: f.height as u32, pix_fmt, pts, planes })
+                _ => {}
+            }
+            pos += len;
+        }
+        if scans == 0 {
+            return Err(Error::invalid_input("JPEG has no scan"));
+        }
+        let mut px = [0u8; 64];
+        let mut nat = [0i32; 64];
+        for (ci, c) in f.comps.iter_mut().enumerate() {
+            let (bw, bh) = store[ci];
+            c.stride = bw * 8;
+            c.plane = vec![0; c.stride * bh * 8];
+            let q = &qts[c.tq];
+            for by in 0..bh {
+                for bx in 0..bw {
+                    let blk = &coefs[ci][by * bw + bx];
+                    for k in 0..64 {
+                        nat[ZIGZAG[k]] = blk[k].wrapping_mul(q[k] as i32);
+                    }
+                    idct(&nat, &mut px);
+                    for r in 0..8 {
+                        let o = (by * 8 + r) * c.stride + bx * 8;
+                        c.plane[o..o + 8].copy_from_slice(&px[r * 8..r * 8 + 8]);
+                    }
+                }
+            }
+        }
+        Ok(finish(&f, pix_fmt, pts))
     }
 }
 

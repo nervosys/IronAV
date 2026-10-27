@@ -1550,6 +1550,14 @@ fn jpeg_422_and_444_decode_to_what_ffmpeg_decodes() {
     jpeg_matches_ffmpeg("jpeg_444");
 }
 
+/// Progressive files (spectral selection and successive approximation, written by libjpeg).
+#[test]
+fn progressive_jpeg_decodes_to_what_ffmpeg_decodes() {
+    for n in ["jpeg_prog_p420", "jpeg_prog_p422", "jpeg_prog_p444", "jpeg_prog_pgray"] {
+        jpeg_matches_ffmpeg(n);
+    }
+}
+
 /// Decoding to raw frames and encoding again gives a JPEG that decodes close to the original.
 #[test]
 fn jpeg_reencode_stays_close() {
