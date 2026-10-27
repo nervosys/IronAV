@@ -1443,6 +1443,34 @@ fn vp8_copied_into_webm_and_matroska_still_decodes_identically() {
     }
 }
 
+#[test]
+fn mjpeg_in_matroska_roundtrips() {
+    let dir = scratch("mjpeg-mkv");
+    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    let src = dir.join("src.y4m");
+    let mut j = job(&data.join("vp8_inter.webm"), &src);
+    j.hwaccel = "off".into();
+    j.video.codec = Some("rawvideo".into());
+    run(&j, &mut |_| {}).unwrap();
+    let mkv = dir.join("clip.mkv");
+    let mut e = job(&src, &mkv);
+    e.hwaccel = "off".into();
+    e.video.codec = Some("mjpeg".into());
+    run(&e, &mut |_| {}).unwrap();
+    let back = dir.join("back.y4m");
+    let mut d = job(&mkv, &back);
+    d.hwaccel = "off".into();
+    d.video.codec = Some("rawvideo".into());
+    run(&d, &mut |_| {}).unwrap();
+    let (a, b) = (y4m_frames_any(&src), y4m_frames_any(&back));
+    assert_eq!(a.len(), b.len());
+    assert_eq!(a.len(), 12);
+    for (x, y) in a.iter().zip(&b) {
+        let mse = x.iter().zip(y).map(|(&p, &q)| (p as f64 - q as f64).powi(2)).sum::<f64>() / x.len() as f64;
+        assert!(10.0 * (255.0f64 * 255.0 / mse.max(1e-9)).log10() > 32.0, "frame too far from the source");
+    }
+}
+
 // ---- JPEG ------------------------------------------------------------------------------
 
 /// Raw planes of the first frame of a y4m file.
@@ -1465,8 +1493,14 @@ fn y4m_frames_any(path: &std::path::Path) -> Vec<Vec<u8>> {
     } else {
         w * h + 2 * w.div_ceil(2) * h.div_ceil(2)
     };
-    let nl = hdr + d[hdr..].iter().position(|&b| b == b'\n').unwrap() + 1;
-    vec![d[nl..nl + size].to_vec()]
+    let mut frames = Vec::new();
+    let mut pos = hdr;
+    while pos < d.len() {
+        let nl = pos + d[pos..].iter().position(|&b| b == b'\n').unwrap() + 1;
+        frames.push(d[nl..nl + size].to_vec());
+        pos = nl + size;
+    }
+    frames
 }
 
 /// A baseline JPEG decodes to what FFmpeg's decoder gives, to within one level (the two use
