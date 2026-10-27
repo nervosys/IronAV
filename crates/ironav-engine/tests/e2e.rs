@@ -1513,7 +1513,7 @@ fn h264_intra_decodes_to_what_ffmpeg_decodes() {
 #[test]
 fn h264_p_slices_decode_to_what_ffmpeg_decodes() {
     let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
-    for name in ["p_ref4", "p_parts", "p_8x8dct", "p_weight2", "p_slices", "p_odd", "p_dbp", "c_ref4", "c_parts", "c_8x8dct", "c_weight", "c_slices", "c_odd", "b_sp_cavlc", "b_sp_cabac", "b_tm_cavlc", "b_tm_cabac", "b_pyr", "b_wimp", "b_odd", "b_slices"] {
+    for name in ["p_ref4", "p_parts", "p_8x8dct", "p_weight2", "p_slices", "p_odd", "p_dbp", "c_ref4", "c_parts", "c_8x8dct", "c_weight", "c_slices", "c_odd", "b_sp_cavlc", "b_sp_cabac", "b_tm_cavlc", "b_tm_cabac", "b_pyr", "b_wimp", "b_odd", "b_slices", "ci_pc", "ci_b", "ci_bn"] {
         let dir = scratch(&format!("h264-{name}"));
         let out = dir.join("out.y4m");
         let mut j = job(&data.join(format!("h264_{name}.mp4")), &out);
