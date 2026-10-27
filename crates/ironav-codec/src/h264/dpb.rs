@@ -13,6 +13,8 @@ pub struct DecodedPic {
     pub mb_h: usize,
     /// chroma_format_idc: 0 monochrome, 1 4:2:0, 2 4:2:2.
     pub cf: u8,
+    /// Width of a macroblock's chroma samples.
+    pub cw: usize,
     pub mbs: Vec<MbInfo>,
     pub poc: i32,
     /// Unique across the stream; deblocking and direct prediction compare references by it.

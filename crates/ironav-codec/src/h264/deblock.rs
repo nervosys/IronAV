@@ -163,7 +163,9 @@ pub fn deblock_picture(pic: &mut Picture, bd: u32) {
             let top_ok = mby > 0 && usable(&pic.mbs[idx - w]);
             let left = if mbx > 0 { pic.mbs[idx - 1] } else { m };
             let top = if mby > 0 { pic.mbs[idx - w] } else { m };
-            // luma
+            // luma, and Cb and Cr filtered the same way in 4:4:4
+            for pl in 0..if pic.cf == 3 { 3 } else { 1 } {
+            let off = if pl > 0 { pic.slices[m.slice as usize - 1].chroma_qp_offset[pl - 1] } else { 0 };
             for dir in 0..2 {
                 for e in 0..4usize {
                     if e == 0 && !(if dir == 0 { left_ok } else { top_ok }) {
@@ -182,21 +184,22 @@ pub fn deblock_picture(pic: &mut Picture, bd: u32) {
                         &m
                     };
                     let bs = strength(&m, other, dir, e);
-                    let qpav = (other.qp as i32 + m.qp as i32 + 1) >> 1;
+                    let qpav = if pl == 0 { (other.qp as i32 + m.qp as i32 + 1) >> 1 } else { (chroma_qp(other.qp as i32, off, bd) + chroma_qp(m.qp as i32, off, bd) + 1) >> 1 };
                     let ia = (qpav + sp.alpha_offset).clamp(0, 51) as usize;
                     let ib = (qpav + sp.beta_offset).clamp(0, 51) as usize;
                     let (alpha, beta) = ((ALPHA[ia] as i32) << (bd - 8), (BETA[ib] as i32) << (bd - 8));
                     let (x0, y0) = (mbx * 16, mby * 16);
                     if dir == 0 {
-                        filter_edge(&mut pic.planes[0], y0 * ls + x0 + e * 4, 1, ls, 16, &bs, 4, alpha, beta, ia, false, bd);
+                        filter_edge(&mut pic.planes[pl], y0 * ls + x0 + e * 4, 1, ls, 16, &bs, 4, alpha, beta, ia, false, bd);
                     } else {
-                        filter_edge(&mut pic.planes[0], (y0 + e * 4) * ls + x0, ls, 1, 16, &bs, 4, alpha, beta, ia, false, bd);
+                        filter_edge(&mut pic.planes[pl], (y0 + e * 4) * ls + x0, ls, 1, 16, &bs, 4, alpha, beta, ia, false, bd);
                     }
                 }
             }
+            }
             // chroma: vertical edges at 0 and 4, horizontal edges every 4 rows (every 4 chroma rows of
             // 4:2:2, every 8 luma rows of 4:2:0); each takes the strength of the luma edge it lines up with
-            if pic.cf == 0 {
+            if matches!(pic.cf, 0 | 3) {
                 continue;
             }
             let chh = pic.ch;

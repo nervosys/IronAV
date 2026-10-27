@@ -32,7 +32,7 @@ pub struct MbInfo {
     pub qp: i8,
     /// Non-zero coefficient counts: 16 luma blocks in raster order, then 8 Cb, then 8 Cr (4 of each
     /// for 4:2:0).
-    pub nnz: [u8; 32],
+    pub nnz: [u8; 48],
     /// Coded-block flags of the DC blocks: bit 0 Intra16x16 luma, bit 1 Cb, bit 2 Cr.
     pub cbf_dc: u8,
     /// Coded block pattern: luma in bits 0-3, chroma in bits 4-5.
@@ -62,7 +62,7 @@ impl Default for MbInfo {
             slice: 0,
             kind: Kind::None,
             qp: 0,
-            nnz: [0; 32],
+            nnz: [0; 48],
             cbf_dc: 0,
             cbp: 0,
             chroma_mode: 0,
@@ -84,6 +84,8 @@ pub struct Picture {
     pub mb_h: usize,
     /// chroma_format_idc (0 monochrome, 1 4:2:0, 2 4:2:2) and the height of a macroblock's chroma.
     pub cf: u8,
+    /// Width and height of a macroblock's chroma samples.
+    pub cw: usize,
     pub ch: usize,
     pub planes: [Vec<u16>; 3],
     pub mbs: Vec<MbInfo>,
@@ -101,15 +103,17 @@ pub struct SliceParams {
 
 impl Picture {
     pub fn new(mb_w: usize, mb_h: usize, cf: u8, bd: u32) -> Self {
-        let ch = if cf == 2 { 16 } else { 8 };
+        let ch = if cf >= 2 { 16 } else { 8 };
+        let cw = if cf == 3 { 16 } else { 8 };
         // a monochrome picture keeps chroma planes at mid-grey, as other decoders output it
         let grey = 1u16 << (bd - 1);
         Picture {
             mb_w,
             mb_h,
             cf,
+            cw,
             ch,
-            planes: [vec![0; mb_w * mb_h * 256], vec![grey; mb_w * mb_h * 8 * ch], vec![grey; mb_w * mb_h * 8 * ch]],
+            planes: [vec![0; mb_w * mb_h * 256], vec![grey; mb_w * mb_h * cw * ch], vec![grey; mb_w * mb_h * cw * ch]],
             mbs: vec![MbInfo::default(); mb_w * mb_h],
             slices: Vec::new(),
         }
@@ -143,7 +147,7 @@ impl LevelScale {
             l4.push(per_m);
         }
         let mut l8 = Vec::new();
-        for list in 0..2 {
+        for list in 0..6 {
             let mut w = [0i32; 64];
             for (k, &p) in ZIGZAG_DIRECT.iter().enumerate() {
                 w[p as usize] = pps.lists8[list][k] as i32;
@@ -190,8 +194,8 @@ pub fn chroma_qp(qp: i32, offset: i32, bd: u32) -> i32 {
 /// Coefficients of one macroblock, as coded levels at raster positions within each block.
 struct Res {
     /// 16 blocks of 4x4 (raster block order), or 4 blocks of 8x8, in the same 256 entries.
-    luma: [i32; 256],
-    dc: [i32; 16],
+    luma: [[i32; 256]; 3],
+    dc: [[i32; 16]; 3],
     cdc: [[i32; 8]; 2],
     /// Chroma AC: [component * 8 + block][raster position within the 4x4 block].
     cac: [[i32; 16]; 16],
@@ -199,7 +203,7 @@ struct Res {
 
 impl Res {
     fn new() -> Self {
-        Res { luma: [0; 256], dc: [0; 16], cdc: [[0; 8]; 2], cac: [[0; 16]; 16] }
+        Res { luma: [[0; 256]; 3], dc: [[0; 16]; 3], cdc: [[0; 8]; 2], cac: [[0; 16]; 16] }
     }
 }
 
@@ -420,7 +424,7 @@ impl<'a> SliceDec<'a> {
                 let _ = k;
                 *e = self.read_pred_mode_syntax()?;
             }
-            if self.pic.cf != 0 {
+            if matches!(self.pic.cf, 1 | 2) {
                 self.cur.chroma_mode = self.read_chroma_pred_mode()?;
             }
             cbp = self.read_cbp()?;
@@ -428,9 +432,9 @@ impl<'a> SliceDec<'a> {
             self.cur.kind = Kind::I16x16;
             let t = mb_type - 1;
             i16_mode = (t % 4) as u8;
-            let chroma = if self.pic.cf == 0 { 0 } else { (t / 4) % 3 };
+            let chroma = if matches!(self.pic.cf, 1 | 2) { (t / 4) % 3 } else { 0 };
             cbp = (chroma << 4) | if t >= 12 { 15 } else { 0 };
-            if self.pic.cf != 0 {
+            if matches!(self.pic.cf, 1 | 2) {
                 self.cur.chroma_mode = self.read_chroma_pred_mode()?;
             }
         } else {
@@ -569,7 +573,7 @@ impl<'a> SliceDec<'a> {
     }
 
     fn read_cbp(&mut self) -> Result<u32> {
-        let gray = self.pic.cf == 0;
+        let gray = matches!(self.pic.cf, 0 | 3);
         match &mut self.rd {
             Reader::Cavlc(r) => {
                 let k = r.ue()?;
@@ -641,12 +645,12 @@ impl<'a> SliceDec<'a> {
 
     fn decode_pcm(&mut self) -> Result<()> {
         self.cur.kind = Kind::IPcm;
-        self.cur.nnz = [16; 32];
+        self.cur.nnz = [16; 48];
         self.cur.cbf_dc = 7;
         self.cur.cbp = 0x2F;
         self.last_dqp = false;
-        let mut samples = [0u16; 512];
-        let nsamples = 256 + 2 * [0, 64, 128][self.pic.cf as usize];
+        let mut samples = [0u16; 768];
+        let nsamples = 256 + 2 * [0, 64, 128, 256][self.pic.cf as usize];
         let bd = self.bd;
         match &mut self.rd {
             Reader::Cavlc(r) => {
@@ -673,14 +677,14 @@ impl<'a> SliceDec<'a> {
             let o = (mby * 16 + y) * ys + mbx * 16;
             self.pic.planes[0][o..o + 16].copy_from_slice(&samples[y * 16..y * 16 + 16]);
         }
-        let cs = self.pic.mb_w * 8;
-        let chh = self.pic.ch;
+        let (cw, chh) = (self.pic.cw, self.pic.ch);
+        let cs = self.pic.mb_w * cw;
         if self.pic.cf != 0 {
             for c in 0..2 {
                 for y in 0..chh {
-                    let o = (mby * chh + y) * cs + mbx * 8;
-                    let s = 256 + c * chh * 8 + y * 8;
-                    self.pic.planes[1 + c][o..o + 8].copy_from_slice(&samples[s..s + 8]);
+                    let o = (mby * chh + y) * cs + mbx * cw;
+                    let s = 256 + c * chh * cw + y * cw;
+                    self.pic.planes[1 + c][o..o + cw].copy_from_slice(&samples[s..s + cw]);
                 }
             }
         }
@@ -1316,7 +1320,7 @@ impl<'a> SliceDec<'a> {
         self.resolve_refs()?;
         let cbp = if let Reader::Cavlc(r) = &mut self.rd {
             let k = r.ue()?;
-            let gray = self.pic.cf == 0;
+            let gray = matches!(self.pic.cf, 0 | 3);
             if k > if gray { 15 } else { 47 } {
                 return Err(Error::invalid_input("H.264 coded_block_pattern code is out of range"));
             }
@@ -1375,11 +1379,12 @@ impl<'a> SliceDec<'a> {
         let (x, y) = ((self.mbx * 16 + bx * 4) as i32, (self.mby * 16 + by * 4) as i32);
         let (bw, bh) = (w * 4, h * 4);
         let c422 = self.pic.cf == 2;
-        let (cw, ch) = (bw / 2, if c422 { bh } else { bh / 2 });
-        let (cpw, cph) = (pw / 2, if c422 { ph } else { ph / 2 });
-        let cy = if c422 { y } else { y / 2 };
+        let c444 = self.pic.cf == 3;
+        let (cw, ch) = (if c444 { bw } else { bw / 2 }, if c422 || c444 { bh } else { bh / 2 });
+        let (cpw, cph) = (if c444 { pw } else { pw / 2 }, if c422 || c444 { ph } else { ph / 2 });
+        let (cx, cy) = (if c444 { x } else { x / 2 }, if c422 || c444 { y } else { y / 2 });
         let mut luma = [[0u16; 256]; 2];
-        let mut chroma = [[[0u16; 128]; 2]; 2];
+        let mut chroma = [[[0u16; 256]; 2]; 2];
         let mut used = [false; 2];
         let mut pics: [Option<(std::sync::Arc<super::dpb::DecodedPic>, bool)>; 2] = [None, None];
         for l in 0..2usize {
@@ -1393,7 +1398,12 @@ impl<'a> SliceDec<'a> {
             };
             let mv = self.cur.mv[l][by * 4 + bx];
             inter::luma_mc(&entry.pic.planes[0], pw, ph, x, y, mv[0] as i32, mv[1] as i32, bw, bh, &mut luma[l], self.maxv);
-            if self.pic.cf != 0 {
+            if c444 {
+                // 4:4:4 chroma is interpolated exactly like luma
+                for c in 0..2usize {
+                    inter::luma_mc(&entry.pic.planes[1 + c], cpw, cph, cx as i32, cy, mv[0] as i32, mv[1] as i32, cw, ch, &mut chroma[l][c], self.maxv);
+                }
+            } else if self.pic.cf != 0 {
                 // 4:2:2 chroma has full vertical resolution, so its vertical vector is in quarter samples
                 let my = if c422 { mv[1] as i32 * 2 } else { mv[1] as i32 };
                 for c in 0..2usize {
@@ -1472,7 +1482,7 @@ impl<'a> SliceDec<'a> {
         }
         for c in 0..if self.pic.cf != 0 { 2usize } else { 0 } {
             for row in 0..ch {
-                let o = (cy as usize + row) * cpw + x as usize / 2;
+                let o = (cy as usize + row) * cpw + cx as usize;
                 self.pic.planes[1 + c][o..o + cw].copy_from_slice(&chroma[0][c][row * cw..row * cw + cw]);
             }
         }
@@ -1481,8 +1491,15 @@ impl<'a> SliceDec<'a> {
 
     /// Adds the decoded residual of an inter macroblock to its prediction.
     fn add_inter_residual(&mut self, res: &Res) -> Result<()> {
-        let qp = self.qp + self.qp_off;
-        let ls = self.luma_stride();
+        for c in 0..self.ncomp() {
+            self.add_inter_residual_comp(res, c);
+        }
+        self.reconstruct_chroma(res)
+    }
+
+    fn add_inter_residual_comp(&mut self, res: &Res, c: usize) {
+        let qp = self.comp_qp(c);
+        let ls = self.stride(c);
         let (x0, y0) = (self.mbx * 16, self.mby * 16);
         let cbp = self.cur.cbp as u32;
         if self.cur.t8x8 {
@@ -1490,17 +1507,17 @@ impl<'a> SliceDec<'a> {
                 if cbp & (1 << i8) == 0 {
                     continue;
                 }
-                let mut c = [0i32; 64];
-                let lsv = &self.scale.l8[1][(qp % 6) as usize];
+                let mut co = [0i32; 64];
+                let lsv = &self.scale.l8[2 * c + 1][(qp % 6) as usize];
                 for k in 0..64 {
-                    let v = res.luma[i8 * 64 + k];
+                    let v = res.luma[c][i8 * 64 + k];
                     if v != 0 {
-                        c[k] = if qp >= 36 { v.wrapping_mul(lsv[k]) << (qp / 6 - 6) } else { (v.wrapping_mul(lsv[k]) + (1 << (5 - qp / 6))) >> (6 - qp / 6) };
+                        co[k] = if qp >= 36 { v.wrapping_mul(lsv[k]) << (qp / 6 - 6) } else { (v.wrapping_mul(lsv[k]) + (1 << (5 - qp / 6))) >> (6 - qp / 6) };
                     }
                 }
-                if c.iter().any(|&v| v != 0) {
+                if co.iter().any(|&v| v != 0) {
                     let (x, y) = (x0 + (i8 & 1) * 8, y0 + (i8 >> 1) * 8);
-                    idct8_add(&c, &mut self.pic.planes[0][y * ls + x..], ls, self.maxv);
+                    idct8_add(&co, &mut self.pic.planes[c][y * ls + x..], ls, self.maxv);
                 }
             }
         } else {
@@ -1508,14 +1525,13 @@ impl<'a> SliceDec<'a> {
                 if cbp & (1 << ((b / 8) * 2 + (b % 4) / 2)) == 0 {
                     continue;
                 }
-                let c = self.scale4(&res.luma[b * 16..b * 16 + 16], 3, qp, false);
-                if c.iter().any(|&v| v != 0) {
+                let co = self.scale4(&res.luma[c][b * 16..b * 16 + 16], 3 + c, qp, false);
+                if co.iter().any(|&v| v != 0) {
                     let (bx, by) = (b % 4, b / 4);
-                    idct4_add(&c, &mut self.pic.planes[0][(y0 + by * 4) * ls + x0 + bx * 4..], ls, self.maxv);
+                    idct4_add(&co, &mut self.pic.planes[c][(y0 + by * 4) * ls + x0 + bx * 4..], ls, self.maxv);
                 }
             }
         }
-        self.reconstruct_chroma(res)
     }
 
     // ---- prediction modes ------------------------------------------------------------------------
@@ -1574,18 +1590,19 @@ impl<'a> SliceDec<'a> {
     // ---- residual parsing --------------------------------------------------------------------------
 
     /// nC for a luma block (CAVLC) or the neighbour flags for coded_block_flag (CABAC).
-    fn neighbour_nnz_luma(&self, bx: usize, by: usize) -> (Option<u8>, Option<u8>) {
+    fn neighbour_nnz_luma(&self, c: usize, bx: usize, by: usize) -> (Option<u8>, Option<u8>) {
+        let o = c * 16;
         let a = if bx > 0 {
-            Some(self.cur.nnz[by * 4 + bx - 1])
+            Some(self.cur.nnz[o + by * 4 + bx - 1])
         } else if self.avail_left() {
-            Some(self.left().nnz[by * 4 + 3])
+            Some(self.left().nnz[o + by * 4 + 3])
         } else {
             None
         };
         let b = if by > 0 {
-            Some(self.cur.nnz[(by - 1) * 4 + bx])
+            Some(self.cur.nnz[o + (by - 1) * 4 + bx])
         } else if self.avail_top() {
-            Some(self.top().nnz[12 + bx])
+            Some(self.top().nnz[o + 12 + bx])
         } else {
             None
         };
@@ -1621,17 +1638,18 @@ impl<'a> SliceDec<'a> {
         }
     }
 
-    fn read_residual(&mut self, res: &mut Res, cbp: u32, i16: bool) -> Result<()> {
+    /// Residual of a component coded like luma: luma itself, or Cb or Cr in 4:4:4.
+    fn read_residual_luma(&mut self, res: &mut Res, cbp: u32, i16: bool, c: usize) -> Result<()> {
         let t8 = self.cur.t8x8;
         if i16 {
             // Intra16x16DCLevel
             let mut lv = [0i32; 16];
-            let n = self.block(0, 0, 0, 16, &mut lv, BlockKind::LumaDc)?;
+            let n = self.block(c, 0, 0, 16, &mut lv, BlockKind::LumaDc)?;
             if n > 0 {
-                self.cur.cbf_dc |= 1;
+                self.cur.cbf_dc |= 1 << c;
             }
             for (k, &p) in ZIGZAG4.iter().enumerate() {
-                res.dc[p as usize] = lv[k];
+                res.dc[c][p as usize] = lv[k];
             }
         }
         for i8 in 0..4usize {
@@ -1639,22 +1657,29 @@ impl<'a> SliceDec<'a> {
                 continue;
             }
             if t8 {
-                self.read_luma8x8(res, i8)?;
+                self.read_luma8x8(res, i8, c)?;
                 continue;
             }
             for i4 in 0..4usize {
                 let (bx, by) = ((i8 & 1) * 2 + (i4 & 1), (i8 >> 1) * 2 + (i4 >> 1));
                 let mut lv = [0i32; 16];
                 let (kind, max) = if i16 { (BlockKind::LumaAc, 15) } else { (BlockKind::Luma4x4, 16) };
-                let n = self.block(0, bx, by, max, &mut lv, kind)?;
-                self.cur.nnz[by * 4 + bx] = n as u8;
+                let n = self.block(c, bx, by, max, &mut lv, kind)?;
+                self.cur.nnz[c * 16 + by * 4 + bx] = n as u8;
                 let start = if i16 { 1 } else { 0 };
                 for k in 0..max {
-                    res.luma[(by * 4 + bx) * 16 + ZIGZAG4[k + start] as usize] = lv[k];
+                    res.luma[c][(by * 4 + bx) * 16 + ZIGZAG4[k + start] as usize] = lv[k];
                 }
             }
         }
-        let chroma = if self.pic.cf == 0 { 0 } else { cbp >> 4 };
+        Ok(())
+    }
+
+    fn read_residual(&mut self, res: &mut Res, cbp: u32, i16: bool) -> Result<()> {
+        for c in 0..self.ncomp() {
+            self.read_residual_luma(res, cbp, i16, c)?;
+        }
+        let chroma = if matches!(self.pic.cf, 1 | 2) { cbp >> 4 } else { 0 };
         let nblk = self.pic.ch / 2;
         if chroma > 0 {
             for comp in 0..2usize {
@@ -1682,7 +1707,7 @@ impl<'a> SliceDec<'a> {
         Ok(())
     }
 
-    fn read_luma8x8(&mut self, res: &mut Res, i8: usize) -> Result<()> {
+    fn read_luma8x8(&mut self, res: &mut Res, i8: usize, c: usize) -> Result<()> {
         let (bx0, by0) = ((i8 & 1) * 2, (i8 >> 1) * 2);
         let cavlc_mode = matches!(self.rd, Reader::Cavlc(_));
         match cavlc_mode {
@@ -1690,21 +1715,21 @@ impl<'a> SliceDec<'a> {
                 for j in 0..4usize {
                     let (bx, by) = (bx0 + (j & 1), by0 + (j >> 1));
                     let mut lv = [0i32; 16];
-                    let n = self.block(0, bx, by, 16, &mut lv, BlockKind::Luma4x4)?;
-                    self.cur.nnz[by * 4 + bx] = n as u8;
+                    let n = self.block(c, bx, by, 16, &mut lv, BlockKind::Luma4x4)?;
+                    self.cur.nnz[c * 16 + by * 4 + bx] = n as u8;
                     for k in 0..16 {
-                        res.luma[i8 * 64 + ZIGZAG_DIRECT[4 * k + j] as usize] = lv[k];
+                        res.luma[c][i8 * 64 + ZIGZAG_DIRECT[4 * k + j] as usize] = lv[k];
                     }
                 }
             }
             false => {
                 let mut lv = [0i32; 64];
-                let n = self.cabac_block(0, 0, 0, 64, BlockKind::Luma8x8, &mut lv)?;
+                let n = self.cabac_block(c, bx0, by0, 64, BlockKind::Luma8x8, &mut lv)?;
                 for (k, &v) in lv.iter().enumerate() {
-                    res.luma[i8 * 64 + ZIGZAG_DIRECT[k] as usize] = v;
+                    res.luma[c][i8 * 64 + ZIGZAG_DIRECT[k] as usize] = v;
                 }
                 for j in 0..4usize {
-                    self.cur.nnz[(by0 + (j >> 1)) * 4 + bx0 + (j & 1)] = n.min(255) as u8;
+                    self.cur.nnz[c * 16 + (by0 + (j >> 1)) * 4 + bx0 + (j & 1)] = n.min(255) as u8;
                 }
             }
         }
@@ -1729,7 +1754,7 @@ impl<'a> SliceDec<'a> {
                         Self::nc_from(a, b)
                     }
                     _ => {
-                        let (a, b) = self.neighbour_nnz_luma(bx, by);
+                        let (a, b) = self.neighbour_nnz_luma(comp, bx, by);
                         Self::nc_from(a, b)
                     }
                 };
@@ -1749,20 +1774,24 @@ impl<'a> SliceDec<'a> {
 
     fn cabac_block(&mut self, comp: usize, bx: usize, by: usize, max: usize, kind: BlockKind, out: &mut [i32; 64]) -> Result<usize> {
         out.fill(0);
+        let cc = comp.min(2);
         let cat = match kind {
-            BlockKind::LumaDc => 0,
-            BlockKind::LumaAc => 1,
-            BlockKind::Luma4x4 => 2,
+            BlockKind::LumaDc => [0, 6, 10][cc],
+            BlockKind::LumaAc => [1, 7, 11][cc],
+            BlockKind::Luma4x4 => [2, 8, 12][cc],
             BlockKind::ChromaDc => 3,
             BlockKind::ChromaAc => 4,
-            BlockKind::Luma8x8 => 5,
+            BlockKind::Luma8x8 => [5, 9, 13][cc],
         };
-        if kind != BlockKind::Luma8x8 {
+        let is8 = matches!(cat, 5 | 9 | 13);
+        // 8x8 blocks carry a coded_block_flag only in 4:4:4
+        if !is8 || self.pic.cf == 3 {
             // coded_block_flag; an unavailable neighbour counts as coded in an intra macroblock
             let un = self.cur.kind != Kind::Inter;
             let (a, b) = match kind {
                 BlockKind::LumaDc => {
-                    let f = |avail: bool, m: &MbInfo| if !avail { un } else { m.kind == Kind::IPcm || m.cbf_dc & 1 != 0 };
+                    let bit = 1u8 << comp;
+                    let f = |avail: bool, m: &MbInfo| if !avail { un } else { m.kind == Kind::IPcm || m.cbf_dc & bit != 0 };
                     (f(self.avail_left(), self.left_or_cur()), f(self.avail_top(), self.top_or_cur()))
                 }
                 BlockKind::ChromaDc => {
@@ -1774,14 +1803,29 @@ impl<'a> SliceDec<'a> {
                     let (a, b) = self.neighbour_nnz_chroma(comp - 1, bx, by);
                     (a.map_or(un, |v| v > 0), b.map_or(un, |v| v > 0))
                 }
+                BlockKind::Luma8x8 => {
+                    // a neighbouring macroblock only counts if it also uses the 8x8 transform (or is PCM)
+                    let (a, b) = self.neighbour_nnz_luma(comp, bx, by);
+                    let other = |m: &MbInfo| !(m.t8x8 || m.kind == Kind::IPcm);
+                    let skip_a = bx == 0 && a.is_some() && other(self.left());
+                    let skip_b = by == 0 && b.is_some() && other(self.top());
+                    (a.map_or(un, |v| v > 0 && !skip_a), b.map_or(un, |v| v > 0 && !skip_b))
+                }
                 _ => {
-                    let (a, b) = self.neighbour_nnz_luma(bx, by);
+                    let (a, b) = self.neighbour_nnz_luma(comp, bx, by);
                     (a.map_or(un, |v| v > 0), b.map_or(un, |v| v > 0))
                 }
             };
             let Reader::Cabac(c) = &mut self.rd else { unreachable!() };
-            let cat_off = [0usize, 4, 8, 12, 16][cat];
-            if c.decision(85 + cat_off + a as usize + 2 * b as usize) == 0 {
+            let base = match cat {
+                0..=4 => 85 + [0usize, 4, 8, 12, 16][cat],
+                5 => 1012,
+                6..=8 => 460 + 4 * (cat - 6),
+                9 => 1016,
+                10..=12 => 472 + 4 * (cat - 10),
+                _ => 1020,
+            };
+            if c.decision(base + a as usize + 2 * b as usize) == 0 {
                 return Ok(0);
             }
         }
@@ -1791,8 +1835,8 @@ impl<'a> SliceDec<'a> {
         let last_idx = max - 1;
         let mut i = 0;
         while i < last_idx {
-            let (sctx, lctx) = if cat == 5 {
-                (SIG_OFF[0][5] as usize + SIG_OFF_8X8[0][i] as usize, LAST_OFF[0][5] as usize + LAST_OFF_8X8[i] as usize)
+            let (sctx, lctx) = if is8 {
+                (SIG_OFF[0][cat] as usize + SIG_OFF_8X8[0][i] as usize, LAST_OFF[0][cat] as usize + LAST_OFF_8X8[i] as usize)
             } else {
                 let inc = if cat == 3 { (i / (self.pic.ch / 8)).min(2) } else { i };
                 (SIG_OFF[0][cat] as usize + inc, LAST_OFF[0][cat] as usize + inc)
@@ -1869,20 +1913,49 @@ impl<'a> SliceDec<'a> {
 
     // ---- reconstruction ----------------------------------------------------------------------------
 
-    fn luma_stride(&self) -> usize {
-        self.pic.mb_w * 16
+    fn stride(&self, plane: usize) -> usize {
+        if plane == 0 {
+            self.pic.mb_w * 16
+        } else {
+            self.pic.mb_w * self.pic.cw
+        }
+    }
+
+    /// Colour components coded like luma: three for 4:4:4, otherwise one.
+    fn ncomp(&self) -> usize {
+        if self.pic.cf == 3 {
+            3
+        } else {
+            1
+        }
+    }
+
+    /// QP' of luma-style component `c` (chroma QP for Cb and Cr).
+    fn comp_qp(&self, c: usize) -> i32 {
+        if c == 0 {
+            self.qp + self.qp_off
+        } else {
+            chroma_qp(self.qp, self.pps.chroma_qp_offset[c - 1], self.bd) + self.qp_off
+        }
     }
 
     fn pix(&self, plane: usize, x: usize, y: usize) -> i32 {
-        let s = if plane == 0 { self.pic.mb_w * 16 } else { self.pic.mb_w * 8 };
+        let s = self.stride(plane);
         self.pic.planes[plane][y * s + x] as i32
     }
 
     fn reconstruct(&mut self, res: &Res, i16_mode: u8, _cbp: u32) -> Result<()> {
-        let qp = self.qp + self.qp_off;
+        for c in 0..self.ncomp() {
+            self.reconstruct_comp(res, i16_mode, c)?;
+        }
+        self.reconstruct_chroma(res)
+    }
+
+    fn reconstruct_comp(&mut self, res: &Res, i16_mode: u8, c: usize) -> Result<()> {
+        let qp = self.comp_qp(c);
         let (mbx, mby) = (self.mbx, self.mby);
         let (la, ta, tla) = (self.avail_left_i(), self.avail_top_i(), self.avail_topleft_i());
-        let ls = self.luma_stride();
+        let ls = self.stride(c);
         match self.cur.kind {
             Kind::I16x16 => {
                 if (i16_mode == 0 && !ta) || (i16_mode == 1 && !la) || (i16_mode == 3 && !(ta && la && tla)) {
@@ -1893,33 +1966,33 @@ impl<'a> SliceDec<'a> {
                 let mut left = [0i32; 16];
                 if ta {
                     for (i, t) in top.iter_mut().enumerate() {
-                        *t = self.pix(0, x0 + i, y0 - 1);
+                        *t = self.pix(c, x0 + i, y0 - 1);
                     }
                 }
                 if la {
                     for (j, l) in left.iter_mut().enumerate() {
-                        *l = self.pix(0, x0 - 1, y0 + j);
+                        *l = self.pix(c, x0 - 1, y0 + j);
                     }
                 }
-                let tl = if tla { self.pix(0, x0 - 1, y0 - 1) } else { 0 };
+                let tl = if tla { self.pix(c, x0 - 1, y0 - 1) } else { 0 };
                 let mut pred = [0u16; 256];
                 predict_16x16(i16_mode, &top, &left, tl, ta, la, &mut pred, self.bd);
                 for y in 0..16 {
-                    self.pic.planes[0][(y0 + y) * ls + x0..(y0 + y) * ls + x0 + 16].copy_from_slice(&pred[y * 16..y * 16 + 16]);
+                    self.pic.planes[c][(y0 + y) * ls + x0..(y0 + y) * ls + x0 + 16].copy_from_slice(&pred[y * 16..y * 16 + 16]);
                 }
                 // DC: inverse Hadamard, then scale
-                let f = hadamard4(&res.dc);
-                let lsd = self.scale.l4[0][(qp % 6) as usize][0];
+                let f = hadamard4(&res.dc[c]);
+                let lsd = self.scale.l4[c][(qp % 6) as usize][0];
                 let mut dcy = [0i32; 16];
                 for k in 0..16 {
                     dcy[k] = if qp >= 36 { f[k].wrapping_mul(lsd) << (qp / 6 - 6) } else { (f[k].wrapping_mul(lsd) + (1 << (5 - qp / 6))) >> (6 - qp / 6) };
                 }
                 for b in 0..16 {
-                    let mut c = self.scale4(&res.luma[b * 16..b * 16 + 16], 0, qp, true);
-                    c[0] = dcy[b];
-                    if c.iter().any(|&v| v != 0) {
+                    let mut co = self.scale4(&res.luma[c][b * 16..b * 16 + 16], c, qp, true);
+                    co[0] = dcy[b];
+                    if co.iter().any(|&v| v != 0) {
                         let (bx, by) = (b % 4, b / 4);
-                        idct4_add(&c, &mut self.pic.planes[0][(y0 + by * 4) * ls + x0 + bx * 4..], ls, self.maxv);
+                        idct4_add(&co, &mut self.pic.planes[c][(y0 + by * 4) * ls + x0 + bx * 4..], ls, self.maxv);
                     }
                 }
             }
@@ -1927,17 +2000,17 @@ impl<'a> SliceDec<'a> {
                 for n in 0..16 {
                     let (bx, by) = block_pos(n);
                     let mode = self.cur.ipm[by * 4 + bx];
-                    let e = self.edges_4x4(bx, by);
+                    let e = self.edges_4x4(c, bx, by);
                     check_mode(mode, &e)?;
                     let mut pred = [0u16; 16];
                     predict_nxn(4, mode, &e, &mut pred, self.bd);
                     let (x, y) = (mbx * 16 + bx * 4, mby * 16 + by * 4);
                     for r in 0..4 {
-                        self.pic.planes[0][(y + r) * ls + x..(y + r) * ls + x + 4].copy_from_slice(&pred[r * 4..r * 4 + 4]);
+                        self.pic.planes[c][(y + r) * ls + x..(y + r) * ls + x + 4].copy_from_slice(&pred[r * 4..r * 4 + 4]);
                     }
-                    let c = self.scale4(&res.luma[(by * 4 + bx) * 16..(by * 4 + bx) * 16 + 16], 0, qp, false);
-                    if c.iter().any(|&v| v != 0) {
-                        idct4_add(&c, &mut self.pic.planes[0][y * ls + x..], ls, self.maxv);
+                    let co = self.scale4(&res.luma[c][(by * 4 + bx) * 16..(by * 4 + bx) * 16 + 16], c, qp, false);
+                    if co.iter().any(|&v| v != 0) {
+                        idct4_add(&co, &mut self.pic.planes[c][y * ls + x..], ls, self.maxv);
                     }
                 }
             }
@@ -1945,31 +2018,31 @@ impl<'a> SliceDec<'a> {
                 for i8 in 0..4 {
                     let (bx, by) = ((i8 & 1) * 2, (i8 >> 1) * 2);
                     let mode = self.cur.ipm[by * 4 + bx];
-                    let mut e = self.edges_8x8(i8);
+                    let mut e = self.edges_8x8(c, i8);
                     check_mode(mode, &e)?;
                     filter_8x8_edges(&mut e);
                     let mut pred = [0u16; 64];
                     predict_nxn(8, mode, &e, &mut pred, self.bd);
                     let (x, y) = (mbx * 16 + bx * 4, mby * 16 + by * 4);
                     for r in 0..8 {
-                        self.pic.planes[0][(y + r) * ls + x..(y + r) * ls + x + 8].copy_from_slice(&pred[r * 8..r * 8 + 8]);
+                        self.pic.planes[c][(y + r) * ls + x..(y + r) * ls + x + 8].copy_from_slice(&pred[r * 8..r * 8 + 8]);
                     }
-                    let mut c = [0i32; 64];
-                    let lsv = &self.scale.l8[0][(qp % 6) as usize];
+                    let mut co = [0i32; 64];
+                    let lsv = &self.scale.l8[2 * c][(qp % 6) as usize];
                     for k in 0..64 {
-                        let v = res.luma[i8 * 64 + k];
+                        let v = res.luma[c][i8 * 64 + k];
                         if v != 0 {
-                            c[k] = if qp >= 36 { v.wrapping_mul(lsv[k]) << (qp / 6 - 6) } else { (v.wrapping_mul(lsv[k]) + (1 << (5 - qp / 6))) >> (6 - qp / 6) };
+                            co[k] = if qp >= 36 { v.wrapping_mul(lsv[k]) << (qp / 6 - 6) } else { (v.wrapping_mul(lsv[k]) + (1 << (5 - qp / 6))) >> (6 - qp / 6) };
                         }
                     }
-                    if c.iter().any(|&v| v != 0) {
-                        idct8_add(&c, &mut self.pic.planes[0][y * ls + x..], ls, self.maxv);
+                    if co.iter().any(|&v| v != 0) {
+                        idct8_add(&co, &mut self.pic.planes[c][y * ls + x..], ls, self.maxv);
                     }
                 }
             }
             _ => {}
         }
-        self.reconstruct_chroma(res)
+        Ok(())
     }
 
     /// Scales one 4x4 block's levels. `list` selects the matrix (0 = intra Y, 1 = Cb, 2 = Cr);
@@ -1987,7 +2060,7 @@ impl<'a> SliceDec<'a> {
     }
 
     fn reconstruct_chroma(&mut self, res: &Res) -> Result<()> {
-        if self.pic.cf == 0 {
+        if matches!(self.pic.cf, 0 | 3) {
             return Ok(());
         }
         let (mbx, mby) = (self.mbx, self.mby);
@@ -2066,7 +2139,7 @@ impl<'a> SliceDec<'a> {
         Ok(())
     }
 
-    fn edges_4x4(&self, bx: usize, by: usize) -> Edges {
+    fn edges_4x4(&self, c: usize, bx: usize, by: usize) -> Edges {
         let (la, ta, tla, tra) = (self.avail_left_i(), self.avail_top_i(), self.avail_topleft_i(), self.avail_topright_i());
         let have_left = bx > 0 || la;
         let have_top = by > 0 || ta;
@@ -2091,24 +2164,24 @@ impl<'a> SliceDec<'a> {
         let mut e = Edges { top: [0; 16], left: [0; 8], topleft: 0, have_top, have_left, have_topleft: have_tl };
         if have_top {
             for i in 0..4 {
-                e.top[i] = self.pix(0, x0 + i, y0 - 1);
+                e.top[i] = self.pix(c, x0 + i, y0 - 1);
             }
             for i in 4..8 {
-                e.top[i] = if have_tr { self.pix(0, x0 + i, y0 - 1) } else { e.top[3] };
+                e.top[i] = if have_tr { self.pix(c, x0 + i, y0 - 1) } else { e.top[3] };
             }
         }
         if have_left {
             for j in 0..4 {
-                e.left[j] = self.pix(0, x0 - 1, y0 + j);
+                e.left[j] = self.pix(c, x0 - 1, y0 + j);
             }
         }
         if have_tl {
-            e.topleft = self.pix(0, x0 - 1, y0 - 1);
+            e.topleft = self.pix(c, x0 - 1, y0 - 1);
         }
         e
     }
 
-    fn edges_8x8(&self, i8: usize) -> Edges {
+    fn edges_8x8(&self, c: usize, i8: usize) -> Edges {
         let (la, ta, tla, tra) = (self.avail_left_i(), self.avail_top_i(), self.avail_topleft_i(), self.avail_topright_i());
         let (bx, by) = (i8 & 1, i8 >> 1);
         let have_left = bx > 0 || la;
@@ -2129,19 +2202,19 @@ impl<'a> SliceDec<'a> {
         let mut e = Edges { top: [0; 16], left: [0; 8], topleft: 0, have_top, have_left, have_topleft: have_tl };
         if have_top {
             for i in 0..8 {
-                e.top[i] = self.pix(0, x0 + i, y0 - 1);
+                e.top[i] = self.pix(c, x0 + i, y0 - 1);
             }
             for i in 8..16 {
-                e.top[i] = if have_tr { self.pix(0, x0 + i, y0 - 1) } else { e.top[7] };
+                e.top[i] = if have_tr { self.pix(c, x0 + i, y0 - 1) } else { e.top[7] };
             }
         }
         if have_left {
             for j in 0..8 {
-                e.left[j] = self.pix(0, x0 - 1, y0 + j);
+                e.left[j] = self.pix(c, x0 - 1, y0 + j);
             }
         }
         if have_tl {
-            e.topleft = self.pix(0, x0 - 1, y0 - 1);
+            e.topleft = self.pix(c, x0 - 1, y0 - 1);
         }
         e
     }
