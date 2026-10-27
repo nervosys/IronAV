@@ -1,11 +1,11 @@
 //! Inverse transforms (ITU-T H.264 8.5). Coefficients are in raster order (row * N + column).
 
-fn clip(v: i32) -> u8 {
-    v.clamp(0, 255) as u8
+fn clip(v: i32, maxv: i32) -> u16 {
+    v.clamp(0, maxv) as u16
 }
 
 /// Inverse 4x4 transform of scaled coefficients, added to the prediction already in `dst`.
-pub fn idct4_add(c: &[i32; 16], dst: &mut [u8], stride: usize) {
+pub fn idct4_add(c: &[i32; 16], dst: &mut [u16], stride: usize, maxv: i32) {
     let mut t = [0i32; 16];
     for i in 0..4 {
         let d = &c[i * 4..i * 4 + 4];
@@ -26,7 +26,7 @@ pub fn idct4_add(c: &[i32; 16], dst: &mut [u8], stride: usize) {
         let h = [g0.wrapping_add(g3), g1.wrapping_add(g2), g1.wrapping_sub(g2), g0.wrapping_sub(g3)];
         for (i, v) in h.iter().enumerate() {
             let p = &mut dst[i * stride + j];
-            *p = clip(*p as i32 + (v.wrapping_add(32) >> 6));
+            *p = clip(*p as i32 + (v.wrapping_add(32) >> 6), maxv);
         }
     }
 }
@@ -52,7 +52,7 @@ fn row8(d: [i32; 8]) -> [i32; 8] {
 }
 
 /// Inverse 8x8 transform of scaled coefficients, added to the prediction in `dst`.
-pub fn idct8_add(c: &[i32; 64], dst: &mut [u8], stride: usize) {
+pub fn idct8_add(c: &[i32; 64], dst: &mut [u16], stride: usize, maxv: i32) {
     let mut t = [0i32; 64];
     for i in 0..8 {
         let mut d = [0i32; 8];
@@ -67,7 +67,7 @@ pub fn idct8_add(c: &[i32; 64], dst: &mut [u8], stride: usize) {
         let h = row8(d);
         for (i, v) in h.iter().enumerate() {
             let p = &mut dst[i * stride + j];
-            *p = clip(*p as i32 + (v.wrapping_add(32) >> 6));
+            *p = clip(*p as i32 + (v.wrapping_add(32) >> 6), maxv);
         }
     }
 }

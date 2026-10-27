@@ -10,8 +10,8 @@ pub const HD_PRED: u8 = 6;
 pub const VL_PRED: u8 = 7;
 pub const HU_PRED: u8 = 8;
 
-fn clip(v: i32) -> u8 {
-    v.clamp(0, 255) as u8
+fn clip(v: i32, bd: u32) -> u16 {
+    v.clamp(0, (1 << bd) - 1) as u16
 }
 
 /// Neighbouring samples of an NxN block. `top` holds 2N samples (the second half is the
@@ -27,7 +27,7 @@ pub struct Edges {
 
 /// Predicts a 4x4 or 8x8 block (`n` is 4 or 8) in one of the nine directional modes. Samples the
 /// mode needs but the stream did not provide read as zero; callers reject those modes first.
-pub fn predict_nxn(n: usize, mode: u8, e: &Edges, out: &mut [u8]) {
+pub fn predict_nxn(n: usize, mode: u8, e: &Edges, out: &mut [u16], bd: u32) {
     let t = |i: i32| -> i32 {
         if i < 0 {
             e.topleft
@@ -56,7 +56,7 @@ pub fn predict_nxn(n: usize, mode: u8, e: &Edges, out: &mut [u8]) {
                         (true, true) => (st + sl + ni) >> (shift + 1),
                         (false, true) => (sl + ni / 2) >> shift,
                         (true, false) => (st + ni / 2) >> shift,
-                        (false, false) => 128,
+                        (false, false) => 1 << (bd - 1),
                     }
                 }
                 DDL_PRED => {
@@ -121,7 +121,7 @@ pub fn predict_nxn(n: usize, mode: u8, e: &Edges, out: &mut [u8]) {
                     }
                 }
             };
-            out[(y * ni + x) as usize] = v as u8;
+            out[(y * ni + x) as usize] = v as u16;
         }
     }
 }
@@ -158,19 +158,19 @@ pub fn filter_8x8_edges(e: &mut Edges) {
 
 /// Intra 16x16 (`n` = 16, luma) or chroma 8x8 (`n` = 8) prediction for the non-DC modes and the
 /// whole-block DC. `mode` follows the Intra16x16 numbering: 0 vertical, 1 horizontal, 2 DC, 3 plane.
-pub fn predict_16x16(mode: u8, top: &[i32; 16], left: &[i32; 16], topleft: i32, have_top: bool, have_left: bool, out: &mut [u8]) {
+pub fn predict_16x16(mode: u8, top: &[i32; 16], left: &[i32; 16], topleft: i32, have_top: bool, have_left: bool, out: &mut [u16], bd: u32) {
     match mode {
         0 => {
             for y in 0..16 {
                 for x in 0..16 {
-                    out[y * 16 + x] = top[x] as u8;
+                    out[y * 16 + x] = top[x] as u16;
                 }
             }
         }
         1 => {
             for y in 0..16 {
                 for x in 0..16 {
-                    out[y * 16 + x] = left[y] as u8;
+                    out[y * 16 + x] = left[y] as u16;
                 }
             }
         }
@@ -181,9 +181,9 @@ pub fn predict_16x16(mode: u8, top: &[i32; 16], left: &[i32; 16], topleft: i32, 
                 (true, true) => (st + sl + 16) >> 5,
                 (false, true) => (sl + 8) >> 4,
                 (true, false) => (st + 8) >> 4,
-                (false, false) => 128,
+                (false, false) => 1 << (bd - 1),
             };
-            out[..256].fill(v as u8);
+            out[..256].fill(v as u16);
         }
         _ => {
             let tt = |i: i32| if i < 0 { topleft } else { top[i as usize] };
@@ -199,7 +199,7 @@ pub fn predict_16x16(mode: u8, top: &[i32; 16], left: &[i32; 16], topleft: i32, 
             let c = (5 * v + 32) >> 6;
             for y in 0..16 {
                 for x in 0..16 {
-                    out[y as usize * 16 + x as usize] = clip((a + b * (x - 7) + c * (y - 7) + 16) >> 5);
+                    out[y as usize * 16 + x as usize] = clip((a + b * (x - 7) + c * (y - 7) + 16) >> 5, bd);
                 }
             }
         }
@@ -208,7 +208,7 @@ pub fn predict_16x16(mode: u8, top: &[i32; 16], left: &[i32; 16], topleft: i32, 
 
 /// Chroma prediction for one 8x8 component. `mode` follows intra_chroma_pred_mode: 0 DC,
 /// 1 horizontal, 2 vertical, 3 plane.
-pub fn predict_chroma(mode: u8, top: &[i32; 8], left: &[i32; 8], topleft: i32, have_top: bool, have_left: bool, out: &mut [u8]) {
+pub fn predict_chroma(mode: u8, top: &[i32; 8], left: &[i32; 8], topleft: i32, have_top: bool, have_left: bool, out: &mut [u16], bd: u32) {
     match mode {
         0 => {
             for by in 0..2 {
@@ -220,7 +220,7 @@ pub fn predict_chroma(mode: u8, top: &[i32; 8], left: &[i32; 8], topleft: i32, h
                             (true, true) => (st + sl + 4) >> 3,
                             (false, true) => (sl + 2) >> 2,
                             (true, false) => (st + 2) >> 2,
-                            (false, false) => 128,
+                            (false, false) => 1 << (bd - 1),
                         }
                     } else if bx > 0 {
                         // top-right block prefers the row above
@@ -229,7 +229,7 @@ pub fn predict_chroma(mode: u8, top: &[i32; 8], left: &[i32; 8], topleft: i32, h
                         } else if have_left {
                             (sl + 2) >> 2
                         } else {
-                            128
+                            1 << (bd - 1)
                         }
                     } else if have_left {
                         // bottom-left block prefers the column to its left
@@ -237,11 +237,11 @@ pub fn predict_chroma(mode: u8, top: &[i32; 8], left: &[i32; 8], topleft: i32, h
                     } else if have_top {
                         (st + 2) >> 2
                     } else {
-                        128
+                        1 << (bd - 1)
                     };
                     for y in 0..4 {
                         for x in 0..4 {
-                            out[(by * 4 + y) * 8 + bx * 4 + x] = v as u8;
+                            out[(by * 4 + y) * 8 + bx * 4 + x] = v as u16;
                         }
                     }
                 }
@@ -250,14 +250,14 @@ pub fn predict_chroma(mode: u8, top: &[i32; 8], left: &[i32; 8], topleft: i32, h
         1 => {
             for y in 0..8 {
                 for x in 0..8 {
-                    out[y * 8 + x] = left[y] as u8;
+                    out[y * 8 + x] = left[y] as u16;
                 }
             }
         }
         2 => {
             for y in 0..8 {
                 for x in 0..8 {
-                    out[y * 8 + x] = top[x] as u8;
+                    out[y * 8 + x] = top[x] as u16;
                 }
             }
         }
@@ -275,7 +275,7 @@ pub fn predict_chroma(mode: u8, top: &[i32; 8], left: &[i32; 8], topleft: i32, h
             let c = (34 * v + 32) >> 6;
             for y in 0..8 {
                 for x in 0..8 {
-                    out[y as usize * 8 + x as usize] = clip((a + b * (x - 3) + c * (y - 3) + 16) >> 5);
+                    out[y as usize * 8 + x as usize] = clip((a + b * (x - 3) + c * (y - 3) + 16) >> 5, bd);
                 }
             }
         }

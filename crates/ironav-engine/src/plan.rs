@@ -248,8 +248,11 @@ pub fn plan(job: &Job) -> Result<Plan> {
             // when the policy allows it and the software decoder is the fallback.
             let soft = ironav_codec::is_implemented(s.codec, false);
             let hw_capable = provider_codecs(Direction::Decode).contains(&s.codec);
-            let hw_first = soft && ironav_codec::prefers_hardware_decode(s.codec) && !matches!(policy, HwPolicy::Off | HwPolicy::Require(_) | HwPolicy::RequireAny);
+            let hw_first = soft && ironav_codec::prefers_hardware_decode(s.codec, &s.params) && !matches!(policy, HwPolicy::Off | HwPolicy::Require(_) | HwPolicy::RequireAny);
             if (soft && !hw_first) || !hw_capable {
+                ironav_codec::new_decoder_for(s)?;
+            } else if soft && !matches!(policy, HwPolicy::Require(_) | HwPolicy::RequireAny) && select(s.codec, Direction::Decode, policy, &probes).is_err() {
+                // the GPU rejects this stream outright (size, profile); the software decoder takes it
                 ironav_codec::new_decoder_for(s)?;
             } else {
                 let sel = select(s.codec, Direction::Decode, policy, &probes)?;
@@ -268,11 +271,20 @@ pub fn plan(job: &Job) -> Result<Plan> {
                     }));
                 }
                 if sel.chosen.is_some() {
+                    let mut use_gpu = true;
                     #[cfg(any(windows, target_os = "linux"))]
-                    ironav_hwaccel::nvdec::accepts(&s.params).map_err(|m| {
-                        Error::new(ErrorCode::UnsupportedCodec, m).hint("only 8-bit and 10-bit 4:2:0 H.264/HEVC can be decoded so far")
-                    })?;
-                    hardware.push(sel);
+                    if let Err(m) = ironav_hwaccel::nvdec::accepts(&s.params) {
+                        // the GPU cannot take this stream; the software decoder can, unless hardware was required
+                        if soft && !matches!(policy, HwPolicy::Require(_) | HwPolicy::RequireAny) {
+                            ironav_codec::new_decoder_for(s)?;
+                            use_gpu = false;
+                        } else {
+                            return Err(Error::new(ErrorCode::UnsupportedCodec, m).hint("only 8-bit and 10-bit 4:2:0 H.264/HEVC can be decoded on the GPU"));
+                        }
+                    }
+                    if use_gpu {
+                        hardware.push(sel);
+                    }
                 }
             }
             let hw_encodable = provider_codecs(Direction::Encode).contains(&to);

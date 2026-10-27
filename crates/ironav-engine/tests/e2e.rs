@@ -5,6 +5,8 @@ use std::path::PathBuf;
 
 fn scratch(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("ironav-test-{}-{name}", std::process::id()));
+    // a reused process id must not see an earlier run's files
+    let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
 }
@@ -1527,6 +1529,26 @@ fn h264_p_slices_decode_to_what_ffmpeg_decodes() {
     }
 }
 
+/// High 10 (10-bit 4:2:0) streams, intra, P and B, CAVLC and CABAC, negative QPs and weighted
+/// prediction, are bit-exact with FFmpeg's decoder. The GPU cannot decode them, so even with
+/// hwaccel "auto" the software decoder takes over.
+#[test]
+fn h264_high10_decodes_to_what_ffmpeg_decodes() {
+    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    for (name, hw) in [("h10_i_cabac", "off"), ("h10_i_cavlc", "off"), ("h10_p", "off"), ("h10_b", "off"), ("h10_neg", "off"), ("h10_wp", "off"), ("h10_noise", "off"), ("h10_b", "auto")] {
+        let dir = scratch(&format!("h264-{name}-{hw}"));
+        let out = dir.join("out.y4m");
+        let mut j = job(&data.join(format!("h264_{name}.mp4")), &out);
+        j.hwaccel = hw.into();
+        j.video.codec = Some("rawvideo".into());
+        run(&j, &mut |_| {}).unwrap();
+        let got: Vec<u8> = y4m_frames_any(&out).concat();
+        let want = std::fs::read(data.join(format!("h264_{name}.ffmpeg.yuv"))).unwrap();
+        assert_eq!(got.len(), want.len(), "{name}: size");
+        assert!(got == want, "{name}: pixels differ from FFmpeg's");
+    }
+}
+
 // ---- JPEG ------------------------------------------------------------------------------
 
 /// Raw planes of the first frame of a y4m file.
@@ -1540,7 +1562,9 @@ fn y4m_frames_any(path: &std::path::Path) -> Vec<Vec<u8>> {
     let head = String::from_utf8_lossy(&d[..hdr]).to_string();
     let get = |p: char| head.split_whitespace().find(|t| t.starts_with(p)).unwrap()[1..].parse::<usize>().unwrap();
     let (w, h) = (get('W'), get('H'));
-    let size = if head.contains("C422") {
+    let size = if head.contains("C420p10") {
+        2 * (w * h + 2 * w.div_ceil(2) * h.div_ceil(2))
+    } else if head.contains("C422") {
         w * h + 2 * w.div_ceil(2) * h
     } else if head.contains("C444") {
         3 * w * h

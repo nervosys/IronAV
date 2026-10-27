@@ -573,7 +573,7 @@ pub fn parse_slice_header(rbsp: &[u8], nal_type: u8, nal_ref_idc: u32, spss: &[O
         return Err(Error::invalid_input("H.264 cabac_init_idc is out of range"));
     }
     let qp = pps.init_qp + r.se()?;
-    if !(0..=51).contains(&qp) {
+    if !(-6 * (sps.bit_depth_luma as i32 - 8)..=51).contains(&qp) {
         return Err(Error::invalid_input("H.264 slice QP is out of range"));
     }
     let (mut disable_deblocking, mut alpha_offset, mut beta_offset) = (0, 0, 0);

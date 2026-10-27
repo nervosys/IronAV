@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 /// A decoded, loop-filtered picture, kept for reference and for output.
 pub struct DecodedPic {
-    pub planes: [Vec<u8>; 3],
+    pub planes: [Vec<u16>; 3],
     pub mb_w: usize,
     pub mb_h: usize,
     pub mbs: Vec<MbInfo>,
@@ -17,6 +17,7 @@ pub struct DecodedPic {
     pub id: i32,
     /// Cropping (left, right, top, bottom) in luma samples, applied when the picture is output.
     pub crop: [usize; 4],
+    pub bit_depth: u32,
 }
 
 /// One entry of a reference picture list.

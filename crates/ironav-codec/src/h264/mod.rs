@@ -1,4 +1,4 @@
-//! A software H.264 decoder (ITU-T H.264 / ISO 14496-10) for 8-bit 4:2:0 progressive video.
+//! A software H.264 decoder (ITU-T H.264 / ISO 14496-10) for 8- and 10-bit 4:2:0 progressive video.
 //!
 //! Intra pictures (I slices, CAVLC and CABAC, 4x4 / 8x8 / 16x16 prediction, I_PCM, 8x8 transform,
 //! scaling matrices, multiple slices, the loop filter), P slices and B slices (all partition sizes,
@@ -67,11 +67,22 @@ impl H264Decoder {
         let [cl, cr, ct, cb] = pic.crop;
         let (w, h) = (pic.mb_w * 16 - cl - cr, pic.mb_h * 16 - ct - cb);
         let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        let wide = pic.bit_depth > 8;
+        // 8-bit samples go out as bytes, deeper ones as little-endian 16-bit words
+        let put = |v: &mut Vec<u8>, src: &[u16]| {
+            if wide {
+                for s in src {
+                    v.extend_from_slice(&s.to_le_bytes());
+                }
+            } else {
+                v.extend(src.iter().map(|&s| s as u8));
+            }
+        };
         let mut planes = Vec::with_capacity(3);
         let ys = pic.mb_w * 16;
         let mut y = Vec::with_capacity(w * h);
         for r in 0..h {
-            y.extend_from_slice(&pic.planes[0][(ct + r) * ys + cl..(ct + r) * ys + cl + w]);
+            put(&mut y, &pic.planes[0][(ct + r) * ys + cl..(ct + r) * ys + cl + w]);
         }
         planes.push(y);
         let cs = pic.mb_w * 8;
@@ -79,16 +90,18 @@ impl H264Decoder {
             let mut v = Vec::with_capacity(cw * ch);
             for r in 0..ch {
                 let o = (ct / 2 + r) * cs + cl / 2;
-                v.extend_from_slice(&pic.planes[pl][o..o + cw]);
+                put(&mut v, &pic.planes[pl][o..o + cw]);
             }
             planes.push(v);
         }
-        self.out.push(Frame::Video(VideoFrame { width: w as u32, height: h as u32, pix_fmt: PixelFormat::Yuv420p, pts: p.pts, planes }));
+        let pix_fmt = if wide { PixelFormat::Yuv420p10 } else { PixelFormat::Yuv420p };
+        self.out.push(Frame::Video(VideoFrame { width: w as u32, height: h as u32, pix_fmt, pts: p.pts, planes }));
     }
 
     fn finish_picture(&mut self) {
         let Some(mut c) = self.cur.take() else { return };
-        deblock::deblock_picture(&mut c.pic);
+        let bd = self.sps[c.sps_id].as_ref().map_or(8, |s| s.bit_depth_luma);
+        deblock::deblock_picture(&mut c.pic, bd);
         let sps = self.sps[c.sps_id].as_ref().expect("the sequence parameter set outlives its picture");
         let id = self.dpb.new_id();
         let pic = Arc::new(DecodedPic {
@@ -99,6 +112,7 @@ impl H264Decoder {
             poc: c.poc,
             id,
             crop: sps.crop,
+            bit_depth: sps.bit_depth_luma,
         });
         for p in self.dpb.finish(sps, &c.hdr, pic, c.pts) {
             self.emit(p);
@@ -112,8 +126,8 @@ impl H264Decoder {
         }
         let sps_id = self.pps[hdr.pps_id as usize].as_ref().map(|p| p.sps_id as usize).unwrap_or(0);
         let sps = self.sps[sps_id].as_ref().ok_or_else(|| Error::invalid_input("H.264 slice has no sequence parameter set"))?;
-        if sps.chroma_format_idc != 1 || sps.bit_depth_luma != 8 || sps.bit_depth_chroma != 8 {
-            return Err(unsupported("this H.264 decoder handles 8-bit 4:2:0 video only"));
+        if sps.chroma_format_idc != 1 || sps.bit_depth_luma != sps.bit_depth_chroma || !(8..=10).contains(&sps.bit_depth_luma) {
+            return Err(unsupported("this H.264 decoder handles 4:2:0 video with 8 or 10 bits per sample only"));
         }
         if sps.transform_bypass {
             return Err(unsupported("H.264 lossless transform bypass is not supported"));

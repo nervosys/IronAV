@@ -3,14 +3,14 @@
 use super::mb::{chroma_qp, Kind, MbInfo, Picture};
 use super::tables::{ALPHA, BETA, TC0};
 
-fn clip1(v: i32) -> u8 {
-    v.clamp(0, 255) as u8
+fn clip1(v: i32, bd: u32) -> u16 {
+    v.clamp(0, (1 << bd) - 1) as u16
 }
 
 /// Filters `lines` sample lines across one edge. `pos` is the first q0 sample, `xs` the step
 /// across the edge and `ys` the step along it.
 #[allow(clippy::too_many_arguments)]
-fn filter_edge(pl: &mut [u8], pos: usize, xs: usize, ys: usize, lines: usize, bs: &[u8; 4], per_bs: usize, alpha: i32, beta: i32, index_a: usize, chroma: bool) {
+fn filter_edge(pl: &mut [u16], pos: usize, xs: usize, ys: usize, lines: usize, bs: &[u8; 4], per_bs: usize, alpha: i32, beta: i32, index_a: usize, chroma: bool, bd: u32) {
     if alpha == 0 || beta == 0 {
         return;
     }
@@ -29,13 +29,13 @@ fn filter_edge(pl: &mut [u8], pos: usize, xs: usize, ys: usize, lines: usize, bs
         }
         if chroma {
             if b < 4 {
-                let tc = TC0[index_a][b as usize].max(0) as i32 + 1;
+                let tc = ((TC0[index_a][b as usize].max(0) as i32) << (bd - 8)) + 1;
                 let delta = ((((q0 - p0) << 2) + (p1 - q1) + 4) >> 3).clamp(-tc, tc);
-                pl[q - xs] = clip1(p0 + delta);
-                pl[q] = clip1(q0 - delta);
+                pl[q - xs] = clip1(p0 + delta, bd);
+                pl[q] = clip1(q0 - delta, bd);
             } else {
-                pl[q - xs] = ((2 * p1 + p0 + q1 + 2) >> 2) as u8;
-                pl[q] = ((2 * q1 + q0 + p1 + 2) >> 2) as u8;
+                pl[q - xs] = ((2 * p1 + p0 + q1 + 2) >> 2) as u16;
+                pl[q] = ((2 * q1 + q0 + p1 + 2) >> 2) as u16;
             }
             continue;
         }
@@ -44,34 +44,34 @@ fn filter_edge(pl: &mut [u8], pos: usize, xs: usize, ys: usize, lines: usize, bs
         let ap = (p2 - p0).abs();
         let aq = (q2 - q0).abs();
         if b < 4 {
-            let tc0 = TC0[index_a][b as usize].max(0) as i32;
+            let tc0 = (TC0[index_a][b as usize].max(0) as i32) << (bd - 8);
             let tc = tc0 + (ap < beta) as i32 + (aq < beta) as i32;
             let delta = ((((q0 - p0) << 2) + (p1 - q1) + 4) >> 3).clamp(-tc, tc);
-            pl[q - xs] = clip1(p0 + delta);
-            pl[q] = clip1(q0 - delta);
+            pl[q - xs] = clip1(p0 + delta, bd);
+            pl[q] = clip1(q0 - delta, bd);
             if ap < beta {
-                pl[q - 2 * xs] = (p1 + ((p2 + ((p0 + q0 + 1) >> 1) - (p1 << 1)) >> 1).clamp(-tc0, tc0)) as u8;
+                pl[q - 2 * xs] = (p1 + ((p2 + ((p0 + q0 + 1) >> 1) - (p1 << 1)) >> 1).clamp(-tc0, tc0)) as u16;
             }
             if aq < beta {
-                pl[q + xs] = (q1 + ((q2 + ((p0 + q0 + 1) >> 1) - (q1 << 1)) >> 1).clamp(-tc0, tc0)) as u8;
+                pl[q + xs] = (q1 + ((q2 + ((p0 + q0 + 1) >> 1) - (q1 << 1)) >> 1).clamp(-tc0, tc0)) as u16;
             }
         } else {
             let small = (p0 - q0).abs() < (alpha >> 2) + 2;
             if ap < beta && small {
                 let p3 = pl[q - 4 * xs] as i32;
-                pl[q - xs] = ((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3) as u8;
-                pl[q - 2 * xs] = ((p2 + p1 + p0 + q0 + 2) >> 2) as u8;
-                pl[q - 3 * xs] = ((2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3) as u8;
+                pl[q - xs] = ((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3) as u16;
+                pl[q - 2 * xs] = ((p2 + p1 + p0 + q0 + 2) >> 2) as u16;
+                pl[q - 3 * xs] = ((2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3) as u16;
             } else {
-                pl[q - xs] = ((2 * p1 + p0 + q1 + 2) >> 2) as u8;
+                pl[q - xs] = ((2 * p1 + p0 + q1 + 2) >> 2) as u16;
             }
             if aq < beta && small {
                 let q3 = pl[q + 3 * xs] as i32;
-                pl[q] = ((p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3) as u8;
-                pl[q + xs] = ((p0 + q0 + q1 + q2 + 2) >> 2) as u8;
-                pl[q + 2 * xs] = ((2 * q3 + 3 * q2 + q1 + q0 + p0 + 4) >> 3) as u8;
+                pl[q] = ((p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3) as u16;
+                pl[q + xs] = ((p0 + q0 + q1 + q2 + 2) >> 2) as u16;
+                pl[q + 2 * xs] = ((2 * q3 + 3 * q2 + q1 + q0 + p0 + 4) >> 3) as u16;
             } else {
-                pl[q] = ((2 * q1 + q0 + p1 + 2) >> 2) as u8;
+                pl[q] = ((2 * q1 + q0 + p1 + 2) >> 2) as u16;
             }
         }
     }
@@ -143,7 +143,7 @@ fn strength(m: &MbInfo, other: &MbInfo, dir: usize, e: usize) -> [u8; 4] {
     out
 }
 
-pub fn deblock_picture(pic: &mut Picture) {
+pub fn deblock_picture(pic: &mut Picture, bd: u32) {
     let (w, h) = (pic.mb_w, pic.mb_h);
     let ls = w * 16;
     let cs = w * 8;
@@ -185,12 +185,12 @@ pub fn deblock_picture(pic: &mut Picture) {
                     let qpav = (other.qp as i32 + m.qp as i32 + 1) >> 1;
                     let ia = (qpav + sp.alpha_offset).clamp(0, 51) as usize;
                     let ib = (qpav + sp.beta_offset).clamp(0, 51) as usize;
-                    let (alpha, beta) = (ALPHA[ia] as i32, BETA[ib] as i32);
+                    let (alpha, beta) = ((ALPHA[ia] as i32) << (bd - 8), (BETA[ib] as i32) << (bd - 8));
                     let (x0, y0) = (mbx * 16, mby * 16);
                     if dir == 0 {
-                        filter_edge(&mut pic.planes[0], y0 * ls + x0 + e * 4, 1, ls, 16, &bs, 4, alpha, beta, ia, false);
+                        filter_edge(&mut pic.planes[0], y0 * ls + x0 + e * 4, 1, ls, 16, &bs, 4, alpha, beta, ia, false, bd);
                     } else {
-                        filter_edge(&mut pic.planes[0], (y0 + e * 4) * ls + x0, ls, 1, 16, &bs, 4, alpha, beta, ia, false);
+                        filter_edge(&mut pic.planes[0], (y0 + e * 4) * ls + x0, ls, 1, 16, &bs, 4, alpha, beta, ia, false, bd);
                     }
                 }
             }
@@ -212,15 +212,15 @@ pub fn deblock_picture(pic: &mut Picture) {
                             &m
                         };
                         let bs = strength(&m, other, dir, e);
-                        let qpav = (chroma_qp(other.qp as i32, off) + chroma_qp(m.qp as i32, off) + 1) >> 1;
+                        let qpav = (chroma_qp(other.qp as i32, off, bd) + chroma_qp(m.qp as i32, off, bd) + 1) >> 1;
                         let ia = (qpav + sp.alpha_offset).clamp(0, 51) as usize;
                         let ib = (qpav + sp.beta_offset).clamp(0, 51) as usize;
-                        let (alpha, beta) = (ALPHA[ia] as i32, BETA[ib] as i32);
+                        let (alpha, beta) = ((ALPHA[ia] as i32) << (bd - 8), (BETA[ib] as i32) << (bd - 8));
                         let (x0, y0) = (mbx * 8, mby * 8);
                         if dir == 0 {
-                            filter_edge(&mut pic.planes[1 + comp], y0 * cs + x0 + e * 2, 1, cs, 8, &bs, 2, alpha, beta, ia, true);
+                            filter_edge(&mut pic.planes[1 + comp], y0 * cs + x0 + e * 2, 1, cs, 8, &bs, 2, alpha, beta, ia, true, bd);
                         } else {
-                            filter_edge(&mut pic.planes[1 + comp], (y0 + e * 2) * cs + x0, cs, 1, 8, &bs, 2, alpha, beta, ia, true);
+                            filter_edge(&mut pic.planes[1 + comp], (y0 + e * 2) * cs + x0, cs, 1, 8, &bs, 2, alpha, beta, ia, true, bd);
                         }
                     }
                 }
