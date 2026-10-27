@@ -395,6 +395,20 @@ hashes. Sixty randomly corrupted files produced no panic. Not covered by any tes
 sign bias (libvpx through PyAV never produced them) and keyframe size changes in mid-stream. Speed has not been tuned; the decoder
 does not use more than one thread. VP8 has no encoder here; VP8 can be copied into WebM or Matroska.
 
+## VP9
+
+VP9 video is decoded in software (`ironav-codec/src/vp9`, a port of FFmpeg's `vp9*.c` files; the tables are generated from FFmpeg's sources).
+Profiles 0 to 3 are parsed; output is 8-bit `yuv420p`, `yuv422p` or `yuv444p` (and the 10-bit forms), cropped to the coded size. It covers key, inter and
+intra-only frames, all block sizes and transforms (including the lossless Walsh-Hadamard mode), compound prediction, switchable interpolation filters,
+segmentation, loop-filter deltas, tiles, superframes with hidden frames and "show existing frame", and backward probability adaptation.
+Reference frames of a different size than the frame being decoded (spatial resampling) are refused with an error, as is 12-bit and 4:4:0.
+
+Checked bit for bit against FFmpeg's decoder (through PyAV) on libvpx output: about 30 clips (key frames at several quantisers, 10 to 20 frame inter
+sequences with alt-ref and compound prediction, odd sizes down to 33x17, 640x360, noise, segmentation modes 1 to 3, error-resilient and frame-parallel streams,
+tile columns and rows, 4:2:2, 4:4:4, lossless) all match on every frame, and six small clips are kept as the `vp9_streams_decode_to_what_ffmpeg_decodes` test.
+**Not tested against any stream:** 10-bit output (the libvpx build used here cannot encode it), intra-only frames, and corrupted-stream robustness beyond what is noted in the
+changelog. Speed has not been tuned; the decoder uses one thread. VP9 has no encoder here.
+
 ## JPEG
 
 Baseline, extended-sequential and progressive 8-bit Huffman JPEG (`.jpg`, `.jpeg`, codec `mjpeg`) is decoded and encoded in software. Decoding handles grey, 4:2:0, 4:2:2 and 4:4:4, restart intervals and non-interleaved scans. Arithmetic-coded, 12-bit and lossless files are refused with a clear error, as are progressive pictures over 67 megapixels (all their coefficients are held in memory). The encoder writes baseline JFIF with the standard tables at quality 90; `--qp N` (0-51, as for the other video codecs) sets the quality to 100 minus twice N, so `--qp 5` is 90 and `--qp 23` is 54.

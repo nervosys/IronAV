@@ -7,6 +7,7 @@ pub mod aac;
 pub mod flac;
 pub mod h264;
 pub mod hevc;
+pub mod vp9;
 pub mod jpeg;
 mod filters;
 pub mod mp3;
@@ -68,6 +69,9 @@ pub fn implemented() -> Vec<CodecImpl> {
             if c == CodecId::Vp8 {
                 return Some(CodecImpl { codec: c, decode: true, encode: false, implementation: "ironav-vp8" });
             }
+            if c == CodecId::Vp9 {
+                return Some(CodecImpl { codec: c, decode: true, encode: false, implementation: "ironav-vp9" });
+            }
             let implementation = if c.sample_format().is_some() {
                 "ironav-pcm"
             } else if c == CodecId::RawVideo {
@@ -119,6 +123,7 @@ pub fn new_decoder_for(s: &ironav_core::StreamInfo) -> Result<Box<dyn Decoder>> 
         CodecId::Vp8 => Ok(Box::new(vp8::Vp8Decoder::new())),
         CodecId::H264 => Ok(Box::new(h264::H264Decoder::new())),
         CodecId::Hevc => Ok(Box::new(hevc::HevcDecoder::new())),
+        CodecId::Vp9 => Ok(Box::new(vp9::Vp9Decoder::new())),
         CodecId::Mjpeg => Ok(Box::new(jpeg::JpegDecoder::new())),
         _ => new_decoder(s.codec, &s.params, s.bits),
     }

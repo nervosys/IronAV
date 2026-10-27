@@ -1587,6 +1587,25 @@ fn hevc_streams_decode_to_what_ffmpeg_decodes() {
     }
 }
 
+/// VP9 streams from libvpx (key and inter frames with compound prediction, segmentation, tiles,
+/// 4:4:4, lossless, odd sizes) are bit-exact with FFmpeg's decoder.
+#[test]
+fn vp9_streams_decode_to_what_ffmpeg_decodes() {
+    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    for name in ["p", "aq", "tiles", "c444", "lossless", "odd"] {
+        let dir = scratch(&format!("vp9-{name}"));
+        let out = dir.join("out.y4m");
+        let mut j = job(&data.join(format!("vp9_{name}.webm")), &out);
+        j.hwaccel = "off".into();
+        j.video.codec = Some("rawvideo".into());
+        run(&j, &mut |_| {}).unwrap();
+        let got: Vec<u8> = y4m_frames_any(&out).concat();
+        let want = std::fs::read(data.join(format!("vp9_{name}.ffmpeg.yuv"))).unwrap();
+        assert_eq!(got.len(), want.len(), "{name}: size");
+        assert!(got == want, "{name}: pixels differ from FFmpeg's");
+    }
+}
+
 // ---- JPEG ------------------------------------------------------------------------------
 
 /// Raw planes of the first frame of a y4m file.

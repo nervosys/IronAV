@@ -583,7 +583,47 @@ fn audio_frame_len(t: &MkTrack, codec: CodecId) -> Option<u32> {
     }
 }
 
-fn build_track(t: &MkTrack, index: usize, frames: &[&Frame], scale: u64, samples: &mut Vec<Sample>) -> Result<Option<TrackInfo>> {
+/// Bit depth and chroma format (1 = 4:2:0, 2 = 4:2:2, 3 = 4:4:4) from the header of a VP9 key frame.
+fn vp9_format(d: &[u8]) -> Option<(u8, u8)> {
+    let mut bits = 0usize;
+    let mut rd = |n: usize| -> Option<u32> {
+        let mut v = 0;
+        for _ in 0..n {
+            let byte = *d.get(bits / 8)?;
+            v = v << 1 | u32::from(byte >> (7 - bits % 8) & 1);
+            bits += 1;
+        }
+        Some(v)
+    };
+    if rd(2)? != 2 {
+        return None;
+    }
+    let lo = rd(1)?;
+    let profile = lo | rd(1)? << 1;
+    if profile == 3 {
+        rd(1)?;
+    }
+    if rd(1)? == 1 || rd(1)? != 0 {
+        return None; // show_existing_frame, or not a key frame
+    }
+    rd(2)?; // show_frame, error_resilient_mode
+    if rd(24)? != 0x498342 {
+        return None;
+    }
+    let depth = if profile >= 2 { if rd(1)? == 1 { 12 } else { 10 } } else { 8 };
+    let cs = rd(3)?;
+    if cs == 7 {
+        return Some((depth, 3)); // RGB is 4:4:4
+    }
+    rd(1)?; // color_range
+    if profile & 1 == 0 {
+        return Some((depth, 1));
+    }
+    let (ssx, ssy) = (rd(1)?, rd(1)?);
+    Some((depth, match (ssx, ssy) { (1, 1) => 1, (1, 0) => 2, (0, 0) => 3, _ => return None }))
+}
+
+fn build_track(t: &MkTrack, index: usize, frames: &[&Frame], scale: u64, samples: &mut Vec<Sample>, vp9: Option<(u8, u8)>) -> Result<Option<TrackInfo>> {
     let video = match t.kind {
         1 => true,
         2 => false,
@@ -607,6 +647,10 @@ fn build_track(t: &MkTrack, index: usize, frames: &[&Frame], scale: u64, samples
         config = match codec {
             CodecId::H264 => parse_avcc(&t.private)?,
             CodecId::Hevc => parse_hvcc(&t.private)?,
+            CodecId::Vp9 => {
+                let (bits, chroma) = vp9.unwrap_or((8, 1));
+                Config { prefix: Vec::new(), nal_length: 0, bits, chroma }
+            }
             _ => Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma: 1 },
         };
         convert = matches!(codec, CodecId::H264 | CodecId::Hevc);
@@ -712,7 +756,16 @@ pub fn open<R: Read + Seek + Send>(mut r: R) -> Result<Mp4Demuxer<BufReader<R>>>
     let mut samples = Vec::new();
     for t in &mk {
         let frames: Vec<&Frame> = scan.frames.iter().filter(|f| f.track == t.number).collect();
-        if let Some(info) = build_track(t, tracks.len(), &frames, scan.scale, &mut samples)? {
+        let mut vp9 = None;
+        if video_codec(&t.codec) == Some(CodecId::Vp9) {
+            if let Some(f) = frames.iter().find(|f| f.key) {
+                let mut head = vec![0u8; (f.size as usize).min(16)];
+                if scan.r.seek(SeekFrom::Start(f.offset)).is_ok() && scan.r.read_exact(&mut head).is_ok() {
+                    vp9 = vp9_format(&head);
+                }
+            }
+        }
+        if let Some(info) = build_track(t, tracks.len(), &frames, scan.scale, &mut samples, vp9)? {
             tracks.push(info);
         }
     }
