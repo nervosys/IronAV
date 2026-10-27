@@ -1508,6 +1508,25 @@ fn h264_intra_decodes_to_what_ffmpeg_decodes() {
     }
 }
 
+/// CAVLC P slices (every partition size, several reference frames, weighted prediction, slices,
+/// the 8x8 transform, odd sizes) are bit-exact with FFmpeg's decoder.
+#[test]
+fn h264_p_slices_decode_to_what_ffmpeg_decodes() {
+    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    for name in ["p_ref4", "p_parts", "p_8x8dct", "p_weight2", "p_slices", "p_odd", "p_dbp"] {
+        let dir = scratch(&format!("h264-{name}"));
+        let out = dir.join("out.y4m");
+        let mut j = job(&data.join(format!("h264_{name}.mp4")), &out);
+        j.hwaccel = "off".into();
+        j.video.codec = Some("rawvideo".into());
+        run(&j, &mut |_| {}).unwrap();
+        let got: Vec<u8> = y4m_frames_any(&out).concat();
+        let want = std::fs::read(data.join(format!("h264_{name}.ffmpeg.yuv"))).unwrap();
+        assert_eq!(got.len(), want.len(), "{name}: size");
+        assert!(got == want, "{name}: pixels differ from FFmpeg's");
+    }
+}
+
 // ---- JPEG ------------------------------------------------------------------------------
 
 /// Raw planes of the first frame of a y4m file.

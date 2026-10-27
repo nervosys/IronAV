@@ -1,6 +1,6 @@
 //! The in-loop deblocking filter (ITU-T H.264 8.7).
 
-use super::mb::{chroma_qp, MbInfo, Picture};
+use super::mb::{chroma_qp, Kind, MbInfo, Picture};
 use super::tables::{ALPHA, BETA, TC0};
 
 fn clip1(v: i32) -> u8 {
@@ -77,11 +77,70 @@ fn filter_edge(pl: &mut [u8], pos: usize, xs: usize, ys: usize, lines: usize, bs
     }
 }
 
-/// Boundary strength of each 4-sample segment along an edge.
-fn strength(cur: &MbInfo, other: &MbInfo, mb_edge: bool) -> [u8; 4] {
-    // intra-only pictures: every edge touches an intra macroblock
-    let _ = (cur, other);
-    [if mb_edge { 4 } else { 3 }; 4]
+/// Whether the transform block holding 4x4 block (bx, by) has non-zero coefficients.
+fn coded(m: &MbInfo, bx: usize, by: usize) -> bool {
+    if m.t8x8 {
+        let (x0, y0) = (bx & 2, by & 2);
+        (0..2).any(|dy| (0..2).any(|dx| m.nnz[(y0 + dy) * 4 + x0 + dx] > 0))
+    } else {
+        m.nnz[by * 4 + bx] > 0
+    }
+}
+
+fn far(a: [i16; 2], b: [i16; 2]) -> bool {
+    (a[0] as i32 - b[0] as i32).abs() >= 4 || (a[1] as i32 - b[1] as i32).abs() >= 4
+}
+
+/// Different reference pictures, a different number of vectors or vectors a whole sample apart.
+fn motion_differs(p: &MbInfo, pb: (usize, usize), q: &MbInfo, qb: (usize, usize)) -> bool {
+    let (pi, qi) = (pb.1 * 4 + pb.0, qb.1 * 4 + qb.0);
+    let (p8, q8) = ((pb.1 >> 1) * 2 + (pb.0 >> 1), (qb.1 >> 1) * 2 + (qb.0 >> 1));
+    let pr = [p.ref_id[0][p8], p.ref_id[1][p8]];
+    let qr = [q.ref_id[0][q8], q.ref_id[1][q8]];
+    let pm = [p.mv[0][pi], p.mv[1][pi]];
+    let qm = [q.mv[0][qi], q.mv[1][qi]];
+    let np = pr.iter().filter(|&&r| r >= 0).count();
+    let nq = qr.iter().filter(|&&r| r >= 0).count();
+    if np != nq {
+        return true;
+    }
+    if np == 1 {
+        let (lp, lq) = (if pr[0] >= 0 { 0 } else { 1 }, if qr[0] >= 0 { 0 } else { 1 });
+        return pr[lp] != qr[lq] || far(pm[lp], qm[lq]);
+    }
+    if !((pr[0] == qr[0] && pr[1] == qr[1]) || (pr[0] == qr[1] && pr[1] == qr[0])) {
+        return true;
+    }
+    if pr[0] != pr[1] {
+        if pr[0] == qr[0] {
+            far(pm[0], qm[0]) || far(pm[1], qm[1])
+        } else {
+            far(pm[0], qm[1]) || far(pm[1], qm[0])
+        }
+    } else {
+        (far(pm[0], qm[0]) || far(pm[1], qm[1])) && (far(pm[0], qm[1]) || far(pm[1], qm[0]))
+    }
+}
+
+/// Boundary strength of each 4-sample segment along edge `e` of the macroblock `m`; `other` is the
+/// macroblock on the far side of a macroblock edge (and `m` itself for inner edges).
+fn strength(m: &MbInfo, other: &MbInfo, dir: usize, e: usize) -> [u8; 4] {
+    let mb_edge = e == 0;
+    if m.kind != Kind::Inter || other.kind != Kind::Inter {
+        return [if mb_edge { 4 } else { 3 }; 4];
+    }
+    let mut out = [0u8; 4];
+    for (i, o) in out.iter_mut().enumerate() {
+        let (q, p) = if dir == 0 { ((e, i), if mb_edge { (3, i) } else { (e - 1, i) }) } else { ((i, e), if mb_edge { (i, 3) } else { (i, e - 1) }) };
+        *o = if coded(m, q.0, q.1) || coded(other, p.0, p.1) {
+            2
+        } else if motion_differs(other, p, m, q) {
+            1
+        } else {
+            0
+        };
+    }
+    out
 }
 
 pub fn deblock_picture(pic: &mut Picture) {
@@ -122,7 +181,7 @@ pub fn deblock_picture(pic: &mut Picture) {
                     } else {
                         &m
                     };
-                    let bs = strength(&m, other, e == 0);
+                    let bs = strength(&m, other, dir, e);
                     let qpav = (other.qp as i32 + m.qp as i32 + 1) >> 1;
                     let ia = (qpav + sp.alpha_offset).clamp(0, 51) as usize;
                     let ib = (qpav + sp.beta_offset).clamp(0, 51) as usize;
@@ -152,7 +211,7 @@ pub fn deblock_picture(pic: &mut Picture) {
                         } else {
                             &m
                         };
-                        let bs = strength(&m, other, e == 0);
+                        let bs = strength(&m, other, dir, e);
                         let qpav = (chroma_qp(other.qp as i32, off) + chroma_qp(m.qp as i32, off) + 1) >> 1;
                         let ia = (qpav + sp.alpha_offset).clamp(0, 51) as usize;
                         let ib = (qpav + sp.beta_offset).clamp(0, 51) as usize;

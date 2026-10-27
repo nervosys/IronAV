@@ -1,27 +1,34 @@
 //! A software H.264 decoder (ITU-T H.264 / ISO 14496-10) for 8-bit 4:2:0 progressive video.
 //!
 //! Intra pictures (I slices, CAVLC and CABAC, 4x4 / 8x8 / 16x16 prediction, I_PCM, 8x8 transform,
-//! scaling matrices, multiple slices, the loop filter) are decoded; inter prediction is not here yet.
+//! scaling matrices, multiple slices, the loop filter) and CAVLC P slices (all partition sizes,
+//! P_Skip, multiple reference frames, explicit weighted prediction) are decoded, with reference
+//! picture marking and output reordering. B slices and CABAC P slices are not here yet.
 
 mod bits;
 mod cabac;
 mod cavlc;
 mod deblock;
+mod dpb;
 mod idct;
+mod inter;
 mod intra;
 mod mb;
 mod ps;
 mod tables;
 
 use bits::{split_annexb, unescape};
+use dpb::{DecodedPic, Dpb, Pending, RefList};
 use ironav_core::{Decoder, Error, ErrorCode, Frame, Packet, PixelFormat, Result, VideoFrame};
 use mb::{LevelScale, Picture, SliceDec, SliceParams};
-use ps::{parse_pps, parse_slice_header, parse_sps, Pps, SliceHeader, Sps};
+use ps::{parse_pps, parse_slice_header, parse_sps, Pps, SliceHeader, SliceType, Sps};
+use std::sync::Arc;
 
 pub struct H264Decoder {
     sps: Vec<Option<Sps>>,
     pps: Vec<Option<Pps>>,
     cur: Option<Current>,
+    dpb: Dpb,
     out: Vec<Frame>,
 }
 
@@ -30,6 +37,7 @@ struct Current {
     sps_id: usize,
     hdr: SliceHeader,
     pts: i64,
+    poc: i32,
     mbs_done: usize,
 }
 
@@ -39,7 +47,7 @@ fn unsupported(msg: &str) -> Error {
 
 impl H264Decoder {
     pub fn new() -> Self {
-        H264Decoder { sps: vec![None; 32], pps: vec![None; 256], cur: None, out: Vec::new() }
+        H264Decoder { sps: vec![None; 32], pps: vec![None; 256], cur: None, dpb: Dpb::default(), out: Vec::new() }
     }
 
     /// Whether a slice starts a new picture (7.4.1.2.4, for frame pictures).
@@ -54,30 +62,47 @@ impl H264Decoder {
             || prev.delta_poc != h.delta_poc
     }
 
+    fn emit(&mut self, p: Pending) {
+        let pic = &p.pic;
+        let [cl, cr, ct, cb] = pic.crop;
+        let (w, h) = (pic.mb_w * 16 - cl - cr, pic.mb_h * 16 - ct - cb);
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        let mut planes = Vec::with_capacity(3);
+        let ys = pic.mb_w * 16;
+        let mut y = Vec::with_capacity(w * h);
+        for r in 0..h {
+            y.extend_from_slice(&pic.planes[0][(ct + r) * ys + cl..(ct + r) * ys + cl + w]);
+        }
+        planes.push(y);
+        let cs = pic.mb_w * 8;
+        for pl in 1..3 {
+            let mut v = Vec::with_capacity(cw * ch);
+            for r in 0..ch {
+                let o = (ct / 2 + r) * cs + cl / 2;
+                v.extend_from_slice(&pic.planes[pl][o..o + cw]);
+            }
+            planes.push(v);
+        }
+        self.out.push(Frame::Video(VideoFrame { width: w as u32, height: h as u32, pix_fmt: PixelFormat::Yuv420p, pts: p.pts, planes }));
+    }
+
     fn finish_picture(&mut self) {
         let Some(mut c) = self.cur.take() else { return };
         deblock::deblock_picture(&mut c.pic);
         let sps = self.sps[c.sps_id].as_ref().expect("the sequence parameter set outlives its picture");
-        let [cl, cr, ct, cb] = sps.crop;
-        let (w, h) = (sps.mb_width * 16 - cl - cr, sps.mb_height * 16 - ct - cb);
-        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-        let mut planes = Vec::with_capacity(3);
-        let ys = c.pic.mb_w * 16;
-        let mut y = Vec::with_capacity(w * h);
-        for r in 0..h {
-            y.extend_from_slice(&c.pic.planes[0][(ct + r) * ys + cl..(ct + r) * ys + cl + w]);
+        let id = self.dpb.new_id();
+        let pic = Arc::new(DecodedPic {
+            planes: std::mem::take(&mut c.pic.planes),
+            mb_w: c.pic.mb_w,
+            mb_h: c.pic.mb_h,
+            mbs: std::mem::take(&mut c.pic.mbs),
+            poc: c.poc,
+            id,
+            crop: sps.crop,
+        });
+        for p in self.dpb.finish(sps, &c.hdr, pic, c.pts) {
+            self.emit(p);
         }
-        planes.push(y);
-        let cs = c.pic.mb_w * 8;
-        for p in 1..3 {
-            let mut v = Vec::with_capacity(cw * ch);
-            for r in 0..ch {
-                let o = (ct / 2 + r) * cs + cl / 2;
-                v.extend_from_slice(&c.pic.planes[p][o..o + cw]);
-            }
-            planes.push(v);
-        }
-        self.out.push(Frame::Video(VideoFrame { width: w as u32, height: h as u32, pix_fmt: PixelFormat::Yuv420p, pts: c.pts, planes }));
     }
 
     fn slice(&mut self, nal_type: u8, nal_ref_idc: u32, rbsp: &[u8], pts: i64) -> Result<()> {
@@ -100,19 +125,19 @@ impl H264Decoder {
         if starts_new {
             self.finish_picture();
             let sps = self.sps[sps_id].as_ref().unwrap();
-            self.cur = Some(Current { pic: Picture::new(sps.mb_width, sps.mb_height), sps_id, hdr: hdr.clone(), pts, mbs_done: 0 });
+            let poc = self.dpb.compute_poc(sps, &hdr);
+            self.cur = Some(Current { pic: Picture::new(sps.mb_width, sps.mb_height), sps_id, hdr: hdr.clone(), pts, poc, mbs_done: 0 });
         }
         let cur = self.cur.as_mut().unwrap();
         let sps = self.sps[sps_id].as_ref().unwrap();
         let pps = self.pps[hdr.pps_id as usize].as_ref().unwrap();
+        let refs: [RefList; 2] = if hdr.slice_type == SliceType::I { [Vec::new(), Vec::new()] } else { self.dpb.ref_lists(sps, &hdr, cur.poc)? };
         let scale = LevelScale::new(pps);
         cur.pic.slices.push(SliceParams { disable_deblocking: hdr.disable_deblocking, alpha_offset: hdr.alpha_offset, beta_offset: hdr.beta_offset, chroma_qp_offset: pps.chroma_qp_offset });
         let id = cur.pic.slices.len() as u16;
-        let before = cur.pic.mbs.iter().filter(|m| m.slice != 0).count();
-        let mut dec = SliceDec::new(sps, pps, &hdr, &mut cur.pic, &scale, id, rbsp)?;
+        let mut dec = SliceDec::new(sps, pps, &hdr, &mut cur.pic, &scale, id, rbsp, &refs)?;
         let r = dec.decode();
         cur.mbs_done = cur.pic.mbs.iter().filter(|m| m.slice != 0).count();
-        let _ = before;
         cur.hdr = hdr;
         r
     }
@@ -164,6 +189,9 @@ impl Decoder for H264Decoder {
 
     fn flush(&mut self) -> Result<Vec<Frame>> {
         self.finish_picture();
+        for p in self.dpb.drain_all() {
+            self.emit(p);
+        }
         Ok(std::mem::take(&mut self.out))
     }
 }

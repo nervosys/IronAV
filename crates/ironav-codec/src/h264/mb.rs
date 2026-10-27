@@ -3,7 +3,9 @@
 use super::bits::BitReader;
 use super::cabac::Cabac;
 use super::cavlc;
+use super::dpb::RefList;
 use super::idct::{hadamard4, idct4_add, idct8_add};
+use super::inter;
 use super::intra::*;
 use super::ps::{Pps, SliceHeader, SliceType, Sps, ZIGZAG4};
 use super::tables::*;
@@ -17,6 +19,8 @@ pub enum Kind {
     I8x8,
     I16x16,
     IPcm,
+    /// Predicted from reference pictures (P and B macroblocks, skipped or not).
+    Inter,
 }
 
 /// What later macroblocks and the loop filter need to know about a decoded macroblock.
@@ -36,11 +40,32 @@ pub struct MbInfo {
     pub t8x8: bool,
     /// Intra 4x4 / 8x8 prediction modes in raster order of 4x4 blocks.
     pub ipm: [u8; 16],
+    /// Motion vectors per list, in raster order of 4x4 blocks, in quarter luma samples.
+    pub mv: [[[i16; 2]; 16]; 2],
+    /// Reference index per list and 8x8 block; -1 when the list is not used.
+    pub ref_idx: [[i8; 4]; 2],
+    /// Identity of the reference picture behind `ref_idx`; -1 when unused.
+    pub ref_id: [[i32; 4]; 2],
+    pub skip: bool,
 }
 
 impl Default for MbInfo {
     fn default() -> Self {
-        MbInfo { slice: 0, kind: Kind::None, qp: 0, nnz: [0; 24], cbf_dc: 0, cbp: 0, chroma_mode: 0, t8x8: false, ipm: [2; 16] }
+        MbInfo {
+            slice: 0,
+            kind: Kind::None,
+            qp: 0,
+            nnz: [0; 24],
+            cbf_dc: 0,
+            cbp: 0,
+            chroma_mode: 0,
+            t8x8: false,
+            ipm: [2; 16],
+            mv: [[[0; 2]; 16]; 2],
+            ref_idx: [[-1; 4]; 2],
+            ref_id: [[-1; 4]; 2],
+            skip: false,
+        }
     }
 }
 
@@ -181,6 +206,9 @@ pub struct SliceDec<'a> {
     mby: usize,
     cur: MbInfo,
     rd: Reader<'a>,
+    refs: &'a [RefList; 2],
+    /// Bit per 4x4 block (raster) of the current macroblock whose motion is already known.
+    done: u16,
 }
 
 /// z-order index of the 4x4 block at (bx, by) within a macroblock.
@@ -194,7 +222,8 @@ fn block_pos(n: usize) -> (usize, usize) {
 }
 
 impl<'a> SliceDec<'a> {
-    pub fn new(sps: &'a Sps, pps: &'a Pps, hdr: &'a SliceHeader, pic: &'a mut Picture, scale: &'a LevelScale, slice_id: u16, rbsp: &'a [u8]) -> Result<Self> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(sps: &'a Sps, pps: &'a Pps, hdr: &'a SliceHeader, pic: &'a mut Picture, scale: &'a LevelScale, slice_id: u16, rbsp: &'a [u8], refs: &'a [RefList; 2]) -> Result<Self> {
         let rd = if pps.cabac {
             // cabac_alignment_one_bit up to the next byte
             let start = hdr.data_pos.div_ceil(8);
@@ -204,31 +233,69 @@ impl<'a> SliceDec<'a> {
             r.skip(hdr.data_pos);
             Reader::Cavlc(r)
         };
-        Ok(SliceDec { sps, pps, hdr, pic, scale, slice_id, qp: hdr.qp, last_dqp: false, mbx: 0, mby: 0, cur: MbInfo::default(), rd })
+        Ok(SliceDec { sps, pps, hdr, pic, scale, slice_id, qp: hdr.qp, last_dqp: false, mbx: 0, mby: 0, cur: MbInfo::default(), rd, refs, done: 0 })
+    }
+
+    fn start_mb(&mut self, addr: usize) -> Result<()> {
+        if addr >= self.pic.mb_w * self.pic.mb_h {
+            return Err(Error::invalid_input("H.264 slice runs past the end of the picture"));
+        }
+        self.mbx = addr % self.pic.mb_w;
+        self.mby = addr / self.pic.mb_w;
+        self.cur = MbInfo { slice: self.slice_id, ..MbInfo::default() };
+        self.done = 0;
+        Ok(())
+    }
+
+    fn finish_mb(&mut self, addr: usize) {
+        self.cur.qp = if self.cur.kind == Kind::IPcm { 0 } else { self.qp as i8 };
+        self.pic.mbs[addr] = self.cur;
     }
 
     pub fn decode(&mut self) -> Result<()> {
-        if self.hdr.slice_type != SliceType::I {
-            return Err(unsupported("H.264 P and B slices are not supported yet"));
+        let inter_slice = self.hdr.slice_type != SliceType::I;
+        if inter_slice {
+            if self.hdr.slice_type == SliceType::B {
+                return Err(unsupported("H.264 B slices are not supported yet"));
+            }
+            if matches!(self.rd, Reader::Cabac(_)) {
+                return Err(unsupported("H.264 CABAC P slices are not supported yet"));
+            }
+            if self.pps.constrained_intra_pred {
+                return Err(unsupported("H.264 constrained intra prediction in P slices is not supported yet"));
+            }
         }
-        let total = self.pic.mb_w * self.pic.mb_h;
         let mut addr = self.hdr.first_mb;
         loop {
-            if addr >= total {
-                return Err(Error::invalid_input("H.264 slice runs past the end of the picture"));
+            let mut more = true;
+            if inter_slice {
+                let run = match &mut self.rd {
+                    Reader::Cavlc(r) => r.ue()?,
+                    Reader::Cabac(_) => 0,
+                };
+                for _ in 0..run {
+                    self.start_mb(addr)?;
+                    self.decode_skip()?;
+                    self.finish_mb(addr);
+                    addr += 1;
+                }
+                if run > 0 {
+                    if let Reader::Cavlc(r) = &self.rd {
+                        more = r.more_rbsp_data();
+                    }
+                }
             }
-            self.mbx = addr % self.pic.mb_w;
-            self.mby = addr / self.pic.mb_w;
-            self.cur = MbInfo { slice: self.slice_id, ..MbInfo::default() };
-            self.decode_mb()?;
-            self.cur.qp = if self.cur.kind == Kind::IPcm { 0 } else { self.qp as i8 };
-            self.pic.mbs[addr] = self.cur;
-            addr += 1;
-            let done = match &mut self.rd {
-                Reader::Cavlc(r) => !r.more_rbsp_data(),
-                Reader::Cabac(c) => c.terminate() == 1,
-            };
-            if done {
+            if more {
+                self.start_mb(addr)?;
+                self.decode_mb()?;
+                self.finish_mb(addr);
+                addr += 1;
+                more = match &mut self.rd {
+                    Reader::Cavlc(r) => r.more_rbsp_data(),
+                    Reader::Cabac(c) => c.terminate() == 0,
+                };
+            }
+            if !more {
                 break;
             }
         }
@@ -261,7 +328,13 @@ impl<'a> SliceDec<'a> {
     // ---- macroblock layer ----------------------------------------------------------------------
 
     fn decode_mb(&mut self) -> Result<()> {
-        let mb_type = self.read_mb_type()?;
+        let mut mb_type = self.read_mb_type()?;
+        if self.hdr.slice_type == SliceType::P {
+            if mb_type < 5 {
+                return self.decode_inter_mb(mb_type);
+            }
+            mb_type -= 5;
+        }
         if mb_type == 25 {
             return self.decode_pcm();
         }
@@ -497,6 +570,350 @@ impl<'a> SliceDec<'a> {
             }
         }
         Ok(())
+    }
+
+    // ---- inter macroblocks ---------------------------------------------------------------------------
+
+    /// Reference index and motion vector of the 4x4 block at (x, y) relative to the current
+    /// macroblock (in 4x4 units, possibly outside it). None when the block is not available.
+    fn nb_motion(&self, l: usize, x: i32, y: i32) -> Option<(i8, [i16; 2])> {
+        let w = self.pic.mb_w;
+        let (mbx, mby) = (self.mbx as i32, self.mby as i32);
+        let (dx, dy, bx, by) = match (x < 0, x >= 4, y < 0) {
+            (true, _, true) => (-1, -1, 3, 3),
+            (true, _, false) => (-1, 0, 3, y),
+            (_, true, true) => (1, -1, 0, 3),
+            (_, true, false) => return None,
+            (_, _, true) => (0, -1, x, 3),
+            _ => {
+                if self.done & (1 << (y * 4 + x)) == 0 {
+                    return None;
+                }
+                let b8 = ((y >> 1) * 2 + (x >> 1)) as usize;
+                return Some((self.cur.ref_idx[l][b8], self.cur.mv[l][(y * 4 + x) as usize]));
+            }
+        };
+        let (nx, ny) = (mbx + dx, mby + dy);
+        if nx < 0 || ny < 0 || nx >= w as i32 || ny >= self.pic.mb_h as i32 {
+            return None;
+        }
+        let m = &self.pic.mbs[ny as usize * w + nx as usize];
+        if m.slice != self.slice_id {
+            return None;
+        }
+        let b8 = ((by >> 1) * 2 + (bx >> 1)) as usize;
+        if m.kind != Kind::Inter {
+            return Some((-1, [0, 0]));
+        }
+        Some((m.ref_idx[l][b8], m.mv[l][(by * 4 + bx) as usize]))
+    }
+
+    /// Motion vector prediction for a partition (8.4.1.3). `dir`: 0 median, 1 = 16x8 partition,
+    /// 2 = 8x16 partition.
+    fn pred_mv(&self, l: usize, bx: i32, by: i32, w: i32, dir: u8, refi: i8) -> [i16; 2] {
+        let a = self.nb_motion(l, bx - 1, by);
+        let b = self.nb_motion(l, bx, by - 1);
+        let c = self.nb_motion(l, bx + w, by - 1).or_else(|| self.nb_motion(l, bx - 1, by - 1));
+        let r = |n: Option<(i8, [i16; 2])>| n.map(|v| v.0).unwrap_or(-1);
+        let mv = |n: Option<(i8, [i16; 2])>| n.map(|v| v.1).unwrap_or([0, 0]);
+        match dir {
+            1 => {
+                if by == 0 && r(b) == refi {
+                    return mv(b);
+                }
+                if by != 0 && r(a) == refi {
+                    return mv(a);
+                }
+            }
+            2 => {
+                if bx == 0 && r(a) == refi {
+                    return mv(a);
+                }
+                if bx != 0 && r(c) == refi {
+                    return mv(c);
+                }
+            }
+            _ => {}
+        }
+        if b.is_none() && c.is_none() && a.is_some() {
+            return mv(a);
+        }
+        let (ra, rb, rc) = (r(a) == refi, r(b) == refi, r(c) == refi);
+        match (ra as u8 + rb as u8 + rc as u8, ra, rb) {
+            (1, true, _) => mv(a),
+            (1, _, true) => mv(b),
+            (1, _, _) => mv(c),
+            _ => {
+                let (ma, mb, mc) = (mv(a), mv(b), mv(c));
+                let med = |p: i16, q: i16, s: i16| p.max(q).min(p.min(q).max(s));
+                [med(ma[0], mb[0], mc[0]), med(ma[1], mb[1], mc[1])]
+            }
+        }
+    }
+
+    fn set_motion(&mut self, l: usize, bx: usize, by: usize, w: usize, h: usize, mv: [i16; 2]) {
+        for y in by..by + h {
+            for x in bx..bx + w {
+                self.cur.mv[l][y * 4 + x] = mv;
+                self.done |= 1 << (y * 4 + x);
+            }
+        }
+    }
+
+    fn set_ref(&mut self, l: usize, bx: usize, by: usize, w: usize, h: usize, r: i8) {
+        for y in (by..by + h).step_by(2) {
+            for x in (bx..bx + w).step_by(2) {
+                self.cur.ref_idx[l][(y >> 1) * 2 + (x >> 1)] = r;
+            }
+        }
+    }
+
+    /// Resolves each 8x8 block's reference index to the identity of its picture.
+    fn resolve_refs(&mut self) -> Result<()> {
+        for l in 0..2 {
+            for b8 in 0..4 {
+                let r = self.cur.ref_idx[l][b8];
+                if r < 0 {
+                    continue;
+                }
+                match self.refs[l].get(r as usize) {
+                    Some(Some(e)) => self.cur.ref_id[l][b8] = e.pic.id,
+                    _ => return Err(Error::invalid_input("H.264 macroblock refers to a reference picture that is not available")),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn decode_skip(&mut self) -> Result<()> {
+        self.cur.kind = Kind::Inter;
+        self.cur.skip = true;
+        self.last_dqp = false;
+        // P_Skip motion (8.4.1.1)
+        let a = self.nb_motion(0, -1, 0);
+        let b = self.nb_motion(0, 0, -1);
+        let still = |n: Option<(i8, [i16; 2])>| n.is_some_and(|v| v.0 == 0 && v.1 == [0, 0]);
+        let mv = if a.is_none() || b.is_none() || still(a) || still(b) { [0, 0] } else { self.pred_mv(0, 0, 0, 4, 0, 0) };
+        self.set_ref(0, 0, 0, 4, 4, 0);
+        self.set_motion(0, 0, 0, 4, 4, mv);
+        self.resolve_refs()?;
+        self.mc_mb()
+    }
+
+    fn read_ref_idx(&mut self, max: u32) -> Result<i8> {
+        if max == 0 {
+            return Ok(0);
+        }
+        let Reader::Cavlc(r) = &mut self.rd else { unreachable!() };
+        let v = r.te(max)?;
+        if v > max {
+            return Err(Error::invalid_input("H.264 reference index is out of range"));
+        }
+        Ok(v as i8)
+    }
+
+    fn read_mvd(&mut self) -> Result<[i32; 2]> {
+        let Reader::Cavlc(r) = &mut self.rd else { unreachable!() };
+        Ok([r.se()?, r.se()?])
+    }
+
+    fn read_partition_mv(&mut self, bx: usize, by: usize, w: usize, h: usize, dir: u8) -> Result<()> {
+        let refi = self.cur.ref_idx[0][(by >> 1) * 2 + (bx >> 1)];
+        let p = self.pred_mv(0, bx as i32, by as i32, w as i32, dir, refi);
+        let d = self.read_mvd()?;
+        let mv = [(p[0] as i32 + d[0]) as i16, (p[1] as i32 + d[1]) as i16];
+        self.set_motion(0, bx, by, w, h, mv);
+        Ok(())
+    }
+
+    fn decode_inter_mb(&mut self, t: u32) -> Result<()> {
+        self.cur.kind = Kind::Inter;
+        let max_ref = self.hdr.num_ref_idx_active[0].saturating_sub(1);
+        let mut all_8x8 = true;
+        match t {
+            0 => {
+                let r = self.read_ref_idx(max_ref)?;
+                self.set_ref(0, 0, 0, 4, 4, r);
+                self.read_partition_mv(0, 0, 4, 4, 0)?;
+            }
+            1 => {
+                let r0 = self.read_ref_idx(max_ref)?;
+                let r1 = self.read_ref_idx(max_ref)?;
+                self.set_ref(0, 0, 0, 4, 2, r0);
+                self.set_ref(0, 0, 2, 4, 2, r1);
+                self.read_partition_mv(0, 0, 4, 2, 1)?;
+                self.read_partition_mv(0, 2, 4, 2, 1)?;
+            }
+            2 => {
+                let r0 = self.read_ref_idx(max_ref)?;
+                let r1 = self.read_ref_idx(max_ref)?;
+                self.set_ref(0, 0, 0, 2, 4, r0);
+                self.set_ref(0, 2, 0, 2, 4, r1);
+                self.read_partition_mv(0, 0, 2, 4, 2)?;
+                self.read_partition_mv(2, 0, 2, 4, 2)?;
+            }
+            _ => {
+                let mut sub = [0u32; 4];
+                for s in sub.iter_mut() {
+                    let Reader::Cavlc(r) = &mut self.rd else { unreachable!() };
+                    *s = r.ue()?;
+                    if *s > 3 {
+                        return Err(Error::invalid_input("H.264 sub-macroblock type is out of range"));
+                    }
+                    if *s != 0 {
+                        all_8x8 = false;
+                    }
+                }
+                for i in 0..4usize {
+                    let r = if t == 4 { 0 } else { self.read_ref_idx(max_ref)? };
+                    self.set_ref(0, (i & 1) * 2, (i >> 1) * 2, 2, 2, r);
+                }
+                for (i, &s) in sub.iter().enumerate() {
+                    let (x0, y0) = ((i & 1) * 2, (i >> 1) * 2);
+                    match s {
+                        0 => self.read_partition_mv(x0, y0, 2, 2, 0)?,
+                        1 => {
+                            self.read_partition_mv(x0, y0, 2, 1, 0)?;
+                            self.read_partition_mv(x0, y0 + 1, 2, 1, 0)?;
+                        }
+                        2 => {
+                            self.read_partition_mv(x0, y0, 1, 2, 0)?;
+                            self.read_partition_mv(x0 + 1, y0, 1, 2, 0)?;
+                        }
+                        _ => {
+                            for j in 0..4 {
+                                self.read_partition_mv(x0 + (j & 1), y0 + (j >> 1), 1, 1, 0)?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.resolve_refs()?;
+        let k = match &mut self.rd {
+            Reader::Cavlc(r) => r.ue()?,
+            Reader::Cabac(_) => unreachable!(),
+        };
+        if k > 47 {
+            return Err(Error::invalid_input("H.264 coded_block_pattern code is out of range"));
+        }
+        let cbp = GOLOMB_TO_INTER_CBP[k as usize] as u32;
+        self.cur.cbp = cbp as u8;
+        if cbp & 15 != 0 && self.pps.transform_8x8 && all_8x8 {
+            self.cur.t8x8 = self.read_t8x8_flag()?;
+        }
+        let mut res = Res::new();
+        if cbp > 0 {
+            let dqp = self.read_qp_delta()?;
+            self.qp = (self.qp + dqp + 52).rem_euclid(52);
+            self.last_dqp = dqp != 0;
+            self.read_residual(&mut res, cbp, false)?;
+        } else {
+            self.last_dqp = false;
+        }
+        self.mc_mb()?;
+        self.add_inter_residual(&res)?;
+        Ok(())
+    }
+
+    /// Motion-compensated prediction of the whole macroblock, written into the picture.
+    fn mc_mb(&mut self) -> Result<()> {
+        let uniform = |this: &Self, bx: usize, by: usize, n: usize| {
+            let first = this.cur.mv[0][by * 4 + bx];
+            (0..n).all(|dy| (0..n).all(|dx| this.cur.mv[0][(by + dy) * 4 + bx + dx] == first))
+        };
+        let same_ref = self.cur.ref_idx[0].iter().all(|&r| r == self.cur.ref_idx[0][0]);
+        if same_ref && uniform(self, 0, 0, 4) {
+            return self.mc_block(0, 0, 4, 4);
+        }
+        for i in 0..4usize {
+            let (bx, by) = ((i & 1) * 2, (i >> 1) * 2);
+            if uniform(self, bx, by, 2) {
+                self.mc_block(bx, by, 2, 2)?;
+            } else {
+                for j in 0..4usize {
+                    self.mc_block(bx + (j & 1), by + (j >> 1), 1, 1)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Predicts a block of `w` x `h` 4x4 units at (bx, by) from list 0.
+    fn mc_block(&mut self, bx: usize, by: usize, w: usize, h: usize) -> Result<()> {
+        let b8 = (by >> 1) * 2 + (bx >> 1);
+        let r = self.cur.ref_idx[0][b8];
+        let entry = match self.refs[0].get(r.max(0) as usize) {
+            Some(Some(e)) if r >= 0 => e.pic.clone(),
+            _ => return Err(Error::invalid_input("H.264 macroblock refers to a reference picture that is not available")),
+        };
+        let mv = self.cur.mv[0][by * 4 + bx];
+        let (pw, ph) = (self.pic.mb_w * 16, self.pic.mb_h * 16);
+        let (x, y) = ((self.mbx * 16 + bx * 4) as i32, (self.mby * 16 + by * 4) as i32);
+        let (bw, bh) = (w * 4, h * 4);
+        let wt = self.hdr.weights.as_ref().map(|wt| (wt, wt.entries[0].get(r as usize).copied()));
+        let mut out = [0u8; 256];
+        inter::luma_mc(&entry.planes[0], pw, ph, x, y, mv[0] as i32, mv[1] as i32, bw, bh, &mut out);
+        if let Some((wt, Some(e))) = wt {
+            inter::weight_uni(&mut out[..bw * bh], wt.luma_log2_denom, e[0], e[1]);
+        }
+        for row in 0..bh {
+            let o = (y as usize + row) * pw + x as usize;
+            self.pic.planes[0][o..o + bw].copy_from_slice(&out[row * bw..row * bw + bw]);
+        }
+        let (cw, ch) = (bw / 2, bh / 2);
+        let (cpw, cph) = (pw / 2, ph / 2);
+        for c in 0..2usize {
+            let mut co = [0u8; 64];
+            inter::chroma_mc(&entry.planes[1 + c], cpw, cph, x / 2, y / 2, mv[0] as i32, mv[1] as i32, cw, ch, &mut co);
+            if let Some((wt, Some(e))) = wt {
+                inter::weight_uni(&mut co[..cw * ch], wt.chroma_log2_denom, e[2 + 2 * c], e[3 + 2 * c]);
+            }
+            for row in 0..ch {
+                let o = (y as usize / 2 + row) * cpw + x as usize / 2;
+                self.pic.planes[1 + c][o..o + cw].copy_from_slice(&co[row * cw..row * cw + cw]);
+            }
+        }
+        Ok(())
+    }
+
+    /// Adds the decoded residual of an inter macroblock to its prediction.
+    fn add_inter_residual(&mut self, res: &Res) -> Result<()> {
+        let qp = self.qp;
+        let ls = self.luma_stride();
+        let (x0, y0) = (self.mbx * 16, self.mby * 16);
+        let cbp = self.cur.cbp as u32;
+        if self.cur.t8x8 {
+            for i8 in 0..4usize {
+                if cbp & (1 << i8) == 0 {
+                    continue;
+                }
+                let mut c = [0i32; 64];
+                let lsv = &self.scale.l8[1][(qp % 6) as usize];
+                for k in 0..64 {
+                    let v = res.luma[i8 * 64 + k];
+                    if v != 0 {
+                        c[k] = if qp >= 36 { v.wrapping_mul(lsv[k]) << (qp / 6 - 6) } else { (v.wrapping_mul(lsv[k]) + (1 << (5 - qp / 6))) >> (6 - qp / 6) };
+                    }
+                }
+                if c.iter().any(|&v| v != 0) {
+                    let (x, y) = (x0 + (i8 & 1) * 8, y0 + (i8 >> 1) * 8);
+                    idct8_add(&c, &mut self.pic.planes[0][y * ls + x..], ls);
+                }
+            }
+        } else {
+            for b in 0..16usize {
+                if cbp & (1 << ((b / 8) * 2 + (b % 4) / 2)) == 0 {
+                    continue;
+                }
+                let c = self.scale4(&res.luma[b * 16..b * 16 + 16], 3, qp, false);
+                if c.iter().any(|&v| v != 0) {
+                    let (bx, by) = (b % 4, b / 4);
+                    idct4_add(&c, &mut self.pic.planes[0][(y0 + by * 4) * ls + x0 + bx * 4..], ls);
+                }
+            }
+        }
+        self.reconstruct_chroma(res)
     }
 
     // ---- prediction modes ------------------------------------------------------------------------
@@ -962,7 +1379,8 @@ impl<'a> SliceDec<'a> {
         let (mbx, mby) = (self.mbx, self.mby);
         let (la, ta, tla) = (self.avail_left(), self.avail_top(), self.avail_topleft());
         let mode = self.cur.chroma_mode;
-        if (mode == 1 && !la) || (mode == 2 && !ta) || (mode == 3 && !(la && ta && tla)) {
+        let inter = self.cur.kind == Kind::Inter;
+        if !inter && ((mode == 1 && !la) || (mode == 2 && !ta) || (mode == 3 && !(la && ta && tla))) {
             return Err(Error::invalid_input("H.264 chroma prediction uses neighbours that are not available"));
         }
         let cs = self.pic.mb_w * 8;
@@ -970,24 +1388,27 @@ impl<'a> SliceDec<'a> {
         let chroma_cbp = self.cur.cbp >> 4;
         for comp in 0..2usize {
             let plane = 1 + comp;
-            let mut top = [0i32; 8];
-            let mut left = [0i32; 8];
-            if ta {
-                for (i, t) in top.iter_mut().enumerate() {
-                    *t = self.pix(plane, x0 + i, y0 - 1);
+            if !inter {
+                let mut top = [0i32; 8];
+                let mut left = [0i32; 8];
+                if ta {
+                    for (i, t) in top.iter_mut().enumerate() {
+                        *t = self.pix(plane, x0 + i, y0 - 1);
+                    }
+                }
+                if la {
+                    for (j, l) in left.iter_mut().enumerate() {
+                        *l = self.pix(plane, x0 - 1, y0 + j);
+                    }
+                }
+                let tl = if tla { self.pix(plane, x0 - 1, y0 - 1) } else { 0 };
+                let mut pred = [0u8; 64];
+                predict_chroma(mode, &top, &left, tl, ta, la, &mut pred);
+                for y in 0..8 {
+                    self.pic.planes[plane][(y0 + y) * cs + x0..(y0 + y) * cs + x0 + 8].copy_from_slice(&pred[y * 8..y * 8 + 8]);
                 }
             }
-            if la {
-                for (j, l) in left.iter_mut().enumerate() {
-                    *l = self.pix(plane, x0 - 1, y0 + j);
-                }
-            }
-            let tl = if tla { self.pix(plane, x0 - 1, y0 - 1) } else { 0 };
-            let mut pred = [0u8; 64];
-            predict_chroma(mode, &top, &left, tl, ta, la, &mut pred);
-            for y in 0..8 {
-                self.pic.planes[plane][(y0 + y) * cs + x0..(y0 + y) * cs + x0 + 8].copy_from_slice(&pred[y * 8..y * 8 + 8]);
-            }
+            let list = if inter { 4 + comp } else { 1 + comp };
             if chroma_cbp == 0 {
                 continue;
             }
@@ -995,13 +1416,13 @@ impl<'a> SliceDec<'a> {
             // DC: 2x2 transform, then scale
             let c = &res.cdc[comp];
             let f = [c[0] + c[1] + c[2] + c[3], c[0] - c[1] + c[2] - c[3], c[0] + c[1] - c[2] - c[3], c[0] - c[1] - c[2] + c[3]];
-            let lsd = self.scale.l4[1 + comp][(qpc % 6) as usize][0];
+            let lsd = self.scale.l4[list][(qpc % 6) as usize][0];
             let mut dc = [0i32; 4];
             for k in 0..4 {
                 dc[k] = (f[k].wrapping_mul(lsd) << (qpc / 6)) >> 5;
             }
             for blk in 0..4usize {
-                let mut cf = self.scale4(&res.cac[comp * 4 + blk], 1 + comp, qpc, true);
+                let mut cf = self.scale4(&res.cac[comp * 4 + blk], list, qpc, true);
                 cf[0] = dc[blk];
                 if cf.iter().any(|&v| v != 0) {
                     let (bx, by) = (blk & 1, blk >> 1);
