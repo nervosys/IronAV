@@ -77,11 +77,11 @@ pub static FORMATS: &[FormatSpec] = &[
     FormatSpec {
         name: "mkv",
         extensions: &["mkv", "mka"],
-        description: "Matroska: read (also WebM, with any codec the file holds) and written with H.264 or HEVC video and AAC, FLAC, MP3, Opus or Vorbis audio copied or encoded; one stream of each kind; no SeekHead",
+        description: "Matroska: read (also WebM, with any codec the file holds) and written with H.264, HEVC or VP8 video (copied) and AAC, FLAC, MP3, Opus or Vorbis audio copied or encoded; one stream of each kind; no SeekHead",
         media: MediaType::Video,
         demux: true,
         mux: true,
-        codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Aac, CodecId::Mp3, CodecId::Opus, CodecId::Vorbis, CodecId::Flac],
+        codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Vp8, CodecId::Aac, CodecId::Mp3, CodecId::Opus, CodecId::Vorbis, CodecId::Flac],
     },
     FormatSpec {
         name: "mp3",
@@ -95,11 +95,11 @@ pub static FORMATS: &[FormatSpec] = &[
     FormatSpec {
         name: "webm",
         extensions: &["webm"],
-        description: "WebM audio (written; Opus or Vorbis only, as the VP8/VP9/AV1 video WebM also allows is not implemented); WebM files with any codec are read as Matroska",
-        media: MediaType::Audio,
+        description: "WebM (written with VP8 video copied from another file, and Opus or Vorbis audio; VP9 and AV1 are not written); WebM files with any codec are read as Matroska",
+        media: MediaType::Video,
         demux: true,
         mux: true,
-        codecs: &[CodecId::Opus, CodecId::Vorbis],
+        codecs: &[CodecId::Vp8, CodecId::Opus, CodecId::Vorbis],
     },
     FormatSpec {
         name: "aac",

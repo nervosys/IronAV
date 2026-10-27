@@ -141,7 +141,7 @@ impl MatroskaWriter {
 
     fn ready(&self) -> bool {
         self.tracks.iter().all(|t| {
-            t.seen > 0 && (!t.video || (t.params.sps.is_some() && t.params.pps.is_some() && (t.stream.codec != CodecId::Hevc || t.params.vps.is_some())))
+            t.seen > 0 && (!t.video || t.stream.codec == CodecId::Vp8 || (t.params.sps.is_some() && t.params.pps.is_some() && (t.stream.codec != CodecId::Hevc || t.params.vps.is_some())))
         })
     }
 
@@ -150,6 +150,7 @@ impl MatroskaWriter {
         Ok(match t.stream.codec {
             CodecId::H264 => Some(avcc_body(&t.params, &missing)?),
             CodecId::Hevc => Some(hvcc_body(&t.params, &missing)?),
+            CodecId::Vp8 => None,
             CodecId::Aac | CodecId::Opus | CodecId::Vorbis => Some(t.stream.extradata.clone()),
             CodecId::Flac => {
                 let (rate, channels, bits) = flac_audio_params(&t.stream)?;
@@ -199,6 +200,7 @@ impl MatroskaWriter {
             let id = match s.codec {
                 CodecId::H264 => "V_MPEG4/ISO/AVC",
                 CodecId::Hevc => "V_MPEGH/ISO/HEVC",
+                CodecId::Vp8 => "V_VP8",
                 CodecId::Aac => "A_AAC",
                 CodecId::Flac => "A_FLAC",
                 CodecId::Opus => "A_OPUS",
@@ -307,7 +309,10 @@ impl MatroskaWriter {
 
     fn put(&mut self, p: &Packet) -> Result<()> {
         let t = p.stream;
-        let (sample, key) = if self.tracks[t].video {
+        let (sample, key) = if self.tracks[t].video && self.tracks[t].stream.codec == CodecId::Vp8 {
+            // bit 0 of the frame tag is clear on key frames
+            (p.data.clone(), p.data.first().is_some_and(|b| b & 1 == 0))
+        } else if self.tracks[t].video {
             let hevc = self.tracks[t].stream.codec == CodecId::Hevc;
             match annexb_sample(hevc, &mut self.tracks[t].params, &p.data) {
                 Some(x) => x,
@@ -347,13 +352,13 @@ impl Muxer for MatroskaWriter {
             if streams[..i].iter().any(|o| o.params.media_type() == media) {
                 return Err(Error::invalid_arg(format!("this Matroska writer holds at most one {media:?} stream")));
             }
-            if self.webm && !matches!(s.codec, CodecId::Opus | CodecId::Vorbis) {
-                return Err(Error::new(ErrorCode::UnsupportedCodec, format!("WebM holds VP8, VP9, AV1, Opus and Vorbis; this writer can write only Opus and Vorbis, not {}", s.codec.name()))
+            if self.webm && !matches!(s.codec, CodecId::Opus | CodecId::Vorbis | CodecId::Vp8) {
+                return Err(Error::new(ErrorCode::UnsupportedCodec, format!("WebM holds VP8, VP9, AV1, Opus and Vorbis; this writer can write only VP8, Opus and Vorbis, not {}", s.codec.name()))
                     .hint("write .mkv for other codecs")
-                    .alternatives(["opus", "vorbis"]));
+                    .alternatives(["vp8", "opus", "vorbis"]));
             }
             let video = match (&s.params, s.codec) {
-                (StreamParams::Video { .. }, CodecId::H264 | CodecId::Hevc) => true,
+                (StreamParams::Video { .. }, CodecId::H264 | CodecId::Hevc | CodecId::Vp8) => true,
                 (StreamParams::Audio { .. }, CodecId::Aac | CodecId::Opus | CodecId::Vorbis) => {
                     if s.extradata.is_empty() {
                         return Err(Error::new(ErrorCode::UnsupportedFormat, format!("{} needs its codec configuration to go into Matroska", s.codec.name()))
@@ -365,9 +370,9 @@ impl Muxer for MatroskaWriter {
                 _ => {
                     return Err(Error::new(
                         ErrorCode::UnsupportedCodec,
-                        format!("this Matroska writer holds h264, hevc, aac, flac, mp3, opus and vorbis, not {}", s.codec.name()),
+                        format!("this Matroska writer holds h264, hevc, vp8, aac, flac, mp3, opus and vorbis, not {}", s.codec.name()),
                     )
-                    .alternatives(["h264", "hevc", "aac", "flac", "mp3", "opus", "vorbis"]));
+                    .alternatives(["h264", "hevc", "vp8", "aac", "flac", "mp3", "opus", "vorbis"]));
                 }
             };
             if s.time_base.den <= 0 || s.time_base.num <= 0 {
@@ -389,7 +394,7 @@ impl Muxer for MatroskaWriter {
             return self.put(p);
         }
         // hold the packet, but look for parameter sets now so the header can go out as soon as they are known
-        if tr.video {
+        if tr.video && tr.stream.codec != CodecId::Vp8 {
             let _ = annexb_sample(tr.stream.codec == CodecId::Hevc, &mut tr.params, &p.data);
         }
         self.held.push(p.clone());

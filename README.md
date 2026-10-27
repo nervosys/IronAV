@@ -382,7 +382,7 @@ non-multiple-of-16 sizes, profiles 0 to 3, one to eight partitions, constant-qua
 segmentation and unsaved probabilities) all match on every frame, and three small clips are kept as tests with FFmpeg's per-frame
 hashes. Sixty randomly corrupted files produced no panic. Not covered by any test file: hidden altref frames and golden/altref
 sign bias (libvpx through PyAV never produced them) and keyframe size changes in mid-stream. Speed has not been tuned; the decoder
-does not use more than one thread. VP8 has no encoder here, and VP8 in WebM or Matroska can be read but not written.
+does not use more than one thread. VP8 has no encoder here; VP8 can be copied into WebM or Matroska.
 
 ## MP3
 
@@ -441,9 +441,9 @@ FFmpeg decodes all 50 frames of each video. IronAV's own tests copy audio throug
 configuration, and decode FLAC through Matroska to the PCM it was made from.
 
 `.webm` is written for Opus or Vorbis audio only (document type `webm`; FFmpeg opens both and decodes them); WebM's video
-codecs, VP8, VP9 and AV1, have no encoder here (VP8 can be decoded, see "VP8").
+codecs, VP8, VP9 and AV1, have no encoder here. VP8 video can be copied into `.webm` or `.mkv` (key frames are read from the frame tag, so Cues are written; no codec private data is needed) and decoded, see "VP8"; FFmpeg opens the copies and decodes the same frames. VP9 and AV1 are not written.
 
-Not done: no SeekHead, tags, chapters or attachments; PCM, VP8/VP9/AV1 and more than one stream per kind are refused; an MP3's gapless trim (from its LAME tag) is not
+Not done: no SeekHead, tags, chapters or attachments; PCM, VP9/AV1 and more than one stream per kind are refused; an MP3's gapless trim (from its LAME tag) is not
 carried over and the Opus pre-skip is carried only as the OpusHead plus CodecDelay. I did not test B-frame video, because the
 encoder here does not produce it.
 

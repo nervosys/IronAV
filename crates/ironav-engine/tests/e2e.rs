@@ -1420,3 +1420,25 @@ fn vp8_segments_decode_to_what_ffmpeg_decodes() {
 fn vp8_bilinear_profile_decodes_to_what_ffmpeg_decodes() {
     vp8_matches_ffmpeg("vp8_bilinear");
 }
+
+/// VP8 copied into WebM and Matroska keeps every packet: the remuxed files decode to FFmpeg's frames.
+#[test]
+fn vp8_copied_into_webm_and_matroska_still_decodes_identically() {
+    let dir = scratch("vp8-remux");
+    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    let want: Vec<u64> = std::fs::read_to_string(data.join("vp8_inter.ffmpeg.fnv")).unwrap().lines().map(|l| u64::from_str_radix(l, 16).unwrap()).collect();
+    for ext in ["webm", "mkv"] {
+        let remux = dir.join(format!("copy.{ext}"));
+        let mut j = job(&data.join("vp8_inter.webm"), &remux);
+        j.hwaccel = "off".into();
+        j.video.codec = Some("copy".into());
+        run(&j, &mut |_| {}).unwrap();
+        let out = dir.join(format!("{ext}.y4m"));
+        let mut d = job(&remux, &out);
+        d.hwaccel = "off".into();
+        d.video.codec = Some("rawvideo".into());
+        run(&d, &mut |_| {}).unwrap();
+        let got: Vec<u64> = y4m_frames(&out).iter().map(|f| fnv64(f)).collect();
+        assert_eq!(got, want, "{ext}");
+    }
+}
