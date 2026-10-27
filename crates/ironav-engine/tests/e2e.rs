@@ -1508,12 +1508,12 @@ fn h264_intra_decodes_to_what_ffmpeg_decodes() {
     }
 }
 
-/// CAVLC P slices (every partition size, several reference frames, weighted prediction, slices,
+/// CAVLC (p_*) and CABAC (c_*) P slices (every partition size, several reference frames, weighted prediction, slices,
 /// the 8x8 transform, odd sizes) are bit-exact with FFmpeg's decoder.
 #[test]
 fn h264_p_slices_decode_to_what_ffmpeg_decodes() {
     let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
-    for name in ["p_ref4", "p_parts", "p_8x8dct", "p_weight2", "p_slices", "p_odd", "p_dbp"] {
+    for name in ["p_ref4", "p_parts", "p_8x8dct", "p_weight2", "p_slices", "p_odd", "p_dbp", "c_ref4", "c_parts", "c_8x8dct", "c_weight", "c_slices", "c_odd"] {
         let dir = scratch(&format!("h264-{name}"));
         let out = dir.join("out.y4m");
         let mut j = job(&data.join(format!("h264_{name}.mp4")), &out);

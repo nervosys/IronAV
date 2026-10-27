@@ -47,6 +47,8 @@ pub struct MbInfo {
     /// Identity of the reference picture behind `ref_idx`; -1 when unused.
     pub ref_id: [[i32; 4]; 2],
     pub skip: bool,
+    /// Absolute motion vector differences (clipped) per list and 4x4 block, for CABAC contexts.
+    pub mvd: [[[u8; 2]; 16]; 2],
 }
 
 impl Default for MbInfo {
@@ -65,6 +67,7 @@ impl Default for MbInfo {
             ref_idx: [[-1; 4]; 2],
             ref_id: [[-1; 4]; 2],
             skip: false,
+            mvd: [[[0; 2]; 16]; 2],
         }
     }
 }
@@ -258,9 +261,6 @@ impl<'a> SliceDec<'a> {
             if self.hdr.slice_type == SliceType::B {
                 return Err(unsupported("H.264 B slices are not supported yet"));
             }
-            if matches!(self.rd, Reader::Cabac(_)) {
-                return Err(unsupported("H.264 CABAC P slices are not supported yet"));
-            }
             if self.pps.constrained_intra_pred {
                 return Err(unsupported("H.264 constrained intra prediction in P slices is not supported yet"));
             }
@@ -273,6 +273,27 @@ impl<'a> SliceDec<'a> {
                     Reader::Cavlc(r) => r.ue()?,
                     Reader::Cabac(_) => 0,
                 };
+                if matches!(self.rd, Reader::Cabac(_)) {
+                    self.start_mb(addr)?;
+                    if self.read_skip_flag() {
+                        self.decode_skip()?;
+                        self.finish_mb(addr);
+                        addr += 1;
+                        let Reader::Cabac(c) = &mut self.rd else { unreachable!() };
+                        if c.terminate() == 1 {
+                            break;
+                        }
+                        continue;
+                    }
+                    self.decode_mb()?;
+                    self.finish_mb(addr);
+                    addr += 1;
+                    let Reader::Cabac(c) = &mut self.rd else { unreachable!() };
+                    if c.terminate() == 1 {
+                        break;
+                    }
+                    continue;
+                }
                 for _ in 0..run {
                     self.start_mb(addr)?;
                     self.decode_skip()?;
@@ -387,8 +408,39 @@ impl<'a> SliceDec<'a> {
             let ta = self.avail_top();
             (la && self.left().kind != Kind::I4x4 && self.left().kind != Kind::I8x8, ta && self.top().kind != Kind::I4x4 && self.top().kind != Kind::I8x8)
         };
+        let p_slice = self.hdr.slice_type == SliceType::P;
         match &mut self.rd {
             Reader::Cavlc(r) => r.ue(),
+            Reader::Cabac(c) if p_slice => {
+                if c.decision(14) == 0 {
+                    return Ok(if c.decision(15) == 0 {
+                        if c.decision(16) == 0 {
+                            0
+                        } else {
+                            3
+                        }
+                    } else if c.decision(17) == 0 {
+                        2
+                    } else {
+                        1
+                    });
+                }
+                // intra macroblock type with the prefix/suffix contexts
+                if c.decision(17) == 0 {
+                    return Ok(5);
+                }
+                if c.terminate() == 1 {
+                    return Ok(5 + 25);
+                }
+                let mut t = 1;
+                t += 12 * c.decision(17 + 1);
+                if c.decision(17 + 2) == 1 {
+                    t += 4 + 4 * c.decision(17 + 2);
+                }
+                t += 2 * c.decision(17 + 3);
+                t += c.decision(17 + 3);
+                Ok(5 + t)
+            }
             Reader::Cabac(c) => {
                 let inc = a as usize + b as usize;
                 if c.decision(3 + inc) == 0 {
@@ -685,6 +737,113 @@ impl<'a> SliceDec<'a> {
         Ok(())
     }
 
+    fn read_skip_flag(&mut self) -> bool {
+        let a = self.avail_left() && !self.left().skip;
+        let b = self.avail_top() && !self.top().skip;
+        let Reader::Cabac(c) = &mut self.rd else { unreachable!() };
+        c.decision(11 + a as usize + b as usize) == 1
+    }
+
+    /// Whether the 8x8 block at (bx, by) in 4x4 units next to the current partition has a
+    /// reference index above zero (CABAC ref_idx context).
+    fn nb_ref_gt0(&self, x: i32, y: i32) -> bool {
+        let w = self.pic.mb_w;
+        let (m, bx, by) = if x < 0 {
+            if !self.avail_left() {
+                return false;
+            }
+            (self.left(), 3, y)
+        } else if y < 0 {
+            if !self.avail_top() {
+                return false;
+            }
+            (self.top(), x, 3)
+        } else {
+            let _ = w;
+            (&self.cur, x, y)
+        };
+        m.kind == Kind::Inter && !m.skip && m.ref_idx[0][((by >> 1) * 2 + (bx >> 1)) as usize] > 0
+    }
+
+    /// Sum of the absolute mvd values of the neighbours (CABAC mvd context).
+    fn nb_mvd(&self, x: i32, y: i32, comp: usize) -> u32 {
+        let (m, bx, by) = if x < 0 {
+            if !self.avail_left() {
+                return 0;
+            }
+            (self.left(), 3, y)
+        } else if y < 0 {
+            if !self.avail_top() {
+                return 0;
+            }
+            (self.top(), x, 3)
+        } else {
+            (&self.cur, x, y)
+        };
+        m.mvd[0][(by * 4 + bx) as usize][comp] as u32
+    }
+
+    fn cabac_ref_idx(&mut self, bx: usize, by: usize, max: u32) -> Result<i8> {
+        if max == 0 {
+            return Ok(0);
+        }
+        let a = self.nb_ref_gt0(bx as i32 - 1, by as i32);
+        let b = self.nb_ref_gt0(bx as i32, by as i32 - 1);
+        let Reader::Cabac(c) = &mut self.rd else { unreachable!() };
+        let mut v = 0u32;
+        let mut ctx = 54 + a as usize + 2 * b as usize;
+        while c.decision(ctx) == 1 {
+            v += 1;
+            ctx = if v == 1 { 54 + 4 } else { 54 + 5 };
+            if v > max {
+                return Err(Error::invalid_input("H.264 reference index is out of range"));
+            }
+        }
+        if v > max {
+            return Err(Error::invalid_input("H.264 reference index is out of range"));
+        }
+        Ok(v as i8)
+    }
+
+    fn cabac_mvd_comp(&mut self, bx: usize, by: usize, comp: usize) -> Result<i32> {
+        let sum = self.nb_mvd(bx as i32 - 1, by as i32, comp) + self.nb_mvd(bx as i32, by as i32 - 1, comp);
+        let base = if comp == 0 { 40 } else { 47 };
+        let Reader::Cabac(c) = &mut self.rd else { unreachable!() };
+        let inc = if sum < 3 {
+            0
+        } else if sum > 32 {
+            2
+        } else {
+            1
+        };
+        if c.decision(base + inc) == 0 {
+            return Ok(0);
+        }
+        let mut v = 1i32;
+        let mut ctx = base + 3;
+        while v < 9 && c.decision(ctx) == 1 {
+            v += 1;
+            if ctx < base + 6 {
+                ctx += 1;
+            }
+        }
+        if v >= 9 {
+            let mut k = 3;
+            while c.bypass() == 1 {
+                v += 1 << k;
+                k += 1;
+                if k > 24 {
+                    return Err(Error::invalid_input("H.264 CABAC mvd is too long"));
+                }
+            }
+            while k > 0 {
+                k -= 1;
+                v += (c.bypass() as i32) << k;
+            }
+        }
+        Ok(if c.bypass() == 1 { -v } else { v })
+    }
+
     fn decode_skip(&mut self) -> Result<()> {
         self.cur.kind = Kind::Inter;
         self.cur.skip = true;
@@ -700,9 +859,12 @@ impl<'a> SliceDec<'a> {
         self.mc_mb()
     }
 
-    fn read_ref_idx(&mut self, max: u32) -> Result<i8> {
+    fn read_ref_idx(&mut self, bx: usize, by: usize, max: u32) -> Result<i8> {
         if max == 0 {
             return Ok(0);
+        }
+        if matches!(self.rd, Reader::Cabac(_)) {
+            return self.cabac_ref_idx(bx, by, max);
         }
         let Reader::Cavlc(r) = &mut self.rd else { unreachable!() };
         let v = r.te(max)?;
@@ -712,15 +874,23 @@ impl<'a> SliceDec<'a> {
         Ok(v as i8)
     }
 
-    fn read_mvd(&mut self) -> Result<[i32; 2]> {
-        let Reader::Cavlc(r) = &mut self.rd else { unreachable!() };
-        Ok([r.se()?, r.se()?])
+    fn read_mvd(&mut self, bx: usize, by: usize) -> Result<[i32; 2]> {
+        if let Reader::Cavlc(r) = &mut self.rd {
+            return Ok([r.se()?, r.se()?]);
+        }
+        Ok([self.cabac_mvd_comp(bx, by, 0)?, self.cabac_mvd_comp(bx, by, 1)?])
     }
 
     fn read_partition_mv(&mut self, bx: usize, by: usize, w: usize, h: usize, dir: u8) -> Result<()> {
         let refi = self.cur.ref_idx[0][(by >> 1) * 2 + (bx >> 1)];
         let p = self.pred_mv(0, bx as i32, by as i32, w as i32, dir, refi);
-        let d = self.read_mvd()?;
+        let d = self.read_mvd(bx, by)?;
+        let clip = |v: i32| v.unsigned_abs().min(64) as u8;
+        for y in by..by + h {
+            for x in bx..bx + w {
+                self.cur.mvd[0][y * 4 + x] = [clip(d[0]), clip(d[1])];
+            }
+        }
         let mv = [(p[0] as i32 + d[0]) as i16, (p[1] as i32 + d[1]) as i16];
         self.set_motion(0, bx, by, w, h, mv);
         Ok(())
@@ -732,22 +902,22 @@ impl<'a> SliceDec<'a> {
         let mut all_8x8 = true;
         match t {
             0 => {
-                let r = self.read_ref_idx(max_ref)?;
+                let r = self.read_ref_idx(0, 0, max_ref)?;
                 self.set_ref(0, 0, 0, 4, 4, r);
                 self.read_partition_mv(0, 0, 4, 4, 0)?;
             }
             1 => {
-                let r0 = self.read_ref_idx(max_ref)?;
-                let r1 = self.read_ref_idx(max_ref)?;
+                let r0 = self.read_ref_idx(0, 0, max_ref)?;
                 self.set_ref(0, 0, 0, 4, 2, r0);
+                let r1 = self.read_ref_idx(0, 2, max_ref)?;
                 self.set_ref(0, 0, 2, 4, 2, r1);
                 self.read_partition_mv(0, 0, 4, 2, 1)?;
                 self.read_partition_mv(0, 2, 4, 2, 1)?;
             }
             2 => {
-                let r0 = self.read_ref_idx(max_ref)?;
-                let r1 = self.read_ref_idx(max_ref)?;
+                let r0 = self.read_ref_idx(0, 0, max_ref)?;
                 self.set_ref(0, 0, 0, 2, 4, r0);
+                let r1 = self.read_ref_idx(2, 0, max_ref)?;
                 self.set_ref(0, 2, 0, 2, 4, r1);
                 self.read_partition_mv(0, 0, 2, 4, 2)?;
                 self.read_partition_mv(2, 0, 2, 4, 2)?;
@@ -755,8 +925,20 @@ impl<'a> SliceDec<'a> {
             _ => {
                 let mut sub = [0u32; 4];
                 for s in sub.iter_mut() {
-                    let Reader::Cavlc(r) = &mut self.rd else { unreachable!() };
-                    *s = r.ue()?;
+                    *s = match &mut self.rd {
+                        Reader::Cavlc(r) => r.ue()?,
+                        Reader::Cabac(c) => {
+                            if c.decision(21) == 1 {
+                                0
+                            } else if c.decision(22) == 0 {
+                                1
+                            } else if c.decision(23) == 1 {
+                                2
+                            } else {
+                                3
+                            }
+                        }
+                    };
                     if *s > 3 {
                         return Err(Error::invalid_input("H.264 sub-macroblock type is out of range"));
                     }
@@ -765,7 +947,7 @@ impl<'a> SliceDec<'a> {
                     }
                 }
                 for i in 0..4usize {
-                    let r = if t == 4 { 0 } else { self.read_ref_idx(max_ref)? };
+                    let r = if t == 4 { 0 } else { self.read_ref_idx((i & 1) * 2, (i >> 1) * 2, max_ref)? };
                     self.set_ref(0, (i & 1) * 2, (i >> 1) * 2, 2, 2, r);
                 }
                 for (i, &s) in sub.iter().enumerate() {
@@ -790,14 +972,15 @@ impl<'a> SliceDec<'a> {
             }
         }
         self.resolve_refs()?;
-        let k = match &mut self.rd {
-            Reader::Cavlc(r) => r.ue()?,
-            Reader::Cabac(_) => unreachable!(),
+        let cbp = if let Reader::Cavlc(r) = &mut self.rd {
+            let k = r.ue()?;
+            if k > 47 {
+                return Err(Error::invalid_input("H.264 coded_block_pattern code is out of range"));
+            }
+            GOLOMB_TO_INTER_CBP[k as usize] as u32
+        } else {
+            self.read_cbp()?
         };
-        if k > 47 {
-            return Err(Error::invalid_input("H.264 coded_block_pattern code is out of range"));
-        }
-        let cbp = GOLOMB_TO_INTER_CBP[k as usize] as u32;
         self.cur.cbp = cbp as u8;
         if cbp & 15 != 0 && self.pps.transform_8x8 && all_8x8 {
             self.cur.t8x8 = self.read_t8x8_flag()?;
@@ -1149,23 +1332,24 @@ impl<'a> SliceDec<'a> {
         };
         if kind != BlockKind::Luma8x8 {
             // coded_block_flag; an unavailable neighbour counts as coded in an intra macroblock
+            let un = self.cur.kind != Kind::Inter;
             let (a, b) = match kind {
                 BlockKind::LumaDc => {
-                    let f = |avail: bool, m: &MbInfo| if !avail { true } else { m.kind == Kind::IPcm || m.cbf_dc & 1 != 0 };
+                    let f = |avail: bool, m: &MbInfo| if !avail { un } else { m.kind == Kind::IPcm || m.cbf_dc & 1 != 0 };
                     (f(self.avail_left(), self.left_or_cur()), f(self.avail_top(), self.top_or_cur()))
                 }
                 BlockKind::ChromaDc => {
                     let bit = 2u8 << (comp - 1);
-                    let f = |avail: bool, m: &MbInfo| if !avail { true } else { m.kind == Kind::IPcm || m.cbf_dc & bit != 0 };
+                    let f = |avail: bool, m: &MbInfo| if !avail { un } else { m.kind == Kind::IPcm || m.cbf_dc & bit != 0 };
                     (f(self.avail_left(), self.left_or_cur()), f(self.avail_top(), self.top_or_cur()))
                 }
                 BlockKind::ChromaAc => {
                     let (a, b) = self.neighbour_nnz_chroma(comp - 1, bx, by);
-                    (a.is_none_or(|v| v > 0), b.is_none_or(|v| v > 0))
+                    (a.map_or(un, |v| v > 0), b.map_or(un, |v| v > 0))
                 }
                 _ => {
                     let (a, b) = self.neighbour_nnz_luma(bx, by);
-                    (a.is_none_or(|v| v > 0), b.is_none_or(|v| v > 0))
+                    (a.map_or(un, |v| v > 0), b.map_or(un, |v| v > 0))
                 }
             };
             let Reader::Cabac(c) = &mut self.rd else { unreachable!() };
