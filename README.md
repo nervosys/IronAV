@@ -384,6 +384,12 @@ hashes. Sixty randomly corrupted files produced no panic. Not covered by any tes
 sign bias (libvpx through PyAV never produced them) and keyframe size changes in mid-stream. Speed has not been tuned; the decoder
 does not use more than one thread. VP8 has no encoder here; VP8 can be copied into WebM or Matroska.
 
+## JPEG
+
+Baseline and extended-sequential 8-bit Huffman JPEG (`.jpg`, `.jpeg`, codec `mjpeg`) is decoded and encoded in software. Decoding handles grey, 4:2:0, 4:2:2 and 4:4:4, restart intervals and non-interleaved scans. Progressive, arithmetic-coded, 12-bit and lossless files are refused with a clear error. The encoder writes JFIF with the standard tables at quality 90.
+
+A `.jpg` holds one picture; `ironav convert -i in.y4m -o out.jpg` picks `mjpeg` by itself. Decoded output differs from FFmpeg's by at most 1 LSB (a different IDCT), checked on 4:2:0, 4:2:2 and 4:4:4 images. Encoded files decode in FFmpeg at 40+ dB PSNR. 150 corrupted or truncated files made it return errors, never panic.
+
 ## MP3
 
 MPEG-1, MPEG-2 and MPEG-2.5 Layer III are decoded (mono, stereo, joint stereo with mid/side), from `.mp3` files (ID3v2 tags

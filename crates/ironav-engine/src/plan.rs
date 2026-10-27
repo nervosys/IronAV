@@ -165,10 +165,18 @@ pub fn plan(job: &Job) -> Result<Plan> {
         }
 
         let opts = if media == MediaType::Audio { &job.audio } else { &job.video };
-        let to = match opts.codec.as_deref() {
+        let mut to = match opts.codec.as_deref() {
             None | Some("copy") => s.codec,
             Some(name) => CodecId::parse(name)?,
         };
+        // a format that holds only one codec of this kind (a .jpg) names the codec itself
+        if opts.codec.is_none() && !spec.codecs.contains(&to) {
+            let only: Vec<CodecId> = spec.codecs.iter().copied().filter(|c| c.media_type() == media).collect();
+            if let [c] = only[..] {
+                warnings.push(format!("{at}: '{}' holds only {}, so the stream is encoded as {} instead of {}", spec.name, c.name(), c.name(), to.name()));
+                to = c;
+            }
+        }
         if to.media_type() != media {
             return Err(Error::invalid_arg(format!("codec {} cannot be used for a {:?} stream", to.name(), media)));
         }

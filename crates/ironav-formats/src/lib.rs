@@ -11,6 +11,7 @@ mod mp4demux;
 mod ogg;
 mod oggwrite;
 mod wav;
+mod jpeg;
 mod y4m;
 
 use ironav_core::{CodecId, Demuxer, Error, ErrorCode, MediaType, Muxer, Result};
@@ -46,6 +47,15 @@ pub static FORMATS: &[FormatSpec] = &[
         demux: true,
         mux: true,
         codecs: &[CodecId::PcmU8, CodecId::PcmS16Le, CodecId::PcmS24Le, CodecId::PcmS32Le, CodecId::PcmF32Le, CodecId::PcmF64Le],
+    },
+    FormatSpec {
+        name: "jpeg",
+        extensions: &["jpg", "jpeg"],
+        description: "One JPEG image (baseline, 8-bit; gray, 4:2:0, 4:2:2 or 4:4:4): read as a single Motion-JPEG frame, written from one",
+        media: MediaType::Video,
+        demux: true,
+        mux: true,
+        codecs: &[CodecId::Mjpeg],
     },
     FormatSpec {
         name: "y4m",
@@ -189,6 +199,8 @@ pub fn open_demuxer(path: &Path) -> Result<Box<dyn Demuxer>> {
         Ok(Box::new(adts::open(f)?))
     } else if mp3::looks_like_mp3(magic) {
         Ok(Box::new(mp3::open(f)?))
+    } else if jpeg::looks_like_jpeg(magic) {
+        Ok(Box::new(jpeg::JpegDemuxer::open(f)?))
     } else if magic.starts_with(b"YUV4MPEG2") {
         Ok(Box::new(y4m::Y4mDemuxer::open(f)?))
     } else {
@@ -208,6 +220,7 @@ pub fn create_muxer(path: &Path, format: &str) -> Result<Box<dyn Muxer>> {
     match spec.name {
         "wav" => Ok(Box::new(wav::WavMuxer::new(out))),
         "y4m" => Ok(Box::new(y4m::Y4mMuxer::new(out))),
+        "jpeg" => Ok(Box::new(jpeg::JpegMuxer::new(out))),
         "flac" => Ok(Box::new(flac::FlacMuxer::new(out))),
         "mp4" => Ok(Box::new(mp4::Mp4Muxer::with_faststart(out, path))),
         "aac" => Ok(Box::new(adts::AdtsMuxer::new(out))),

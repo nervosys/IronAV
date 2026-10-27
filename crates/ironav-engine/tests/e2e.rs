@@ -1442,3 +1442,81 @@ fn vp8_copied_into_webm_and_matroska_still_decodes_identically() {
         assert_eq!(got, want, "{ext}");
     }
 }
+
+// ---- JPEG ------------------------------------------------------------------------------
+
+/// Raw planes of the first frame of a y4m file.
+fn y4m_first_frame(path: &std::path::Path) -> Vec<u8> {
+    y4m_frames_any(path).remove(0)
+}
+
+fn y4m_frames_any(path: &std::path::Path) -> Vec<Vec<u8>> {
+    let d = std::fs::read(path).unwrap();
+    let hdr = d.iter().position(|&b| b == b'\n').unwrap() + 1;
+    let head = String::from_utf8_lossy(&d[..hdr]).to_string();
+    let get = |p: char| head.split_whitespace().find(|t| t.starts_with(p)).unwrap()[1..].parse::<usize>().unwrap();
+    let (w, h) = (get('W'), get('H'));
+    let size = if head.contains("C422") {
+        w * h + 2 * w.div_ceil(2) * h
+    } else if head.contains("C444") {
+        3 * w * h
+    } else if head.contains("Cmono") {
+        w * h
+    } else {
+        w * h + 2 * w.div_ceil(2) * h.div_ceil(2)
+    };
+    let nl = hdr + d[hdr..].iter().position(|&b| b == b'\n').unwrap() + 1;
+    vec![d[nl..nl + size].to_vec()]
+}
+
+/// A baseline JPEG decodes to what FFmpeg's decoder gives, to within one level (the two use
+/// different integer inverse DCTs).
+fn jpeg_matches_ffmpeg(name: &str) {
+    let dir = scratch(name);
+    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    let out = dir.join("out.y4m");
+    let mut j = job(&data.join(format!("{name}.jpg")), &out);
+    j.hwaccel = "off".into();
+    j.video.codec = Some("rawvideo".into());
+    run(&j, &mut |_| {}).unwrap();
+    let got = y4m_first_frame(&out);
+    let want = std::fs::read(data.join(format!("{name}.ffmpeg.yuv"))).unwrap();
+    assert_eq!(got.len(), want.len());
+    let worst = got.iter().zip(&want).map(|(a, b)| (*a as i32 - *b as i32).abs()).max().unwrap();
+    let differing = got.iter().zip(&want).filter(|(a, b)| a != b).count();
+    assert!(worst <= 1, "largest difference from FFmpeg is {worst}");
+    assert!(differing * 20 < got.len(), "{differing} of {} samples differ", got.len());
+}
+
+#[test]
+fn jpeg_420_decodes_to_what_ffmpeg_decodes() {
+    jpeg_matches_ffmpeg("jpeg_420");
+}
+
+#[test]
+fn jpeg_422_and_444_decode_to_what_ffmpeg_decodes() {
+    jpeg_matches_ffmpeg("jpeg_422");
+    jpeg_matches_ffmpeg("jpeg_444");
+}
+
+/// Decoding to raw frames and encoding again gives a JPEG that decodes close to the original.
+#[test]
+fn jpeg_reencode_stays_close() {
+    let dir = scratch("jpeg-enc");
+    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    let raw = dir.join("raw.y4m");
+    let mut j = job(&data.join("jpeg_420.jpg"), &raw);
+    j.hwaccel = "off".into();
+    j.video.codec = Some("rawvideo".into());
+    run(&j, &mut |_| {}).unwrap();
+    let again = dir.join("again.jpg");
+    run(&job(&raw, &again), &mut |_| {}).unwrap();
+    let back = dir.join("back.y4m");
+    let mut k = job(&again, &back);
+    k.video.codec = Some("rawvideo".into());
+    run(&k, &mut |_| {}).unwrap();
+    let (a, b) = (y4m_first_frame(&raw), y4m_first_frame(&back));
+    let mse = a.iter().zip(&b).map(|(x, y)| (*x as f64 - *y as f64).powi(2)).sum::<f64>() / a.len() as f64;
+    let psnr = 10.0 * (255.0f64 * 255.0 / mse.max(1e-9)).log10();
+    assert!(psnr > 35.0, "PSNR {psnr}");
+}

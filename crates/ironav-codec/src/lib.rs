@@ -5,6 +5,7 @@
 
 pub mod aac;
 pub mod flac;
+pub mod jpeg;
 mod filters;
 pub mod mp3;
 pub mod opus;
@@ -46,6 +47,9 @@ pub fn implemented() -> Vec<CodecImpl> {
             }
             if c == CodecId::Vorbis {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-vorbis" });
+            }
+            if c == CodecId::Mjpeg {
+                return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-jpeg" });
             }
             if c == CodecId::Vp8 {
                 return Some(CodecImpl { codec: c, decode: true, encode: false, implementation: "ironav-vp8" });
@@ -99,6 +103,7 @@ pub fn new_decoder_for(s: &ironav_core::StreamInfo) -> Result<Box<dyn Decoder>> 
         CodecId::Opus => Ok(trimmed(s, Box::new(opus::OpusDecoder::new(&s.extradata, &s.params)?))),
         CodecId::Vorbis => Ok(trimmed(s, Box::new(vorbis::VorbisDecoder::new(&s.extradata, &s.params)?))),
         CodecId::Vp8 => Ok(Box::new(vp8::Vp8Decoder::new())),
+        CodecId::Mjpeg => Ok(Box::new(jpeg::JpegDecoder::new())),
         _ => new_decoder(s.codec, &s.params, s.bits),
     }
 }
@@ -242,6 +247,7 @@ pub fn new_encoder_with(codec: CodecId, params: &StreamParams, bits: Option<u8>,
             Ok(Box::new(mp3::Mp3Encoder::new(*sample_rate, *channels as usize, bitrate)?))
         }
         (CodecId::RawVideo, StreamParams::Video { .. }) => Ok(Box::new(rawvideo::RawVideoEncoder)),
+        (CodecId::Mjpeg, StreamParams::Video { .. }) => Ok(Box::new(jpeg::JpegEncoder::new(jpeg::JpegEncoder::default_quality()))),
         (c, p) if c.media_type() != p.media_type() => Err(Error::invalid_arg(format!(
             "codec {} is {:?} but the stream is {:?}",
             c.name(),
