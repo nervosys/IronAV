@@ -30,8 +30,9 @@ pub struct MbInfo {
     pub slice: u16,
     pub kind: Kind,
     pub qp: i8,
-    /// Non-zero coefficient counts: 16 luma blocks in raster order, then 4 Cb, then 4 Cr.
-    pub nnz: [u8; 24],
+    /// Non-zero coefficient counts: 16 luma blocks in raster order, then 8 Cb, then 8 Cr (4 of each
+    /// for 4:2:0).
+    pub nnz: [u8; 32],
     /// Coded-block flags of the DC blocks: bit 0 Intra16x16 luma, bit 1 Cb, bit 2 Cr.
     pub cbf_dc: u8,
     /// Coded block pattern: luma in bits 0-3, chroma in bits 4-5.
@@ -61,7 +62,7 @@ impl Default for MbInfo {
             slice: 0,
             kind: Kind::None,
             qp: 0,
-            nnz: [0; 24],
+            nnz: [0; 32],
             cbf_dc: 0,
             cbp: 0,
             chroma_mode: 0,
@@ -81,6 +82,9 @@ impl Default for MbInfo {
 pub struct Picture {
     pub mb_w: usize,
     pub mb_h: usize,
+    /// chroma_format_idc (0 monochrome, 1 4:2:0, 2 4:2:2) and the height of a macroblock's chroma.
+    pub cf: u8,
+    pub ch: usize,
     pub planes: [Vec<u16>; 3],
     pub mbs: Vec<MbInfo>,
     /// Per slice (index = slice id - 1): loop-filter parameters and chroma QP offsets.
@@ -96,11 +100,16 @@ pub struct SliceParams {
 }
 
 impl Picture {
-    pub fn new(mb_w: usize, mb_h: usize) -> Self {
+    pub fn new(mb_w: usize, mb_h: usize, cf: u8, bd: u32) -> Self {
+        let ch = if cf == 2 { 16 } else { 8 };
+        // a monochrome picture keeps chroma planes at mid-grey, as other decoders output it
+        let grey = 1u16 << (bd - 1);
         Picture {
             mb_w,
             mb_h,
-            planes: [vec![0; mb_w * mb_h * 256], vec![0; mb_w * mb_h * 64], vec![0; mb_w * mb_h * 64]],
+            cf,
+            ch,
+            planes: [vec![0; mb_w * mb_h * 256], vec![grey; mb_w * mb_h * 8 * ch], vec![grey; mb_w * mb_h * 8 * ch]],
             mbs: vec![MbInfo::default(); mb_w * mb_h],
             slices: Vec::new(),
         }
@@ -183,14 +192,14 @@ struct Res {
     /// 16 blocks of 4x4 (raster block order), or 4 blocks of 8x8, in the same 256 entries.
     luma: [i32; 256],
     dc: [i32; 16],
-    cdc: [[i32; 4]; 2],
-    /// Chroma AC: [component * 4 + block][raster position within the 4x4 block].
-    cac: [[i32; 16]; 8],
+    cdc: [[i32; 8]; 2],
+    /// Chroma AC: [component * 8 + block][raster position within the 4x4 block].
+    cac: [[i32; 16]; 16],
 }
 
 impl Res {
     fn new() -> Self {
-        Res { luma: [0; 256], dc: [0; 16], cdc: [[0; 4]; 2], cac: [[0; 16]; 8] }
+        Res { luma: [0; 256], dc: [0; 16], cdc: [[0; 8]; 2], cac: [[0; 16]; 16] }
     }
 }
 
@@ -411,15 +420,19 @@ impl<'a> SliceDec<'a> {
                 let _ = k;
                 *e = self.read_pred_mode_syntax()?;
             }
-            self.cur.chroma_mode = self.read_chroma_pred_mode()?;
+            if self.pic.cf != 0 {
+                self.cur.chroma_mode = self.read_chroma_pred_mode()?;
+            }
             cbp = self.read_cbp()?;
         } else if mb_type <= 24 {
             self.cur.kind = Kind::I16x16;
             let t = mb_type - 1;
             i16_mode = (t % 4) as u8;
-            let chroma = (t / 4) % 3;
+            let chroma = if self.pic.cf == 0 { 0 } else { (t / 4) % 3 };
             cbp = (chroma << 4) | if t >= 12 { 15 } else { 0 };
-            self.cur.chroma_mode = self.read_chroma_pred_mode()?;
+            if self.pic.cf != 0 {
+                self.cur.chroma_mode = self.read_chroma_pred_mode()?;
+            }
         } else {
             return Err(Error::invalid_input("H.264 macroblock type is out of range for an I slice"));
         }
@@ -556,13 +569,14 @@ impl<'a> SliceDec<'a> {
     }
 
     fn read_cbp(&mut self) -> Result<u32> {
+        let gray = self.pic.cf == 0;
         match &mut self.rd {
             Reader::Cavlc(r) => {
                 let k = r.ue()?;
-                if k > 47 {
+                if k > if gray { 15 } else { 47 } {
                     return Err(Error::invalid_input("H.264 coded_block_pattern code is out of range"));
                 }
-                Ok(GOLOMB_TO_INTRA4X4_CBP[k as usize] as u32)
+                Ok(if gray { GOLOMB_TO_INTRA4X4_CBP_GRAY[k as usize] } else { GOLOMB_TO_INTRA4X4_CBP[k as usize] } as u32)
             }
             Reader::Cabac(_) => {
                 let (la, ta) = (self.avail_left(), self.avail_top());
@@ -590,7 +604,7 @@ impl<'a> SliceDec<'a> {
                 let ca = la && (lpcm || lc != 0);
                 let cb = ta && (tpcm || tc != 0);
                 let mut chroma = 0;
-                if c.decision(77 + ca as usize + 2 * cb as usize) == 1 {
+                if !gray && c.decision(77 + ca as usize + 2 * cb as usize) == 1 {
                     let ca2 = la && (lpcm || lc == 2);
                     let cb2 = ta && (tpcm || tc == 2);
                     chroma = 1 + c.decision(77 + 4 + ca2 as usize + 2 * cb2 as usize);
@@ -627,26 +641,27 @@ impl<'a> SliceDec<'a> {
 
     fn decode_pcm(&mut self) -> Result<()> {
         self.cur.kind = Kind::IPcm;
-        self.cur.nnz = [16; 24];
+        self.cur.nnz = [16; 32];
         self.cur.cbf_dc = 7;
         self.cur.cbp = 0x2F;
         self.last_dqp = false;
-        let mut samples = [0u16; 384];
+        let mut samples = [0u16; 512];
+        let nsamples = 256 + 2 * [0, 64, 128][self.pic.cf as usize];
         let bd = self.bd;
         match &mut self.rd {
             Reader::Cavlc(r) => {
                 r.align();
-                for s in samples.iter_mut() {
+                for s in samples[..nsamples].iter_mut() {
                     *s = r.bits(bd)? as u16;
                 }
             }
             Reader::Cabac(c) => {
                 let start = c.pcm_byte_pos();
-                let len = 384 * bd as usize / 8;
+                let len = nsamples * bd as usize / 8;
                 let d = c.data();
                 let src = d.get(start..start + len).ok_or_else(|| Error::invalid_input("H.264 I_PCM samples are cut short"))?;
                 let mut r = BitReader::new(src);
-                for s in samples.iter_mut() {
+                for s in samples[..nsamples].iter_mut() {
                     *s = r.bits(bd)? as u16;
                 }
                 c.restart_at(start + len);
@@ -659,11 +674,14 @@ impl<'a> SliceDec<'a> {
             self.pic.planes[0][o..o + 16].copy_from_slice(&samples[y * 16..y * 16 + 16]);
         }
         let cs = self.pic.mb_w * 8;
-        for c in 0..2 {
-            for y in 0..8 {
-                let o = (mby * 8 + y) * cs + mbx * 8;
-                let s = 256 + c * 64 + y * 8;
-                self.pic.planes[1 + c][o..o + 8].copy_from_slice(&samples[s..s + 8]);
+        let chh = self.pic.ch;
+        if self.pic.cf != 0 {
+            for c in 0..2 {
+                for y in 0..chh {
+                    let o = (mby * chh + y) * cs + mbx * 8;
+                    let s = 256 + c * chh * 8 + y * 8;
+                    self.pic.planes[1 + c][o..o + 8].copy_from_slice(&samples[s..s + 8]);
+                }
             }
         }
         Ok(())
@@ -1298,10 +1316,11 @@ impl<'a> SliceDec<'a> {
         self.resolve_refs()?;
         let cbp = if let Reader::Cavlc(r) = &mut self.rd {
             let k = r.ue()?;
-            if k > 47 {
+            let gray = self.pic.cf == 0;
+            if k > if gray { 15 } else { 47 } {
                 return Err(Error::invalid_input("H.264 coded_block_pattern code is out of range"));
             }
-            GOLOMB_TO_INTER_CBP[k as usize] as u32
+            (if gray { GOLOMB_TO_INTER_CBP_GRAY[k as usize] } else { GOLOMB_TO_INTER_CBP[k as usize] }) as u32
         } else {
             self.read_cbp()?
         };
@@ -1355,10 +1374,12 @@ impl<'a> SliceDec<'a> {
         let (pw, ph) = (self.pic.mb_w * 16, self.pic.mb_h * 16);
         let (x, y) = ((self.mbx * 16 + bx * 4) as i32, (self.mby * 16 + by * 4) as i32);
         let (bw, bh) = (w * 4, h * 4);
-        let (cw, ch) = (bw / 2, bh / 2);
-        let (cpw, cph) = (pw / 2, ph / 2);
+        let c422 = self.pic.cf == 2;
+        let (cw, ch) = (bw / 2, if c422 { bh } else { bh / 2 });
+        let (cpw, cph) = (pw / 2, if c422 { ph } else { ph / 2 });
+        let cy = if c422 { y } else { y / 2 };
         let mut luma = [[0u16; 256]; 2];
-        let mut chroma = [[[0u16; 64]; 2]; 2];
+        let mut chroma = [[[0u16; 128]; 2]; 2];
         let mut used = [false; 2];
         let mut pics: [Option<(std::sync::Arc<super::dpb::DecodedPic>, bool)>; 2] = [None, None];
         for l in 0..2usize {
@@ -1372,8 +1393,12 @@ impl<'a> SliceDec<'a> {
             };
             let mv = self.cur.mv[l][by * 4 + bx];
             inter::luma_mc(&entry.pic.planes[0], pw, ph, x, y, mv[0] as i32, mv[1] as i32, bw, bh, &mut luma[l], self.maxv);
-            for c in 0..2usize {
-                inter::chroma_mc(&entry.pic.planes[1 + c], cpw, cph, x / 2, y / 2, mv[0] as i32, mv[1] as i32, cw, ch, &mut chroma[l][c]);
+            if self.pic.cf != 0 {
+                // 4:2:2 chroma has full vertical resolution, so its vertical vector is in quarter samples
+                let my = if c422 { mv[1] as i32 * 2 } else { mv[1] as i32 };
+                for c in 0..2usize {
+                    inter::chroma_mc(&entry.pic.planes[1 + c], cpw, cph, x / 2, cy, mv[0] as i32, my, cw, ch, &mut chroma[l][c]);
+                }
             }
             used[l] = true;
             pics[l] = Some((entry.pic.clone(), entry.long));
@@ -1417,7 +1442,7 @@ impl<'a> SliceDec<'a> {
                 Some(wt) => inter::weight_bi(a, bb, wt[0].0, wt[0].1, wt[0].2, wt[0].3, self.maxv),
                 None => inter::average(a, bb),
             }
-            for c in 0..2usize {
+            for c in 0..if self.pic.cf != 0 { 2usize } else { 0 } {
                 let (c0, c1) = chroma.split_at_mut(1);
                 let (a, bb) = (&mut c0[0][c][..cw * ch], &c1[0][c][..cw * ch]);
                 match wts {
@@ -1431,7 +1456,7 @@ impl<'a> SliceDec<'a> {
             if let Some(wt) = explicit {
                 if let Some(e) = wt.entries[l].get(r) {
                     inter::weight_uni(&mut luma[l][..bw * bh], wt.luma_log2_denom, e[0], e[1] << (self.bd - 8), self.maxv);
-                    for c in 0..2usize {
+                    for c in 0..if self.pic.cf != 0 { 2usize } else { 0 } {
                         inter::weight_uni(&mut chroma[l][c][..cw * ch], wt.chroma_log2_denom, e[2 + 2 * c], e[3 + 2 * c] << (self.bd - 8), self.maxv);
                     }
                 }
@@ -1445,9 +1470,9 @@ impl<'a> SliceDec<'a> {
             let o = (y as usize + row) * pw + x as usize;
             self.pic.planes[0][o..o + bw].copy_from_slice(&luma[0][row * bw..row * bw + bw]);
         }
-        for c in 0..2usize {
+        for c in 0..if self.pic.cf != 0 { 2usize } else { 0 } {
             for row in 0..ch {
-                let o = (y as usize / 2 + row) * cpw + x as usize / 2;
+                let o = (cy as usize + row) * cpw + x as usize / 2;
                 self.pic.planes[1 + c][o..o + cw].copy_from_slice(&chroma[0][c][row * cw..row * cw + cw]);
             }
         }
@@ -1568,7 +1593,8 @@ impl<'a> SliceDec<'a> {
     }
 
     fn neighbour_nnz_chroma(&self, comp: usize, bx: usize, by: usize) -> (Option<u8>, Option<u8>) {
-        let base = 16 + 4 * comp;
+        let base = 16 + 8 * comp;
+        let last_row = self.pic.ch / 4 - 1;
         let a = if bx > 0 {
             Some(self.cur.nnz[base + by * 2])
         } else if self.avail_left() {
@@ -1577,9 +1603,9 @@ impl<'a> SliceDec<'a> {
             None
         };
         let b = if by > 0 {
-            Some(self.cur.nnz[base + bx])
+            Some(self.cur.nnz[base + (by - 1) * 2 + bx])
         } else if self.avail_top() {
-            Some(self.top().nnz[base + 2 + bx])
+            Some(self.top().nnz[base + last_row * 2 + bx])
         } else {
             None
         };
@@ -1628,26 +1654,27 @@ impl<'a> SliceDec<'a> {
                 }
             }
         }
-        let chroma = cbp >> 4;
+        let chroma = if self.pic.cf == 0 { 0 } else { cbp >> 4 };
+        let nblk = self.pic.ch / 2;
         if chroma > 0 {
             for comp in 0..2usize {
                 let mut lv = [0i32; 16];
-                let n = self.block(comp + 1, 0, 0, 4, &mut lv, BlockKind::ChromaDc)?;
+                let n = self.block(comp + 1, 0, 0, nblk, &mut lv, BlockKind::ChromaDc)?;
                 if n > 0 {
                     self.cur.cbf_dc |= 2 << comp;
                 }
-                res.cdc[comp].copy_from_slice(&lv[..4]);
+                res.cdc[comp][..nblk].copy_from_slice(&lv[..nblk]);
             }
         }
         if chroma == 2 {
             for comp in 0..2usize {
-                for blk in 0..4usize {
+                for blk in 0..nblk {
                     let (bx, by) = (blk & 1, blk >> 1);
                     let mut lv = [0i32; 16];
                     let n = self.block(comp + 1, bx, by, 15, &mut lv, BlockKind::ChromaAc)?;
-                    self.cur.nnz[16 + 4 * comp + by * 2 + bx] = n as u8;
+                    self.cur.nnz[16 + 8 * comp + by * 2 + bx] = n as u8;
                     for k in 0..15 {
-                        res.cac[comp * 4 + blk][ZIGZAG4[k + 1] as usize] = lv[k];
+                        res.cac[comp * 8 + blk][ZIGZAG4[k + 1] as usize] = lv[k];
                     }
                 }
             }
@@ -1690,7 +1717,13 @@ impl<'a> SliceDec<'a> {
         match self.rd {
             Reader::Cavlc(_) => {
                 let nc = match kind {
-                    BlockKind::ChromaDc => -1,
+                    BlockKind::ChromaDc => {
+                        if self.pic.cf == 2 {
+                            -2
+                        } else {
+                            -1
+                        }
+                    }
                     BlockKind::ChromaAc => {
                         let (a, b) = self.neighbour_nnz_chroma(comp - 1, bx, by);
                         Self::nc_from(a, b)
@@ -1761,7 +1794,7 @@ impl<'a> SliceDec<'a> {
             let (sctx, lctx) = if cat == 5 {
                 (SIG_OFF[0][5] as usize + SIG_OFF_8X8[0][i] as usize, LAST_OFF[0][5] as usize + LAST_OFF_8X8[i] as usize)
             } else {
-                let inc = if cat == 3 { i.min(2) } else { i };
+                let inc = if cat == 3 { (i / (self.pic.ch / 8)).min(2) } else { i };
                 (SIG_OFF[0][cat] as usize + inc, LAST_OFF[0][cat] as usize + inc)
             };
             if c.decision(sctx) == 1 {
@@ -1954,6 +1987,9 @@ impl<'a> SliceDec<'a> {
     }
 
     fn reconstruct_chroma(&mut self, res: &Res) -> Result<()> {
+        if self.pic.cf == 0 {
+            return Ok(());
+        }
         let (mbx, mby) = (self.mbx, self.mby);
         let (la, ta, tla) = (self.avail_left_i(), self.avail_top_i(), self.avail_topleft_i());
         let mode = self.cur.chroma_mode;
@@ -1962,27 +1998,28 @@ impl<'a> SliceDec<'a> {
             return Err(Error::invalid_input("H.264 chroma prediction uses neighbours that are not available"));
         }
         let cs = self.pic.mb_w * 8;
-        let (x0, y0) = (mbx * 8, mby * 8);
+        let chh = self.pic.ch;
+        let (x0, y0) = (mbx * 8, mby * chh);
         let chroma_cbp = self.cur.cbp >> 4;
         for comp in 0..2usize {
             let plane = 1 + comp;
             if !inter {
                 let mut top = [0i32; 8];
-                let mut left = [0i32; 8];
+                let mut left = [0i32; 16];
                 if ta {
                     for (i, t) in top.iter_mut().enumerate() {
                         *t = self.pix(plane, x0 + i, y0 - 1);
                     }
                 }
                 if la {
-                    for (j, l) in left.iter_mut().enumerate() {
+                    for (j, l) in left.iter_mut().enumerate().take(chh) {
                         *l = self.pix(plane, x0 - 1, y0 + j);
                     }
                 }
                 let tl = if tla { self.pix(plane, x0 - 1, y0 - 1) } else { 0 };
-                let mut pred = [0u16; 64];
-                predict_chroma(mode, &top, &left, tl, ta, la, &mut pred, self.bd);
-                for y in 0..8 {
+                let mut pred = [0u16; 128];
+                predict_chroma(mode, &top, &left, tl, ta, la, &mut pred, self.bd, chh);
+                for y in 0..chh {
                     self.pic.planes[plane][(y0 + y) * cs + x0..(y0 + y) * cs + x0 + 8].copy_from_slice(&pred[y * 8..y * 8 + 8]);
                 }
             }
@@ -1991,16 +2028,34 @@ impl<'a> SliceDec<'a> {
                 continue;
             }
             let qpc = chroma_qp(self.qp, self.pps.chroma_qp_offset[comp], self.bd) + self.qp_off;
-            // DC: 2x2 transform, then scale
             let c = &res.cdc[comp];
-            let f = [c[0] + c[1] + c[2] + c[3], c[0] - c[1] + c[2] - c[3], c[0] + c[1] - c[2] - c[3], c[0] - c[1] - c[2] + c[3]];
-            let lsd = self.scale.l4[list][(qpc % 6) as usize][0];
-            let mut dc = [0i32; 4];
-            for k in 0..4 {
-                dc[k] = (f[k].wrapping_mul(lsd) << (qpc / 6)) >> 5;
+            let mut dc = [0i32; 8];
+            if chh == 8 {
+                // 2x2 transform, then scale
+                let f = [c[0] + c[1] + c[2] + c[3], c[0] - c[1] + c[2] - c[3], c[0] + c[1] - c[2] - c[3], c[0] - c[1] - c[2] + c[3]];
+                let lsd = self.scale.l4[list][(qpc % 6) as usize][0];
+                for k in 0..4 {
+                    dc[k] = (f[k].wrapping_mul(lsd) << (qpc / 6)) >> 5;
+                }
+            } else {
+                // 2x4 transform of the DC levels, which are coded in a fixed non-raster order
+                let m = [[c[0], c[2]], [c[1], c[5]], [c[3], c[6]], [c[4], c[7]]];
+                const A: [[i32; 4]; 4] = [[1, 1, 1, 1], [1, 1, -1, -1], [1, -1, -1, 1], [1, -1, 1, -1]];
+                let qdc = qpc + 3;
+                let lsd = self.scale.l4[list][(qdc % 6) as usize][0];
+                for r in 0..4 {
+                    let (mut t0, mut t1) = (0i32, 0i32);
+                    for k in 0..4 {
+                        t0 += A[r][k] * m[k][0];
+                        t1 += A[r][k] * m[k][1];
+                    }
+                    for (j, f) in [t0 + t1, t0 - t1].into_iter().enumerate() {
+                        dc[2 * r + j] = if qdc >= 36 { f.wrapping_mul(lsd) << (qdc / 6 - 6) } else { (f.wrapping_mul(lsd) + (1 << (5 - qdc / 6))) >> (6 - qdc / 6) };
+                    }
+                }
             }
-            for blk in 0..4usize {
-                let mut cf = self.scale4(&res.cac[comp * 4 + blk], list, qpc, true);
+            for blk in 0..chh / 2 {
+                let mut cf = self.scale4(&res.cac[comp * 8 + blk], list, qpc, true);
                 cf[0] = dc[blk];
                 if cf.iter().any(|&v| v != 0) {
                     let (bx, by) = (blk & 1, blk >> 1);

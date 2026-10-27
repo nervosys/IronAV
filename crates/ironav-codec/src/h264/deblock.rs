@@ -194,11 +194,17 @@ pub fn deblock_picture(pic: &mut Picture, bd: u32) {
                     }
                 }
             }
-            // chroma: the edge at 0 and the one at 4 (luma edge 2)
+            // chroma: vertical edges at 0 and 4, horizontal edges every 4 rows (every 4 chroma rows of
+            // 4:2:2, every 8 luma rows of 4:2:0); each takes the strength of the luma edge it lines up with
+            if pic.cf == 0 {
+                continue;
+            }
+            let chh = pic.ch;
             for comp in 0..2usize {
                 let off = pic.slices[m.slice as usize - 1].chroma_qp_offset[comp];
                 for dir in 0..2 {
-                    for e in [0usize, 2] {
+                    let edges: &[usize] = if dir == 1 && chh == 16 { &[0, 1, 2, 3] } else { &[0, 2] };
+                    for &e in edges {
                         if e == 0 && !(if dir == 0 { left_ok } else { top_ok }) {
                             continue;
                         }
@@ -216,9 +222,11 @@ pub fn deblock_picture(pic: &mut Picture, bd: u32) {
                         let ia = (qpav + sp.alpha_offset).clamp(0, 51) as usize;
                         let ib = (qpav + sp.beta_offset).clamp(0, 51) as usize;
                         let (alpha, beta) = ((ALPHA[ia] as i32) << (bd - 8), (BETA[ib] as i32) << (bd - 8));
-                        let (x0, y0) = (mbx * 8, mby * 8);
+                        let (x0, y0) = (mbx * 8, mby * chh);
                         if dir == 0 {
-                            filter_edge(&mut pic.planes[1 + comp], y0 * cs + x0 + e * 2, 1, cs, 8, &bs, 2, alpha, beta, ia, true, bd);
+                            filter_edge(&mut pic.planes[1 + comp], y0 * cs + x0 + e * 2, 1, cs, chh, &bs, chh / 4, alpha, beta, ia, true, bd);
+                        } else if chh == 16 {
+                            filter_edge(&mut pic.planes[1 + comp], (y0 + e * 4) * cs + x0, cs, 1, 8, &bs, 2, alpha, beta, ia, true, bd);
                         } else {
                             filter_edge(&mut pic.planes[1 + comp], (y0 + e * 2) * cs + x0, cs, 1, 8, &bs, 2, alpha, beta, ia, true, bd);
                         }

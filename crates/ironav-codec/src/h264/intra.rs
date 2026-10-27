@@ -206,12 +206,13 @@ pub fn predict_16x16(mode: u8, top: &[i32; 16], left: &[i32; 16], topleft: i32, 
     }
 }
 
-/// Chroma prediction for one 8x8 component. `mode` follows intra_chroma_pred_mode: 0 DC,
-/// 1 horizontal, 2 vertical, 3 plane.
-pub fn predict_chroma(mode: u8, top: &[i32; 8], left: &[i32; 8], topleft: i32, have_top: bool, have_left: bool, out: &mut [u16], bd: u32) {
+/// Chroma prediction for one component of 8 samples across and `h` (8 or 16) down. `mode` follows
+/// intra_chroma_pred_mode: 0 DC, 1 horizontal, 2 vertical, 3 plane.
+#[allow(clippy::too_many_arguments)]
+pub fn predict_chroma(mode: u8, top: &[i32; 8], left: &[i32; 16], topleft: i32, have_top: bool, have_left: bool, out: &mut [u16], bd: u32, h: usize) {
     match mode {
         0 => {
-            for by in 0..2 {
+            for by in 0..h / 4 {
                 for bx in 0..2 {
                     let st: i32 = top[bx * 4..bx * 4 + 4].iter().sum();
                     let sl: i32 = left[by * 4..by * 4 + 4].iter().sum();
@@ -223,7 +224,7 @@ pub fn predict_chroma(mode: u8, top: &[i32; 8], left: &[i32; 8], topleft: i32, h
                             (false, false) => 1 << (bd - 1),
                         }
                     } else if bx > 0 {
-                        // top-right block prefers the row above
+                        // a block on the top row, right of the first, prefers the row above
                         if have_top {
                             (st + 2) >> 2
                         } else if have_left {
@@ -232,7 +233,7 @@ pub fn predict_chroma(mode: u8, top: &[i32; 8], left: &[i32; 8], topleft: i32, h
                             1 << (bd - 1)
                         }
                     } else if have_left {
-                        // bottom-left block prefers the column to its left
+                        // a block in the left column, below the first, prefers the column to its left
                         (sl + 2) >> 2
                     } else if have_top {
                         (st + 2) >> 2
@@ -248,34 +249,37 @@ pub fn predict_chroma(mode: u8, top: &[i32; 8], left: &[i32; 8], topleft: i32, h
             }
         }
         1 => {
-            for y in 0..8 {
+            for y in 0..h {
                 for x in 0..8 {
                     out[y * 8 + x] = left[y] as u16;
                 }
             }
         }
         2 => {
-            for y in 0..8 {
+            for y in 0..h {
                 for x in 0..8 {
                     out[y * 8 + x] = top[x] as u16;
                 }
             }
         }
         _ => {
+            let yc = (h as i32 - 8) / 2;
             let tt = |i: i32| if i < 0 { topleft } else { top[i as usize] };
             let ll = |j: i32| if j < 0 { topleft } else { left[j as usize] };
-            let mut h = 0;
-            let mut v = 0;
+            let mut hh = 0;
+            let mut vv = 0;
             for k in 0..4 {
-                h += (k + 1) * (tt(4 + k) - tt(2 - k));
-                v += (k + 1) * (ll(4 + k) - ll(2 - k));
+                hh += (k + 1) * (tt(4 + k) - tt(2 - k));
             }
-            let a = 16 * (left[7] + top[7]);
-            let b = (34 * h + 32) >> 6;
-            let c = (34 * v + 32) >> 6;
-            for y in 0..8 {
-                for x in 0..8 {
-                    out[y as usize * 8 + x as usize] = clip((a + b * (x - 3) + c * (y - 3) + 16) >> 5, bd);
+            for k in 0..4 + yc {
+                vv += (k + 1) * (ll(4 + yc + k) - ll(2 + yc - k));
+            }
+            let a = 16 * (left[h - 1] + top[7]);
+            let b = (34 * hh + 32) >> 6;
+            let c = ((if h == 16 { 5 } else { 34 }) * vv + 32) >> 6;
+            for y in 0..h as i32 {
+                for x in 0..8i32 {
+                    out[y as usize * 8 + x as usize] = clip((a + b * (x - 3) + c * (y - 3 - yc) + 16) >> 5, bd);
                 }
             }
         }

@@ -68,7 +68,7 @@ def grab_rows(file, name, width, nrows):
     return out + [0] * (nrows * width - len(out))
 
 
-def rust(name, ty, vals, dims):
+def rust(name, ty, vals, dims, attr=None):
     def nest(v, d):
         if len(d) == 1:
             return "[" + ", ".join(str(x) for x in v) + "]"
@@ -83,6 +83,8 @@ def rust(name, ty, vals, dims):
     for n in dims:
         total *= n
     assert len(vals) == total, (name, len(vals), total)
+    if attr:
+        print(attr)
     print(f"pub const {name}: {sig} = {nest(vals, dims)};\n")
 
 
@@ -96,9 +98,9 @@ rust("SIG_OFF", "u16", grab(cabac, "significant_coeff_flag_offset"), [2, 14])
 rust("LAST_OFF", "u16", grab(cabac, "last_coeff_flag_offset"), [2, 14])
 rust("ABS_OFF", "u16", grab(cabac, "coeff_abs_level_m1_offset"), [14])
 rust("SIG_OFF_8X8", "u8", grab(cabac, "significant_coeff_flag_offset_8x8"), [2, 63])
-rust("ABS1_CTX", "u8", grab(cabac, "coeff_abs_level1_ctx"), [8])
-rust("ABSGT1_CTX", "u8", grab(cabac, "coeff_abs_levelgt1_ctx"), [2, 8])
-rust("ABS_TRANSITION", "u8", grab(cabac, "coeff_abs_level_transition"), [2, 8])
+rust("ABS1_CTX", "u8", grab(cabac, "coeff_abs_level1_ctx"), [8], "#[allow(dead_code)]")
+rust("ABSGT1_CTX", "u8", grab(cabac, "coeff_abs_levelgt1_ctx"), [2, 8], "#[allow(dead_code)]")
+rust("ABS_TRANSITION", "u8", grab(cabac, "coeff_abs_level_transition"), [2, 8], "#[allow(dead_code)]")
 
 # the packed arithmetic-coder tables: 512 shift entries, then the LPS range for each of the four
 # range quarters indexed by 2 * state + mps, then the state transitions, then the 8x8 "last" offsets
@@ -119,13 +121,13 @@ for n, d in [("coeff_token_len", [4, 68]), ("coeff_token_bits", [4, 68]), ("chro
 rust("GOLOMB_TO_INTRA4X4_CBP", "u8", grab("h264data.c", "ff_h264_golomb_to_intra4x4_cbp"), [48])
 rust("GOLOMB_TO_INTER_CBP", "u8", grab("h264data.c", "ff_h264_golomb_to_inter_cbp"), [48])
 rust("DEQUANT4_COEFF_INIT", "u8", grab("h264data.c", "ff_h264_dequant4_coeff_init"), [6, 3])
-rust("DEQUANT8_COEFF_INIT_SCAN", "u8", grab("h264data.c", "ff_h264_dequant8_coeff_init_scan"), [16])
+rust("DEQUANT8_COEFF_INIT_SCAN", "u8", grab("h264data.c", "ff_h264_dequant8_coeff_init_scan"), [16], "#[allow(dead_code)]")
 rust("DEQUANT8_COEFF_INIT", "u8", grab("h264data.c", "ff_h264_dequant8_coeff_init"), [6, 6])
 rust("DEFAULT_SCALING4", "u8", grab("h264_ps.c", "default_scaling4"), [2, 16])
 rust("DEFAULT_SCALING8", "u8", grab("h264_ps.c", "default_scaling8"), [2, 64])
 rust("ZIGZAG_DIRECT", "u8", grab("mathtables.c", "ff_zigzag_direct"), [64])
 cav8 = grab("h264_slice.c", "zigzag_scan8x8_cavlc")
-rust("ZIGZAG_8X8_CAVLC", "u8", cav8[:64], [64])
+rust("ZIGZAG_8X8_CAVLC", "u8", cav8[:64], [64], "#[allow(dead_code)]")
 
 # loop-filter thresholds: the tables are padded by 52 entries on each side for the QP offsets;
 # the middle 52 entries are the ones for QP 0 to 51
@@ -135,3 +137,16 @@ tc = grab("h264_loopfilter.c", "tc0_table")
 rust("ALPHA", "u8", a[52:104], [52])
 rust("BETA", "u8", b[52:104], [52])
 rust("TC0", "i8", tc[52 * 4:104 * 4], [52, 4])
+
+# 4:2:2 chroma DC CAVLC tables, the gray-coded CBP mappings and the 4:2:2 chroma DC scan; nothing
+# consumes them yet, hence the dead_code allowance. total_zeros rows are jagged (8 down to 2
+# entries), so grab_rows zero-pads them to 8. The scan is written as "(x + y * 2) * 16" arithmetic
+# in FFmpeg and is evaluated directly, no macro is involved.
+unused = "#[allow(dead_code)]"
+rust("CHROMA422_DC_COEFF_TOKEN_LEN", "u8", grab(cavlc, "chroma422_dc_coeff_token_len"), [36], unused)
+rust("CHROMA422_DC_COEFF_TOKEN_BITS", "u8", grab(cavlc, "chroma422_dc_coeff_token_bits"), [36], unused)
+rust("CHROMA422_DC_TOTAL_ZEROS_LEN", "u8", grab_rows(cavlc, "chroma422_dc_total_zeros_len", 8, 7), [7, 8], unused)
+rust("CHROMA422_DC_TOTAL_ZEROS_BITS", "u8", grab_rows(cavlc, "chroma422_dc_total_zeros_bits", 8, 7), [7, 8], unused)
+rust("GOLOMB_TO_INTRA4X4_CBP_GRAY", "u8", grab(cavlc, "golomb_to_intra4x4_cbp_gray"), [16], unused)
+rust("GOLOMB_TO_INTER_CBP_GRAY", "u8", grab(cavlc, "golomb_to_inter_cbp_gray"), [16], unused)
+rust("CHROMA422_DC_SCAN", "u8", grab("h264data.c", "ff_h264_chroma422_dc_scan"), [8], unused)

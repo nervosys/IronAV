@@ -16,7 +16,7 @@
 //! copy re-bases each track to its own first timestamp.
 
 use crate::mp4demux::{gcd, parse_avcc, parse_hvcc, Config, Mp4Demuxer, Sample, TrackInfo};
-use ironav_core::{CodecId, Error, ErrorCode, PixelFormat, Rational, Result, StreamInfo, StreamParams};
+use ironav_core::{CodecId, Error, ErrorCode, Rational, Result, StreamInfo, StreamParams};
 use std::io::{BufReader, Read, Seek, SeekFrom};
 
 const EBML: u32 = 0x1A45_DFA3;
@@ -607,7 +607,7 @@ fn build_track(t: &MkTrack, index: usize, frames: &[&Frame], scale: u64, samples
         config = match codec {
             CodecId::H264 => parse_avcc(&t.private)?,
             CodecId::Hevc => parse_hvcc(&t.private)?,
-            _ => Config { prefix: Vec::new(), nal_length: 0, bits: 8 },
+            _ => Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma: 1 },
         };
         convert = matches!(codec, CodecId::H264 | CodecId::Hevc);
         time_base = tick;
@@ -631,10 +631,10 @@ fn build_track(t: &MkTrack, index: usize, frames: &[&Frame], scale: u64, samples
         } else {
             0.0
         };
-        let pix_fmt = if config.bits == 10 { PixelFormat::Yuv420p10 } else { PixelFormat::Yuv420p };
+        let pix_fmt = config.pix_fmt();
         params = StreamParams::Video { width: t.width, height: t.height, pix_fmt, frame_rate: frame_rate(fps) };
     } else {
-        config = Config { prefix: Vec::new(), nal_length: 0, bits: 8 };
+        config = Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma: 1 };
         convert = false;
         let rate = t.rate.round() as u32;
         bits = t.bits;

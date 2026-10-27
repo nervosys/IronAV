@@ -43,6 +43,8 @@ impl Vlc {
 struct Tables {
     coeff_token: [Vlc; 4],
     chroma_dc_token: Vlc,
+    chroma422_dc_token: Vlc,
+    chroma422_dc_total_zeros: Vec<Vlc>,
     total_zeros: Vec<Vlc>,
     chroma_dc_total_zeros: Vec<Vlc>,
     run_before: Vec<Vlc>,
@@ -53,13 +55,16 @@ fn tables() -> &'static Tables {
     T.get_or_init(|| Tables {
         coeff_token: [0, 1, 2, 3].map(|i| Vlc::build(&COEFF_TOKEN_LEN[i], &COEFF_TOKEN_BITS[i])),
         chroma_dc_token: Vlc::build(&CHROMA_DC_COEFF_TOKEN_LEN, &CHROMA_DC_COEFF_TOKEN_BITS),
+        chroma422_dc_token: Vlc::build(&CHROMA422_DC_COEFF_TOKEN_LEN, &CHROMA422_DC_COEFF_TOKEN_BITS),
+        chroma422_dc_total_zeros: (0..7).map(|i| Vlc::build(&CHROMA422_DC_TOTAL_ZEROS_LEN[i], &CHROMA422_DC_TOTAL_ZEROS_BITS[i])).collect(),
         total_zeros: (0..15).map(|i| Vlc::build(&TOTAL_ZEROS_LEN[i], &TOTAL_ZEROS_BITS[i])).collect(),
         chroma_dc_total_zeros: (0..3).map(|i| Vlc::build(&CHROMA_DC_TOTAL_ZEROS_LEN[i], &CHROMA_DC_TOTAL_ZEROS_BITS[i])).collect(),
         run_before: (0..7).map(|i| Vlc::build(&RUN_LEN[i], &RUN_BITS[i])).collect(),
     })
 }
 
-/// Parses one residual block. `nc` is the neighbour-derived context (-1 for chroma DC) and
+/// Parses one residual block. `nc` is the neighbour-derived context (-1 for 4:2:0 chroma DC, -2
+/// for 4:2:2 chroma DC) and
 /// `max_coef` the number of coefficients the block can hold (16, 15 or 4). The levels are written
 /// to `out` in scan order; the return value is the number of non-zero coefficients.
 pub fn residual_block(r: &mut BitReader, nc: i32, max_coef: usize, out: &mut [i32; 16]) -> Result<usize> {
@@ -67,6 +72,8 @@ pub fn residual_block(r: &mut BitReader, nc: i32, max_coef: usize, out: &mut [i3
     out.fill(0);
     let token = if nc == -1 {
         t.chroma_dc_token.read(r)?
+    } else if nc == -2 {
+        t.chroma422_dc_token.read(r)?
     } else {
         let class = match nc {
             0..=1 => 0,
@@ -130,6 +137,8 @@ pub fn residual_block(r: &mut BitReader, nc: i32, max_coef: usize, out: &mut [i3
     let mut zeros_left = if total < max_coef {
         if nc == -1 {
             t.chroma_dc_total_zeros[total - 1].read(r)?
+        } else if nc == -2 {
+            t.chroma422_dc_total_zeros[total - 1].read(r)?
         } else {
             t.total_zeros[total - 1].read(r)?
         }

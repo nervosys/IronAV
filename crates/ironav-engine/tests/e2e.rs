@@ -1549,6 +1549,25 @@ fn h264_high10_decodes_to_what_ffmpeg_decodes() {
     }
 }
 
+/// 8-bit 4:2:2 and monochrome H.264 (I, P and B slices, CAVLC and CABAC) are bit-exact with
+/// FFmpeg's decoder; monochrome comes out as gray, and neither can go to the GPU.
+#[test]
+fn h264_422_and_monochrome_decode_to_what_ffmpeg_decodes() {
+    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    for (name, hw) in [("y422_i", "off"), ("y422_p", "off"), ("y422_b", "off"), ("y422_cavlc", "off"), ("y422_b", "auto"), ("y400_i", "off"), ("y400_p", "off"), ("y400_b", "off"), ("y400_b", "auto")] {
+        let dir = scratch(&format!("h264-{name}-{hw}"));
+        let out = dir.join("out.y4m");
+        let mut j = job(&data.join(format!("h264_{name}.mp4")), &out);
+        j.hwaccel = hw.into();
+        j.video.codec = Some("rawvideo".into());
+        run(&j, &mut |_| {}).unwrap();
+        let got: Vec<u8> = y4m_frames_any(&out).concat();
+        let want = std::fs::read(data.join(format!("h264_{name}.ffmpeg.yuv"))).unwrap();
+        assert_eq!(got.len(), want.len(), "{name}: size");
+        assert!(got == want, "{name}: pixels differ from FFmpeg's");
+    }
+}
+
 // ---- JPEG ------------------------------------------------------------------------------
 
 /// Raw planes of the first frame of a y4m file.
