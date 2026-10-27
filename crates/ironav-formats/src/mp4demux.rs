@@ -654,7 +654,8 @@ pub(crate) fn parse_hvcc(c: &[u8]) -> Result<Config> {
         return Err(corrupt("hvcC is malformed"));
     }
     let (chroma, luma, chroma_bits) = (c[16] & 3, c[17] & 7, c[18] & 7);
-    let bits = supported_depth(chroma, luma, chroma_bits, false)?;
+    // the HEVC decoder takes monochrome as well as 4:2:0
+    let bits = if chroma == 0 { supported_depth(0, luma, chroma_bits, true)? } else { supported_depth(chroma, luma, chroma_bits, false)? };
     let mut prefix = Vec::new();
     let mut at = 23;
     for _ in 0..c[22] {
@@ -666,7 +667,7 @@ pub(crate) fn parse_hvcc(c: &[u8]) -> Result<Config> {
             at += 2 + len;
         }
     }
-    Ok(Config { prefix, nal_length: (c[21] & 3) as usize + 1, bits, chroma: 1 })
+    Ok(Config { prefix, nal_length: (c[21] & 3) as usize + 1, bits, chroma })
 }
 
 /// 8-bit or 10-bit 4:2:0 with the same depth for luma and chroma; anything else is refused. With

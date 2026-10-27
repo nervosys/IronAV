@@ -1568,6 +1568,25 @@ fn h264_444_422_and_monochrome_decode_to_what_ffmpeg_decodes() {
     }
 }
 
+/// HEVC Main and Main 10 streams from x265 (intra, P and B pictures, weighted prediction, wavefronts,
+/// multiple slices, conformance-window cropping, monochrome) are bit-exact with FFmpeg's decoder.
+#[test]
+fn hevc_streams_decode_to_what_ffmpeg_decodes() {
+    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    for name in ["intra", "p", "b", "wpp_slices", "p10", "gray", "crop"] {
+        let dir = scratch(&format!("hevc-{name}"));
+        let out = dir.join("out.y4m");
+        let mut j = job(&data.join(format!("hevc_{name}.mp4")), &out);
+        j.hwaccel = "off".into();
+        j.video.codec = Some("rawvideo".into());
+        run(&j, &mut |_| {}).unwrap();
+        let got: Vec<u8> = y4m_frames_any(&out).concat();
+        let want = std::fs::read(data.join(format!("hevc_{name}.ffmpeg.yuv"))).unwrap();
+        assert_eq!(got.len(), want.len(), "{name}: size");
+        assert!(got == want, "{name}: pixels differ from FFmpeg's");
+    }
+}
+
 // ---- JPEG ------------------------------------------------------------------------------
 
 /// Raw planes of the first frame of a y4m file.

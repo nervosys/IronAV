@@ -8,7 +8,7 @@ A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so 
 > **WAV, FLAC and Y4M containers; PCM (8/16/24/32-bit, float), FLAC and raw-video codecs, an AAC-LC decoder, an Opus decoder and an Opus (CELT) encoder; `volume`, `resample`, `gray`, `hflip` filters.**
 > **H.264 and HEVC can be encoded and decoded on NVIDIA GPUs (NVENC/NVDEC)**, MP4 files can be read and written, and
 > Matroska/WebM files can be read.
-> HEVC has no software codec, so it needs an NVIDIA GPU; H.264 has a software decoder for progressive 8-bit 4:2:0 (see below). MP4 can carry FLAC audio next to the video, and AAC
+> H.264 and HEVC both have a software decoder (see below), so they decode without a GPU; HEVC and H.264 *encoding* still needs an NVIDIA GPU. MP4 can carry FLAC audio next to the video, and AAC
 > audio copied from another MP4/M4A (AAC can be decoded but not encoded; Opus can be both). AV1, writing Matroska etc. are modelled in
 > the ontology as `planned`.
 > IronAV is not yet a drop-in replacement for FFmpeg or HandBrake.
@@ -83,7 +83,12 @@ exact 8.000 s duration, all frames decoded, and seeking lands on the right keyfr
 `ironav probe`, `convert` and the other tools read MP4 (regular files with the index anywhere, and fragmented files). H.264/HEVC video is decoded by NVDEC through the driver's `nvcuvid` library, loaded at run time like NVENC;
 the output is cropped to the display size and returned as planar `yuv420p` in display order, so B-frame streams work.
 8-bit and 10-bit 4:2:0, 4:2:2 (`yuv422p`, `yuv422p10le`) and 4:4:4 (`yuv444p`, `yuv444p10le`; including the lossless transform-bypass mode) and monochrome (8-bit comes back as `gray`) are accepted (10-bit 4:2:0 comes back as `yuv420p10le`); interlaced and 12-bit are refused with a clear error. The GPU cannot take 4:2:2, 4:4:4 or monochrome, so those use the software decoder even with `--hwaccel auto`.
-10-bit HEVC decoding was compared with FFmpeg's software decoder on a 60-frame 720p Main 10 clip: every sample of every
+HEVC also has a software decoder (`--hwaccel off`, or automatically where the GPU cannot take a stream): Main and Main 10 (and monochrome) with I, P and B pictures,
+merge and AMVP motion prediction, temporal motion vectors, weighted prediction, wavefronts, multiple slices, default scaling lists, transform skip, lossless (transquant bypass),
+QP deltas, constrained intra, the deblocking filter and sample adaptive offset. These are checked sample-for-sample against FFmpeg on x265 streams (the
+`hevc_streams_decode_to_what_ffmpeg_decodes` test and a wider sweep of encoder settings). Written from the specification but **not yet checked against a reference stream** because x265
+cannot produce them: tiles, PCM, long-term reference pictures, scaling lists sent in the SPS/PPS, 12-bit, and random-access (CRA/RASL) handling. 4:2:2, 4:4:4 and the range extensions are refused.
+10-bit HEVC GPU decoding was compared with FFmpeg's software decoder on a 60-frame 720p Main 10 clip: every sample of every
 frame is identical. 10-bit H.264 (High 10) and 10-bit encoding of H.264 are not offered (consumer NVENC cannot encode it).
 
 ```

@@ -5,8 +5,8 @@
 //! skip and direct modes, multiple reference frames, bi-prediction, weighted prediction) are decoded
 //! with CAVLC and CABAC, with reference picture marking and output reordering.
 
-mod bits;
-mod cabac;
+pub(crate) mod bits;
+pub(crate) mod cabac;
 mod cavlc;
 mod deblock;
 mod dpb;
@@ -15,7 +15,7 @@ mod inter;
 mod intra;
 mod mb;
 mod ps;
-mod tables;
+pub(crate) mod tables;
 
 use bits::{split_annexb, unescape};
 use dpb::{DecodedPic, Dpb, Pending, RefList};
