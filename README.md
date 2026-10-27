@@ -386,7 +386,7 @@ does not use more than one thread. VP8 has no encoder here; VP8 can be copied in
 
 ## JPEG
 
-Baseline and extended-sequential 8-bit Huffman JPEG (`.jpg`, `.jpeg`, codec `mjpeg`) is decoded and encoded in software. Decoding handles grey, 4:2:0, 4:2:2 and 4:4:4, restart intervals and non-interleaved scans. Progressive, arithmetic-coded, 12-bit and lossless files are refused with a clear error. The encoder writes JFIF with the standard tables at quality 90.
+Baseline and extended-sequential 8-bit Huffman JPEG (`.jpg`, `.jpeg`, codec `mjpeg`) is decoded and encoded in software. Decoding handles grey, 4:2:0, 4:2:2 and 4:4:4, restart intervals and non-interleaved scans. Progressive, arithmetic-coded, 12-bit and lossless files are refused with a clear error. The encoder writes JFIF with the standard tables at quality 90; `--qp N` (0-51, as for the other video codecs) sets the quality to 100 minus twice N, so `--qp 5` is 90 and `--qp 23` is 54.
 
 Motion-JPEG can also be written into Matroska (`V_MJPEG`, `-o clip.mkv --vcodec mjpeg`); FFmpeg opens and decodes those files. A `.jpg` holds one picture; `ironav convert -i in.y4m -o out.jpg` picks `mjpeg` by itself. Decoded output differs from FFmpeg's by at most 1 LSB (a different IDCT), checked on 4:2:0, 4:2:2 and 4:4:4 images. Encoded files decode in FFmpeg at 40+ dB PSNR. 150 corrupted or truncated files made it return errors, never panic.
 

@@ -1444,6 +1444,23 @@ fn vp8_copied_into_webm_and_matroska_still_decodes_identically() {
 }
 
 #[test]
+fn qp_sets_the_jpeg_quality() {
+    let dir = scratch("jpeg-qp");
+    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    let mut sizes = Vec::new();
+    for qp in [2u8, 23, 45] {
+        let out = dir.join(format!("q{qp}.jpg"));
+        let mut j = job(&data.join("jpeg_420.jpg"), &out);
+        j.hwaccel = "off".into();
+        j.video.codec = Some("mjpeg".into());
+        j.video.qp = Some(qp);
+        run(&j, &mut |_| {}).unwrap();
+        sizes.push(std::fs::metadata(&out).unwrap().len());
+    }
+    assert!(sizes[0] > sizes[1] && sizes[1] > sizes[2], "{sizes:?}");
+}
+
+#[test]
 fn mjpeg_in_matroska_roundtrips() {
     let dir = scratch("mjpeg-mkv");
     let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");

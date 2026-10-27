@@ -29,6 +29,9 @@ pub struct Step {
     /// The audio encoder's target bit rate, when one was asked for.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bitrate_kbps: Option<u32>,
+    /// The constant quantizer asked for the video encoder (0 to 51), when one was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qp: Option<u8>,
     /// Hardware decisions for each codec stage, with the reason for each candidate.
     pub hardware: Vec<Selection>,
 }
@@ -206,10 +209,10 @@ pub fn plan(job: &Job) -> Result<Plan> {
         }
 
         // asking for a bit rate from a codec that has one means re-encoding, not copying
-        let rate_wanted = media == MediaType::Audio && opts.bitrate_kbps.is_some() && audio_bitrate_range(to).is_some();
+        let rate_wanted = (media == MediaType::Audio && opts.bitrate_kbps.is_some() && audio_bitrate_range(to).is_some()) || (to == CodecId::Mjpeg && opts.qp.is_some());
         let action = if to == s.codec && chain.is_empty() && !rate_wanted { Action::Copy } else { Action::Transcode };
         if rate_wanted && to == s.codec && chain.is_empty() {
-            warnings.push(format!("{at}: bitrate_kbps was set, so the {} stream is re-encoded instead of copied", to.name()));
+            warnings.push(format!("{at}: a rate or quality was set, so the {} stream is re-encoded instead of copied", to.name()));
         }
         if media == MediaType::Audio && opts.qp.is_some() {
             return Err(Error::invalid_arg("qp applies to video streams only"));
@@ -308,7 +311,7 @@ pub fn plan(job: &Job) -> Result<Plan> {
             lead_in: if action == Action::Copy { s.lead_in } else { ironav_codec::encoder_lead_in(to) },
             params,
         });
-        steps.push(Step { input_file: file, input_stream: s.index, output_stream: steps.len(), action, from_codec: s.codec, to_codec: to, filters: chain, bitrate_kbps: audio_kbps, hardware });
+        steps.push(Step { input_file: file, input_stream: s.index, output_stream: steps.len(), action, from_codec: s.codec, to_codec: to, filters: chain, bitrate_kbps: audio_kbps, qp: if media == MediaType::Video && action == Action::Transcode { opts.qp } else { None }, hardware });
     }
 
     if let Some(i) = used.iter().position(|u| !u) {

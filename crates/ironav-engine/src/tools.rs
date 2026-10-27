@@ -65,7 +65,7 @@ pub fn job_schema() -> Value {
             "video": object(json!({ "codec": { "type": "string", "enum": codec_names(MediaType::Video),
                         "description": "Target video codec; 'copy' (default) forwards packets untouched; 'none' leaves the video out. h264 and hevc are encoded on the GPU (NVENC) and need hwaccel auto or cuda." },
                         "bitrate_kbps": { "type": "integer", "minimum": 1, "description": "Target average bitrate in kbit/s. Mutually exclusive with qp." },
-                        "qp": { "type": "integer", "minimum": 0, "maximum": 51, "description": "Constant quantizer: lower is better quality and larger. Default 23 when no bitrate is set." } }), &[]),
+                        "qp": { "type": "integer", "minimum": 0, "maximum": 51, "description": "Constant quantizer: lower is better quality and larger. Default 23 when no bitrate is set. For mjpeg it sets the JPEG quality (100 minus twice qp, so 5 is 90 and 23 is 54); default quality 90." } }), &[]),
             "filters": { "type": "array", "description": "Applied in order to every stream of the matching media type.",
                          "items": object(json!({
                              "name": { "type": "string", "enum": FILTERS.iter().map(|f| f.name).collect::<Vec<_>>() },

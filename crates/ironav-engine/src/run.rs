@@ -1,7 +1,8 @@
 use crate::job::Job;
 use crate::plan::{plan, rate_control, Action, Plan};
+use ironav_codec::jpeg::JpegEncoder;
 use ironav_codec::{build_filter, new_encoder_with};
-use ironav_core::{Decoder, Encoder, Error, ErrorCode, Filter, Frame, MediaType, Packet, Rational, Result};
+use ironav_core::{CodecId, Decoder, Encoder, Error, ErrorCode, Filter, Frame, MediaType, Packet, Rational, Result};
 use ironav_hwaccel::{new_video_decoder, new_video_encoder, Direction, RateControl};
 use ironav_formats::{create_muxer, open_demuxer};
 use serde::Serialize;
@@ -166,6 +167,10 @@ fn execute(
                 Some(backend) if dst.params.media_type() == MediaType::Video => {
                     hw_name = Some(backend.name());
                     new_video_encoder(backend, dst.codec, &dst.params, rate)?
+                }
+                _ if dst.codec == CodecId::Mjpeg && dst.params.media_type() == MediaType::Video => {
+                    let quality = st.qp.map_or(JpegEncoder::default_quality(), JpegEncoder::quality_for_qp);
+                    Box::new(JpegEncoder::new(quality))
                 }
                 _ => new_encoder_with(dst.codec, &dst.params, dst.bits, st.bitrate_kbps)?,
             };

@@ -722,6 +722,11 @@ impl JpegEncoder {
         90
     }
 
+    /// The JPEG quality (1 to 100) that stands for a 0 to 51 quantizer: 0 is 100, 5 is 90, 23 is 54.
+    pub fn quality_for_qp(qp: u8) -> u32 {
+        100u32.saturating_sub(qp as u32 * 2).max(1)
+    }
+
     fn encode_image(&self, v: &VideoFrame) -> Result<Vec<u8>> {
         let (samp, n): (&[(u8, u8)], usize) = match v.pix_fmt {
             PixelFormat::Gray8 => (&[(1, 1)], 1),
