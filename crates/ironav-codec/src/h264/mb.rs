@@ -282,9 +282,6 @@ impl<'a> SliceDec<'a> {
     pub fn decode(&mut self) -> Result<()> {
         let inter_slice = self.hdr.slice_type != SliceType::I;
         if inter_slice {
-            if self.pps.constrained_intra_pred {
-                return Err(unsupported("H.264 constrained intra prediction in P slices is not supported yet"));
-            }
         }
         let mut addr = self.hdr.first_mb;
         loop {
@@ -359,6 +356,23 @@ impl<'a> SliceDec<'a> {
     }
     fn avail_topright(&self) -> bool {
         self.mby > 0 && self.mbx + 1 < self.pic.mb_w && self.pic.mbs[self.idx() - self.pic.mb_w + 1].slice == self.slice_id
+    }
+    /// Neighbour availability for intra sample and mode prediction: with constrained intra
+    /// prediction, inter-coded neighbours do not count.
+    fn intra_usable(&self, idx: usize) -> bool {
+        !self.pps.constrained_intra_pred || self.pic.mbs[idx].kind != Kind::Inter
+    }
+    fn avail_left_i(&self) -> bool {
+        self.avail_left() && self.intra_usable(self.idx() - 1)
+    }
+    fn avail_top_i(&self) -> bool {
+        self.avail_top() && self.intra_usable(self.idx() - self.pic.mb_w)
+    }
+    fn avail_topleft_i(&self) -> bool {
+        self.avail_topleft() && self.intra_usable(self.idx() - self.pic.mb_w - 1)
+    }
+    fn avail_topright_i(&self) -> bool {
+        self.avail_topright() && self.intra_usable(self.idx() - self.pic.mb_w + 1)
     }
     fn left(&self) -> &MbInfo {
         &self.pic.mbs[self.idx() - 1]
@@ -1476,7 +1490,7 @@ impl<'a> SliceDec<'a> {
     // ---- prediction modes ------------------------------------------------------------------------
 
     fn assign_pred_modes(&mut self, syn: &[(bool, u8); 16]) -> Result<()> {
-        let (la, ta) = (self.avail_left(), self.avail_top());
+        let (la, ta) = (self.avail_left_i(), self.avail_top_i());
         let t8 = self.cur.t8x8;
         let step = if t8 { 2 } else { 1 };
         let count = if t8 { 4 } else { 16 };
@@ -1828,7 +1842,7 @@ impl<'a> SliceDec<'a> {
     fn reconstruct(&mut self, res: &Res, i16_mode: u8, _cbp: u32) -> Result<()> {
         let qp = self.qp;
         let (mbx, mby) = (self.mbx, self.mby);
-        let (la, ta, tla) = (self.avail_left(), self.avail_top(), self.avail_topleft());
+        let (la, ta, tla) = (self.avail_left_i(), self.avail_top_i(), self.avail_topleft_i());
         let ls = self.luma_stride();
         match self.cur.kind {
             Kind::I16x16 => {
@@ -1935,7 +1949,7 @@ impl<'a> SliceDec<'a> {
 
     fn reconstruct_chroma(&mut self, res: &Res) -> Result<()> {
         let (mbx, mby) = (self.mbx, self.mby);
-        let (la, ta, tla) = (self.avail_left(), self.avail_top(), self.avail_topleft());
+        let (la, ta, tla) = (self.avail_left_i(), self.avail_top_i(), self.avail_topleft_i());
         let mode = self.cur.chroma_mode;
         let inter = self.cur.kind == Kind::Inter;
         if !inter && ((mode == 1 && !la) || (mode == 2 && !ta) || (mode == 3 && !(la && ta && tla))) {
@@ -1992,7 +2006,7 @@ impl<'a> SliceDec<'a> {
     }
 
     fn edges_4x4(&self, bx: usize, by: usize) -> Edges {
-        let (la, ta, tla, tra) = (self.avail_left(), self.avail_top(), self.avail_topleft(), self.avail_topright());
+        let (la, ta, tla, tra) = (self.avail_left_i(), self.avail_top_i(), self.avail_topleft_i(), self.avail_topright_i());
         let have_left = bx > 0 || la;
         let have_top = by > 0 || ta;
         let have_tl = match (bx > 0, by > 0) {
@@ -2034,7 +2048,7 @@ impl<'a> SliceDec<'a> {
     }
 
     fn edges_8x8(&self, i8: usize) -> Edges {
-        let (la, ta, tla, tra) = (self.avail_left(), self.avail_top(), self.avail_topleft(), self.avail_topright());
+        let (la, ta, tla, tra) = (self.avail_left_i(), self.avail_top_i(), self.avail_topleft_i(), self.avail_topright_i());
         let (bx, by) = (i8 & 1, i8 >> 1);
         let have_left = bx > 0 || la;
         let have_top = by > 0 || ta;
