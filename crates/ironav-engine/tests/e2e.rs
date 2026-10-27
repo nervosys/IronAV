@@ -1554,7 +1554,7 @@ fn h264_high10_decodes_to_what_ffmpeg_decodes() {
 #[test]
 fn h264_444_422_and_monochrome_decode_to_what_ffmpeg_decodes() {
     let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
-    for (name, hw) in [("y422_i", "off"), ("y422_p", "off"), ("y422_b", "off"), ("y422_cavlc", "off"), ("y422_b", "auto"), ("y400_i", "off"), ("y400_p", "off"), ("y400_b", "off"), ("y400_b", "auto"), ("y444_i_cavlc", "off"), ("y444_i_cabac", "off"), ("y444_p", "off"), ("y444_b", "off"), ("y444_b_cavlc", "off"), ("y444_b", "auto"), ("lossless_444_i", "off"), ("lossless_444_b", "off"), ("lossless_420_i", "off"), ("lossless_422_p", "off")] {
+    for (name, hw) in [("y422_i", "off"), ("y422_p", "off"), ("y422_b", "off"), ("y422_cavlc", "off"), ("y422_b", "auto"), ("y400_i", "off"), ("y400_p", "off"), ("y400_b", "off"), ("y400_b", "auto"), ("y444_i_cavlc", "off"), ("y444_i_cabac", "off"), ("y444_p", "off"), ("y444_b", "off"), ("y444_b_cavlc", "off"), ("y444_b", "auto"), ("lossless_444_i", "off"), ("lossless_444_b", "off"), ("lossless_420_i", "off"), ("lossless_422_p", "off"), ("y422p10_i_cavlc", "off"), ("y422p10_p", "off"), ("y422p10_b", "off"), ("y422p10_b", "auto"), ("y444p10_i", "off"), ("y444p10_b", "off"), ("lossless_444p10_b", "off")] {
         let dir = scratch(&format!("h264-{name}-{hw}"));
         let out = dir.join("out.y4m");
         let mut j = job(&data.join(format!("h264_{name}.mp4")), &out);
@@ -1583,6 +1583,10 @@ fn y4m_frames_any(path: &std::path::Path) -> Vec<Vec<u8>> {
     let (w, h) = (get('W'), get('H'));
     let size = if head.contains("C420p10") {
         2 * (w * h + 2 * w.div_ceil(2) * h.div_ceil(2))
+    } else if head.contains("C422p10") {
+        2 * (w * h + 2 * w.div_ceil(2) * h)
+    } else if head.contains("C444p10") {
+        6 * w * h
     } else if head.contains("C422") {
         w * h + 2 * w.div_ceil(2) * h
     } else if head.contains("C444") {

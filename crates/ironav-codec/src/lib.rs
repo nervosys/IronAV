@@ -36,7 +36,7 @@ pub struct CodecImpl {
 /// Whether a GPU decoder, when one is usable, should be chosen over the software decoder.
 /// NVDEC cannot decode 10-bit H.264, so those streams go to the software decoder.
 pub fn prefers_hardware_decode(c: CodecId, params: &ironav_core::StreamParams) -> bool {
-    c == CodecId::H264 && !matches!(params, ironav_core::StreamParams::Video { pix_fmt: ironav_core::PixelFormat::Yuv420p10, .. })
+    c == CodecId::H264 && !matches!(params, ironav_core::StreamParams::Video { pix_fmt: ironav_core::PixelFormat::Yuv420p10 | ironav_core::PixelFormat::Yuv422p10 | ironav_core::PixelFormat::Yuv444p10, .. })
 }
 
 pub fn implemented() -> Vec<CodecImpl> {

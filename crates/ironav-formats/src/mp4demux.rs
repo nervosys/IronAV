@@ -113,7 +113,9 @@ impl Config {
     /// decode it, is not chosen.
     pub(crate) fn pix_fmt(&self) -> PixelFormat {
         match (self.chroma, self.bits) {
+            (2, 10) => PixelFormat::Yuv422p10,
             (2, _) => PixelFormat::Yuv422p,
+            (3, 10) => PixelFormat::Yuv444p10,
             (3, _) => PixelFormat::Yuv444p,
             (0, 8) => PixelFormat::Gray8,
             (_, 10) => PixelFormat::Yuv420p10,
@@ -676,6 +678,7 @@ fn supported_depth(chroma: u8, luma_minus8: u8, chroma_minus8: u8, h264: bool) -
         (0, 0, 0) if h264 => Ok(8),
         (0, 2, 2) if h264 => Ok(10),
         (2 | 3, 0, 0) if h264 => Ok(8),
+        (2 | 3, 2, 2) if h264 => Ok(10),
         _ => Err(unsupported_format(chroma, luma_minus8 + 8)),
     }
 }
@@ -790,8 +793,8 @@ mod tests {
         assert_eq!(parse_avcc(&c).unwrap_err().code, ErrorCode::UnsupportedCodec);
         c[n - 2] = 0xFA; // both 10-bit
         assert_eq!(parse_avcc(&c).unwrap().bits, 10);
-        c[n - 4] = 0xFE; // 4:2:2 at 10 bits is refused
-        assert_eq!(parse_avcc(&c).unwrap_err().code, ErrorCode::UnsupportedCodec);
+        c[n - 4] = 0xFE; // 4:2:2 at 10 bits is accepted
+        assert_eq!(parse_avcc(&c).unwrap().chroma, 2);
         c[n - 3] = 0xF8; // 4:2:2 at 8 bits is accepted
         c[n - 2] = 0xF8;
         assert_eq!(parse_avcc(&c).unwrap().chroma, 2);
@@ -799,8 +802,10 @@ mod tests {
         assert_eq!(parse_avcc(&c).unwrap().chroma, 0);
         c[n - 4] = 0xFF; // 4:4:4 at 8 bits is accepted
         assert_eq!(parse_avcc(&c).unwrap().chroma, 3);
-        c[n - 3] = 0xFA; // but not at 10
+        c[n - 3] = 0xFA; // and at 10 bits
         c[n - 2] = 0xFA;
+        assert_eq!(parse_avcc(&c).unwrap().bits, 10);
+        c[n - 3] = 0xFC; // but mixed depths are still refused
         assert_eq!(parse_avcc(&c).unwrap_err().code, ErrorCode::UnsupportedCodec);
     }
 

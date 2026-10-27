@@ -1,4 +1,4 @@
-//! A software H.264 decoder (ITU-T H.264 / ISO 14496-10) for progressive video: 8- and 10-bit 4:2:0, 8-bit 4:2:2 and 4:4:4, and monochrome.
+//! A software H.264 decoder (ITU-T H.264 / ISO 14496-10) for progressive video: 8- and 10-bit 4:2:0, 4:2:2 and 4:4:4, and monochrome.
 //!
 //! Intra pictures (I slices, CAVLC and CABAC, 4x4 / 8x8 / 16x16 prediction, I_PCM, 8x8 transform,
 //! scaling matrices, multiple slices, the loop filter), P slices and B slices (all partition sizes,
@@ -99,8 +99,10 @@ impl H264Decoder {
         }
         let pix_fmt = match (c422, wide) {
             _ if gray => PixelFormat::Gray8,
+            _ if c444 && wide => PixelFormat::Yuv444p10,
             _ if c444 => PixelFormat::Yuv444p,
-            (true, _) => PixelFormat::Yuv422p,
+            (true, true) => PixelFormat::Yuv422p10,
+            (true, false) => PixelFormat::Yuv422p,
             (false, true) => PixelFormat::Yuv420p10,
             (false, false) => PixelFormat::Yuv420p,
         };
@@ -139,9 +141,6 @@ impl H264Decoder {
         let sps = self.sps[sps_id].as_ref().ok_or_else(|| Error::invalid_input("H.264 slice has no sequence parameter set"))?;
         if sps.chroma_format_idc > 3 || sps.bit_depth_luma != sps.bit_depth_chroma || !(8..=10).contains(&sps.bit_depth_luma) {
             return Err(unsupported("this H.264 decoder handles monochrome, 4:2:0, 4:2:2 and 4:4:4 video with 8 or 10 bits per sample only"));
-        }
-        if sps.chroma_format_idc >= 2 && sps.bit_depth_luma != 8 {
-            return Err(unsupported("this H.264 decoder handles 4:2:2 and 4:4:4 video with 8 bits per sample only"));
         }
         let starts_new = match &self.cur {
             Some(c) => Self::new_picture(&c.hdr, &hdr),

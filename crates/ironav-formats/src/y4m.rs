@@ -31,8 +31,10 @@ impl<R: BufRead + Seek + Send> Y4mDemuxer<R> {
                 "C" => {
                     pix = match v {
                         "420p10" => PixelFormat::Yuv420p10,
+                        "422p10" => PixelFormat::Yuv422p10,
+                        "444p10" => PixelFormat::Yuv444p10,
                         v if v.starts_with("420p") && v != "420p" => {
-                            return Err(Error::new(ErrorCode::UnsupportedFormat, format!("Y4M colour space '{v}' is not supported (only 8-bit and 420p10)")))
+                            return Err(Error::new(ErrorCode::UnsupportedFormat, format!("Y4M colour space '{v}' is not supported (only 8-bit, 420p10, 422p10 and 444p10)")))
                         }
                         v if v.starts_with("420") => PixelFormat::Yuv420p,
                         "422" => PixelFormat::Yuv422p,
@@ -130,6 +132,8 @@ impl Muxer for Y4mMuxer {
         let c = match pix_fmt {
             PixelFormat::Yuv420p => "420jpeg",
             PixelFormat::Yuv420p10 => "420p10",
+            PixelFormat::Yuv422p10 => "422p10",
+            PixelFormat::Yuv444p10 => "444p10",
             PixelFormat::Yuv422p => "422",
             PixelFormat::Yuv444p => "444",
             PixelFormat::Gray8 => "mono",

@@ -50,7 +50,7 @@ fn to_yuv444(v: &VideoFrame, m: Matrix) -> [Vec<u8>; 3] {
     match v.pix_fmt {
         PixelFormat::Gray8 => [v.planes[0].clone(), vec![128; w * h], vec![128; w * h]],
         PixelFormat::Yuv444p => [v.planes[0].clone(), v.planes[1].clone(), v.planes[2].clone()],
-        PixelFormat::Yuv420p10 => unreachable!("10-bit frames are narrowed before conversion"),
+        PixelFormat::Yuv420p10 | PixelFormat::Yuv422p10 | PixelFormat::Yuv444p10 => unreachable!("10-bit frames are narrowed before conversion"),
         PixelFormat::Yuv420p | PixelFormat::Yuv422p => {
             let (cw, ch, _) = layout[1];
             [v.planes[0].clone(), resize_plane(&v.planes[1], cw, ch, w, h, 1), resize_plane(&v.planes[2], cw, ch, w, h, 1)]
@@ -72,24 +72,34 @@ fn to_yuv444(v: &VideoFrame, m: Matrix) -> [Vec<u8>; 3] {
     }
 }
 
-/// 10-bit 4:2:0 to 8-bit 4:2:0 by rounding away the two low bits.
+/// 10-bit to 8-bit with the same subsampling by rounding away the two low bits.
 fn narrow(v: VideoFrame) -> VideoFrame {
     let planes = v
         .planes
         .iter()
         .map(|p| p.chunks_exact(2).map(|w| ((u16::from_le_bytes([w[0], w[1]]) as u32 + 2) >> 2).min(255) as u8).collect())
         .collect();
-    VideoFrame { pix_fmt: PixelFormat::Yuv420p, planes, ..v }
+    let pix_fmt = match v.pix_fmt {
+        PixelFormat::Yuv422p10 => PixelFormat::Yuv422p,
+        PixelFormat::Yuv444p10 => PixelFormat::Yuv444p,
+        _ => PixelFormat::Yuv420p,
+    };
+    VideoFrame { pix_fmt, planes, ..v }
 }
 
-/// 8-bit 4:2:0 to 10-bit 4:2:0 by replicating the top bits, so that 255 becomes 1023.
+/// 8-bit to 10-bit with the same subsampling by replicating the top bits, so that 255 becomes 1023.
 fn widen(v: VideoFrame) -> VideoFrame {
     let planes = v
         .planes
         .iter()
         .map(|p| p.iter().flat_map(|&b| (((b as u16) << 2) | (b as u16 >> 6)).to_le_bytes()).collect())
         .collect();
-    VideoFrame { pix_fmt: PixelFormat::Yuv420p10, planes, ..v }
+    let pix_fmt = match v.pix_fmt {
+        PixelFormat::Yuv422p => PixelFormat::Yuv422p10,
+        PixelFormat::Yuv444p => PixelFormat::Yuv444p10,
+        _ => PixelFormat::Yuv420p10,
+    };
+    VideoFrame { pix_fmt, planes, ..v }
 }
 
 /// Convert a frame to another pixel format. Conversions to or from 10-bit go through 8-bit
@@ -98,11 +108,17 @@ pub fn convert(v: VideoFrame, to: PixelFormat, m: Matrix) -> VideoFrame {
     if v.pix_fmt == to {
         return v;
     }
-    if v.pix_fmt == PixelFormat::Yuv420p10 {
+    if matches!(v.pix_fmt, PixelFormat::Yuv420p10 | PixelFormat::Yuv422p10 | PixelFormat::Yuv444p10) {
         return convert(narrow(v), to, m);
     }
     if to == PixelFormat::Yuv420p10 {
         return widen(convert8(v, PixelFormat::Yuv420p, m));
+    }
+    if to == PixelFormat::Yuv422p10 {
+        return widen(convert8(v, PixelFormat::Yuv422p, m));
+    }
+    if to == PixelFormat::Yuv444p10 {
+        return widen(convert8(v, PixelFormat::Yuv444p, m));
     }
     convert8(v, to, m)
 }
@@ -113,7 +129,7 @@ fn convert8(v: VideoFrame, to: PixelFormat, m: Matrix) -> VideoFrame {
     let planes = match to {
         PixelFormat::Gray8 => vec![y],
         PixelFormat::Yuv444p => vec![y, u, vv],
-        PixelFormat::Yuv420p10 => unreachable!("10-bit output is widened from 8-bit 4:2:0"),
+        PixelFormat::Yuv420p10 | PixelFormat::Yuv422p10 | PixelFormat::Yuv444p10 => unreachable!("10-bit output is widened from 8-bit"),
         PixelFormat::Yuv420p | PixelFormat::Yuv422p => {
             let (cw, ch, _) = to.planes(w, h)[1];
             vec![y, resize_plane(&u, w, h, cw, ch, 1), resize_plane(&vv, w, h, cw, ch, 1)]

@@ -53,10 +53,16 @@ pub enum PixelFormat {
     /// 4:2:0 with 10-bit samples stored as little-endian 16-bit words (value in the low 10 bits).
     #[serde(rename = "yuv420p10le")]
     Yuv420p10,
+    /// 4:2:2 with 10-bit samples stored as little-endian 16-bit words.
+    #[serde(rename = "yuv422p10le")]
+    Yuv422p10,
+    /// 4:4:4 with 10-bit samples stored as little-endian 16-bit words.
+    #[serde(rename = "yuv444p10le")]
+    Yuv444p10,
 }
 
 impl PixelFormat {
-    pub const ALL: [PixelFormat; 6] = [Self::Gray8, Self::Yuv420p, Self::Yuv422p, Self::Yuv444p, Self::Rgb24, Self::Yuv420p10];
+    pub const ALL: [PixelFormat; 8] = [Self::Gray8, Self::Yuv420p, Self::Yuv422p, Self::Yuv444p, Self::Rgb24, Self::Yuv420p10, Self::Yuv422p10, Self::Yuv444p10];
     pub fn name(self) -> &'static str {
         match self {
             Self::Gray8 => "gray8",
@@ -65,11 +71,13 @@ impl PixelFormat {
             Self::Yuv444p => "yuv444p",
             Self::Rgb24 => "rgb24",
             Self::Yuv420p10 => "yuv420p10le",
+            Self::Yuv422p10 => "yuv422p10le",
+            Self::Yuv444p10 => "yuv444p10le",
         }
     }
     /// Bits per sample.
     pub fn bit_depth(self) -> u8 {
-        if self == Self::Yuv420p10 { 10 } else { 8 }
+        if matches!(self, Self::Yuv420p10 | Self::Yuv422p10 | Self::Yuv444p10) { 10 } else { 8 }
     }
     /// `(width, height, bytes_per_pixel)` of each plane for a frame of the given size.
     pub fn planes(self, w: usize, h: usize) -> Vec<(usize, usize, usize)> {
@@ -81,6 +89,8 @@ impl PixelFormat {
             Self::Yuv444p => vec![(w, h, 1); 3],
             Self::Rgb24 => vec![(w, h, 3)],
             Self::Yuv420p10 => vec![(w, h, 2), (cw, ch, 2), (cw, ch, 2)],
+            Self::Yuv422p10 => vec![(w, h, 2), (cw, h, 2), (cw, h, 2)],
+            Self::Yuv444p10 => vec![(w, h, 2); 3],
         }
     }
     pub fn frame_bytes(self, w: usize, h: usize) -> usize {
