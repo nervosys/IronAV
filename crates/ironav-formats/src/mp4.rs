@@ -1,6 +1,6 @@
-//! MP4 (ISO BMFF) writer for H.264 or HEVC video and FLAC audio, at most one track of each.
+//! MP4 (ISO BMFF) writer for H.264, HEVC, VP9 or AV1 video and AAC or FLAC audio, at most one track of each.
 //!
-//! Input packets are Annex B access units from the encoder. They are rewritten as
+//! H.264 and HEVC packets are Annex B access units from the encoder. They are rewritten as
 //! length-prefixed samples, parameter sets are lifted out into the `avcC` / `hvcC` box, and the
 //! `moov` index is first written after the media data; when the muxer is given its file path it then
 //! copies the file once with the index moved in front ("fast start"). Decode times are constant
@@ -8,12 +8,15 @@
 //! box of composition offsets and an edit list that starts the track at its first shown frame.
 //! FLAC frames are stored as they come, one per sample, with the STREAMINFO block in a `dfLa` box;
 //! AAC frames likewise, described by an `esds` box built from the stream's AudioSpecificConfig.
+//! VP9 frames are stored as they come, with a `vpcC` box built from the first key frame's header;
+//! AV1 temporal units lose their temporal delimiter and padding OBUs and keep the stream's `av1C`.
 //!
 //! Layout while writing: `ftyp`, `mdat` (64-bit size, patched at the end), `moov`. Each track's samples are
 //! gathered into chunks of about half a second, so a player reading both tracks finds the
 //! video and audio for the same moment close together in the file.
 
 use crate::flac::{flac_audio_params, FlacStats};
+use crate::vpxav1::{av1_sample, vp9_key, vpcc_body};
 use crate::WriteSeek;
 use ironav_core::{CodecId, Error, ErrorCode, Muxer, Packet, Rational, Result, StreamInfo, StreamParams};
 use std::io::{Seek, SeekFrom};
@@ -117,8 +120,11 @@ struct Track {
     pts: Vec<i64>,
     params: ParamSets,
     flac: FlacStats,
-    /// AudioSpecificConfig of an AAC track.
-    asc: Vec<u8>,
+    /// The AudioSpecificConfig of an AAC track, the `av1C` record of an AV1 track, or the `vpcC`
+    /// body of a VP9 track (built at its first key frame).
+    config: Vec<u8>,
+    /// The AV1 sequence header's `reduced_still_picture_header`.
+    av1_still: bool,
     /// Time skipped at the start of the stream (in `time_base` units), written as an edit list.
     lead_in: i64,
     /// The stream's declared length (in `time_base` units), which ends the edit list of an audio track.
@@ -144,10 +150,12 @@ impl Track {
 
     fn video_entry(&self, width: u32, height: u32) -> Result<Vec<u8>> {
         let missing = |what: &str| Error::new(ErrorCode::Internal, format!("stream has no {what}; the encoder must emit parameter sets with its first frame"));
-        let (kind, config) = if self.is_hevc() {
-            (b"hvc1", self.hvcc(&missing)?)
-        } else {
-            (b"avc1", self.avcc(&missing)?)
+        let (kind, config) = match self.codec {
+            CodecId::Hevc => (b"hvc1", self.hvcc(&missing)?),
+            CodecId::Av1 => (b"av01", bx(b"av1C", &self.config)),
+            CodecId::Vp9 if self.config.is_empty() => return Err(Error::invalid_input("the VP9 stream has no key frame to describe it to MP4")),
+            CodecId::Vp9 => (b"vp09", bx(b"vpcC", &self.config)),
+            _ => (b"avc1", self.avcc(&missing)?),
         };
         let mut e = vec![0u8; 6];
         e.extend_from_slice(&1u16.to_be_bytes()); // data reference index
@@ -174,7 +182,7 @@ impl Track {
         e.extend_from_slice(&(bits as u16).to_be_bytes());
         e.extend_from_slice(&[0u8; 4]);
         e.extend_from_slice(&(rate.min(65535) << 16).to_be_bytes());
-        let asc = &self.asc;
+        let asc = &self.config;
         let mut config = vec![0x40, 0x15, 0, 0, 0]; // AAC, audio stream, buffer size unknown
         config.extend_from_slice(&[0u8; 8]); // maximum and average bit rate unknown
         config.extend_from_slice(&[5, asc.len() as u8]);
@@ -348,10 +356,26 @@ impl Track {
         Ok(bx(b"trak", &[tkhd, edts, mdia].concat()))
     }
 
-    /// Convert one Annex B access unit to a length-prefixed sample, collecting parameter sets.
-    /// Returns `None` if the packet held nothing but parameter sets and delimiters.
-    fn video_sample(&mut self, data: &[u8]) -> Option<(Vec<u8>, bool)> {
-        annexb_sample(self.is_hevc(), &mut self.params, data)
+    /// The sample for one video packet and whether it is a key frame: an Annex B access unit becomes
+    /// length-prefixed (its parameter sets collected), AV1 loses the OBUs MP4 does not store.
+    /// Returns `None` if the packet held nothing to store.
+    fn video_sample(&mut self, p: &Packet) -> Result<Option<(Vec<u8>, bool)>> {
+        match self.codec {
+            CodecId::Vp9 => {
+                let key = vp9_key(&p.data);
+                if let (Some(k), true, Kind::Video { width, height }) = (&key, self.config.is_empty(), &self.kind) {
+                    self.config = vpcc_body(k, *width, *height, Rational::new(self.timescale as i64, self.video_delta as i64))
+                        .ok_or_else(|| Error::new(ErrorCode::UnsupportedFormat, "MP4 cannot describe 4:4:0 VP9").hint("write .webm or .mkv"))?;
+                }
+                Ok(Some((p.data.clone(), key.is_some())))
+            }
+            CodecId::Av1 => match av1_sample(&p.data, &mut self.av1_still) {
+                Some((sample, _)) if sample.is_empty() => Ok(None),
+                Some(x) => Ok(Some(x)),
+                None => Err(Error::invalid_input(format!("an AV1 packet at {} does not parse as OBUs", p.pts))),
+            },
+            _ => Ok(annexb_sample(self.is_hevc(), &mut self.params, &p.data)),
+        }
     }
 }
 
@@ -567,7 +591,11 @@ impl Muxer for Mp4Muxer {
                 return Err(Error::invalid_arg(format!("this MP4 writer holds at most one {media:?} stream")));
             }
             let (kind, timescale, video_delta) = match (&s.params, s.codec) {
-                (StreamParams::Video { width, height, frame_rate, .. }, CodecId::H264 | CodecId::Hevc) => {
+                (StreamParams::Video { .. }, CodecId::Av1) if s.extradata.first() != Some(&0x81) || s.extradata.len() < 4 => {
+                    return Err(Error::new(ErrorCode::UnsupportedFormat, "AV1 needs its av1C configuration record to go into an MP4")
+                        .hint("copy it from an MP4, Matroska or WebM file, which carries it"));
+                }
+                (StreamParams::Video { width, height, frame_rate, .. }, CodecId::H264 | CodecId::Hevc | CodecId::Vp9 | CodecId::Av1) => {
                     if frame_rate.num <= 0 || frame_rate.den <= 0 || frame_rate.num > u32::MAX as i64 || frame_rate.den > u32::MAX as i64 {
                         return Err(Error::invalid_arg("MP4 needs a known, constant frame rate"));
                     }
@@ -588,10 +616,15 @@ impl Muxer for Mp4Muxer {
                     (Kind::Audio { rate, channels, bits }, rate, 0)
                 }
                 _ => {
-                    return Err(Error::new(ErrorCode::UnsupportedCodec, format!("this MP4 writer holds h264, hevc, aac (copied) and flac, not {}", s.codec.name()))
-                        .alternatives(["h264", "hevc", "aac", "flac"]));
+                    return Err(Error::new(ErrorCode::UnsupportedCodec, format!("this MP4 writer holds h264, hevc, vp9 and av1 (copied), aac (copied) and flac, not {}", s.codec.name()))
+                        .alternatives(["h264", "hevc", "vp9", "av1", "aac", "flac"]));
                 }
             };
+            // the av1C record's configuration OBUs may hold the sequence header
+            let mut av1_still = false;
+            if s.codec == CodecId::Av1 {
+                let _ = av1_sample(&s.extradata[4..], &mut av1_still);
+            }
             self.tracks.push(Track {
                 codec: s.codec,
                 kind,
@@ -611,7 +644,8 @@ impl Muxer for Mp4Muxer {
                 pts: Vec::new(),
                 params: ParamSets::default(),
                 flac: FlacStats::new(),
-                asc: s.extradata.clone(),
+                config: if s.codec == CodecId::Vp9 { Vec::new() } else { s.extradata.clone() },
+                av1_still,
                 lead_in: s.lead_in.max(0),
                 declared: s.duration,
             });
@@ -622,6 +656,7 @@ impl Muxer for Mp4Muxer {
             match t.codec {
                 CodecId::Hevc => brands.push(b"hvc1"),
                 CodecId::H264 => brands.push(b"avc1"),
+                CodecId::Av1 => brands.push(b"av01"),
                 _ => {}
             }
         }
@@ -645,7 +680,7 @@ impl Muxer for Mp4Muxer {
         let t = p.stream;
         let tr = self.tracks.get_mut(t).ok_or_else(|| Error::new(ErrorCode::Internal, format!("packet for unknown output stream {t}")))?;
         let (sample, key, delta) = if tr.is_video() {
-            let Some((sample, key)) = tr.video_sample(&p.data) else { return Ok(()) };
+            let Some((sample, key)) = tr.video_sample(p)? else { return Ok(()) };
             tr.reordered |= tr.last_pts.is_some_and(|last| p.pts < last);
             tr.last_pts = Some(p.pts);
             tr.pts.push(tr.media_time(p.pts));

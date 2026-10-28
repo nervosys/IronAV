@@ -498,6 +498,7 @@ fn parse_trak(trak: &[u8], index: usize, samples: &mut Vec<Sample>) -> Result<Op
                 extradata = c.to_vec();
                 av1c_config(c)?
             }
+            CodecId::Vp9 => vpcc_config(child(kids, b"vpcC")?),
             _ => Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma: 1 },
         };
         let total: i64 = samples[first..].iter().map(|s| s.duration as i64).sum();
@@ -619,6 +620,15 @@ fn aac_config(esds: &[u8]) -> Result<Vec<u8>> {
 fn push_start_coded(out: &mut Vec<u8>, nal: &[u8]) {
     out.extend_from_slice(&[0, 0, 0, 1]);
     out.extend_from_slice(nal);
+}
+
+/// Bit depth and chroma layout from a VP9 `vpcC` box (version 1); 8-bit 4:2:0 without one.
+fn vpcc_config(c: Option<&[u8]>) -> Config {
+    let (bits, chroma) = match c {
+        Some(c) if c.len() >= 7 && c[0] == 1 => (c[6] >> 4, match c[6] >> 1 & 7 { 2 => 2, 3 => 3, _ => 1 }),
+        _ => (8, 1),
+    };
+    Config { prefix: Vec::new(), nal_length: 0, bits, chroma }
 }
 
 /// Bit depth and chroma layout from an AV1CodecConfigurationRecord (`av1C`, also Matroska's

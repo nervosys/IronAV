@@ -585,42 +585,8 @@ fn audio_frame_len(t: &MkTrack, codec: CodecId) -> Option<u32> {
 
 /// Bit depth and chroma format (1 = 4:2:0, 2 = 4:2:2, 3 = 4:4:4) from the header of a VP9 key frame.
 fn vp9_format(d: &[u8]) -> Option<(u8, u8)> {
-    let mut bits = 0usize;
-    let mut rd = |n: usize| -> Option<u32> {
-        let mut v = 0;
-        for _ in 0..n {
-            let byte = *d.get(bits / 8)?;
-            v = v << 1 | u32::from(byte >> (7 - bits % 8) & 1);
-            bits += 1;
-        }
-        Some(v)
-    };
-    if rd(2)? != 2 {
-        return None;
-    }
-    let lo = rd(1)?;
-    let profile = lo | rd(1)? << 1;
-    if profile == 3 {
-        rd(1)?;
-    }
-    if rd(1)? == 1 || rd(1)? != 0 {
-        return None; // show_existing_frame, or not a key frame
-    }
-    rd(2)?; // show_frame, error_resilient_mode
-    if rd(24)? != 0x498342 {
-        return None;
-    }
-    let depth = if profile >= 2 { if rd(1)? == 1 { 12 } else { 10 } } else { 8 };
-    let cs = rd(3)?;
-    if cs == 7 {
-        return Some((depth, 3)); // RGB is 4:4:4
-    }
-    rd(1)?; // color_range
-    if profile & 1 == 0 {
-        return Some((depth, 1));
-    }
-    let (ssx, ssy) = (rd(1)?, rd(1)?);
-    Some((depth, match (ssx, ssy) { (1, 1) => 1, (1, 0) => 2, (0, 0) => 3, _ => return None }))
+    let k = crate::vpxav1::vp9_key(d)?;
+    Some((k.bits, match (k.ssx, k.ssy) { (true, true) => 1, (true, false) => 2, (false, false) => 3, _ => return None }))
 }
 
 fn build_track(t: &MkTrack, index: usize, frames: &[&Frame], scale: u64, samples: &mut Vec<Sample>, vp9: Option<(u8, u8)>) -> Result<Option<TrackInfo>> {

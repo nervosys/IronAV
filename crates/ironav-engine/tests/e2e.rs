@@ -922,10 +922,10 @@ fn audio_copied_into_matroska_keeps_its_packets() {
     assert!(pcm(&dir.join("flac.wav")) == std::fs::read(data.join("flac_in_ogg.expect.s16")).unwrap(), "FLAC through Matroska is not the source PCM");
 }
 
-/// WebM output: Opus and Vorbis audio only, with the `webm` document type; anything else is refused
+/// WebM output: its audio is Opus or Vorbis, with the `webm` document type; other audio is refused
 /// with the codecs that would fit.
 #[test]
-fn webm_holds_opus_and_vorbis_only() {
+fn webm_audio_is_opus_or_vorbis() {
     let dir = scratch("webm");
     let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
     for file in ["opus_celt_stereo.opus", "vorbis_stereo.ogg"] {
@@ -1608,6 +1608,60 @@ fn vp9_streams_decode_to_what_ffmpeg_decodes() {
         assert_eq!(got.len(), want.len(), "{name}: size");
         assert!(got == want, "{name}: pixels differ from FFmpeg's");
     }
+}
+
+/// The packets of a file's only video stream: the time each is shown, in seconds, and its payload.
+fn video_packets(path: &std::path::Path) -> (ironav_core::StreamInfo, Vec<(f64, Vec<u8>)>) {
+    let mut d = ironav_formats::open_demuxer(path).unwrap();
+    let s = d.streams()[0].clone();
+    let mut packets = Vec::new();
+    while let Some(p) = d.read_packet().unwrap() {
+        packets.push(((p.pts - s.lead_in) as f64 * s.time_base.as_f64(), p.data));
+    }
+    (s, packets)
+}
+
+/// VP9 and AV1 copied from WebM into MP4 and from there into Matroska or WebM keep every packet and
+/// its time, and the VP9 copies in MP4 still decode to what FFmpeg decodes.
+#[test]
+fn vp9_and_av1_copy_between_webm_matroska_and_mp4() {
+    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    let dir = scratch("vpx-copy");
+    let files = ["vp9_p.webm", "vp9_aq.webm", "vp9_tiles.webm", "vp9_c444.webm", "vp9_lossless.webm", "vp9_odd.webm", "av1_p.webm", "av1_odd.webm", "av1_h10.mp4"];
+    for file in files {
+        let src = data.join(file);
+        let (mid, last) = if file.ends_with(".mp4") { (dir.join(format!("{file}.webm")), dir.join(format!("{file}.mp4"))) } else { (dir.join(format!("{file}.mp4")), dir.join(format!("{file}.mkv"))) };
+        run(&job(&src, &mid), &mut |_| {}).unwrap();
+        run(&job(&mid, &last), &mut |_| {}).unwrap();
+        let (s0, p0) = video_packets(&src);
+        for out in [&mid, &last] {
+            let (s1, p1) = video_packets(out);
+            assert_eq!((s1.codec, &s1.params), (s0.codec, &s0.params), "{}", out.display());
+            if s0.codec == ironav_core::CodecId::Av1 {
+                assert_eq!(s1.extradata, s0.extradata, "{}: av1C", out.display());
+            }
+            assert_eq!(p1.len(), p0.len(), "{}: packets", out.display());
+            for (i, (a, b)) in p0.iter().zip(&p1).enumerate() {
+                assert!(a.1 == b.1, "{}: packet {i} payload", out.display());
+                assert!((a.0 - b.0).abs() < 0.0015, "{}: packet {i} at {} s, not {} s", out.display(), b.0, a.0);
+            }
+        }
+        if let Some(name) = file.strip_prefix("vp9_").and_then(|f| f.strip_suffix(".webm")) {
+            let mp4 = std::fs::read(&mid).unwrap();
+            assert!(has(&mp4, b"vp09") && has(&mp4, b"vpcC"), "{file}: VP9 sample entry");
+            let out = dir.join(format!("{name}.y4m"));
+            let mut j = job(&mid, &out);
+            j.hwaccel = "off".into();
+            j.video.codec = Some("rawvideo".into());
+            run(&j, &mut |_| {}).unwrap();
+            let want = std::fs::read(data.join(format!("vp9_{name}.ffmpeg.yuv"))).unwrap();
+            assert!(y4m_frames_any(&out).concat() == want, "{file}: the copy in MP4 decodes differently");
+        }
+    }
+    // H.264 has no place in WebM
+    let e = run(&job(&data.join("bframes_aac.mkv"), &dir.join("x.webm")), &mut |_| {}).unwrap_err();
+    assert_eq!(e.code, ErrorCode::UnsupportedCodec);
+    assert!(e.alternatives.iter().any(|a| a == "vp9") && e.alternatives.iter().any(|a| a == "av1"));
 }
 
 // ---- AV1 -------------------------------------------------------------------------------

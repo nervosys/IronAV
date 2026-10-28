@@ -9,6 +9,7 @@ mod mp4;
 mod mp3;
 mod mp4demux;
 mod ogg;
+mod vpxav1;
 mod oggwrite;
 mod wav;
 mod jpeg;
@@ -78,20 +79,20 @@ pub static FORMATS: &[FormatSpec] = &[
     FormatSpec {
         name: "mp4",
         extensions: &["mp4", "m4a", "m4v"],
-        description: "MP4 (ISO BMFF) with H.264 or HEVC video and optionally FLAC audio, or AAC audio (copied or encoded). Read as well as written; written with the index first (fast-start); fragmented files (moof) are read but never written",
+        description: "MP4 (ISO BMFF) with H.264 or HEVC video (or VP9 or AV1 copied from another file) and optionally FLAC audio, or AAC audio (copied or encoded). Read as well as written; written with the index first (fast-start); fragmented files (moof) are read but never written",
         media: MediaType::Video,
         demux: true,
         mux: true,
-        codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Aac, CodecId::Flac],
+        codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Vp9, CodecId::Av1, CodecId::Aac, CodecId::Flac],
     },
     FormatSpec {
         name: "mkv",
         extensions: &["mkv", "mka"],
-        description: "Matroska: read (also WebM, with any codec the file holds) and written with H.264, HEVC, VP8 or Motion-JPEG video (copied; VP8 and MJPEG also encoded by IronAV where it has the codec) and AAC, FLAC, MP3, Opus or Vorbis audio copied or encoded; one stream of each kind; no SeekHead",
+        description: "Matroska: read (also WebM, with any codec the file holds) and written with H.264, HEVC, VP8, VP9, AV1 or Motion-JPEG video (copied; VP8 and MJPEG also encoded by IronAV where it has the codec) and AAC, FLAC, MP3, Opus or Vorbis audio copied or encoded; one stream of each kind; no SeekHead",
         media: MediaType::Video,
         demux: true,
         mux: true,
-        codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Vp8, CodecId::Mjpeg, CodecId::Aac, CodecId::Mp3, CodecId::Opus, CodecId::Vorbis, CodecId::Flac],
+        codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Vp8, CodecId::Vp9, CodecId::Av1, CodecId::Mjpeg, CodecId::Aac, CodecId::Mp3, CodecId::Opus, CodecId::Vorbis, CodecId::Flac],
     },
     FormatSpec {
         name: "mp3",
@@ -105,11 +106,11 @@ pub static FORMATS: &[FormatSpec] = &[
     FormatSpec {
         name: "webm",
         extensions: &["webm"],
-        description: "WebM (written with VP8 video copied from another file, and Opus or Vorbis audio; VP9 and AV1 are not written); WebM files with any codec are read as Matroska",
+        description: "WebM (written with VP8, VP9 or AV1 video copied from another file, and Opus or Vorbis audio); WebM files with any codec are read as Matroska",
         media: MediaType::Video,
         demux: true,
         mux: true,
-        codecs: &[CodecId::Vp8, CodecId::Opus, CodecId::Vorbis],
+        codecs: &[CodecId::Vp8, CodecId::Vp9, CodecId::Av1, CodecId::Opus, CodecId::Vorbis],
     },
     FormatSpec {
         name: "aac",

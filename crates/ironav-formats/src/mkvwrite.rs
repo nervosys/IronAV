@@ -1,5 +1,5 @@
-//! Matroska writer (`.mkv`, `.mka`, and `.webm` for Opus or Vorbis audio): H.264 or HEVC video and AAC, FLAC, MP3, Opus or Vorbis audio,
-//! at most one stream of each kind.
+//! Matroska writer (`.mkv`, `.mka`, and `.webm` for VP8, VP9 or AV1 video and Opus or Vorbis audio): H.264, HEVC, VP8, VP9,
+//! AV1 or Motion-JPEG video and AAC, FLAC, MP3, Opus or Vorbis audio, at most one stream of each kind.
 //!
 //! Layout: EBML header, Segment (its size patched at the end), Info, Tracks, Clusters, Cues. The
 //! timestamp scale is one millisecond. Nothing is written until every stream has delivered a
@@ -10,10 +10,12 @@
 //! cluster itself, without video).
 //!
 //! Video comes in as Annex B access units and goes out length-prefixed, with the `avcC` / `hvcC`
-//! record as CodecPrivate. There is no SeekHead, no tags and no chapters.
+//! record as CodecPrivate. AV1 keeps its `av1C` record as CodecPrivate and loses its temporal
+//! delimiter and padding OBUs; VP8 and VP9 go in as they are. There is no SeekHead, no tags and no chapters.
 
 use crate::flac::{flac_audio_params, FlacStats};
 use crate::mp4::{annexb_sample, avcc_body, hvcc_body, ParamSets};
+use crate::vpxav1::{av1_sample, vp9_is_key};
 use crate::WriteSeek;
 use ironav_core::{CodecId, Error, ErrorCode, Muxer, Packet, Result, StreamInfo, StreamParams};
 use std::io::{Seek, SeekFrom};
@@ -70,6 +72,13 @@ struct Track {
     seen: u64,
     /// The first packet's duration in stream time units, for DefaultDuration.
     first_duration: i64,
+    /// The AV1 sequence header's `reduced_still_picture_header`.
+    av1_still: bool,
+}
+
+/// Video that goes in as it comes, with no parameter sets to collect first.
+fn self_contained(codec: CodecId) -> bool {
+    matches!(codec, CodecId::Vp8 | CodecId::Vp9 | CodecId::Av1 | CodecId::Mjpeg)
 }
 
 struct Cluster {
@@ -95,7 +104,7 @@ pub struct MatroskaWriter {
     /// (time ms, track number, cluster offset from the segment data)
     cues: Vec<(i64, usize, u64)>,
     end_ms: i64,
-    /// WebM holds only Opus and Vorbis audio here (no VP8/VP9/AV1 video is written yet).
+    /// WebM holds only VP8, VP9 and AV1 video and Opus and Vorbis audio.
     webm: bool,
 }
 
@@ -141,7 +150,7 @@ impl MatroskaWriter {
 
     fn ready(&self) -> bool {
         self.tracks.iter().all(|t| {
-            t.seen > 0 && (!t.video || matches!(t.stream.codec, CodecId::Vp8 | CodecId::Mjpeg) || (t.params.sps.is_some() && t.params.pps.is_some() && (t.stream.codec != CodecId::Hevc || t.params.vps.is_some())))
+            t.seen > 0 && (!t.video || self_contained(t.stream.codec) || (t.params.sps.is_some() && t.params.pps.is_some() && (t.stream.codec != CodecId::Hevc || t.params.vps.is_some())))
         })
     }
 
@@ -150,8 +159,8 @@ impl MatroskaWriter {
         Ok(match t.stream.codec {
             CodecId::H264 => Some(avcc_body(&t.params, &missing)?),
             CodecId::Hevc => Some(hvcc_body(&t.params, &missing)?),
-            CodecId::Vp8 | CodecId::Mjpeg => None,
-            CodecId::Aac | CodecId::Opus | CodecId::Vorbis => Some(t.stream.extradata.clone()),
+            CodecId::Vp8 | CodecId::Vp9 | CodecId::Mjpeg => None,
+            CodecId::Av1 | CodecId::Aac | CodecId::Opus | CodecId::Vorbis => Some(t.stream.extradata.clone()),
             CodecId::Flac => {
                 let (rate, channels, bits) = flac_audio_params(&t.stream)?;
                 let mut v = b"fLaC".to_vec();
@@ -201,6 +210,8 @@ impl MatroskaWriter {
                 CodecId::H264 => "V_MPEG4/ISO/AVC",
                 CodecId::Hevc => "V_MPEGH/ISO/HEVC",
                 CodecId::Vp8 => "V_VP8",
+                CodecId::Vp9 => "V_VP9",
+                CodecId::Av1 => "V_AV1",
                 CodecId::Mjpeg => "V_MJPEG",
                 CodecId::Aac => "A_AAC",
                 CodecId::Flac => "A_FLAC",
@@ -313,6 +324,14 @@ impl MatroskaWriter {
         let (sample, key) = if self.tracks[t].video && self.tracks[t].stream.codec == CodecId::Vp8 {
             // bit 0 of the frame tag is clear on key frames
             (p.data.clone(), p.data.first().is_some_and(|b| b & 1 == 0))
+        } else if self.tracks[t].video && self.tracks[t].stream.codec == CodecId::Vp9 {
+            (p.data.clone(), vp9_is_key(&p.data))
+        } else if self.tracks[t].video && self.tracks[t].stream.codec == CodecId::Av1 {
+            match av1_sample(&p.data, &mut self.tracks[t].av1_still) {
+                Some((sample, _)) if sample.is_empty() => return Ok(()),
+                Some(x) => x,
+                None => return Err(Error::invalid_input(format!("an AV1 packet at {} does not parse as OBUs", p.pts))),
+            }
         } else if self.tracks[t].video && self.tracks[t].stream.codec == CodecId::Mjpeg {
             // every JPEG picture stands alone
             (p.data.clone(), true)
@@ -356,13 +375,20 @@ impl Muxer for MatroskaWriter {
             if streams[..i].iter().any(|o| o.params.media_type() == media) {
                 return Err(Error::invalid_arg(format!("this Matroska writer holds at most one {media:?} stream")));
             }
-            if self.webm && !matches!(s.codec, CodecId::Opus | CodecId::Vorbis | CodecId::Vp8) {
-                return Err(Error::new(ErrorCode::UnsupportedCodec, format!("WebM holds VP8, VP9, AV1, Opus and Vorbis; this writer can write only VP8, Opus and Vorbis, not {}", s.codec.name()))
+            if self.webm && !matches!(s.codec, CodecId::Opus | CodecId::Vorbis | CodecId::Vp8 | CodecId::Vp9 | CodecId::Av1) {
+                return Err(Error::new(ErrorCode::UnsupportedCodec, format!("WebM holds VP8, VP9, AV1, Opus and Vorbis, not {}", s.codec.name()))
                     .hint("write .mkv for other codecs")
-                    .alternatives(["vp8", "opus", "vorbis"]));
+                    .alternatives(["vp8", "vp9", "av1", "opus", "vorbis"]));
             }
             let video = match (&s.params, s.codec) {
-                (StreamParams::Video { .. }, CodecId::H264 | CodecId::Hevc | CodecId::Vp8 | CodecId::Mjpeg) => true,
+                (StreamParams::Video { .. }, CodecId::Av1) => {
+                    if s.extradata.first() != Some(&0x81) || s.extradata.len() < 4 {
+                        return Err(Error::new(ErrorCode::UnsupportedFormat, "AV1 needs its av1C configuration record to go into Matroska")
+                            .hint("copy it from an MP4, Matroska or WebM file, which carries it"));
+                    }
+                    true
+                }
+                (StreamParams::Video { .. }, CodecId::H264 | CodecId::Hevc | CodecId::Vp8 | CodecId::Vp9 | CodecId::Mjpeg) => true,
                 (StreamParams::Audio { .. }, CodecId::Aac | CodecId::Opus | CodecId::Vorbis) => {
                     if s.extradata.is_empty() {
                         return Err(Error::new(ErrorCode::UnsupportedFormat, format!("{} needs its codec configuration to go into Matroska", s.codec.name()))
@@ -374,15 +400,20 @@ impl Muxer for MatroskaWriter {
                 _ => {
                     return Err(Error::new(
                         ErrorCode::UnsupportedCodec,
-                        format!("this Matroska writer holds h264, hevc, vp8, aac, flac, mp3, opus and vorbis, not {}", s.codec.name()),
+                        format!("this Matroska writer holds h264, hevc, vp8, vp9, av1, mjpeg, aac, flac, mp3, opus and vorbis, not {}", s.codec.name()),
                     )
-                    .alternatives(["h264", "hevc", "vp8", "aac", "flac", "mp3", "opus", "vorbis"]));
+                    .alternatives(["h264", "hevc", "vp8", "vp9", "av1", "mjpeg", "aac", "flac", "mp3", "opus", "vorbis"]));
                 }
             };
             if s.time_base.den <= 0 || s.time_base.num <= 0 {
                 return Err(Error::invalid_arg("a stream has no time base"));
             }
-            self.tracks.push(Track { stream: s.clone(), video, params: ParamSets::default(), flac: FlacStats::new(), seen: 0, first_duration: 0 });
+            // the av1C record's configuration OBUs may hold the sequence header
+            let mut av1_still = false;
+            if s.codec == CodecId::Av1 {
+                let _ = av1_sample(&s.extradata[4..], &mut av1_still);
+            }
+            self.tracks.push(Track { stream: s.clone(), video, params: ParamSets::default(), flac: FlacStats::new(), seen: 0, first_duration: 0, av1_still });
         }
         Ok(())
     }
@@ -398,7 +429,7 @@ impl Muxer for MatroskaWriter {
             return self.put(p);
         }
         // hold the packet, but look for parameter sets now so the header can go out as soon as they are known
-        if tr.video && !matches!(tr.stream.codec, CodecId::Vp8 | CodecId::Mjpeg) {
+        if tr.video && !self_contained(tr.stream.codec) {
             let _ = annexb_sample(tr.stream.codec == CodecId::Hevc, &mut tr.params, &p.data);
         }
         self.held.push(p.clone());

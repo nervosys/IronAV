@@ -8,7 +8,7 @@ A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so 
 > Audio codecs, each decoded and encoded: **PCM, FLAC, AAC-LC (plus HE-AAC v1 decode), MP3, Opus and Vorbis.**
 > Video: **software decoders for H.264, HEVC, VP8 and VP9; JPEG/Motion-JPEG decoded and encoded in software.**
 > H.264 and HEVC *encoding* needs an NVIDIA GPU (NVENC), and they can also be decoded on NVIDIA GPUs (NVDEC).
-> AV1 is decoded on NVIDIA GPUs only (NVDEC); it has no software decoder and no encoder yet.
+> AV1 is decoded on NVIDIA GPUs only (NVDEC); it has no software decoder and no encoder yet. VP9 and AV1 copy between WebM, Matroska and MP4.
 > IronAV is not yet a drop-in replacement for FFmpeg or HandBrake.
 
 ## Interfaces
@@ -101,6 +101,9 @@ records composition offsets (`ctts`) and an edit list, and a copy of an x264 fil
 AAC audio can be copied into an MP4 too (see the AAC decoder below for decoding). The writer builds the `esds`
 box from the stream's AudioSpecificConfig and keeps the encoder-delay edit list, so a copy of an x264+AAC file decodes
 to the identical 50 frames and 88,064 audio samples as the original.
+VP9 and AV1 can be copied into an MP4 as well: VP9 gets a `vpcC` box built from its first key frame (profile, level, bit
+depth, chroma layout), AV1 keeps its `av1C` record and loses its temporal delimiter and padding OBUs, and the key frames are
+listed in `stss` (see "Matroska output" for how the copies were checked).
 Fragmented MP4 (`moof`/`traf`/`trun`, as made by streaming tools and `-movflags frag_keyframe`) is read too, with or without
 `default-base-is-moof`; checked on two fragmented files made by FFmpeg, which copy to the same frames, times and audio samples.
 Fragmented MP4 is not written.
@@ -115,8 +118,8 @@ times. Audio whose frame length is known (AAC, MP3, Opus, anything with a `Defau
 times are exact despite the file's millisecond ticks.
 Checked on files remuxed by FFmpeg: an x264 file with B-frames and AAC and an HEVC file copy into MP4 with the same frames
 (identical pixels when decoded by FFmpeg) and audio samples; the 1080p H.264 file decodes on the GPU to the same 50 frames
-as FFmpeg's decoder; AAC in a `.mka` decodes to within 1 LSB of FFmpeg's. Opus in Matroska decodes too (see below); a VP9 WebM is listed by `probe`
-but cannot be decoded (there is no VP9 decoder yet).
+as FFmpeg's decoder; AAC in a `.mka` decodes to within 1 LSB of FFmpeg's. Opus in Matroska decodes too (see below), and so do VP9 and
+AV1 in WebM (see "VP9" and "AV1").
 Not handled: tracks with a content encoding (header stripping, compression, encryption) are refused; chapters, tags, cues
 and attachments are ignored; subtitle tracks are skipped; Matroska is never written. A copied track starts at its own first
 timestamp rounded to the output's frame grid, so a video that starts a fraction of a frame after the audio in the source
@@ -405,7 +408,7 @@ Checked bit for bit against FFmpeg's decoder (through PyAV) on libvpx output: ab
 sequences with alt-ref and compound prediction, odd sizes down to 33x17, 640x360, noise, segmentation modes 1 to 3, error-resilient and frame-parallel streams,
 tile columns and rows, 4:2:2, 4:4:4, lossless) all match on every frame, and six small clips are kept as the `vp9_streams_decode_to_what_ffmpeg_decodes` test.
 **Not tested against any stream:** 10-bit output (the libvpx build used here cannot encode it), intra-only frames, and corrupted-stream robustness beyond what is noted in the
-changelog. VP9 has no encoder here.
+changelog. VP9 has no encoder here; it can be copied between WebM, Matroska and MP4 (see "Matroska output").
 
 Tile columns are decoded on separate threads (one per core, at most one per tile column), each into its own copy of the picture, and merged
 afterwards; streams with one tile column (every stream 448 pixels wide or narrower, and any the encoder made with one) still decode on one thread.
@@ -432,7 +435,7 @@ takes, and IronAV checks them: the RTX 3090 Ti used here decodes 128x128 to 8192
 
 There is **no software AV1 decoder**, so with `--hwaccel off`, or on a machine without a usable NVIDIA GPU, an AV1 job is refused at planning time with
 `hardware-unavailable`, and nothing is written. (FFmpeg itself has no AV1 decoder of its own either; it uses libdav1d or libaom, or the GPU.) AV1 is not encoded
-(consumer NVENC before the RTX 40 series cannot encode it), and AV1 cannot be copied into MP4 or WebM yet.
+(consumer NVENC before the RTX 40 series cannot encode it), but it can be copied between WebM, Matroska and MP4 with no GPU (see "Matroska output").
 
 Checked bit for bit against FFmpeg's libdav1d (through PyAV) on SVT-AV1 output: 27 clips from 128x128 to 3840x2160, including odd sizes, 10-bit, film grain
 (8-bit and 10-bit; the grain is applied, and matches libdav1d's), several key frames, hierarchical prediction with overlay frames, screen-content tools,
@@ -491,7 +494,7 @@ becomes 160 kb/s MP3 in about 2 s. Converting an MP3 to MP3 is a copy unless a b
 
 ## Matroska output
 
-`.mkv` and `.mka` can be written: H.264 or HEVC video (from the hardware encoder or copied) with AAC, FLAC, MP3, Opus or Vorbis
+`.mkv` and `.mka` can be written: H.264 or HEVC video (from the hardware encoder or copied), or VP8, VP9, AV1 or Motion-JPEG video, with AAC, FLAC, MP3, Opus or Vorbis
 audio, copied or encoded, at most one stream of each kind. Timestamps are in milliseconds; clusters are gathered in memory and
 written whole, so there are no unknown-size elements, and the file ends with Cues for the video key frames (or the clusters, for
 audio only). The header is held back until every stream has delivered a packet and the video's SPS/PPS have been seen.
@@ -501,10 +504,17 @@ encoder, with and without the AAC audio in `.mkv`: FFmpeg opens every file, the 
 FFmpeg decodes all 50 frames of each video. IronAV's own tests copy audio through and compare every packet's bytes and the codec
 configuration, and decode FLAC through Matroska to the PCM it was made from.
 
-`.webm` is written for Opus or Vorbis audio only (document type `webm`; FFmpeg opens both and decodes them); WebM's video
-codecs, VP8, VP9 and AV1, have no encoder here. VP8 video can be copied into `.webm` or `.mkv` (key frames are read from the frame tag, so Cues are written; no codec private data is needed) and decoded, see "VP8"; FFmpeg opens the copies and decodes the same frames. VP9 and AV1 are not written.
+`.webm` is written with VP8, VP9 or AV1 video and Opus or Vorbis audio (document type `webm`; FFmpeg opens the files and decodes them).
+IronAV has no encoder for WebM's video codecs, so the video is copied, from WebM, Matroska or (VP9 and AV1) MP4. Key frames come from
+the bitstream: VP8's frame tag, the first frame header of a VP9 packet (or superframe), and for AV1 the first frame header of the temporal unit,
+which must be a shown key frame. So the Cues are right. VP8 and VP9 have no CodecPrivate. AV1's is its `av1C` record (a stream without one is
+refused), and temporal delimiter and padding OBUs are dropped, as the Matroska AV1 mapping asks. FFmpeg (through PyAV) checked the copies:
+the six VP9 and three AV1 test clips, plus VP9 and AV1 clips with a key frame every 8 to 12 frames, alt-ref superframes, 4:4:4 VP9 and 10-bit AV1,
+were each copied into MP4, Matroska and WebM and back out of MP4. FFmpeg finds the same packets, the same key frames and the same decoded pixels
+as in the source. The `vp9_and_av1_copy_between_webm_matroska_and_mp4` test makes these copies of the kept clips, compares every packet
+and decodes the VP9 copies in MP4.
 
-Not done: no SeekHead, tags, chapters or attachments; PCM, VP9/AV1 and more than one stream per kind are refused; an MP3's gapless trim (from its LAME tag) is not
+Not done: no SeekHead, tags, chapters or attachments; PCM and more than one stream per kind are refused; an MP3's gapless trim (from its LAME tag) is not
 carried over and the Opus pre-skip is carried only as the OpusHead plus CodecDelay. I did not test B-frame video, because the
 encoder here does not produce it.
 
