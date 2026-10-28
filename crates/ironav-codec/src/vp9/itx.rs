@@ -106,8 +106,8 @@ fn idct16(v: &[i64], out: &mut [i64]) {
     let mut t1a = r14((v[0] - v[8]) * 11585);
     let mut t2a = r14(v[4] * 6270 - v[12] * 15137);
     let mut t3a = r14(v[4] * 15137 + v[12] * 6270);
-    let mut t4a = r14(v[2] * 3196 - v[14] * 16069);
-    let mut t7a = r14(v[2] * 16069 + v[14] * 3196);
+    let t4a = r14(v[2] * 3196 - v[14] * 16069);
+    let t7a = r14(v[2] * 16069 + v[14] * 3196);
     let mut t5a = r14(v[10] * 13623 - v[6] * 9102);
     let mut t6a = r14(v[10] * 9102 + v[6] * 13623);
     let mut t8a = r14(v[1] * 1606 - v[15] * 16305);
@@ -119,22 +119,22 @@ fn idct16(v: &[i64], out: &mut [i64]) {
     let mut t11a = r14(v[13] * 15679 - v[3] * 4756);
     let mut t12a = r14(v[13] * 4756 + v[3] * 15679);
 
-    let mut t0 = t0a + t3a;
-    let mut t1 = t1a + t2a;
-    let mut t2 = t1a - t2a;
-    let mut t3 = t0a - t3a;
+    let t0 = t0a + t3a;
+    let t1 = t1a + t2a;
+    let t2 = t1a - t2a;
+    let t3 = t0a - t3a;
     let mut t4 = t4a + t5a;
     let mut t5 = t4a - t5a;
     let mut t6 = t7a - t6a;
     let mut t7 = t7a + t6a;
-    let mut t8 = t8a + t9a;
+    let t8 = t8a + t9a;
     let mut t9 = t8a - t9a;
     let mut t10 = t11a - t10a;
     let mut t11 = t11a + t10a;
     let mut t12 = t12a + t13a;
     let mut t13 = t12a - t13a;
     let mut t14 = t15a - t14a;
-    let mut t15 = t15a + t14a;
+    let t15 = t15a + t14a;
 
     t5a = r14((t6 - t5) * 11585);
     t6a = r14((t6 + t5) * 11585);
@@ -201,10 +201,10 @@ fn iadst16(v: &[i64], out: &mut [i64]) {
     let mut t14 = v[1] * 2404 + v[14] * 16207;
     let mut t15 = v[1] * 16207 - v[14] * 2404;
 
-    let mut t0a = r14(t0 + t8);
-    let mut t1a = r14(t1 + t9);
-    let mut t2a = r14(t2 + t10);
-    let mut t3a = r14(t3 + t11);
+    let t0a = r14(t0 + t8);
+    let t1a = r14(t1 + t9);
+    let t2a = r14(t2 + t10);
+    let t3a = r14(t3 + t11);
     let mut t4a = r14(t4 + t12);
     let mut t5a = r14(t5 + t13);
     let mut t6a = r14(t6 + t14);

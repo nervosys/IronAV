@@ -4,13 +4,11 @@ Audio and video conversion in Rust, built to be driven by AI agents as well as p
 A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so they cannot drift apart.
 
 > **Status: foundation (v0.1).** The architecture, agent interface, ontology, hardware model, CLI, MCP server
-> and both GUIs are working and tested. The codec/container set is deliberately small so far:
-> **WAV, FLAC and Y4M containers; PCM (8/16/24/32-bit, float), FLAC and raw-video codecs, an AAC-LC decoder, an Opus decoder and an Opus (CELT) encoder; `volume`, `resample`, `gray`, `hflip` filters.**
-> **H.264 and HEVC can be encoded and decoded on NVIDIA GPUs (NVENC/NVDEC)**, MP4 files can be read and written, and
-> Matroska/WebM files can be read.
-> H.264 and HEVC both have a software decoder (see below), so they decode without a GPU; HEVC and H.264 *encoding* still needs an NVIDIA GPU. MP4 can carry FLAC audio next to the video, and AAC
-> audio copied from another MP4/M4A (AAC can be decoded but not encoded; Opus can be both). AV1, writing Matroska etc. are modelled in
-> the ontology as `planned`.
+> and both GUIs are working and tested. Containers: **WAV, FLAC, Y4M, MP4, Matroska/WebM (read and write), Ogg, ADTS, MP3 and JPEG.**
+> Audio codecs, each decoded and encoded: **PCM, FLAC, AAC-LC (plus HE-AAC v1 decode), MP3, Opus and Vorbis.**
+> Video: **software decoders for H.264, HEVC, VP8 and VP9; JPEG/Motion-JPEG decoded and encoded in software.**
+> H.264 and HEVC *encoding* needs an NVIDIA GPU (NVENC), and they can also be decoded on NVIDIA GPUs (NVDEC).
+> AV1 is not implemented yet.
 > IronAV is not yet a drop-in replacement for FFmpeg or HandBrake.
 
 ## Interfaces
@@ -107,7 +105,7 @@ Fragmented MP4 (`moof`/`traf`/`trun`, as made by streaming tools and `-movflags 
 `default-base-is-moof`; checked on two fragmented files made by FFmpeg, which copy to the same frames, times and audio samples.
 Fragmented MP4 is not written.
 
-### Matroska and WebM (read only)
+### Reading Matroska and WebM
 
 `.mkv`, `.webm` and `.mka` files are read: the elements are walked once to find every frame (simple blocks, block groups,
 Xiph/EBML/fixed lacing, clusters of unknown size, a file cut short mid-cluster), and the frames then go through the same
@@ -376,7 +374,7 @@ is not is decoded differently by the specification and by some FFmpeg builds, so
 
 ## H.264 (software decoder)
 
-`ironav-codec` has a software H.264 decoder written from the specification, with the constant tables read out of FFmpeg's source by `tools/gen_h264_tables.py`. It decodes **I, P and B slices** with CAVLC or CABAC: Intra 4x4, 8x8 and 16x16 prediction, I_PCM, the 8x8 transform, scaling matrices, several slices per picture, every inter partition size, quarter-sample motion compensation, several reference frames with list modification and MMCO marking, spatial and temporal direct prediction, bi-prediction with explicit and implicit weights, output reordering, cropping constrained intra prediction and the loop filter, for 8-bit and 10-bit (High 10) 4:2:0 progressive video, which it writes out as `yuv420p` or `yuv420p10le`. NVDEC cannot decode 10-bit H.264, so those streams always take the software path. Interlaced coding (field pictures, MBAFF), slice groups, 4:2:2/4:4:4, monochrome and bit depths above 10 are refused with a clear error. It is correct but not fast: the CABAC engine and the interpolation are not optimised.
+`ironav-codec` has a software H.264 decoder written from the specification, with the constant tables read out of FFmpeg's source by `tools/gen_h264_tables.py`. It decodes **I, P and B slices** with CAVLC or CABAC: Intra 4x4, 8x8 and 16x16 prediction, I_PCM, the 8x8 transform, scaling matrices, several slices per picture, every inter partition size, quarter-sample motion compensation, several reference frames with list modification and MMCO marking, spatial and temporal direct prediction, bi-prediction with explicit and implicit weights, output reordering, cropping constrained intra prediction and the loop filter. It handles 8-bit and 10-bit (High 10) progressive video in monochrome, 4:2:0, 4:2:2 and 4:4:4, including the lossless transform-bypass mode. Output is `gray` (8-bit monochrome), `yuv420p` or `yuv420p10le`, `yuv422p` or `yuv422p10le`, and `yuv444p` or `yuv444p10le`. NVDEC cannot decode 10-bit H.264 and cannot take 4:2:2, 4:4:4 or monochrome, so those streams always take the software path. Interlaced coding (field pictures, MBAFF), slice groups, separate colour planes, SP/SI slices and bit depths above 10 are refused with a clear error. It is correct but not fast: the CABAC engine and the interpolation are not optimised.
 
 When a GPU decoder is usable (`--hwaccel auto`) it is still chosen for 4:2:0 H.264; the software decoder runs with `--hwaccel off` or when no GPU backend works. About 50 small streams (a further 75 8-bit and 50 10-bit random libx264 configurations also matched) (libx264 in many configurations, with B-frames, pyramids, weighted prediction, several slices and reference frames, plus hand-built all-I_PCM streams) decode bit-for-bit like FFmpeg's decoder; hundreds of corrupted streams made it return errors, never panic.
 
@@ -407,7 +405,15 @@ Checked bit for bit against FFmpeg's decoder (through PyAV) on libvpx output: ab
 sequences with alt-ref and compound prediction, odd sizes down to 33x17, 640x360, noise, segmentation modes 1 to 3, error-resilient and frame-parallel streams,
 tile columns and rows, 4:2:2, 4:4:4, lossless) all match on every frame, and six small clips are kept as the `vp9_streams_decode_to_what_ffmpeg_decodes` test.
 **Not tested against any stream:** 10-bit output (the libvpx build used here cannot encode it), intra-only frames, and corrupted-stream robustness beyond what is noted in the
-changelog. Speed has not been tuned; the decoder uses one thread. VP9 has no encoder here.
+changelog. VP9 has no encoder here.
+
+Tile columns are decoded on separate threads (one per core, at most one per tile column), each into its own copy of the picture, and merged
+afterwards; streams with one tile column (every stream 448 pixels wide or narrower, and any the encoder made with one) still decode on one thread.
+The loop filter runs on one thread after the tiles. Decode alone (no output file; `IRONAV_PERF_WEBM=clip.webm cargo test --release -p ironav-engine --test vp9_perf -- --ignored --nocapture`,
+best of 7, on a machine whose cores were all busy with other work, so the decoder ran at high priority): a 1080p clip of random noise with four tile
+columns went from 898 ms to 390 ms for 8 frames (2.3x); a lighter 30-frame 1080p clip from 1,147 ms to 963 ms, because there the loop filter and the
+rest of the frame work are most of the time. Threaded output was checked against FFmpeg on 4:2:0 and 4:4:4 clips with two and four tile columns, two tile rows,
+an odd width (1000x300) and 1080p, and 120 corrupted copies caused no panic. `IRONAV_VP9_THREADS=1` turns the threading off.
 
 ## JPEG
 

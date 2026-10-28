@@ -72,6 +72,38 @@ impl Pic {
     pub fn info(&self) -> RefInfo {
         RefInfo { w: self.w, h: self.h, ss_h: self.ss_h, ss_v: self.ss_v, bpp: self.bpp }
     }
+
+    /// A picture shaped like `like`, reusing one from `pool` when one fits. A reused picture still holds
+    /// an earlier frame: `clear_cols` the columns that are to be decoded into it.
+    pub fn from_pool(pool: &mut Vec<Pic>, like: &Pic) -> Pic {
+        while let Some(mut p) = pool.pop() {
+            if (p.w, p.h, p.ss_h, p.ss_v, p.bpp) == (like.w, like.h, like.ss_h, like.ss_v, like.bpp) {
+                p.pts = like.pts;
+                return p;
+            }
+        }
+        Pic::new(like.w, like.h, like.ss_h, like.ss_v, like.bpp, like.pts)
+    }
+
+    /// Sets the 8x8 columns `col_start..col_end` back to what `Pic::new` puts there.
+    pub fn clear_cols(&mut self, col_start: usize, col_end: usize) {
+        let mid = 1u16 << (self.bpp - 1);
+        for pl in 0..3 {
+            let sh = if pl == 0 { 0 } else { self.ss_h as usize };
+            let stride = self.stride[pl];
+            let (x0, x1) = ((col_start * 8) >> sh, ((col_end * 8) >> sh).min(stride));
+            for row in self.planes[pl].chunks_exact_mut(stride) {
+                row[x0..x1].fill(mid);
+            }
+        }
+        let w8 = self.stride[0] / 8;
+        for row in self.mv.chunks_exact_mut(w8) {
+            row[col_start..col_end].fill(MvRef::default());
+        }
+        for row in self.segmap.chunks_exact_mut(w8) {
+            row[col_start..col_end].fill(0);
+        }
+    }
 }
 
 #[derive(Default, Clone)]
@@ -105,6 +137,62 @@ pub struct Counts {
     pub y_mode: [[u32; 10]; 4],
     pub uv_mode: [[u32; 10]; 10],
     pub mv_comp: [MvCompCounts; 2],
+}
+
+/// Element-wise addition, for merging the counts of tile columns decoded on separate threads.
+trait Acc {
+    fn acc(&mut self, o: &Self);
+}
+
+impl Acc for u32 {
+    fn acc(&mut self, o: &Self) {
+        *self += *o;
+    }
+}
+
+impl<T: Acc, const N: usize> Acc for [T; N] {
+    fn acc(&mut self, o: &Self) {
+        for (a, b) in self.iter_mut().zip(o) {
+            a.acc(b);
+        }
+    }
+}
+
+impl Acc for MvCompCounts {
+    fn acc(&mut self, o: &Self) {
+        let MvCompCounts { sign, classes, class0, bits, class0_fp, fp, class0_hp, hp } = o;
+        self.sign.acc(sign);
+        self.classes.acc(classes);
+        self.class0.acc(class0);
+        self.bits.acc(bits);
+        self.class0_fp.acc(class0_fp);
+        self.fp.acc(fp);
+        self.class0_hp.acc(class0_hp);
+        self.hp.acc(hp);
+    }
+}
+
+impl Counts {
+    pub fn add(&mut self, o: &Counts) {
+        let Counts { coef, eob, skip, intra, comp, comp_ref, single_ref, partition, tx8p, tx16p, tx32p, filter, mv_mode, mv_joint, y_mode, uv_mode, mv_comp } = o;
+        self.coef.acc(coef);
+        self.eob.acc(eob);
+        self.skip.acc(skip);
+        self.intra.acc(intra);
+        self.comp.acc(comp);
+        self.comp_ref.acc(comp_ref);
+        self.single_ref.acc(single_ref);
+        self.partition.acc(partition);
+        self.tx8p.acc(tx8p);
+        self.tx16p.acc(tx16p);
+        self.tx32p.acc(tx32p);
+        self.filter.acc(filter);
+        self.mv_mode.acc(mv_mode);
+        self.mv_joint.acc(mv_joint);
+        self.y_mode.acc(y_mode);
+        self.uv_mode.acc(uv_mode);
+        self.mv_comp.acc(mv_comp);
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -196,6 +284,8 @@ pub struct Dec {
     pub eob: Vec<u16>,
     pub uveob: [Vec<u16>; 2],
     pub lflvl: Vec<Filt>,
+    /// Pictures of earlier forks, kept so that forking does not allocate a new picture every frame.
+    pub pool: Vec<Pic>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -265,11 +355,60 @@ impl Dec {
             eob: vec![0; 256],
             uveob: [vec![0; 256], vec![0; 256]],
             lflvl: vec![Filt::default(); sb_cols * sb_rows],
+            pool: Vec::new(),
         }
     }
 
     pub fn keyintra(&self) -> bool {
         self.h.keyframe || self.h.intraonly
+    }
+
+    /// A decoder for other tile columns of the same frame: the same headers, probabilities, references
+    /// and above contexts, with its own picture, left contexts and counts.
+    pub fn fork(&mut self) -> Dec {
+        let cur = Pic::from_pool(&mut self.pool, &self.cur);
+        let mut d = Dec::new(self.h.clone(), self.p, self.coef, cur);
+        d.refs = self.refs.clone();
+        d.prev = self.prev.clone();
+        d.segmap_ref = self.segmap_ref.clone();
+        d.above_partition.clone_from(&self.above_partition);
+        d.above_skip.clone_from(&self.above_skip);
+        d.above_txfm.clone_from(&self.above_txfm);
+        d.above_mode.clone_from(&self.above_mode);
+        d.above_y_nnz.clone_from(&self.above_y_nnz);
+        d.above_uv_nnz.clone_from(&self.above_uv_nnz);
+        d.above_intra.clone_from(&self.above_intra);
+        d.above_comp.clone_from(&self.above_comp);
+        d.above_ref.clone_from(&self.above_ref);
+        d.above_filter.clone_from(&self.above_filter);
+        d.above_segpred.clone_from(&self.above_segpred);
+        d.above_mv.clone_from(&self.above_mv);
+        d
+    }
+
+    /// Takes the 8x8 columns `col_start..col_end` (whole tile columns) of the frame from `t`, a fork
+    /// that decoded them, with their motion, segment map, loop filter levels and counts.
+    pub fn merge_cols(&mut self, t: &Dec, col_start: usize, col_end: usize) {
+        for pl in 0..3 {
+            let sh = if pl == 0 { 0 } else { self.ss_h };
+            let stride = self.cur.stride[pl];
+            let (x0, x1) = ((col_start * 8) >> sh, ((col_end * 8) >> sh).min(stride));
+            for (d, s) in self.cur.planes[pl].chunks_exact_mut(stride).zip(t.cur.planes[pl].chunks_exact(stride)) {
+                d[x0..x1].copy_from_slice(&s[x0..x1]);
+            }
+        }
+        let w8 = self.sb_cols * 8;
+        for (d, s) in self.cur.mv.chunks_exact_mut(w8).zip(t.cur.mv.chunks_exact(w8)) {
+            d[col_start..col_end].copy_from_slice(&s[col_start..col_end]);
+        }
+        for (d, s) in self.cur.segmap.chunks_exact_mut(w8).zip(t.cur.segmap.chunks_exact(w8)) {
+            d[col_start..col_end].copy_from_slice(&s[col_start..col_end]);
+        }
+        let (sb0, sb1) = (col_start / 8, col_end.div_ceil(8));
+        for (d, s) in self.lflvl.chunks_exact_mut(self.sb_cols).zip(t.lflvl.chunks_exact(self.sb_cols)) {
+            d[sb0..sb1].copy_from_slice(&s[sb0..sb1]);
+        }
+        self.counts.add(&t.counts);
     }
 }
 

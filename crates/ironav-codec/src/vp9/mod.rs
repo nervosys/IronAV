@@ -47,6 +47,8 @@ pub struct Vp9Decoder {
     prev_seg: (bool, bool),
     last_keyframe: bool,
     out: Vec<OutFrame>,
+    /// Picture buffers for the threads that decode tile columns, reused from frame to frame.
+    pool: Vec<Pic>,
 }
 
 impl Vp9Decoder {
@@ -59,6 +61,7 @@ impl Vp9Decoder {
             prev_seg: (false, false),
             last_keyframe: false,
             out: Vec::new(),
+            pool: Vec::new(),
         }
     }
 
@@ -122,6 +125,7 @@ impl Vp9Decoder {
 
         let mut d = Dec::new(h.clone(), probs, coef, cur);
         d.segmap_ref = self.segmap_ref.clone();
+        d.pool = std::mem::take(&mut self.pool);
         if !intra {
             for i in 0..3 {
                 d.refs[i] = self.refs[h.refidx[i]].clone();
@@ -149,7 +153,9 @@ impl Vp9Decoder {
         }
 
         let tiles = &data[h.uncompressed_size + h.compressed_size..];
-        d.decode_tiles(tiles).map_err(|m| Error::new(ErrorCode::InvalidInput, m.to_string()))?;
+        let res = d.decode_tiles(tiles);
+        self.pool = std::mem::take(&mut d.pool);
+        res.map_err(|m| Error::new(ErrorCode::InvalidInput, m.to_string()))?;
 
         if h.refreshctx && !h.parallelmode {
             adapt::adapt_probs(&d, &mut self.st, self.last_keyframe);
@@ -259,9 +265,9 @@ impl Dec {
             *v = 0;
         }
 
+        // Every tile's data, by tile column and then tile row.
+        let mut racs: Vec<Vec<Rac>> = (0..tile_cols).map(|_| Vec::with_capacity(tile_rows)).collect();
         for tile_row in 0..tile_rows {
-            let (row_start, row_end) = set_tile_offset(tile_row, self.h.log2_tile_rows, self.sb_rows);
-            let mut racs: Vec<Rac> = Vec::with_capacity(tile_cols);
             for tile_col in 0..tile_cols {
                 let size = if tile_col == tile_cols - 1 && tile_row == tile_rows - 1 {
                     data.len()
@@ -280,35 +286,79 @@ impl Dec {
                 if r.get(128) {
                     return Err("tile marker bit set");
                 }
-                racs.push(r);
+                racs[tile_col].push(r);
                 data = &data[size..];
             }
+        }
 
+        // Tile columns depend on nothing outside themselves, so several are decoded at once, each by a
+        // fork with its own copy of the picture, and their columns are merged back afterwards.
+        let threads = std::env::var("IRONAV_VP9_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get())).min(tile_cols);
+        if threads <= 1 {
+            for (tile_col, r) in racs.into_iter().enumerate() {
+                self.decode_tile_col(tile_col, r)?;
+            }
+            return Ok(());
+        }
+        let per = tile_cols.div_ceil(threads);
+        let (log2_cols, sb_cols) = (self.h.log2_tile_cols, self.sb_cols);
+        let range = |first: usize| {
+            let last = (first + per).min(tile_cols) - 1;
+            (set_tile_offset(first, log2_cols, sb_cols).0, set_tile_offset(last, log2_cols, sb_cols).1)
+        };
+        let mut jobs: Vec<(usize, (usize, usize), Vec<Vec<Rac>>, Dec)> = Vec::new();
+        let mut it = racs.into_iter();
+        for first in (0..tile_cols).step_by(per) {
+            jobs.push((first, range(first), it.by_ref().take(per).collect(), self.fork()));
+        }
+        let results: Vec<std::result::Result<(), &'static str>> = std::thread::scope(|s| {
+            let handles: Vec<_> = jobs
+                .iter_mut()
+                .map(|(first, (col_start, col_end), cols, d)| {
+                    let (first, col_start, col_end, cols) = (*first, *col_start, *col_end, std::mem::take(cols));
+                    s.spawn(move || {
+                        d.cur.clear_cols(col_start, col_end);
+                        for (i, r) in cols.into_iter().enumerate() {
+                            d.decode_tile_col(first + i, r)?;
+                        }
+                        Ok(())
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e))).collect()
+        });
+        for r in results {
+            r?;
+        }
+        for (_, (col_start, col_end), _, d) in &jobs {
+            self.merge_cols(d, *col_start, *col_end);
+        }
+        self.pool.extend(jobs.into_iter().map(|(_, _, _, d)| d.cur));
+        Ok(())
+    }
+
+    /// Decodes one tile column, top to bottom through every tile row.
+    fn decode_tile_col(&mut self, tile_col: usize, racs: Vec<Rac>) -> std::result::Result<(), &'static str> {
+        let keyintra = self.keyintra();
+        let (col_start, col_end) = set_tile_offset(tile_col, self.h.log2_tile_cols, self.sb_cols);
+        self.tile_col_start = col_start;
+        for (tile_row, rac) in racs.into_iter().enumerate() {
+            let (row_start, row_end) = set_tile_offset(tile_row, self.h.log2_tile_rows, self.sb_rows);
+            self.c = rac;
             let mut row = row_start;
             while row < row_end {
-                for tile_col in 0..tile_cols {
-                    let (col_start, col_end) = set_tile_offset(tile_col, self.h.log2_tile_cols, self.sb_cols);
-                    self.tile_col_start = col_start;
-                    self.left_partition = [0; 8];
-                    self.left_skip = [0; 8];
-                    self.left_mode = [if keyintra { DC_PRED } else { NEARESTMV }; 16];
-                    self.left_y_nnz = [0; 16];
-                    self.left_uv_nnz = [[0; 16]; 2];
-                    self.left_segpred = [0; 8];
-                    std::mem::swap(&mut self.c, &mut racs[tile_col]);
-                    let mut col = col_start;
-                    let mut res = Ok(());
-                    while col < col_end {
-                        let sb = (row >> 3) * self.sb_cols + (col >> 3);
-                        self.lflvl[sb] = Filt::default();
-                        res = self.decode_sb(row, col, 0);
-                        if res.is_err() {
-                            break;
-                        }
-                        col += 8;
-                    }
-                    std::mem::swap(&mut self.c, &mut racs[tile_col]);
-                    res?;
+                self.left_partition = [0; 8];
+                self.left_skip = [0; 8];
+                self.left_mode = [if keyintra { DC_PRED } else { NEARESTMV }; 16];
+                self.left_y_nnz = [0; 16];
+                self.left_uv_nnz = [[0; 16]; 2];
+                self.left_segpred = [0; 8];
+                let mut col = col_start;
+                while col < col_end {
+                    let sb = (row >> 3) * self.sb_cols + (col >> 3);
+                    self.lflvl[sb] = Filt::default();
+                    self.decode_sb(row, col, 0)?;
+                    col += 8;
                 }
                 row += 8;
             }

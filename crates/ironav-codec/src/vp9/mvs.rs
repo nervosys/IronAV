@@ -13,6 +13,8 @@ impl Dec {
 
     /// Candidate list search: the `idx`'th distinct candidate (0 = nearest, 1 = near) for `ref_`.
     /// `sb` is the sub-block of an 8x8 block being predicted, or -1.
+    // The last expansion of `ret_mv!` stores a candidate that nothing reads afterwards.
+    #[allow(unused_assignments)]
     fn find_ref_mvs(&self, ref_: i8, z: usize, idx: bool, sb: i32) -> Mv {
         let (row, col) = (self.row, self.col);
         let row7 = row & 7;
