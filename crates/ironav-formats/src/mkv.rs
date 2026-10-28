@@ -15,7 +15,7 @@
 //! chapters, tags, cues and attachments, which are skipped; and a track's start offset, since a
 //! copy re-bases each track to its own first timestamp.
 
-use crate::mp4demux::{gcd, parse_avcc, parse_hvcc, Config, Mp4Demuxer, Sample, TrackInfo};
+use crate::mp4demux::{av1c_config, gcd, parse_avcc, parse_hvcc, Config, Mp4Demuxer, Sample, TrackInfo};
 use ironav_core::{CodecId, Error, ErrorCode, Rational, Result, StreamInfo, StreamParams};
 use std::io::{BufReader, Read, Seek, SeekFrom};
 
@@ -650,6 +650,10 @@ fn build_track(t: &MkTrack, index: usize, frames: &[&Frame], scale: u64, samples
             CodecId::Vp9 => {
                 let (bits, chroma) = vp9.unwrap_or((8, 1));
                 Config { prefix: Vec::new(), nal_length: 0, bits, chroma }
+            }
+            CodecId::Av1 if !t.private.is_empty() => {
+                extradata = t.private.clone();
+                av1c_config(&t.private)?
             }
             _ => Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma: 1 },
         };

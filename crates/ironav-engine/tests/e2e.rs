@@ -417,7 +417,11 @@ fn schema_and_ontology_know_hardware_codecs() {
     let o = ontology();
     let h264 = o.get("codec/h264").expect("h264 entity");
     assert_eq!(h264.status, ironav_ontology::Status::Implemented);
-    assert!(o.get("codec/av1").is_some_and(|e| e.status == ironav_ontology::Status::Planned));
+    assert!(o.get("codec/mpeg4").is_some_and(|e| e.status == ironav_ontology::Status::Planned));
+    // AV1 has no software codec; it is usable only where the NVDEC provider is compiled in.
+    let av1 = o.get("codec/av1").expect("av1 entity");
+    let gpu = cfg!(any(windows, target_os = "linux"));
+    assert_eq!(av1.status, if gpu { ironav_ontology::Status::Implemented } else { ironav_ontology::Status::Planned });
 }
 
 fn tone(n: usize) -> Vec<i16> {
@@ -1603,6 +1607,39 @@ fn vp9_streams_decode_to_what_ffmpeg_decodes() {
         let want = std::fs::read(data.join(format!("vp9_{name}.ffmpeg.yuv"))).unwrap();
         assert_eq!(got.len(), want.len(), "{name}: size");
         assert!(got == want, "{name}: pixels differ from FFmpeg's");
+    }
+}
+
+// ---- AV1 -------------------------------------------------------------------------------
+
+/// AV1 is decoded only on the GPU. Without one (or with hardware off) the job must refuse
+/// precisely; with one, the pictures must equal libdav1d's (AV1 decoding is exact).
+#[test]
+fn av1_decodes_on_the_gpu_to_what_dav1d_decodes_or_refuses_precisely() {
+    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    for (name, ext) in [("p", "webm"), ("h10", "mp4"), ("odd", "webm")] {
+        let dir = scratch(&format!("av1-{name}"));
+        let out = dir.join("out.y4m");
+        let mut j = job(&data.join(format!("av1_{name}.{ext}")), &out);
+        j.video.codec = Some("rawvideo".into());
+
+        let mut off = j.clone();
+        off.hwaccel = "off".into();
+        assert_eq!(plan(&off).unwrap_err().code, ErrorCode::HardwareUnavailable, "{name}: no software AV1 decoder");
+
+        let report = match run(&j, &mut |_| {}) {
+            Ok(r) => r,
+            Err(e) => {
+                assert_eq!(e.code, ErrorCode::HardwareUnavailable, "{name}: {}", e.message);
+                assert!(!out.exists(), "{name}: nothing is written when decoding is refused");
+                continue;
+            }
+        };
+        assert_eq!(report.steps[0].hardware_decoder, Some("cuda"));
+        let got: Vec<u8> = y4m_frames_any(&out).concat();
+        let want = std::fs::read(data.join(format!("av1_{name}.dav1d.yuv"))).unwrap();
+        assert_eq!(got.len(), want.len(), "{name}: size");
+        assert!(got == want, "{name}: pixels differ from libdav1d's");
     }
 }
 

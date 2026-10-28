@@ -470,7 +470,7 @@ impl App {
             });
         });
         ui.weak(if slot == "copy" { "Packets pass through untouched: fastest, no quality loss." } else { "Re-encoded in software." });
-        ui.weak("Compressed codecs (H.264, HEVC, AV1, AAC, Opus…) are in the ontology as planned and appear here once implemented.");
+        ui.weak("Codecs the ontology lists as planned (such as MPEG-4 Part 2) appear here once implemented.");
     }
 
     fn filters_ui(&mut self, ui: &mut egui::Ui) {

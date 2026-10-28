@@ -493,6 +493,11 @@ fn parse_trak(trak: &[u8], index: usize, samples: &mut Vec<Sample>) -> Result<Op
         let config = match codec {
             CodecId::H264 => parse_avcc(need(kids, b"avcC", "the avc1 entry")?)?,
             CodecId::Hevc => parse_hvcc(need(kids, b"hvcC", "the hvc1 entry")?)?,
+            CodecId::Av1 => {
+                let c = need(kids, b"av1C", "the av01 entry")?;
+                extradata = c.to_vec();
+                av1c_config(c)?
+            }
             _ => Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma: 1 },
         };
         let total: i64 = samples[first..].iter().map(|s| s.duration as i64).sum();
@@ -614,6 +619,22 @@ fn aac_config(esds: &[u8]) -> Result<Vec<u8>> {
 fn push_start_coded(out: &mut Vec<u8>, nal: &[u8]) {
     out.extend_from_slice(&[0, 0, 0, 1]);
     out.extend_from_slice(nal);
+}
+
+/// Bit depth and chroma layout from an AV1CodecConfigurationRecord (`av1C`, also Matroska's
+/// CodecPrivate for AV1). Twelve-bit streams are reported as 12 bits, which no decoder here takes.
+pub(crate) fn av1c_config(c: &[u8]) -> Result<Config> {
+    if c.len() < 4 || c[0] != 0x81 {
+        return Err(corrupt("av1C is malformed"));
+    }
+    let bits = if c[2] & 0x40 == 0 { 8 } else if c[2] & 0x20 == 0 { 10 } else { 12 };
+    let chroma = match (c[2] & 0x10 != 0, c[2] & 0x08 != 0, c[2] & 0x04 != 0) {
+        (true, _, _) => 0,
+        (false, true, true) => 1,
+        (false, true, false) => 2,
+        _ => 3,
+    };
+    Ok(Config { prefix: Vec::new(), nal_length: 0, bits, chroma })
 }
 
 pub(crate) fn parse_avcc(c: &[u8]) -> Result<Config> {
@@ -767,6 +788,19 @@ impl<R: Read + Seek + Send> Demuxer for Mp4Demuxer<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn av1c_gives_bit_depth_and_chroma_layout() {
+        let fmt = |b2: u8| av1c_config(&[0x81, 0x08, b2, 0x00]).unwrap().pix_fmt();
+        assert_eq!(fmt(0x0C), PixelFormat::Yuv420p);
+        assert_eq!(fmt(0x4C), PixelFormat::Yuv420p10);
+        assert_eq!(fmt(0x1C), PixelFormat::Gray8);
+        assert_eq!(fmt(0x08), PixelFormat::Yuv422p);
+        assert_eq!(fmt(0x40), PixelFormat::Yuv444p10);
+        assert_eq!(av1c_config(&[0x81, 0x08, 0x6C, 0x00]).unwrap().bits, 12);
+        assert!(av1c_config(&[0x01, 0, 0, 0]).is_err());
+        assert!(av1c_config(&[0x81, 0]).is_err());
+    }
 
     #[test]
     fn recognises_mp4_by_its_first_box() {

@@ -310,16 +310,17 @@ pub fn new_video_encoder(
     ))
 }
 
-/// Open a hardware video decoder on `backend`.
-pub fn new_video_decoder(backend: Backend, codec: CodecId, params: &ironav_core::StreamParams) -> Result<Box<dyn ironav_core::Decoder>> {
+/// Open a hardware video decoder on `backend`. `extradata` is the stream's codec configuration
+/// (AV1's av1C; H.264 and HEVC carry theirs in the packets).
+pub fn new_video_decoder(backend: Backend, codec: CodecId, params: &ironav_core::StreamParams, extradata: &[u8]) -> Result<Box<dyn ironav_core::Decoder>> {
     #[cfg(any(windows, target_os = "linux"))]
     if backend == Backend::Cuda {
         let ironav_core::StreamParams::Video { width, height, pix_fmt, .. } = params else {
             return Err(Error::invalid_arg("hardware video decoder needs a video stream"));
         };
-        return Ok(Box::new(nvdec::NvdecDecoder::new(codec, *width, *height, pix_fmt.bit_depth())?));
+        return Ok(Box::new(nvdec::NvdecDecoder::new(codec, *width, *height, pix_fmt.bit_depth(), extradata)?));
     }
-    let _ = params;
+    let _ = (params, extradata);
     Err(Error::new(
         ErrorCode::HardwareUnavailable,
         format!("no hardware decoder provider for {} on {}", codec.name(), backend.name()),

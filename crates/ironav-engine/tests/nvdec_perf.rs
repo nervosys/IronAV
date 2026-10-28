@@ -22,7 +22,7 @@ fn nvdec_decode_only() {
     let mut frames = 0;
     for _ in 0..5 {
         let t = Instant::now();
-        let mut dec = new_video_decoder(Backend::Cuda, info.codec, &info.params).unwrap();
+        let mut dec = new_video_decoder(Backend::Cuda, info.codec, &info.params, &info.extradata).unwrap();
         frames = 0;
         println!("  decoder created after {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
         let mut first = None;

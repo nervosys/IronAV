@@ -30,7 +30,7 @@ pub fn open_video_decoder(s: &StreamInfo, hwaccel: &str) -> Result<(Box<dyn Deco
     }
     let sel = select(s.codec, Direction::Decode, policy, &probe_all())?;
     match sel.chosen {
-        Some(backend) => match new_video_decoder(backend, s.codec, &s.params) {
+        Some(backend) => match new_video_decoder(backend, s.codec, &s.params, &s.extradata) {
             Ok(d) => Ok((d, backend.name())),
             // the GPU cannot take this stream (for example 10-bit H.264); the software decoder can
             Err(_) if soft && !matches!(policy, HwPolicy::Require(_) | HwPolicy::RequireAny) => Ok((ironav_codec::new_decoder_for(s)?, "software")),

@@ -260,9 +260,10 @@ pub fn plan(job: &Job) -> Result<Plan> {
                     ironav_codec::new_decoder_for(s)?;
                 } else if sel.chosen.is_none() {
                     let why = sel.considered.iter().map(|c| format!("{}: {}", c.backend.name(), c.reason)).collect::<Vec<_>>().join("; ");
+                    let why = if why.is_empty() { String::new() } else { format!(" ({why})") };
                     return Err(Error::new(
                         ErrorCode::HardwareUnavailable,
-                        format!("{} has no software decoder in this build and no hardware backend is usable here ({why})", s.codec.name()),
+                        format!("{} has no software decoder in this build and no hardware backend is usable here{why}", s.codec.name()),
                     )
                     .hint(if matches!(policy, HwPolicy::Off) {
                         "hwaccel is \"off\"; set it to \"auto\" so the GPU decoder can be used"
@@ -279,7 +280,7 @@ pub fn plan(job: &Job) -> Result<Plan> {
                             ironav_codec::new_decoder_for(s)?;
                             use_gpu = false;
                         } else {
-                            return Err(Error::new(ErrorCode::UnsupportedCodec, m).hint("only 8-bit and 10-bit 4:2:0 H.264/HEVC can be decoded on the GPU"));
+                            return Err(Error::new(ErrorCode::UnsupportedCodec, m).hint("only 8-bit and 10-bit 4:2:0 H.264, HEVC and AV1 can be decoded on the GPU"));
                         }
                     }
                     if use_gpu {

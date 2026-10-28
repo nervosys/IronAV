@@ -8,7 +8,7 @@ A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so 
 > Audio codecs, each decoded and encoded: **PCM, FLAC, AAC-LC (plus HE-AAC v1 decode), MP3, Opus and Vorbis.**
 > Video: **software decoders for H.264, HEVC, VP8 and VP9; JPEG/Motion-JPEG decoded and encoded in software.**
 > H.264 and HEVC *encoding* needs an NVIDIA GPU (NVENC), and they can also be decoded on NVIDIA GPUs (NVDEC).
-> AV1 is not implemented yet.
+> AV1 is decoded on NVIDIA GPUs only (NVDEC); it has no software decoder and no encoder yet.
 > IronAV is not yet a drop-in replacement for FFmpeg or HandBrake.
 
 ## Interfaces
@@ -48,7 +48,7 @@ Export: `ironav ontology jsonld` (also an MCP resource).
 OpenCL across Windows, Linux, macOS, Android and iOS: capability matrix, driver detection, and policy-based selection
 (`auto`, `off`, `require`, or a named backend) that explains every rejected candidate.
 A backend is *usable* only if its driver is detected **and** a native provider implements the codec and direction.
-Today there is one vendor: **NVIDIA, NVENC encode and NVDEC decode of H.264 and HEVC** (Windows and Linux). Every other
+Today there is one vendor: **NVIDIA, NVENC encode of H.264 and HEVC and NVDEC decode of H.264, HEVC and AV1** (Windows and Linux). Every other
 backend is detected and reported but not driven, and `select` says so per candidate. Where no provider applies,
 `auto` falls back to software and `require` fails with `hardware-unavailable`.
 
@@ -422,6 +422,22 @@ above it, the distance at which the filters' reach no longer overlaps, so the re
 Threaded output was checked against FFmpeg in both modes on 22 clips: sizes from 33x17 and 64x64 to 1080p, odd sizes, one to four tile columns,
 tile rows, 4:2:2, 4:4:4, lossless, loop-filter sharpness 2, 3 and 7, strong filtering (crf 55-60), adaptive quantisation, error-resilient and frame-parallel
 streams. All match on every frame. 90 corrupted copies caused no panic (and 120 more before the loop filter was threaded). `IRONAV_VP9_THREADS=1` turns the threading off.
+
+## AV1 (GPU only)
+
+AV1 video in `.webm`, `.mkv` and `.mp4` files is decoded on NVIDIA GPUs through NVDEC (the same provider as H.264 and HEVC). The demuxers read the bit depth and chroma
+layout from the `av1C` configuration record, and its configuration OBUs (the sequence header) are handed to the driver's parser before the first packet, as FFmpeg's
+`cuviddec` does. 8-bit and 10-bit 4:2:0 come out as `yuv420p` and `yuv420p10le`; anything else is refused before the GPU is touched. The GPU says which sizes it
+takes, and IronAV checks them: the RTX 3090 Ti used here decodes 128x128 to 8192x8192, and a smaller stream is refused with that range in the message.
+
+There is **no software AV1 decoder**, so with `--hwaccel off`, or on a machine without a usable NVIDIA GPU, an AV1 job is refused at planning time with
+`hardware-unavailable`, and nothing is written. (FFmpeg itself has no AV1 decoder of its own either; it uses libdav1d or libaom, or the GPU.) AV1 is not encoded
+(consumer NVENC before the RTX 40 series cannot encode it), and AV1 cannot be copied into MP4 or WebM yet.
+
+Checked bit for bit against FFmpeg's libdav1d (through PyAV) on SVT-AV1 output: 27 clips from 128x128 to 3840x2160, including odd sizes, 10-bit, film grain
+(8-bit and 10-bit; the grain is applied, and matches libdav1d's), several key frames, hierarchical prediction with overlay frames, screen-content tools,
+loop restoration and CDEF, superres, and WebM, Matroska and MP4 files. All match on every frame. Three small clips are kept as the
+`av1_decodes_on_the_gpu_to_what_dav1d_decodes_or_refuses_precisely` test, which on a machine without a GPU checks the refusal instead.
 
 ## JPEG
 

@@ -1,8 +1,9 @@
-//! NVIDIA NVDEC provider: H.264 and HEVC decoding on the GPU through the driver's `nvcuvid`
+//! NVIDIA NVDEC provider: H.264, HEVC and AV1 decoding on the GPU through the driver's `nvcuvid`
 //! library, loaded at run time like the NVENC provider.
 //!
-//! The driver's own bitstream parser does the NAL parsing, reference management and output
-//! reordering: packets (Annex B access units, as the MP4 reader produces them) go in, and
+//! The driver's own bitstream parser does the NAL/OBU parsing, reference management and output
+//! reordering: packets (Annex B access units, as the MP4 reader produces them, or AV1 temporal
+//! units with the av1C configuration OBUs handed over at the start) go in, and
 //! decoded pictures come out in display order through callbacks. Each picture is copied from
 //! the GPU into a planar `yuv420p` [`VideoFrame`] with its original timestamp.
 //!
@@ -17,10 +18,11 @@ use std::ffi::{c_ulong, c_void};
 use std::ptr;
 
 /// Codecs this provider can decode.
-pub const DECODE_CODECS: &[CodecId] = &[CodecId::H264, CodecId::Hevc];
+pub const DECODE_CODECS: &[CodecId] = &[CodecId::H264, CodecId::Hevc, CodecId::Av1];
 
 const CODEC_H264: u32 = 4;
 const CODEC_HEVC: u32 = 8;
+const CODEC_AV1: u32 = 11;
 const CHROMA_420: u32 = 1;
 const SURFACE_NV12: u32 = 0;
 const SURFACE_P016: u32 = 1;
@@ -114,6 +116,14 @@ struct VideoFormat {
     aspect: [i32; 2],
     signal: [u8; 4],
     seqhdr_data_length: u32,
+}
+
+/// CUVIDEOFORMATEX: the format followed by raw sequence header bytes (the union with
+/// CUVIDAV1SEQHDR is 1024 bytes either way).
+#[repr(C)]
+struct FormatEx {
+    format: VideoFormat,
+    seqhdr: [u8; 1024],
 }
 
 #[repr(C)]
@@ -252,7 +262,11 @@ impl State {
     }
 
     fn on_sequence(&mut self, f: &VideoFormat) -> i32 {
-        let want = if self.codec == CodecId::Hevc { CODEC_HEVC } else { CODEC_H264 };
+        let want = match self.codec {
+            CodecId::Hevc => CODEC_HEVC,
+            CodecId::Av1 => CODEC_AV1,
+            _ => CODEC_H264,
+        };
         if f.codec != want {
             return self.fail(Error::invalid_input(format!("the bitstream is not {}", self.codec.name())));
         }
@@ -299,13 +313,25 @@ impl State {
         if r != 0 {
             return self.fail(Error::new(ErrorCode::Internal, format!("NVDEC: cuvidGetDecoderCaps failed with CUDA error {r}")));
         }
-        if caps.is_supported == 0 || f.coded_width > caps.max_width || f.coded_height > caps.max_height {
+        let (min_w, min_h) = (caps.min_width as u32, caps.min_height as u32);
+        if caps.is_supported == 0 || f.coded_width > caps.max_width || f.coded_height > caps.max_height || f.coded_width < min_w || f.coded_height < min_h {
             return self.fail(
                 Error::new(
                     ErrorCode::HardwareUnavailable,
-                    format!("this GPU's NVDEC cannot decode {} at {}x{} (it supports up to {}x{})", self.codec.name(), f.coded_width, f.coded_height, caps.max_width, caps.max_height),
+                    format!(
+                        "this GPU's NVDEC cannot decode {} at {}x{} (it supports {min_w}x{min_h} to {}x{})",
+                        self.codec.name(),
+                        f.coded_width,
+                        f.coded_height,
+                        caps.max_width,
+                        caps.max_height
+                    ),
                 )
-                .hint("set hwaccel to \"off\" only if a software decoder exists; none does for this codec yet"),
+                .hint(if self.codec == CodecId::Av1 {
+                    "AV1 has no software decoder in this build, so this stream cannot be decoded here"
+                } else {
+                    "set hwaccel to \"off\" to use the software decoder"
+                }),
             );
         }
 
@@ -499,6 +525,8 @@ pub struct NvdecDecoder {
     parser: *mut c_void,
     set_ctx: FnSetCtx,
     flushed: bool,
+    /// AV1 configuration OBUs given to the parser; it may read them after creation.
+    _seqhdr: Option<Box<FormatEx>>,
 }
 
 // SAFETY: the decoder is moved between threads, never shared, and the CUDA context is bound to
@@ -508,13 +536,26 @@ unsafe impl Send for NvdecDecoder {}
 impl NvdecDecoder {
     /// Open a decoder for `codec` on the first NVIDIA GPU. `width` and `height` are the
     /// stream's display size; frames of any other size are rejected.
-    /// `bits` is the sample depth of the stream, 8 or 10.
-    pub fn new(codec: CodecId, width: u32, height: u32, bits: u8) -> Result<Self> {
+    /// `bits` is the sample depth of the stream, 8 or 10. `extradata` is the stream's codec
+    /// configuration; for AV1 its configuration OBUs (the sequence header) go to the parser.
+    pub fn new(codec: CodecId, width: u32, height: u32, bits: u8, extradata: &[u8]) -> Result<Self> {
         let parser_codec = match codec {
             CodecId::H264 => CODEC_H264,
             CodecId::Hevc => CODEC_HEVC,
-            other => return Err(Error::invalid_arg(format!("NVDEC provider cannot decode {}", other.name())).alternatives(["h264", "hevc"])),
+            CodecId::Av1 => CODEC_AV1,
+            other => return Err(Error::invalid_arg(format!("NVDEC provider cannot decode {}", other.name())).alternatives(["h264", "hevc", "av1"])),
         };
+        // An AV1CodecConfigurationRecord starts with a 4-byte header the parser does not take (as
+        // FFmpeg's cuviddec does); a larger sequence header than fits is left to the key frames, which
+        // carry one too.
+        let config = if extradata.len() >= 4 && extradata[0] & 0x80 != 0 { &extradata[4..] } else { extradata };
+        let seqhdr = (codec == CodecId::Av1 && !config.is_empty() && config.len() <= 1024).then(|| {
+            // SAFETY: FormatEx is plain integers and bytes, for which all zeroes is valid.
+            let mut x: Box<FormatEx> = Box::new(unsafe { std::mem::zeroed() });
+            x.seqhdr[..config.len()].copy_from_slice(config);
+            x.format.seqhdr_data_length = config.len() as u32;
+            x
+        });
         let cuvid = load(&if cfg!(windows) { vec!["nvcuvid.dll"] } else { vec!["libnvcuvid.so.1", "libnvcuvid.so"] })
             .map_err(|e| unavailable(format!("NVDEC driver library not found ({e})")))?;
         let cuda = load(&if cfg!(windows) { vec!["nvcuda.dll"] } else { vec!["libcuda.so.1"] })
@@ -572,7 +613,8 @@ impl NvdecDecoder {
                 error: None,
             }));
             // From here on the struct owns everything, so Drop cleans up on any error path.
-            let mut this = NvdecDecoder { _cuvid: cuvid, cuda, ctx, dev, state, parser: ptr::null_mut(), set_ctx, flushed: false };
+            let mut this = NvdecDecoder { _cuvid: cuvid, cuda, ctx, dev, state, parser: ptr::null_mut(), set_ctx, flushed: false, _seqhdr: seqhdr };
+            let ext_video_info = this._seqhdr.as_deref_mut().map_or(ptr::null_mut(), |x| (x as *mut FormatEx).cast());
             let mut params = ParserParams {
                 codec: parser_codec,
                 max_num_decode_surfaces: 1,
@@ -589,7 +631,7 @@ impl NvdecDecoder {
                 on_operating_point: ptr::null_mut(),
                 on_sei: ptr::null_mut(),
                 reserved2: [ptr::null_mut(); 5],
-                ext_video_info: ptr::null_mut(),
+                ext_video_info,
             };
             cu((api.create_parser)(&mut this.parser, &mut params), "cuvidCreateVideoParser")?;
             Ok(this)
@@ -676,6 +718,7 @@ mod tests {
         assert_eq!(size_of::<SourcePacket>(), if cfg!(windows) { 24 } else { 32 });
         assert_eq!(size_of::<DispInfo>(), 24);
         assert_eq!(size_of::<VideoFormat>(), 64);
+        assert_eq!(size_of::<FormatEx>(), 1088);
         assert_eq!(size_of::<ProcParams>(), 264);
         assert_eq!(size_of::<Caps>(), 88);
         assert_eq!(size_of::<Memcpy2D>(), 128);
@@ -688,7 +731,7 @@ mod tests {
 
     #[test]
     fn rejects_other_codecs_without_touching_the_driver() {
-        let e = NvdecDecoder::new(CodecId::Flac, 64, 64, 8).err().unwrap();
+        let e = NvdecDecoder::new(CodecId::Flac, 64, 64, 8, &[]).err().unwrap();
         assert_eq!(e.code, ErrorCode::InvalidArgument);
     }
 }

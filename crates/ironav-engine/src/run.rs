@@ -178,7 +178,7 @@ fn execute(
             let decoder = match hw_dec {
                 Some(backend) => {
                     hw_dec_name = Some(backend.name());
-                    new_video_decoder(backend, src.codec, &src.params)?
+                    new_video_decoder(backend, src.codec, &src.params, &src.extradata)?
                 }
                 None => ironav_codec::new_decoder_for(src)?,
             };
