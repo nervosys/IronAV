@@ -409,11 +409,19 @@ changelog. VP9 has no encoder here.
 
 Tile columns are decoded on separate threads (one per core, at most one per tile column), each into its own copy of the picture, and merged
 afterwards; streams with one tile column (every stream 448 pixels wide or narrower, and any the encoder made with one) still decode on one thread.
-The loop filter runs on one thread after the tiles. Decode alone (no output file; `IRONAV_PERF_WEBM=clip.webm cargo test --release -p ironav-engine --test vp9_perf -- --ignored --nocapture`,
-best of 7, on a machine whose cores were all busy with other work, so the decoder ran at high priority): a 1080p clip of random noise with four tile
-columns went from 898 ms to 390 ms for 8 frames (2.3x); a lighter 30-frame 1080p clip from 1,147 ms to 963 ms, because there the loop filter and the
-rest of the frame work are most of the time. Threaded output was checked against FFmpeg on 4:2:0 and 4:4:4 clips with two and four tile columns, two tile rows,
-an odd width (1000x300) and 1080p, and 120 corrupted copies caused no panic. `IRONAV_VP9_THREADS=1` turns the threading off.
+The loop filter then runs on several threads too, one superblock row each, as a wavefront: each row follows two superblocks behind the row
+above it, the distance at which the filters' reach no longer overlaps, so the result is the same as filtering in raster order. Decode alone
+(no output file; `IRONAV_PERF_WEBM=clip.webm cargo test --release -p ironav-engine --test vp9_perf -- --ignored --nocapture`, best of 7, on a
+24-thread machine whose cores were all busy with other work, so the decoder ran at high priority), against `IRONAV_VP9_THREADS=1`:
+
+| 1080p clip, four tile columns | one thread | four threads | one per core |
+|---|---|---|---|
+| synthetic picture, 30 frames | 1,067-1,186 ms | 633-707 ms | 545-617 ms |
+| random noise, 8 frames (the encoder turned the loop filter off) | 827-861 ms | 343-345 ms | 364-388 ms |
+
+Threaded output was checked against FFmpeg in both modes on 22 clips: sizes from 33x17 and 64x64 to 1080p, odd sizes, one to four tile columns,
+tile rows, 4:2:2, 4:4:4, lossless, loop-filter sharpness 2, 3 and 7, strong filtering (crf 55-60), adaptive quantisation, error-resilient and frame-parallel
+streams. All match on every frame. 90 corrupted copies caused no panic (and 120 more before the loop filter was threaded). `IRONAV_VP9_THREADS=1` turns the threading off.
 
 ## JPEG
 

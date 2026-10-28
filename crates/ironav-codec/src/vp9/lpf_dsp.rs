@@ -6,10 +6,28 @@ fn clip_intp2(x: i32, bits: u32) -> i32 {
     x.clamp(-(1i32 << bits), (1i32 << bits) - 1)
 }
 
+/// Where the filters read and write samples: a slice, or a plane shared by the loop-filter threads.
+pub trait Samples {
+    fn get(&self, i: usize) -> u16;
+    fn set(&mut self, i: usize, v: u16);
+}
+
+impl Samples for [u16] {
+    #[inline]
+    fn get(&self, i: usize) -> u16 {
+        self[i]
+    }
+
+    #[inline]
+    fn set(&mut self, i: usize, v: u16) {
+        self[i] = v;
+    }
+}
+
 /// Read the sample at offset `j` (in units of `across`) from q0 at index `q0`.
 #[inline]
-fn rd(buf: &[u16], q0: usize, across: usize, j: isize) -> i32 {
-    buf[(q0 as isize + j * across as isize) as usize] as i32
+fn rd<B: Samples + ?Sized>(buf: &B, q0: usize, across: usize, j: isize) -> i32 {
+    buf.get((q0 as isize + j * across as isize) as usize) as i32
 }
 
 /// Flat-region smoothing over `s` (8 or 16 taps). Writes the smoothed value for
@@ -34,8 +52,8 @@ fn wide_smooth(s: &[i32], out: &mut [i32; 16]) {
 /// perpendicular to the edge, `along` the step between positions. `e`, `i`
 /// and `h` are the 8-bit-scale mb limit, interior limit and hev threshold;
 /// they are shifted left by `bd - 8` here, as the FFmpeg template does.
-pub fn filter_edge(
-    buf: &mut [u16],
+pub fn filter_edge<B: Samples + ?Sized>(
+    buf: &mut B,
     pos: usize,
     across: usize,
     along: usize,
@@ -106,8 +124,7 @@ pub fn filter_edge(
                 let mut o = [0i32; 16];
                 wide_smooth(&s, &mut o);
                 for c in 1..15 {
-                    buf[(q0 as isize + (c as isize - 8) * across as isize) as usize] =
-                        o[c] as u16;
+                    buf.set((q0 as isize + (c as isize - 8) * across as isize) as usize, o[c] as u16);
                 }
                 continue;
             }
@@ -118,7 +135,7 @@ pub fn filter_edge(
             let mut o = [0i32; 16];
             wide_smooth(&s, &mut o);
             for c in 1..7 {
-                buf[(q0 as isize + (c as isize - 4) * across as isize) as usize] = o[c] as u16;
+                buf.set((q0 as isize + (c as isize - 4) * across as isize) as usize, o[c] as u16);
             }
             continue;
         }
@@ -133,13 +150,13 @@ pub fn filter_edge(
         let f2 = (f + 3).min(slim) >> 3;
 
         let at = |j: isize| (q0 as isize + j * across as isize) as usize;
-        buf[at(-1)] = (p0 + f2).clamp(0, pmax) as u16;
-        buf[at(0)] = (q0v - f1).clamp(0, pmax) as u16;
+        buf.set(at(-1), (p0 + f2).clamp(0, pmax) as u16);
+        buf.set(at(0), (q0v - f1).clamp(0, pmax) as u16);
 
         if !hev {
             let f = (f1 + 1) >> 1;
-            buf[at(-2)] = (p1 + f).clamp(0, pmax) as u16;
-            buf[at(1)] = (q1 - f).clamp(0, pmax) as u16;
+            buf.set(at(-2), (p1 + f).clamp(0, pmax) as u16);
+            buf.set(at(1), (q1 - f).clamp(0, pmax) as u16);
         }
     }
 }
@@ -163,7 +180,7 @@ mod tests {
     fn flat_region_unchanged() {
         for &wd in &[4usize, 8, 16] {
             let mut buf = vec![100u16; 256];
-            filter_edge(&mut buf, 8, 1, 16, 16, wd, 20, 10, 2, 8);
+            filter_edge(&mut buf[..], 8, 1, 16, 16, wd, 20, 10, 2, 8);
             assert!(buf.iter().all(|&v| v == 100), "wd={wd}");
         }
     }
@@ -171,7 +188,7 @@ mod tests {
     #[test]
     fn small_step_is_smoothed() {
         let mut buf = vertical_step(100, 104);
-        filter_edge(&mut buf, 8, 1, 16, 16, 4, 20, 10, 2, 8);
+        filter_edge(&mut buf[..], 8, 1, 16, 16, 4, 20, 10, 2, 8);
         for y in 0..16 {
             let row = &buf[y * 16..y * 16 + 16];
             assert_eq!(&row[0..6], &[100; 6]);
@@ -184,7 +201,7 @@ mod tests {
     #[test]
     fn horizontal_matches_transposed_vertical() {
         let mut v = vertical_step(100, 104);
-        filter_edge(&mut v, 8, 1, 16, 16, 8, 20, 10, 2, 8);
+        filter_edge(&mut v[..], 8, 1, 16, 16, 8, 20, 10, 2, 8);
 
         // Horizontal edge between row 7 and row 8.
         let mut h = vec![0u16; 256];
@@ -193,7 +210,7 @@ mod tests {
                 h[y * 16 + x] = if y < 8 { 100 } else { 104 };
             }
         }
-        filter_edge(&mut h, 8 * 16, 16, 1, 16, 8, 20, 10, 2, 8);
+        filter_edge(&mut h[..], 8 * 16, 16, 1, 16, 8, 20, 10, 2, 8);
 
         for y in 0..16 {
             for x in 0..16 {
@@ -205,7 +222,7 @@ mod tests {
     #[test]
     fn high_bitdepth_flat_region_unchanged() {
         let mut buf = vec![600u16; 256];
-        filter_edge(&mut buf, 8, 1, 16, 16, 16, 20, 10, 2, 10);
+        filter_edge(&mut buf[..], 8, 1, 16, 16, 16, 20, 10, 2, 10);
         assert!(buf.iter().all(|&v| v == 600));
     }
 }

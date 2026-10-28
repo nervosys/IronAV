@@ -412,6 +412,11 @@ impl Dec {
     }
 }
 
+/// Threads to decode with: `IRONAV_VP9_THREADS` if set (1 turns threading off), otherwise one per core.
+pub fn thread_count() -> usize {
+    std::env::var("IRONAV_VP9_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get())).max(1)
+}
+
 pub fn splat(a: &mut [u8], off: usize, n: usize, v: u8) {
     for x in &mut a[off..off + n] {
         *x = v;

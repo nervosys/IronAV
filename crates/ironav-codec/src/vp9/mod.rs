@@ -293,7 +293,7 @@ impl Dec {
 
         // Tile columns depend on nothing outside themselves, so several are decoded at once, each by a
         // fork with its own copy of the picture, and their columns are merged back afterwards.
-        let threads = std::env::var("IRONAV_VP9_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get())).min(tile_cols);
+        let threads = thread_count().min(tile_cols);
         if threads <= 1 {
             for (tile_col, r) in racs.into_iter().enumerate() {
                 self.decode_tile_col(tile_col, r)?;
