@@ -63,7 +63,7 @@ pub fn job_schema() -> Value {
                         "description": "Target audio codec; 'copy' (default) forwards packets untouched; 'none' leaves the audio out." },
                         "bitrate_kbps": { "type": "integer", "minimum": 6, "maximum": 510, "description": "Target bitrate in kbit/s; Opus only (default 64 per channel)." } }), &[]),
             "video": object(json!({ "codec": { "type": "string", "enum": codec_names(MediaType::Video),
-                        "description": "Target video codec; 'copy' (default) forwards packets untouched; 'none' leaves the video out. h264 is encoded on the GPU (NVENC) when one is usable and in software (Constrained Baseline, yuv420p, even dimensions) otherwise; hevc is encoded only on the GPU and needs hwaccel auto or cuda." },
+                        "description": "Target video codec; 'copy' (default) forwards packets untouched; 'none' leaves the video out. h264 is encoded on the GPU (NVENC) when one is usable and in software (Main profile with CABAC, yuv420p, even dimensions) otherwise; hevc is encoded only on the GPU and needs hwaccel auto or cuda." },
                         "bitrate_kbps": { "type": "integer", "minimum": 1, "description": "Target average bitrate in kbit/s. Mutually exclusive with qp." },
                         "qp": { "type": "integer", "minimum": 0, "maximum": 51, "description": "Constant quantizer: lower is better quality and larger. Default 23 when no bitrate is set. For mjpeg it sets the JPEG quality (100 minus twice qp, so 5 is 90 and 23 is 54); default quality 90." } }), &[]),
             "filters": { "type": "array", "description": "Applied in order to every stream of the matching media type.",
@@ -123,7 +123,7 @@ fn h_capabilities(_: &Value) -> Result<Value> {
         "tools": tools().iter().map(|t| json!({ "name": t.name, "description": t.description, "cli": t.cli, "read_only": t.read_only })).collect::<Vec<_>>(),
         "error_codes": ErrorCode::ALL,
         "ontology": ontology().summary(),
-        "not_implemented": "Implemented: software decoders for H.264, HEVC (Main, Main 10), VP8, VP9 (profiles 0-3), JPEG, AAC-LC (plus HE-AAC v1), MP3, Vorbis, Opus, FLAC and PCM; software encoders for H.264 (Constrained Baseline: CAVLC, I and P frames, 8-bit yuv420p with even dimensions), JPEG, AAC-LC, MP3, Vorbis, Opus, FLAC and PCM. NVIDIA GPUs encode H.264 (preferred when usable) and HEVC (NVENC; HEVC has no software encoder); GPU decoding (NVDEC) is also available for them. AV1 is decoded only on NVIDIA GPUs (NVDEC, no software decoder) and cannot be encoded. Not implemented (planned in the ontology): ALAC, ProRes, MPEG-4 Part 2. VP9 and AV1 cannot be written (copied into a file). A video file and an audio file are combined into one output with extra_inputs."
+        "not_implemented": "Implemented: software decoders for H.264, HEVC (Main, Main 10), VP8, VP9 (profiles 0-3), JPEG, AAC-LC (plus HE-AAC v1), MP3, Vorbis, Opus, FLAC and PCM; software encoders for H.264 (Main profile: CABAC, I and P frames, 8-bit yuv420p with even dimensions), JPEG, AAC-LC, MP3, Vorbis, Opus, FLAC and PCM. NVIDIA GPUs encode H.264 (preferred when usable) and HEVC (NVENC; HEVC has no software encoder); GPU decoding (NVDEC) is also available for them. AV1 is decoded only on NVIDIA GPUs (NVDEC, no software decoder) and cannot be encoded. Not implemented (planned in the ontology): ALAC, ProRes, MPEG-4 Part 2. VP9 and AV1 cannot be written (copied into a file). A video file and an audio file are combined into one output with extra_inputs."
     }))
 }
 

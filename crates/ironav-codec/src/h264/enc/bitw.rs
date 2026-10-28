@@ -1,5 +1,6 @@
 //! Bit writing for the encoder: RBSP bits, Exp-Golomb codes and NAL unit framing (ITU-T H.264 7.2, 7.4.1).
 
+#[derive(Default)]
 pub struct BitWriter {
     buf: Vec<u8>,
     cur: u64,
@@ -46,6 +47,23 @@ impl BitWriter {
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.buf.len() * 8 + self.n as usize
+    }
+
+    /// cabac_alignment_one_bit: ones to the byte boundary.
+    pub fn align_ones(&mut self) {
+        if self.n > 0 {
+            let pad = 8 - self.n;
+            self.put(pad, (1 << pad) - 1);
+        }
+    }
+
+    /// The bytes written, the last one padded with zeros.
+    pub fn into_bytes(mut self) -> Vec<u8> {
+        if self.n > 0 {
+            let pad = 8 - self.n;
+            self.put(pad, 0);
+        }
+        self.buf
     }
 
     /// rbsp_trailing_bits(): a one, then zeros to the byte boundary.

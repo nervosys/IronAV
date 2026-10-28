@@ -3,6 +3,7 @@
 //! filter, so the reference the encoder keeps is the one a decoder builds) and CAVLC macroblock syntax.
 
 use super::bitw::{se_bits, BitWriter};
+use super::cabac::{self, CabacWriter};
 use super::cavlc::write_block;
 use crate::h264::idct::{hadamard4, idct4_add};
 use super::subpel::HalfPel;
@@ -107,6 +108,15 @@ struct MbState {
     nnz: [u8; 16],
     cnnz: [[u8; 4]; 2],
     mv: [i16; 2],
+    // for the CABAC contexts
+    skip: bool,
+    kind: Kind,
+    cbp: u8,
+    chroma_mode: u8,
+    /// Coded DC blocks: bit 0 Intra16x16 luma, bit 1 Cb, bit 2 Cr.
+    cbf_dc: u8,
+    /// Absolute motion vector difference, capped at 64.
+    mvd: [u8; 2],
 }
 
 /// A macroblock's decisions and levels, ready to write.
@@ -154,6 +164,9 @@ pub struct FrameCoder<'a> {
     p_slice: bool,
     state: Vec<MbState>,
     w: BitWriter,
+    /// The CABAC engine once the slice data starts, when the slice uses CABAC.
+    cabac: Option<CabacWriter>,
+    use_cabac: bool,
     skip_run: u32,
     /// Macroblocks coded as intra, inter and skipped.
     pub counts: [usize; 3],
@@ -162,7 +175,8 @@ pub struct FrameCoder<'a> {
 impl<'a> FrameCoder<'a> {
     /// A coder for the slice of macroblock rows `rows` against the reference `refp` (none for an I slice),
     /// whose half samples are `half`.
-    pub fn new(src: &'a Source, refp: Option<(&'a Picture, &'a HalfPel)>, mb_w: usize, mb_h: usize, qp: i32, rows: Range<usize>, slice_id: u16) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(src: &'a Source, refp: Option<(&'a Picture, &'a HalfPel)>, mb_w: usize, mb_h: usize, qp: i32, rows: Range<usize>, slice_id: u16, use_cabac: bool) -> Self {
         FrameCoder {
             src,
             refp: refp.map(|r| r.0),
@@ -178,6 +192,8 @@ impl<'a> FrameCoder<'a> {
             p_slice: refp.is_some(),
             state: vec![MbState::default(); mb_w * mb_h],
             w: BitWriter::new(),
+            cabac: None,
+            use_cabac,
             skip_run: 0,
             counts: [0; 3],
         }
@@ -187,17 +203,30 @@ impl<'a> FrameCoder<'a> {
     /// holding the slice's reconstruction (not yet loop filtered) and macroblocks.
     pub fn encode(mut self, header: impl FnOnce(&mut BitWriter)) -> (Vec<u8>, Picture, [usize; 3]) {
         header(&mut self.w);
+        if self.use_cabac {
+            self.w.align_ones();
+            let w = std::mem::take(&mut self.w);
+            self.cabac = Some(CabacWriter::new(w, !self.p_slice, 0, self.qp));
+        }
         for mby in self.rows.clone() {
             for mbx in 0..self.mb_w {
                 let code = self.code_mb(mbx, mby);
-                self.write_mb(&code, mbx, mby);
+                if self.use_cabac {
+                    let last = mby + 1 == self.rows.end && mbx + 1 == self.mb_w;
+                    self.write_mb_cabac(&code, mbx, mby, last);
+                } else {
+                    self.write_mb(&code, mbx, mby);
+                }
                 self.finish_mb(&code, mbx, mby);
             }
+        }
+        let counts = self.counts;
+        if let Some(c) = self.cabac.take() {
+            return (c.finish(), self.pic, counts);
         }
         if self.skip_run > 0 {
             self.w.ue(self.skip_run);
         }
-        let counts = self.counts;
         (self.w.finish(), self.pic, counts)
     }
 
@@ -919,10 +948,196 @@ impl<'a> FrameCoder<'a> {
         }
     }
 
+    /// Writes a macroblock with CABAC, followed by end_of_slice_flag; the contexts follow the
+    /// decoder's (9.3.3.1.1 and 9.3.3.1.3).
+    fn write_mb_cabac(&mut self, code: &MbCode, mbx: usize, mby: usize, last: bool) {
+        let (x, y) = (mbx as i32, mby as i32);
+        let left = self.nb_state(x - 1, y).copied();
+        let top = self.nb_state(x, y - 1).copied();
+        let mut c = self.cabac.take().unwrap();
+        let cond = |n: Option<MbState>, f: &dyn Fn(&MbState) -> bool| n.as_ref().is_some_and(f) as usize;
+        if self.p_slice {
+            c.decision(11 + cond(left, &|m| !m.skip) + cond(top, &|m| !m.skip), code.skip);
+            if code.skip {
+                c.terminate(last);
+                self.cabac = Some(c);
+                return;
+            }
+        }
+        let cbpl = code.cbp & 15;
+        let cbpc = code.cbp >> 4;
+        // mb_type
+        let (prefix_ok, base) = (self.p_slice, if self.p_slice { 17 } else { 3 });
+        match code.kind {
+            Kind::Inter => {
+                // P_L0_16x16
+                c.decision(14, false);
+                c.decision(15, false);
+                c.decision(16, false);
+            }
+            kind => {
+                let first = if prefix_ok {
+                    c.decision(14, true);
+                    17
+                } else {
+                    3 + cond(left, &|m| m.kind != Kind::I4x4) + cond(top, &|m| m.kind != Kind::I4x4)
+                };
+                if kind == Kind::I4x4 {
+                    c.decision(first, false);
+                } else {
+                    c.decision(first, true);
+                    c.terminate(false); // not I_PCM
+                    let (b1, b2, b3) = if prefix_ok { (base + 1, base + 2, base + 3) } else { (base + 3, base + 4, base + 6) };
+                    c.decision(b1, cbpl != 0);
+                    c.decision(b2, cbpc != 0);
+                    if cbpc != 0 {
+                        c.decision(if prefix_ok { base + 2 } else { base + 5 }, cbpc == 2);
+                    }
+                    c.decision(b3, code.i16_mode >> 1 == 1);
+                    c.decision(if prefix_ok { base + 3 } else { base + 7 }, code.i16_mode & 1 == 1);
+                }
+            }
+        }
+        if code.kind == Kind::I4x4 {
+            let mut so_far = [2u8; 16];
+            for n in 0..16 {
+                let (bx, by) = block_pos(n);
+                let mode = code.modes[by * 4 + bx];
+                let pred = self.pred_i4_mode(&so_far, mbx, mby, bx, by);
+                so_far[by * 4 + bx] = mode;
+                c.decision(68, mode == pred);
+                if mode != pred {
+                    let rem = if mode < pred { mode } else { mode - 1 };
+                    for k in 0..3 {
+                        c.decision(69, (rem >> k) & 1 == 1);
+                    }
+                }
+            }
+        }
+        if code.kind != Kind::Inter {
+            let m = code.chroma_mode;
+            let ch = |n: &MbState| !n.inter && n.chroma_mode != 0;
+            c.decision(64 + cond(left, &ch) + cond(top, &ch), m > 0);
+            if m > 0 {
+                c.decision(67, m > 1);
+                if m > 1 {
+                    c.decision(67, m > 2);
+                }
+            }
+        } else {
+            let p = self.mv_pred(mbx, mby);
+            for comp in 0..2 {
+                let d = code.mv[comp] as i32 - p[comp] as i32;
+                let sum = left.map_or(0, |m| m.mvd[comp] as u32) + top.map_or(0, |m| m.mvd[comp] as u32);
+                let base = if comp == 0 { 40 } else { 47 };
+                let inc = if sum < 3 { 0 } else if sum > 32 { 2 } else { 1 };
+                let abs = d.unsigned_abs();
+                c.decision(base + inc, abs > 0);
+                if abs > 0 {
+                    let mut ctx = base + 3;
+                    for v in 1..abs.min(9) {
+                        let _ = v;
+                        c.decision(ctx, true);
+                        if ctx < base + 6 {
+                            ctx += 1;
+                        }
+                    }
+                    if abs < 9 {
+                        c.decision(ctx, false);
+                    } else {
+                        c.exp_golomb(abs - 9, 3);
+                    }
+                    c.bypass(d < 0);
+                }
+            }
+        }
+        if code.kind != Kind::I16x16 {
+            let mut luma = 0u8;
+            for b8 in 0..4usize {
+                let cond_a = if b8 & 1 == 1 { (luma >> (b8 - 1)) & 1 == 0 } else { left.is_some_and(|m| (m.cbp >> (b8 + 1)) & 1 == 0) };
+                let cond_b = if b8 >= 2 { (luma >> (b8 - 2)) & 1 == 0 } else { top.is_some_and(|m| (m.cbp >> (b8 + 2)) & 1 == 0) };
+                let bit = (cbpl >> b8) & 1;
+                c.decision(73 + cond_a as usize + 2 * cond_b as usize, bit == 1);
+                luma |= bit << b8;
+            }
+            let ca = cond(left, &|m| m.cbp >> 4 != 0);
+            let cb = cond(top, &|m| m.cbp >> 4 != 0);
+            c.decision(77 + ca + 2 * cb, cbpc != 0);
+            if cbpc != 0 {
+                let ca = cond(left, &|m| m.cbp >> 4 == 2);
+                let cb = cond(top, &|m| m.cbp >> 4 == 2);
+                c.decision(77 + 4 + ca + 2 * cb, cbpc == 2);
+            }
+        }
+        if code.cbp != 0 || code.kind == Kind::I16x16 {
+            c.decision(60, false); // mb_qp_delta 0, after a macroblock without a change
+            // an unavailable neighbour counts as a coded block for an intra macroblock
+            let un = code.kind != Kind::Inter;
+            let flag = |n: Option<u8>| n.map_or(un, |v| v > 0) as usize;
+            if code.kind == Kind::I16x16 {
+                let dc = |n: Option<MbState>| n.map_or(un, |m| m.cbf_dc & 1 != 0) as usize;
+                cabac::write_block(&mut c, 0, 85 + dc(left) + 2 * dc(top), &code.dc);
+            }
+            let (cat, base) = if code.kind == Kind::I16x16 { (1, 85 + 4) } else { (2, 85 + 8) };
+            for n in 0..16 {
+                let (bx, by) = block_pos(n);
+                if cbpl & (1 << (n / 4)) == 0 {
+                    continue;
+                }
+                let a = if bx > 0 { Some(code.nnz[by * 4 + bx - 1]) } else { left.map(|m| m.nnz[by * 4 + 3]) };
+                let b = if by > 0 { Some(code.nnz[(by - 1) * 4 + bx]) } else { top.map(|m| m.nnz[12 + bx]) };
+                let blk = &code.luma[by * 4 + bx];
+                cabac::write_block(&mut c, cat, base + flag(a) + 2 * flag(b), if cat == 1 { &blk[1..] } else { blk });
+            }
+            if cbpc > 0 {
+                for comp in 0..2 {
+                    let dc = |n: Option<MbState>| n.map_or(un, |m| m.cbf_dc & (2 << comp) != 0) as usize;
+                    cabac::write_block(&mut c, 3, 85 + 12 + dc(left) + 2 * dc(top), &code.cdc[comp]);
+                }
+            }
+            if cbpc == 2 {
+                for comp in 0..2 {
+                    for blk in 0..4 {
+                        let (bx, by) = (blk & 1, blk >> 1);
+                        let cur = &code.cnnz[comp];
+                        let a = if bx > 0 { Some(cur[by * 2]) } else { left.map(|m| m.cnnz[comp][by * 2 + 1]) };
+                        let b = if by > 0 { Some(cur[bx]) } else { top.map(|m| m.cnnz[comp][2 + bx]) };
+                        cabac::write_block(&mut c, 4, 85 + 16 + flag(a) + 2 * flag(b), &code.cac[comp][blk][1..]);
+                    }
+                }
+            }
+        }
+        c.terminate(last);
+        self.cabac = Some(c);
+    }
+
     fn finish_mb(&mut self, code: &MbCode, mbx: usize, mby: usize) {
         let idx = mby * self.mb_w + mbx;
         let inter = code.kind == Kind::Inter;
-        self.state[idx] = MbState { i4: code.kind == Kind::I4x4, inter, modes: code.modes, nnz: code.nnz, cnnz: code.cnnz, mv: code.mv };
+        let mvd = if inter && !code.skip {
+            let p = self.mv_pred(mbx, mby);
+            [0, 1].map(|c| (code.mv[c] as i32 - p[c] as i32).unsigned_abs().min(64) as u8)
+        } else {
+            [0, 0]
+        };
+        let cbpc = code.cbp >> 4;
+        let cbf_dc = (code.kind == Kind::I16x16 && code.dc.iter().any(|&l| l != 0)) as u8
+            | ((cbpc > 0 && code.cdc[0].iter().any(|&l| l != 0)) as u8) << 1
+            | ((cbpc > 0 && code.cdc[1].iter().any(|&l| l != 0)) as u8) << 2;
+        self.state[idx] = MbState {
+            i4: code.kind == Kind::I4x4,
+            inter,
+            modes: code.modes,
+            nnz: code.nnz,
+            cnnz: code.cnnz,
+            mv: code.mv,
+            skip: code.skip,
+            kind: code.kind,
+            cbp: code.cbp,
+            chroma_mode: if inter { 0 } else { code.chroma_mode },
+            cbf_dc,
+            mvd,
+        };
         self.counts[if code.skip { 2 } else if inter { 1 } else { 0 }] += 1;
         let mut info = MbInfo { slice: self.slice_id, kind: code.kind, qp: self.qp as i8, ..MbInfo::default() };
         info.nnz[..16].copy_from_slice(&code.nnz);
