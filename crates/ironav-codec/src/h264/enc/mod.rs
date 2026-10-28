@@ -1,15 +1,19 @@
 //! A software H.264 encoder: Constrained Baseline profile (CAVLC, I and P pictures, one reference
 //! picture), 8-bit 4:2:0 with even dimensions. Macroblocks are coded as Intra4x4, Intra16x16,
 //! P_L0_16x16 or P_Skip, chosen by SATD and an estimate of their bits; motion is searched to
-//! quarter samples. Output is Annex B with SPS and PPS ahead of every IDR picture.
+//! quarter samples. Pictures are cut into slices of macroblock rows that are coded on separate
+//! threads. Output is Annex B with SPS and PPS ahead of every IDR picture.
 
 mod bitw;
 mod cavlc;
 mod frame;
+mod subpel;
 
-use super::mb::Picture;
+use super::deblock::deblock_picture;
+use super::mb::{Picture, SliceParams};
 use bitw::{put_nal, BitWriter};
 use frame::{FrameCoder, Source};
+use subpel::HalfPel;
 use ironav_core::{Encoder, Error, ErrorCode, Frame, Packet, PixelFormat, Rational, Result, StreamParams};
 
 /// Pictures between IDR pictures.
@@ -55,7 +59,10 @@ pub struct H264Encoder {
     rc_qp: f64,
     spent: f64,
     allowed: f64,
-    refp: Option<Picture>,
+    /// The last picture as decoders reconstruct it, with its half samples.
+    refp: Option<(Picture, HalfPel)>,
+    /// Slices per picture, each coded on its own thread.
+    slices: usize,
     count: u64,
     frame_num: u32,
     idr_id: u32,
@@ -95,6 +102,8 @@ impl H264Encoder {
             spent: 0.0,
             allowed: 0.0,
             refp: None,
+            // a slice per eight rows or so: more slices lose too much prediction across their edges
+            slices: std::thread::available_parallelism().map_or(1, |n| n.get()).min((mb_h / 8).max(1)),
             count: 0,
             frame_num: 0,
             idr_id: 0,
@@ -238,9 +247,10 @@ impl Encoder for H264Encoder {
         }
         let qp = self.next_qp(idr);
         let (frame_num, idr_id) = (self.frame_num, self.idr_id);
-        let coder = FrameCoder::new(&src, if idr { None } else { self.refp.as_ref() }, self.mb_w, self.mb_h, qp);
-        let (rbsp, pic, _) = coder.encode(|w| {
-            w.ue(0); // first_mb_in_slice
+        let (mb_w, mb_h, n) = (self.mb_w, self.mb_h, self.slices.clamp(1, self.mb_h));
+        let refp = if idr { None } else { self.refp.as_ref().map(|(p, h)| (p, h)) };
+        let header = |w: &mut BitWriter, first_mb: usize| {
+            w.ue(first_mb as u32); // first_mb_in_slice
             w.ue(if idr { 7 } else { 5 }); // slice_type: I or P, all slices of the picture alike
             w.ue(0); // pic_parameter_set_id
             w.put(8, frame_num);
@@ -257,16 +267,40 @@ impl Encoder for H264Encoder {
                 w.flag(false); // adaptive_ref_pic_marking_mode_flag
             }
             w.se(qp - 26); // slice_qp_delta
+        };
+        let bands: Vec<_> = (0..n).map(|i| i * mb_h / n..(i + 1) * mb_h / n).collect();
+        let coded: Vec<_> = std::thread::scope(|s| {
+            let jobs: Vec<_> = bands
+                .iter()
+                .enumerate()
+                .map(|(i, rows)| {
+                    let (src, rows) = (&src, rows.clone());
+                    s.spawn(move || FrameCoder::new(src, refp, mb_w, mb_h, qp, rows.clone(), i as u16 + 1).encode(|w| header(w, rows.start * mb_w)))
+                })
+                .collect();
+            jobs.into_iter().map(|j| j.join().expect("an H.264 slice thread panicked")).collect()
         });
-        let mut data = Vec::with_capacity(rbsp.len() + 64);
+        // the slices' rows and macroblocks make up the picture, which is then loop filtered across them
+        let mut pic = Picture::new(mb_w, mb_h, 1, 8);
+        let mut data = Vec::new();
         if idr {
             put_nal(&mut data, 3, 7, &self.sps());
             put_nal(&mut data, 3, 8, &Self::pps());
             self.idr_id = (self.idr_id + 1) % 65536;
         }
-        put_nal(&mut data, if idr { 3 } else { 2 }, if idr { 5 } else { 1 }, &rbsp);
+        for (rows, (rbsp, part, _)) in bands.iter().zip(coded) {
+            put_nal(&mut data, if idr { 3 } else { 2 }, if idr { 5 } else { 1 }, &rbsp);
+            for (c, unit) in [(0, mb_w * 256), (1, mb_w * 64), (2, mb_w * 64)] {
+                let span = rows.start * unit..rows.end * unit;
+                pic.planes[c][span.clone()].copy_from_slice(&part.planes[c][span]);
+            }
+            pic.mbs[rows.start * mb_w..rows.end * mb_w].copy_from_slice(&part.mbs[rows.start * mb_w..rows.end * mb_w]);
+        }
+        pic.slices = vec![SliceParams { disable_deblocking: 0, alpha_offset: 0, beta_offset: 0, chroma_qp_offset: [0, 0] }; n];
+        deblock_picture(&mut pic, 8);
         self.rate_update(data.len() * 8, qp, idr);
-        self.refp = Some(pic);
+        let half = HalfPel::new(&pic.planes[0], mb_w * 16, mb_h * 16);
+        self.refp = Some((pic, half));
         self.count += 1;
         self.frame_num = (self.frame_num + 1) % 256;
         Ok(vec![Packet { stream: 0, pts: v.pts, duration: 1, data }])
@@ -310,16 +344,17 @@ mod tests {
         10.0 * (255.0f64 * 255.0 / se.max(1e-9)).log10()
     }
 
-    fn run(w: usize, h: usize, frames: usize, qp: Option<u8>, bitrate: Option<u32>) -> (Vec<VideoFrame>, Vec<VideoFrame>, usize) {
+    fn run(w: usize, h: usize, frames: usize, qp: Option<u8>, bitrate: Option<u32>, slices: usize) -> (Vec<VideoFrame>, Vec<VideoFrame>, usize) {
         let params = StreamParams::Video { width: w as u32, height: h as u32, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational::new(25, 1) };
         let mut enc = H264Encoder::new(&params, qp, bitrate).unwrap();
+        enc.slices = slices;
         let mut dec = H264Decoder::new();
         let (mut src, mut out, mut bytes) = (Vec::new(), Vec::new(), 0);
         for t in 0..frames {
             let f = scene(w, h, t);
             let pkts = enc.encode(&Frame::Video(f.clone())).unwrap();
             // the decoder sees the reference the encoder keeps
-            let recon = enc.refp.as_ref().unwrap();
+            let recon = &enc.refp.as_ref().unwrap().0;
             for p in &pkts {
                 bytes += p.data.len();
                 for d in dec.decode(p).unwrap() {
@@ -346,9 +381,9 @@ mod tests {
 
     #[test]
     fn decoder_rebuilds_the_encoders_reference() {
-        for (w, h) in [(64, 48), (200, 120), (16, 16), (34, 18)] {
+        for (w, h, slices) in [(64, 48, 1), (200, 120, 3), (16, 16, 1), (34, 18, 2), (96, 80, 5)] {
             for qp in [4, 20, 30, 45] {
-                let (src, out, _) = run(w, h, 6, Some(qp), None);
+                let (src, out, _) = run(w, h, 6, Some(qp), None, slices);
                 assert_eq!(out.len(), src.len());
                 if qp == 20 {
                     for (s, d) in src.iter().zip(&out) {
@@ -363,7 +398,7 @@ mod tests {
     #[test]
     fn a_bit_rate_is_followed_on_average() {
         let target = 300_000;
-        let (_, _, bytes) = run(160, 96, 75, None, Some(target));
+        let (_, _, bytes) = run(160, 96, 75, None, Some(target), 2);
         let rate = bytes as f64 * 8.0 / 3.0;
         assert!((rate / target as f64 - 1.0).abs() < 0.25, "{rate:.0} bit/s against {target}");
     }

@@ -393,7 +393,9 @@ H.264 can be written without a GPU. The software encoder (`h264/enc/`) produces 
 CAVLC, I and P pictures with one reference picture, 8-bit `yuv420p` with even dimensions (other sizes are padded to whole
 macroblocks and cropped in the SPS). Each macroblock is coded as Intra 4x4, Intra 16x16, P 16x16 or P_Skip, chosen
 by SATD plus an estimate of the bits; motion is found by a diamond search from the neighbours' vectors, then refined
-to half and quarter samples. Reconstruction reuses the decoder's prediction, inverse transform and loop filter, so the
+to half and quarter samples, using half-sample planes of the reference picture computed once per picture. Each picture
+is cut into slices of about eight macroblock rows, coded on separate threads (up to the number of CPUs), then loop
+filtered as a whole. Reconstruction reuses the decoder's prediction, inverse transform and loop filter, so the
 reference the encoder keeps is the one every decoder builds (a unit test decodes each picture and compares). `--qp N`
 holds a quantiser (23 by default); `--vbitrate KBPS` steers the quantiser picture by picture to an average rate.
 An IDR picture with SPS and PPS starts every 250 pictures. NVENC is still chosen when a usable GPU is present;
@@ -402,9 +404,11 @@ An IDR picture with SPS and PPS starts every 250 pictures. NVENC is still chosen
 Checked by decoding with FFmpeg (through PyAV): 24 cases from 16x16 to 1280x720, QP 0 to 51 and four bit rates all decode
 bit-for-bit like IronAV's own decoder. On a noisy 720p clip (60 frames) it makes 2.21 MB at 46.6 dB luma PSNR at QP 23,
 where libx264's baseline profile makes 2.23 MB at 46.5 dB with `veryfast` and 1.57 MB at 47.2 dB with `medium`, so it compresses
-about as well as x264 `veryfast` (x264 also uses smaller partitions, several references and RD decisions). It is far
-slower: about 7 frames per second at 720p on one thread. A 240-frame 720p run at 5000 kbit/s came out at 5013 kbit/s.
-Not done: B pictures, CABAC, 8x8 transform (High profile), partitions below 16x16, multiple references, threads, 10-bit.
+about as well as x264 `veryfast` (x264 also uses smaller partitions, several references and RD decisions). Those
+figures are for one slice; the five slices a 720p picture now gets cost 1.9 % more bits at equal quality (BD-rate over
+QP 22-38). 60 frames of that 720p clip take 1.6 s (about 38 frames per second, best of three on a fully loaded 24-thread
+machine), against 7.0 s on one thread before the slices and half-sample planes; x264 is still much faster. A 240-frame 720p run at 5000 kbit/s came out at 5013 kbit/s.
+Not done: B pictures, CABAC, 8x8 transform (High profile), partitions below 16x16, multiple references, 10-bit.
 
 ## VP8
 

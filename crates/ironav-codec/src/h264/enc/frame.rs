@@ -4,11 +4,12 @@
 
 use super::bitw::{se_bits, BitWriter};
 use super::cavlc::write_block;
-use crate::h264::deblock::deblock_picture;
 use crate::h264::idct::{hadamard4, idct4_add};
-use crate::h264::inter::{chroma_mc, luma_mc};
+use super::subpel::HalfPel;
+use crate::h264::inter::chroma_mc;
 use crate::h264::intra::{predict_16x16, predict_chroma, predict_nxn, Edges};
-use crate::h264::mb::{chroma_qp, Kind, MbInfo, Picture, SliceParams};
+use crate::h264::mb::{chroma_qp, Kind, MbInfo, Picture};
+use std::ops::Range;
 use crate::h264::ps::ZIGZAG4;
 use crate::h264::tables::{GOLOMB_TO_INTER_CBP, GOLOMB_TO_INTRA4X4_CBP};
 
@@ -63,7 +64,22 @@ fn quant(c: i32, mf: i32, f: i32, qbits: u32) -> i32 {
 
 /// The sum of absolute Hadamard-transformed differences of a 4x4 block, halved.
 fn satd4(d: &[i32; 16]) -> i32 {
-    hadamard4(d).iter().map(|v| v.abs()).sum::<i32>() >> 1
+    let mut t = [0i32; 16];
+    for r in 0..4 {
+        let (a, b, c, e) = (d[r * 4], d[r * 4 + 1], d[r * 4 + 2], d[r * 4 + 3]);
+        let (s0, s1, d0, d1) = (a + b, c + e, a - b, c - e);
+        t[r * 4] = s0 + s1;
+        t[r * 4 + 1] = s0 - s1;
+        t[r * 4 + 2] = d0 - d1;
+        t[r * 4 + 3] = d0 + d1;
+    }
+    let mut sum = 0;
+    for c in 0..4 {
+        let (a, b, cc, e) = (t[c], t[4 + c], t[8 + c], t[12 + c]);
+        let (s0, s1, d0, d1) = (a + b, cc + e, a - b, cc - e);
+        sum += (s0 + s1).abs() + (s0 - s1).abs() + (d0 - d1).abs() + (d0 + d1).abs();
+    }
+    sum >> 1
 }
 
 /// The Lagrange multiplier that weighs bits against SATD at `qp`.
@@ -125,7 +141,11 @@ pub struct Source {
 pub struct FrameCoder<'a> {
     src: &'a Source,
     refp: Option<&'a Picture>,
+    half: Option<&'a HalfPel>,
     pub pic: Picture,
+    /// The macroblock rows of this slice, and its 1-based id.
+    rows: Range<usize>,
+    slice_id: u16,
     mb_w: usize,
     mb_h: usize,
     qp: i32,
@@ -140,11 +160,16 @@ pub struct FrameCoder<'a> {
 }
 
 impl<'a> FrameCoder<'a> {
-    pub fn new(src: &'a Source, refp: Option<&'a Picture>, mb_w: usize, mb_h: usize, qp: i32) -> Self {
+    /// A coder for the slice of macroblock rows `rows` against the reference `refp` (none for an I slice),
+    /// whose half samples are `half`.
+    pub fn new(src: &'a Source, refp: Option<(&'a Picture, &'a HalfPel)>, mb_w: usize, mb_h: usize, qp: i32, rows: Range<usize>, slice_id: u16) -> Self {
         FrameCoder {
             src,
-            refp,
+            refp: refp.map(|r| r.0),
+            half: refp.map(|r| r.1),
             pic: Picture::new(mb_w, mb_h, 1, 8),
+            rows,
+            slice_id,
             mb_w,
             mb_h,
             qp,
@@ -158,10 +183,11 @@ impl<'a> FrameCoder<'a> {
         }
     }
 
-    /// Codes the picture; `header` writes the slice header first. Returns the slice RBSP.
+    /// Codes the slice; `header` writes the slice header first. Returns the slice RBSP and a picture
+    /// holding the slice's reconstruction (not yet loop filtered) and macroblocks.
     pub fn encode(mut self, header: impl FnOnce(&mut BitWriter)) -> (Vec<u8>, Picture, [usize; 3]) {
         header(&mut self.w);
-        for mby in 0..self.mb_h {
+        for mby in self.rows.clone() {
             for mbx in 0..self.mb_w {
                 let code = self.code_mb(mbx, mby);
                 self.write_mb(&code, mbx, mby);
@@ -171,10 +197,13 @@ impl<'a> FrameCoder<'a> {
         if self.skip_run > 0 {
             self.w.ue(self.skip_run);
         }
-        self.pic.slices = vec![SliceParams { disable_deblocking: 0, alpha_offset: 0, beta_offset: 0, chroma_qp_offset: [0, 0] }];
-        deblock_picture(&mut self.pic, 8);
         let counts = self.counts;
         (self.w.finish(), self.pic, counts)
+    }
+
+    /// Whether the macroblock row above `mby` belongs to this slice.
+    fn up(&self, mby: usize) -> bool {
+        mby > self.rows.start
     }
 
     fn ls(&self) -> usize {
@@ -188,7 +217,8 @@ impl<'a> FrameCoder<'a> {
     // ---- neighbours -------------------------------------------------------------------------------
 
     fn nb_state(&self, mbx: i32, mby: i32) -> Option<&MbState> {
-        if mbx < 0 || mby < 0 || mbx as usize >= self.mb_w || mby as usize >= self.mb_h {
+        // macroblocks of earlier slices are not available for prediction
+        if mbx < 0 || mby < self.rows.start as i32 || mbx as usize >= self.mb_w || mby as usize >= self.mb_h {
             return None;
         }
         Some(&self.state[mby as usize * self.mb_w + mbx as usize])
@@ -265,13 +295,16 @@ impl<'a> FrameCoder<'a> {
     /// SATD of the `w` x `h` source block at (x, y) of `plane` against `pred` (row-major, `w` wide).
     fn satd(&self, plane: usize, x: usize, y: usize, w: usize, h: usize, pred: &[u16]) -> i32 {
         let s = if plane == 0 { self.ls() } else { self.cs() };
+        let src = &self.src.planes[plane];
         let mut total = 0;
         for by in (0..h).step_by(4) {
             for bx in (0..w).step_by(4) {
                 let mut d = [0i32; 16];
                 for r in 0..4 {
+                    let o = (y + by + r) * s + x + bx;
+                    let (sr, pr) = (&src[o..o + 4], &pred[(by + r) * w + bx..(by + r) * w + bx + 4]);
                     for c in 0..4 {
-                        d[r * 4 + c] = self.src.planes[plane][(y + by + r) * s + x + bx + c] as i32 - pred[(by + r) * w + bx + c] as i32;
+                        d[r * 4 + c] = sr[c] as i32 - pr[c] as i32;
                     }
                 }
                 total += satd4(&d);
@@ -280,32 +313,22 @@ impl<'a> FrameCoder<'a> {
         total
     }
 
-    fn sad16_int(&self, refp: &Picture, x0: usize, y0: usize, mv: [i16; 2]) -> i32 {
+    fn sad16_int(&self, x0: usize, y0: usize, mv: [i16; 2]) -> i32 {
         let ls = self.ls();
-        let (pw, ph) = (ls as i32, (self.mb_h * 16) as i32);
-        let (rx, ry) = (x0 as i32 + (mv[0] >> 2) as i32, y0 as i32 + (mv[1] >> 2) as i32);
-        let inside = rx >= 0 && ry >= 0 && rx + 16 <= pw && ry + 16 <= ph;
+        let rows = self.half.unwrap().rows16(x0 as i32 + (mv[0] >> 2) as i32, y0 as i32 + (mv[1] >> 2) as i32);
         let mut sad = 0;
-        for r in 0..16 {
-            let srow = &self.src.planes[0][(y0 + r) * ls + x0..(y0 + r) * ls + x0 + 16];
-            if inside {
-                let o = (ry as usize + r) * ls + rx as usize;
-                for (a, b) in srow.iter().zip(&refp.planes[0][o..o + 16]) {
-                    sad += (*a as i32 - *b as i32).abs();
-                }
-            } else {
-                let yy = (ry + r as i32).clamp(0, ph - 1) as usize;
-                for (c, a) in srow.iter().enumerate() {
-                    let xx = (rx + c as i32).clamp(0, pw - 1) as usize;
-                    sad += (*a as i32 - refp.planes[0][yy * ls + xx] as i32).abs();
-                }
+        for (r, rrow) in rows.enumerate() {
+            let srow: &[u16; 16] = self.src.planes[0][(y0 + r) * ls + x0..(y0 + r) * ls + x0 + 16].try_into().unwrap();
+            let rrow: &[u8; 16] = rrow.try_into().unwrap();
+            for c in 0..16 {
+                sad += (srow[c] as i32 - rrow[c] as i32).abs();
             }
         }
         sad
     }
 
-    fn luma_pred(&self, refp: &Picture, x0: usize, y0: usize, mv: [i16; 2], out: &mut [u16; 256]) {
-        luma_mc(&refp.planes[0], self.ls(), self.mb_h * 16, x0 as i32, y0 as i32, mv[0] as i32, mv[1] as i32, 16, 16, out, 255);
+    fn luma_pred(&self, x0: usize, y0: usize, mv: [i16; 2], out: &mut [u16; 256]) {
+        self.half.unwrap().predict(x0 as i32, y0 as i32, mv, 16, 16, out);
     }
 
     // ---- macroblock analysis -------------------------------------------------------------------------
@@ -313,19 +336,28 @@ impl<'a> FrameCoder<'a> {
     fn code_mb(&mut self, mbx: usize, mby: usize) -> MbCode {
         let (x0, y0) = (mbx * 16, mby * 16);
         let lam = self.lambda;
+        let mut inter = None;
+        if self.refp.is_some() {
+            // P_Skip first: when the skip vector leaves nothing worth coding, nothing else can be cheaper.
+            // A prediction whose differences average a quantiser step or more cannot be skipped.
+            let skip_mv = self.skip_mv(mbx, mby);
+            let mut pred = [0u16; 256];
+            self.luma_pred(x0, y0, skip_mv, &mut pred);
+            let ls = self.ls();
+            let sad: i32 = (0..256).map(|i| (self.src.planes[0][(y0 + i / 16) * ls + x0 + i % 16] as i32 - pred[i] as i32).abs()).sum();
+            if (sad as f64) < 256.0 * 0.625 * 2f64.powf(self.qp as f64 / 6.0) {
+                let mut code = self.code_inter(mbx, mby, skip_mv);
+                if code.cbp == 0 {
+                    code.skip = true;
+                    return code;
+                }
+            }
+        }
         let i16 = self.best_i16(mbx, mby);
         let mut best_intra = i16.1 + lam * 4;
-        let mut inter = None;
-        if let Some(refp) = self.refp {
-            // P_Skip first: when the skip vector leaves nothing worth coding, nothing else can be cheaper
-            let skip_mv = self.skip_mv(mbx, mby);
-            let mut code = self.code_inter(mbx, mby, skip_mv);
-            if code.cbp == 0 {
-                code.skip = true;
-                return code;
-            }
+        if self.refp.is_some() {
             let mvp = self.mv_pred(mbx, mby);
-            let (mv, cost) = self.motion_search(refp, x0, y0, mvp, mbx, mby);
+            let (mv, cost) = self.motion_search(x0, y0, mvp, mbx, mby);
             inter = Some((mv, cost + lam * (mvd_bits(mv, mvp) + 1)));
         }
         // Intra4x4 is tried by coding it, which leaves its reconstruction in place; it is kept only if it wins
@@ -361,7 +393,7 @@ impl<'a> FrameCoder<'a> {
         let p = &self.pic.planes[0];
         let mut top = [0; 16];
         let mut left = [0; 16];
-        if mby > 0 {
+        if self.up(mby) {
             for (i, t) in top.iter_mut().enumerate() {
                 *t = p[(y0 - 1) * ls + x0 + i] as i32;
             }
@@ -371,13 +403,13 @@ impl<'a> FrameCoder<'a> {
                 *l = p[(y0 + j) * ls + x0 - 1] as i32;
             }
         }
-        let tl = if mbx > 0 && mby > 0 { p[(y0 - 1) * ls + x0 - 1] as i32 } else { 0 };
+        let tl = if mbx > 0 && self.up(mby) { p[(y0 - 1) * ls + x0 - 1] as i32 } else { 0 };
         (top, left, tl)
     }
 
     /// The best Intra16x16 mode and its SATD.
     fn best_i16(&self, mbx: usize, mby: usize) -> (u8, i32) {
-        let (ta, la) = (mby > 0, mbx > 0);
+        let (ta, la) = (self.up(mby), mbx > 0);
         let (top, left, tl) = self.i16_neighbours(mbx, mby);
         let mut best = (2, i32::MAX);
         for mode in 0..4u8 {
@@ -401,13 +433,13 @@ impl<'a> FrameCoder<'a> {
     }
 
     /// Integer-sample diamond search from the best of a few candidates, then half- and quarter-sample refinement.
-    fn motion_search(&self, refp: &Picture, x0: usize, y0: usize, mvp: [i16; 2], mbx: usize, mby: usize) -> ([i16; 2], i32) {
+    fn motion_search(&self, x0: usize, y0: usize, mvp: [i16; 2], mbx: usize, mby: usize) -> ([i16; 2], i32) {
         let lam = self.lambda;
         let (lo_x, hi_x) = (-(x0 as i32 + 24) * 4, ((self.mb_w * 16 - x0) as i32 + 8) * 4);
         let (lo_y, hi_y) = (-(y0 as i32 + 24) * 4, ((self.mb_h * 16 - y0) as i32 + 8) * 4);
         let clamp = |mv: [i32; 2]| -> [i16; 2] { [mv[0].clamp(lo_x.max(-2048), hi_x.min(2047)) as i16, mv[1].clamp(lo_y.max(-512), hi_y.min(511)) as i16] };
         let int = |mv: [i16; 2]| -> [i16; 2] { [(mv[0] + 2) & !3, (mv[1] + 2) & !3] };
-        let cost_int = |mv: [i16; 2]| self.sad16_int(refp, x0, y0, mv) + lam * mvd_bits(mv, mvp);
+        let cost_int = |mv: [i16; 2]| self.sad16_int(x0, y0, mv) + lam * mvd_bits(mv, mvp);
         let mut cands = vec![int(clamp([mvp[0] as i32, mvp[1] as i32])), [0, 0]];
         for (dx, dy) in [(-1, 0), (0, -1), (1, -1)] {
             if let Some((0, mv)) = self.nb_motion(mbx as i32 + dx, mby as i32 + dy) {
@@ -440,7 +472,7 @@ impl<'a> FrameCoder<'a> {
         // sub-sample refinement by SATD
         let mut pred = [0u16; 256];
         let cost_sub = |mv: [i16; 2], pred: &mut [u16; 256]| {
-            self.luma_pred(refp, x0, y0, mv, pred);
+            self.luma_pred(x0, y0, mv, pred);
             self.satd(0, x0, y0, 16, 16, pred) + lam * mvd_bits(mv, mvp)
         };
         best_cost = cost_sub(best, &mut pred);
@@ -488,7 +520,8 @@ impl<'a> FrameCoder<'a> {
     /// the code and its cost.
     fn code_i4(&mut self, mbx: usize, mby: usize) -> (MbCode, i32) {
         let mut code = MbCode::new(Kind::I4x4);
-        let (la, ta, tla, tra) = (mbx > 0, mby > 0, mbx > 0 && mby > 0, mby > 0 && mbx + 1 < self.mb_w);
+        let ta = self.up(mby);
+        let (la, tla, tra) = (mbx > 0, mbx > 0 && ta, ta && mbx + 1 < self.mb_w);
         let ls = self.ls();
         let mut cost = 0;
         for n in 0..16 {
@@ -580,7 +613,7 @@ impl<'a> FrameCoder<'a> {
         code.i16_mode = mode;
         let (top, left, tl) = self.i16_neighbours(mbx, mby);
         let mut pred = [0u16; 256];
-        predict_16x16(mode, &top, &left, tl, mby > 0, mbx > 0, &mut pred, 8);
+        predict_16x16(mode, &top, &left, tl, self.up(mby), mbx > 0, &mut pred, 8);
         let (x0, y0, ls) = (mbx * 16, mby * 16, self.ls());
         let qp = self.qp;
         let mut dcs = [0i32; 16];
@@ -640,7 +673,7 @@ impl<'a> FrameCoder<'a> {
         code.mv = mv;
         let (x0, y0, ls) = (mbx * 16, mby * 16, self.ls());
         let mut pred = [0u16; 256];
-        self.luma_pred(refp, x0, y0, mv, &mut pred);
+        self.luma_pred(x0, y0, mv, &mut pred);
         let mut cos = [[0i32; 16]; 16];
         let mut score = [0i32; 4];
         for b in 0..16 {
@@ -693,7 +726,7 @@ impl<'a> FrameCoder<'a> {
     }
 
     fn code_intra_chroma(&mut self, code: &mut MbCode, mbx: usize, mby: usize) {
-        let (la, ta) = (mbx > 0, mby > 0);
+        let (la, ta) = (mbx > 0, self.up(mby));
         let (x0, y0, cs) = (mbx * 8, mby * 8, self.cs());
         let mut nbs = [([0i32; 8], [0i32; 16], 0i32); 2];
         for (c, nb) in nbs.iter_mut().enumerate() {
@@ -891,7 +924,7 @@ impl<'a> FrameCoder<'a> {
         let inter = code.kind == Kind::Inter;
         self.state[idx] = MbState { i4: code.kind == Kind::I4x4, inter, modes: code.modes, nnz: code.nnz, cnnz: code.cnnz, mv: code.mv };
         self.counts[if code.skip { 2 } else if inter { 1 } else { 0 }] += 1;
-        let mut info = MbInfo { slice: 1, kind: code.kind, qp: self.qp as i8, ..MbInfo::default() };
+        let mut info = MbInfo { slice: self.slice_id, kind: code.kind, qp: self.qp as i8, ..MbInfo::default() };
         info.nnz[..16].copy_from_slice(&code.nnz);
         info.cbp = code.cbp;
         info.skip = code.skip;
@@ -903,6 +936,7 @@ impl<'a> FrameCoder<'a> {
         self.pic.mbs[idx] = info;
     }
 }
+
 
 /// The neighbour-derived CAVLC context nC (9.2.1).
 fn nc(a: Option<u8>, b: Option<u8>) -> i32 {
