@@ -1,5 +1,6 @@
 use crate::job::Job;
 use crate::plan::{plan, rate_control, Action, Plan};
+use ironav_codec::h264::H264Encoder;
 use ironav_codec::jpeg::JpegEncoder;
 use ironav_codec::{build_filter, new_encoder_with};
 use ironav_core::{CodecId, Decoder, Encoder, Error, ErrorCode, Filter, Frame, MediaType, Packet, Rational, Result};
@@ -171,6 +172,13 @@ fn execute(
                 _ if dst.codec == CodecId::Mjpeg && dst.params.media_type() == MediaType::Video => {
                     let quality = st.qp.map_or(JpegEncoder::default_quality(), JpegEncoder::quality_for_qp);
                     Box::new(JpegEncoder::new(quality))
+                }
+                _ if dst.codec == CodecId::H264 && dst.params.media_type() == MediaType::Video => {
+                    let (qp, bitrate) = match rate {
+                        RateControl::ConstQp(q) => (Some(q), None),
+                        RateControl::Bitrate(b) => (None, Some(b)),
+                    };
+                    Box::new(H264Encoder::new(&dst.params, qp, bitrate)?)
                 }
                 _ => new_encoder_with(dst.codec, &dst.params, dst.bits, st.bitrate_kbps)?,
             };

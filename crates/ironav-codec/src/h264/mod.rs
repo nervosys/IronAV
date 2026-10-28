@@ -10,6 +10,7 @@ pub(crate) mod cabac;
 mod cavlc;
 mod deblock;
 mod dpb;
+mod enc;
 mod idct;
 mod inter;
 mod intra;
@@ -18,6 +19,7 @@ mod ps;
 pub(crate) mod tables;
 
 use bits::{split_annexb, unescape};
+pub use enc::H264Encoder;
 use dpb::{DecodedPic, Dpb, Pending, RefList};
 use ironav_core::{Decoder, Error, ErrorCode, Frame, Packet, PixelFormat, Result, VideoFrame};
 use mb::{LevelScale, Picture, SliceDec, SliceParams};

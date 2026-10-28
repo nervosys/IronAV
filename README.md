@@ -6,8 +6,8 @@ A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so 
 > **Status: foundation (v0.1).** The architecture, agent interface, ontology, hardware model, CLI, MCP server
 > and both GUIs are working and tested. Containers: **WAV, FLAC, Y4M, MP4, Matroska/WebM (read and write), Ogg, ADTS, MP3 and JPEG.**
 > Audio codecs, each decoded and encoded: **PCM, FLAC, AAC-LC (plus HE-AAC v1 decode), MP3, Opus and Vorbis.**
-> Video: **software decoders for H.264, HEVC (including 4:2:2 and 4:4:4), VP8 and VP9; JPEG/Motion-JPEG decoded and encoded in software.**
-> H.264 and HEVC *encoding* needs an NVIDIA GPU (NVENC), and they can also be decoded on NVIDIA GPUs (NVDEC).
+> Video: **software decoders for H.264, HEVC (including 4:2:2 and 4:4:4), VP8 and VP9; a software H.264 encoder (Constrained Baseline); JPEG/Motion-JPEG decoded and encoded in software.**
+> NVIDIA GPUs encode H.264 and HEVC (NVENC, preferred for H.264 when usable; HEVC has no software encoder) and decode H.264, HEVC and AV1 (NVDEC).
 > AV1 is decoded on NVIDIA GPUs only (NVDEC); it has no software decoder and no encoder yet. VP9 and AV1 copy between WebM, Matroska and MP4.
 > IronAV is not yet a drop-in replacement for FFmpeg or HandBrake.
 
@@ -387,6 +387,25 @@ is not is decoded differently by the specification and by some FFmpeg builds, so
 
 When a GPU decoder is usable (`--hwaccel auto`) it is still chosen for 4:2:0 H.264; the software decoder runs with `--hwaccel off` or when no GPU backend works. About 50 small streams (a further 75 8-bit and 50 10-bit random libx264 configurations also matched) (libx264 in many configurations, with B-frames, pyramids, weighted prediction, several slices and reference frames, plus hand-built all-I_PCM streams) decode bit-for-bit like FFmpeg's decoder; hundreds of corrupted streams made it return errors, never panic.
 
+### H.264 encoder
+
+H.264 can be written without a GPU. The software encoder (`h264/enc/`) produces **Constrained Baseline** streams:
+CAVLC, I and P pictures with one reference picture, 8-bit `yuv420p` with even dimensions (other sizes are padded to whole
+macroblocks and cropped in the SPS). Each macroblock is coded as Intra 4x4, Intra 16x16, P 16x16 or P_Skip, chosen
+by SATD plus an estimate of the bits; motion is found by a diamond search from the neighbours' vectors, then refined
+to half and quarter samples. Reconstruction reuses the decoder's prediction, inverse transform and loop filter, so the
+reference the encoder keeps is the one every decoder builds (a unit test decodes each picture and compares). `--qp N`
+holds a quantiser (23 by default); `--vbitrate KBPS` steers the quantiser picture by picture to an average rate.
+An IDR picture with SPS and PPS starts every 250 pictures. NVENC is still chosen when a usable GPU is present;
+`--hwaccel off` selects the software encoder.
+
+Checked by decoding with FFmpeg (through PyAV): 24 cases from 16x16 to 1280x720, QP 0 to 51 and four bit rates all decode
+bit-for-bit like IronAV's own decoder. On a noisy 720p clip (60 frames) it makes 2.21 MB at 46.6 dB luma PSNR at QP 23,
+where libx264's baseline profile makes 2.23 MB at 46.5 dB with `veryfast` and 1.57 MB at 47.2 dB with `medium`, so it compresses
+about as well as x264 `veryfast` (x264 also uses smaller partitions, several references and RD decisions). It is far
+slower: about 7 frames per second at 720p on one thread. A 240-frame 720p run at 5000 kbit/s came out at 5013 kbit/s.
+Not done: B pictures, CABAC, 8x8 transform (High profile), partitions below 16x16, multiple references, threads, 10-bit.
+
 ## VP8
 
 VP8 video is decoded in software (`ironav-codec/src/vp8`, a port of FFmpeg's `vp8.c` and `vp8dsp.c`; the probability, quantiser and
@@ -500,7 +519,7 @@ becomes 160 kb/s MP3 in about 2 s. Converting an MP3 to MP3 is a copy unless a b
 
 ## Matroska output
 
-`.mkv` and `.mka` can be written: H.264 or HEVC video (from the hardware encoder or copied), or VP8, VP9, AV1 or Motion-JPEG video, with AAC, FLAC, MP3, Opus or Vorbis
+`.mkv` and `.mka` can be written: H.264 (from the software or hardware encoder, or copied) or HEVC video (from the hardware encoder or copied), or VP8, VP9, AV1 or Motion-JPEG video, with AAC, FLAC, MP3, Opus or Vorbis
 audio, copied or encoded, at most one stream of each kind. Timestamps are in milliseconds; clusters are gathered in memory and
 written whole, so there are no unknown-size elements, and the file ends with Cues for the video key frames (or the clusters, for
 audio only). The header is held back until every stream has delivered a packet and the video's SPS/PPS have been seen.

@@ -61,7 +61,7 @@ pub fn implemented() -> Vec<CodecImpl> {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-jpeg" });
             }
             if c == CodecId::H264 {
-                return Some(CodecImpl { codec: c, decode: true, encode: false, implementation: "ironav-h264" });
+                return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-h264" });
             }
             if c == CodecId::Hevc {
                 return Some(CodecImpl { codec: c, decode: true, encode: false, implementation: "ironav-hevc" });
@@ -269,6 +269,7 @@ pub fn new_encoder_with(codec: CodecId, params: &StreamParams, bits: Option<u8>,
         }
         (CodecId::RawVideo, StreamParams::Video { .. }) => Ok(Box::new(rawvideo::RawVideoEncoder)),
         (CodecId::Mjpeg, StreamParams::Video { .. }) => Ok(Box::new(jpeg::JpegEncoder::new(jpeg::JpegEncoder::default_quality()))),
+        (CodecId::H264, StreamParams::Video { .. }) => Ok(Box::new(h264::H264Encoder::new(params, None, bitrate_kbps.map(|k| k.saturating_mul(1000)))?)),
         (c, p) if c.media_type() != p.media_type() => Err(Error::invalid_arg(format!(
             "codec {} is {:?} but the stream is {:?}",
             c.name(),

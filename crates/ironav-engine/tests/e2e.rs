@@ -349,21 +349,24 @@ fn write_y4m(path: &std::path::Path, w: usize, h: usize, frames: usize) {
     std::fs::write(path, f).unwrap();
 }
 
-/// H.264 has no software encoder, so the result depends on the machine: with a usable NVENC
-/// GPU it must produce a real Annex B stream; without one it must fail with a precise,
-/// recoverable error and leave nothing behind.
+/// H.264 is encoded by NVENC when a usable GPU is present and in software otherwise (or with
+/// hardware off); either way the result is a real Annex B stream that decodes back to the source.
 #[test]
-fn h264_uses_the_gpu_or_fails_precisely() {
+fn h264_encodes_on_the_gpu_or_in_software() {
     let d = scratch("h264");
     let (src, out) = (d.join("in.y4m"), d.join("out.h264"));
     write_y4m(&src, 256, 144, 30);
 
-    let mut off = job(&src, &out);
+    let mut off = job(&src, &d.join("soft.h264"));
     off.video.codec = Some("h264".into());
+    off.video.qp = Some(28);
     off.hwaccel = "off".into();
-    let e = plan(&off).unwrap_err();
-    assert_eq!(e.code, ErrorCode::HardwareUnavailable);
-    assert!(e.hint.as_deref().unwrap_or("").contains("auto"), "hint should say how to recover: {:?}", e.hint);
+    let report = run(&off, &mut |_| {}).unwrap();
+    assert_eq!(report.steps[0].hardware_encoder, None);
+    assert_eq!(report.steps[0].packets_out, 30);
+    let bytes = std::fs::read(d.join("soft.h264")).unwrap();
+    assert!(bytes.starts_with(&[0, 0, 0, 1, 0x67]), "Annex B, starting with the SPS");
+    assert!(bytes.len() < 256 * 144 * 3 * 30 / 2 / 20, "compressed at least 20:1, got {} bytes", bytes.len());
 
     let mut bad = job(&src, &out);
     bad.video.codec = Some("h264".into());
@@ -376,17 +379,27 @@ fn h264_uses_the_gpu_or_fails_precisely() {
     audio_opt.audio.qp = Some(20);
     assert_eq!(plan(&audio_opt).unwrap_err().code, ErrorCode::InvalidArgument);
 
-    // MP4 only holds codecs it can carry; the same GPU requirement applies.
+    // MP4 carries the software encoder's stream with its configuration in avcC.
     let mp4 = d.join("out.mp4");
     let mut m = job(&src, &mp4);
     m.video.codec = Some("h264".into());
     m.video.qp = Some(28);
-    if run(&m, &mut |_| {}).is_ok() {
-        let b = std::fs::read(&mp4).unwrap();
-        assert_eq!(&b[4..8], b"ftyp");
-        assert!(b.windows(4).any(|w| w == b"moov") && b.windows(4).any(|w| w == b"avcC"));
-    } else {
-        assert!(!mp4.exists());
+    m.hwaccel = "off".into();
+    run(&m, &mut |_| {}).unwrap();
+    let b = std::fs::read(&mp4).unwrap();
+    assert_eq!(&b[4..8], b"ftyp");
+    assert!(b.windows(4).any(|w| w == b"moov") && b.windows(4).any(|w| w == b"avcC"));
+    let back = d.join("soft.y4m");
+    let mut dec = job(&mp4, &back);
+    dec.video.codec = Some("rawvideo".into());
+    dec.hwaccel = "off".into();
+    run(&dec, &mut |_| {}).unwrap();
+    let (a, b) = (y4m_frames(&src), y4m_frames(&back));
+    assert_eq!(b.len(), 30);
+    for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+        let mse = x.iter().zip(y).map(|(p, q)| (*p as f64 - *q as f64).powi(2)).sum::<f64>() / x.len() as f64;
+        let psnr = 10.0 * (255.0f64 * 255.0 / mse.max(1e-9)).log10();
+        assert!(psnr > 34.0, "frame {i} only {psnr:.1} dB");
     }
     let mut keep = job(&src, &d.join("copy.mp4"));
     keep.video.codec = Some("copy".into());
@@ -395,19 +408,13 @@ fn h264_uses_the_gpu_or_fails_precisely() {
     let mut j = job(&src, &out);
     j.video.codec = Some("h264".into());
     j.video.qp = Some(28);
-    match run(&j, &mut |_| {}) {
-        Ok(report) => {
-            assert_eq!(report.steps[0].hardware_encoder, Some("cuda"));
-            assert_eq!(report.steps[0].packets_out, 30);
-            let bytes = std::fs::read(&out).unwrap();
-            assert!(bytes.starts_with(&[0, 0, 0, 1]), "Annex B start code");
-            assert!(bytes.len() > 100 && bytes.len() < 256 * 144 * 3 * 30 / 4, "plausible compressed size, got {}", bytes.len());
-        }
-        Err(e) => {
-            assert_eq!(e.code, ErrorCode::HardwareUnavailable, "{e:?}");
-            assert!(!out.exists() && !d.join("out.h264.partial").exists(), "failure must leave no output");
-        }
-    }
+    // with hardware allowed, a usable GPU is preferred
+    let report = run(&j, &mut |_| {}).unwrap();
+    assert!(matches!(report.steps[0].hardware_encoder, None | Some("cuda")));
+    assert_eq!(report.steps[0].packets_out, 30);
+    let bytes = std::fs::read(&out).unwrap();
+    assert!(bytes.starts_with(&[0, 0, 0, 1]), "Annex B start code");
+    assert!(bytes.len() > 100 && bytes.len() < 256 * 144 * 3 * 30 / 4, "plausible compressed size, got {}", bytes.len());
 }
 
 #[test]
@@ -465,23 +472,15 @@ fn video_and_audio_files_combine_into_one_mp4() {
     j.video.qp = Some(28);
     j.audio.codec = Some("flac".into());
 
-    match run(&j, &mut |_| {}) {
-        Ok(report) => {
-            assert_eq!(report.steps.len(), 2);
-            assert_eq!(report.plan.output.streams.len(), 2);
-            assert_eq!((report.steps[0].input_stream, report.steps[1].input_stream), (0, 0));
-            assert_eq!(report.plan.extra_inputs.len(), 1);
-            let b = std::fs::read(&out).unwrap();
-            assert!(has(&b, b"avcC") && has(&b, b"fLaC") && has(&b, b"vide") && has(&b, b"soun"));
-            let secs = report.media_seconds.unwrap();
-            assert!((secs - 1.0).abs() < 0.05, "one second of media, got {secs}");
-        }
-        Err(e) => {
-            // Without a usable GPU the video stream cannot be encoded; nothing may be left behind.
-            assert_eq!(e.code, ErrorCode::HardwareUnavailable, "{e:?}");
-            assert!(!out.exists() && !d.join("out.mp4.partial").exists());
-        }
-    }
+    let report = run(&j, &mut |_| {}).unwrap();
+    assert_eq!(report.steps.len(), 2);
+    assert_eq!(report.plan.output.streams.len(), 2);
+    assert_eq!((report.steps[0].input_stream, report.steps[1].input_stream), (0, 0));
+    assert_eq!(report.plan.extra_inputs.len(), 1);
+    let b = std::fs::read(&out).unwrap();
+    assert!(has(&b, b"avcC") && has(&b, b"fLaC") && has(&b, b"vide") && has(&b, b"soun"));
+    let secs = report.media_seconds.unwrap();
+    assert!((secs - 1.0).abs() < 0.05, "one second of media, got {secs}");
 }
 
 #[test]
@@ -535,8 +534,8 @@ fn mp4_decodes_on_the_gpu_or_fails_precisely() {
     let mut enc = job(&src, &mp4);
     enc.video.codec = Some("h264".into());
     enc.video.qp = Some(10);
-    if run(&enc, &mut |_| {}).is_err() {
-        // No usable GPU: decoding must refuse just as precisely, and write nothing.
+    if run(&enc, &mut |_| {}).unwrap().steps[0].hardware_encoder.is_none() {
+        // no usable GPU: the software encoder wrote the file, and there is no GPU decoder to test
         return;
     }
 
