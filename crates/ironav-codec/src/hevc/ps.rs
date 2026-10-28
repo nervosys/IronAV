@@ -193,6 +193,114 @@ impl ScalingList {
     }
 }
 
+/// Reads past hrd_parameters() (E.2.2).
+fn skip_hrd(r: &mut BitReader, max_sub_layers_minus1: u32) -> Result<()> {
+    let (nal, vcl) = (r.flag()?, r.flag()?);
+    let mut sub_pic = false;
+    if nal || vcl {
+        sub_pic = r.flag()?;
+        if sub_pic {
+            r.skip(19); // tick_divisor_minus2, du_cpb_removal_delay_increment_length_minus1, sub_pic_cpb_params_in_pic_timing_sei_flag, dpb_output_delay_du_length_minus1
+        }
+        r.skip(8); // bit_rate_scale, cpb_size_scale
+        if sub_pic {
+            r.skip(4);
+        }
+        r.skip(15); // the three delay lengths
+    }
+    for _ in 0..=max_sub_layers_minus1 {
+        let fixed_general = r.flag()?;
+        let fixed_cvs = fixed_general || r.flag()?;
+        let mut low_delay = false;
+        if fixed_cvs {
+            r.ue()?; // elemental_duration_in_tc_minus1
+        } else {
+            low_delay = r.flag()?;
+        }
+        let cpb = if low_delay { 1 } else { r.ue()? + 1 };
+        if cpb > 32 {
+            return Err(bad("too many CPB specifications"));
+        }
+        for _ in 0..(nal as u32 + vcl as u32) * cpb {
+            r.ue()?; // bit_rate_value_minus1
+            r.ue()?; // cpb_size_value_minus1
+            if sub_pic {
+                r.ue()?;
+                r.ue()?;
+            }
+            r.skip(1); // cbr_flag
+        }
+    }
+    Ok(())
+}
+
+/// Reads past vui_parameters() (E.2.1): nothing in it changes decoding.
+fn skip_vui(r: &mut BitReader, max_sub_layers_minus1: u32) -> Result<()> {
+    if r.flag()? && r.bits(8)? == 255 {
+        r.skip(32); // sar_width, sar_height
+    }
+    if r.flag()? {
+        r.skip(1); // overscan_appropriate_flag
+    }
+    if r.flag()? {
+        r.skip(4); // video_format, video_full_range_flag
+        if r.flag()? {
+            r.skip(24); // colour_primaries, transfer_characteristics, matrix_coeffs
+        }
+    }
+    if r.flag()? {
+        r.ue()?; // chroma_sample_loc_type_top_field
+        r.ue()?;
+    }
+    r.skip(3); // neutral_chroma_indication_flag, field_seq_flag, frame_field_info_present_flag
+    if r.flag()? {
+        for _ in 0..4 {
+            r.ue()?; // default display window offsets
+        }
+    }
+    if r.flag()? {
+        r.skip(64); // vui_num_units_in_tick, vui_time_scale
+        if r.flag()? {
+            r.ue()?; // vui_num_ticks_poc_diff_one_minus1
+        }
+        if r.flag()? {
+            skip_hrd(r, max_sub_layers_minus1)?;
+        }
+    }
+    if r.flag()? {
+        r.skip(3); // tiles_fixed_structure_flag, motion_vectors_over_pic_boundaries_flag, restricted_ref_pic_lists_flag
+        for _ in 0..5 {
+            r.ue()?;
+        }
+    }
+    if r.bits_left() == 0 {
+        return Err(bad("the VUI runs to the end of the SPS"));
+    }
+    Ok(())
+}
+
+/// The first range extension coding tool an SPS turns on (7.3.2.2.2), if any.
+fn sps_range_tool(r: &mut BitReader) -> Result<Option<&'static str>> {
+    const TOOLS: [&str; 9] = [
+        "transform skip rotation",
+        "transform skip context",
+        "implicit RDPCM",
+        "explicit RDPCM",
+        "extended precision processing",
+        "disabled intra smoothing",
+        "high precision weighted prediction offsets",
+        "persistent Rice adaptation",
+        "CABAC bypass alignment",
+    ];
+    let mut first = None;
+    for t in TOOLS {
+        if r.flag()? && first.is_none() {
+            first = Some(t);
+        }
+    }
+    Ok(first)
+}
+
 fn skip_ptl(r: &mut BitReader, max_sub_layers_minus1: u32) -> Result<()> {
     r.skip(96);
     let mut prof = [false; 8];
@@ -255,6 +363,19 @@ pub struct Sps {
     pub strong_intra_smoothing: bool,
     pub ctb_w: usize,
     pub ctb_h: usize,
+    /// A range extension coding tool the SPS turns on, which this decoder does not implement.
+    pub range_tool: Option<&'static str>,
+}
+
+impl Sps {
+    /// Horizontal and vertical chroma subsampling, as shifts.
+    pub fn chroma_shift(&self) -> (usize, usize) {
+        match self.chroma_format_idc {
+            2 => (1, 0),
+            3 => (0, 0),
+            _ => (1, 1),
+        }
+    }
 }
 
 pub fn parse_sps(rbsp: &[u8]) -> Result<Sps> {
@@ -352,6 +473,16 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps> {
     }
     let temporal_mvp = r.flag()?;
     let strong_intra_smoothing = r.flag()?;
+    // a VUI that does not parse (some encoders write it wrongly) leaves the extensions unread
+    let vui_ok = !r.flag()? || skip_vui(&mut r, max_sub_layers_minus1).is_ok();
+    let mut range_tool = None;
+    if vui_ok && r.flag().unwrap_or(false) {
+        let range = r.flag()?;
+        r.skip(7); // multilayer, 3D, SCC and the 4 reserved extension flags
+        if range {
+            range_tool = sps_range_tool(&mut r)?;
+        }
+    }
     let ctb = 1usize << log2_ctb;
     Ok(Sps {
         id,
@@ -389,6 +520,7 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps> {
         strong_intra_smoothing,
         ctb_w: width.div_ceil(ctb),
         ctb_h: height.div_ceil(ctb),
+        range_tool,
     })
 }
 
@@ -430,6 +562,8 @@ pub struct Pps {
     pub lists_modification_present: bool,
     pub log2_parallel_merge_level: u32,
     pub slice_header_extension_present: bool,
+    /// A range extension coding tool the PPS turns on, which this decoder does not implement.
+    pub range_tool: Option<&'static str>,
 }
 
 pub fn parse_pps(rbsp: &[u8]) -> Result<Pps> {
@@ -492,6 +626,25 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<Pps> {
     let lists_modification_present = r.flag()?;
     let log2_parallel_merge_level = r.ue()? + 2;
     let slice_header_extension_present = r.flag()?;
+    // pps_range_extension() (7.3.2.3.2)
+    let mut range_tool = None;
+    if r.flag().unwrap_or(false) {
+        let range = r.flag()?;
+        r.skip(7);
+        if range {
+            if transform_skip && r.ue()? != 0 {
+                range_tool = Some("transform skip of blocks larger than 4x4");
+            }
+            if r.flag()? {
+                range_tool = range_tool.or(Some("cross-component prediction"));
+            }
+            if r.flag()? {
+                range_tool = range_tool.or(Some("chroma QP offset lists"));
+            } else if r.ue()? != 0 || r.ue()? != 0 {
+                range_tool = range_tool.or(Some("scaled SAO offsets"));
+            }
+        }
+    }
     Ok(Pps {
         id,
         sps_id,
@@ -529,6 +682,7 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<Pps> {
         lists_modification_present,
         log2_parallel_merge_level,
         slice_header_extension_present,
+        range_tool,
     })
 }
 
@@ -858,4 +1012,62 @@ pub fn parse_slice_header(rbsp: &[u8], nal_type: u8, temporal_id: u8, sps_tab: &
         return Err(bad("slice segment has no data"));
     }
     Ok(h)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn range_extension_tools_are_named() {
+        // the nine sps_range_extension() flags, the third (implicit RDPCM) and the eighth set
+        let mut r = BitReader::new(&[0b0010_0001, 0b0000_0000]);
+        assert_eq!(sps_range_tool(&mut r).unwrap(), Some("implicit RDPCM"));
+        assert_eq!(r.pos(), 9);
+        assert_eq!(sps_range_tool(&mut BitReader::new(&[0, 0])).unwrap(), None);
+    }
+
+    #[test]
+    fn vui_with_timing_and_hrd_is_skipped_to_its_end() {
+        // aspect ratio idc 1; no overscan; video signal (format 5, limited range) with colour description;
+        // no chroma location; three zero flags; no display window; timing (1/25) with HRD (NAL, one CPB,
+        // fixed rate); bitstream restriction with five zero codes; then a marker bit
+        let mut bits = String::new();
+        bits.push_str("1");
+        bits.push_str("00000001");
+        bits.push_str("0");
+        bits.push_str("1");
+        bits.push_str("1010");
+        bits.push_str("1");
+        bits.push_str("000000010000000100000001");
+        bits.push_str("0");
+        bits.push_str("000");
+        bits.push_str("0");
+        bits.push_str("1");
+        bits.push_str(&format!("{:032b}{:032b}", 1, 25));
+        bits.push_str("0");
+        bits.push_str("1");
+        bits.push_str("10"); // nal_hrd_parameters_present, vcl absent
+        bits.push_str("0"); // sub_pic_hrd_params_present_flag
+        bits.push_str("00000000"); // bit_rate_scale, cpb_size_scale
+        bits.push_str("000000000000000"); // delay lengths
+        bits.push_str("1"); // fixed_pic_rate_general_flag
+        bits.push_str("1"); // elemental_duration_in_tc_minus1 = 0
+        bits.push_str("1"); // cpb_cnt_minus1 = 0
+        bits.push_str("1"); // bit_rate_value_minus1
+        bits.push_str("1"); // cpb_size_value_minus1
+        bits.push_str("0"); // cbr_flag
+        bits.push_str("1");
+        bits.push_str("000");
+        bits.push_str("11111");
+        let at = bits.len();
+        bits.push_str("1");
+        while bits.len() % 8 != 0 {
+            bits.push('0');
+        }
+        let bytes: Vec<u8> = bits.as_bytes().chunks(8).map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap(), 2).unwrap()).collect();
+        let mut r = BitReader::new(&bytes);
+        skip_vui(&mut r, 0).unwrap();
+        assert_eq!(r.pos(), at);
+    }
 }

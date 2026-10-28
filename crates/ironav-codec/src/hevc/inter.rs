@@ -457,7 +457,7 @@ impl<'a> Dec<'a> {
             _ => self.pps.weighted_bipred,
         };
         for c in 0..ncomp {
-            let (sx, sy) = if c == 0 { (0, 0) } else { (1, 1) };
+            let (sx, sy) = if c == 0 { (0, 0) } else { sps.chroma_shift() };
             let (bx, by, bw, bh) = (x >> sx, y >> sy, w >> sx, h >> sy);
             let bd = if c == 0 { self.bd_y } else { self.bd_c };
             let mut pred: [Vec<i16>; 2] = [Vec::new(), Vec::new()];
@@ -472,7 +472,7 @@ impl<'a> Dec<'a> {
                 if c == 0 {
                     luma_mc(&f.planes[0], pw, ph, bx as i32, by as i32, m.mv[l], bw, bh, bd, &mut out);
                 } else {
-                    chroma_mc(&f.planes[c], pw, ph, bx as i32, by as i32, m.mv[l], bw, bh, bd, &mut out);
+                    chroma_mc(&f.planes[c], pw, ph, bx as i32, by as i32, m.mv[l], (sx, sy), bw, bh, bd, &mut out);
                 }
                 pred[l] = out;
             }
@@ -614,10 +614,18 @@ fn luma_mc(src: &[u16], pw: usize, ph: usize, bx: i32, by: i32, mv: [i16; 2], bw
     interpolate::<8>(src, pw, ph, ix, iy, if fx != 0 { Some(&QPEL_FILTERS[fx]) } else { None }, if fy != 0 { Some(&QPEL_FILTERS[fy]) } else { None }, bw, bh, bd, out);
 }
 
-/// Chroma sample interpolation for 4:2:0 (8.5.3.3.3.2).
+/// Chroma sample interpolation (8.5.3.3.3.2). The luma vector is in quarter samples, so it is in
+/// eighths of a chroma sample along a subsampled axis and in quarters (taken as even eighths) along a full one.
 #[allow(clippy::too_many_arguments)]
-fn chroma_mc(src: &[u16], pw: usize, ph: usize, bx: i32, by: i32, mv: [i16; 2], bw: usize, bh: usize, bd: u32, out: &mut [i16]) {
-    let (fx, fy) = ((mv[0] & 7) as usize, (mv[1] & 7) as usize);
-    let (ix, iy) = (bx + (mv[0] >> 3) as i32, by + (mv[1] >> 3) as i32);
+fn chroma_mc(src: &[u16], pw: usize, ph: usize, bx: i32, by: i32, mv: [i16; 2], (sx, sy): (usize, usize), bw: usize, bh: usize, bd: u32, out: &mut [i16]) {
+    let split = |v: i16, s: usize| -> (i32, usize) {
+        if s == 1 {
+            ((v >> 3) as i32, (v & 7) as usize)
+        } else {
+            ((v >> 2) as i32, ((v & 3) << 1) as usize)
+        }
+    };
+    let ((dx, fx), (dy, fy)) = (split(mv[0], sx), split(mv[1], sy));
+    let (ix, iy) = (bx + dx, by + dy);
     interpolate::<4>(src, pw, ph, ix, iy, if fx != 0 { Some(&EPEL_FILTERS[fx]) } else { None }, if fy != 0 { Some(&EPEL_FILTERS[fy]) } else { None }, bw, bh, bd, out);
 }

@@ -671,7 +671,7 @@ pub(crate) fn parse_avcc(c: &[u8]) -> Result<Config> {
     if matches!(c[1], 100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134) {
         if let Some(ext) = c.get(at..at + 3) {
             let (cf, luma, chroma_bits) = (ext[0] & 3, ext[1] & 7, ext[2] & 7);
-            bits = supported_depth(cf, luma, chroma_bits, true)?;
+            bits = supported_depth(cf, luma, chroma_bits)?;
             chroma = cf;
         } else if matches!(c[1], 110 | 122 | 244) {
             return Err(Error::new(ErrorCode::UnsupportedCodec, "H.264 high-bit-depth profile without a stated bit depth; only 8-bit and 10-bit 4:2:0 are supported"));
@@ -686,7 +686,7 @@ pub(crate) fn parse_hvcc(c: &[u8]) -> Result<Config> {
     }
     let (chroma, luma, chroma_bits) = (c[16] & 3, c[17] & 7, c[18] & 7);
     // the HEVC decoder takes monochrome as well as 4:2:0
-    let bits = if chroma == 0 { supported_depth(0, luma, chroma_bits, true)? } else { supported_depth(chroma, luma, chroma_bits, false)? };
+    let bits = supported_depth(chroma, luma, chroma_bits)?;
     let mut prefix = Vec::new();
     let mut at = 23;
     for _ in 0..c[22] {
@@ -701,24 +701,20 @@ pub(crate) fn parse_hvcc(c: &[u8]) -> Result<Config> {
     Ok(Config { prefix, nal_length: (c[21] & 3) as usize + 1, bits, chroma })
 }
 
-/// 8-bit or 10-bit 4:2:0 with the same depth for luma and chroma; anything else is refused. With
-/// `h264`, monochrome (either depth) and 8-bit 4:2:2 are accepted too.
-fn supported_depth(chroma: u8, luma_minus8: u8, chroma_minus8: u8, h264: bool) -> Result<u8> {
-    match (chroma, luma_minus8, chroma_minus8) {
-        (1, 0, 0) => Ok(8),
-        (1, 2, 2) => Ok(10),
-        (0, 0, 0) if h264 => Ok(8),
-        (0, 2, 2) if h264 => Ok(10),
-        (2 | 3, 0, 0) if h264 => Ok(8),
-        (2 | 3, 2, 2) if h264 => Ok(10),
+/// 8-bit or 10-bit video (monochrome, 4:2:0, 4:2:2 or 4:4:4) with the same depth for luma and
+/// chroma; anything else is refused.
+fn supported_depth(chroma: u8, luma_minus8: u8, chroma_minus8: u8) -> Result<u8> {
+    match (luma_minus8, chroma_minus8) {
+        (0, 0) => Ok(8),
+        (2, 2) => Ok(10),
         _ => Err(unsupported_format(chroma, luma_minus8 + 8)),
     }
 }
 
 fn unsupported_format(chroma: u8, bits: u8) -> Error {
     let chroma = ["4:0:0", "4:2:0", "4:2:2", "4:4:4"][chroma as usize & 3];
-    Error::new(ErrorCode::UnsupportedCodec, format!("the video is {bits}-bit {chroma}; only 8-bit and 10-bit 4:2:0 (and 8-bit 4:2:2 or monochrome H.264) are supported"))
-        .hint("convert the source to yuv420p or yuv420p10le first")
+    Error::new(ErrorCode::UnsupportedCodec, format!("the video is {bits}-bit {chroma}; only 8-bit and 10-bit video with the same depth for luma and chroma is supported"))
+        .hint("convert the source to an 8-bit or 10-bit format first")
 }
 
 impl<R: Read + Seek + Send> Demuxer for Mp4Demuxer<R> {

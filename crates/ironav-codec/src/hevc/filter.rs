@@ -147,6 +147,7 @@ fn deblock(pic: &mut CurPic, sps: &Sps, pps: &Pps, geo: &Geometry) {
     let l = sps.log2_ctb;
     let (bd_y, bd_c) = (sps.bit_depth_luma, sps.bit_depth_chroma);
     let chroma = sps.chroma_format_idc != 0;
+    let (sx, sy) = sps.chroma_shift();
     let (width, cwidth) = (pic.frame.width, pic.frame.cwidth);
     for vertical in [true, false] {
         for y4 in 0..h4 {
@@ -195,13 +196,15 @@ fn deblock(pic: &mut CurPic, sps: &Sps, pps: &Pps, geo: &Geometry) {
                 let (across, along) = if vertical { (1isize, width as isize) } else { (width as isize, 1isize) };
                 luma_segment(&mut pic.frame.planes[0], y * width + x, across, along, bs, qpl, sq.beta_offset_div2, sq.tc_offset_div2, bd_y, no_p, no_q);
                 if bs == 2 && chroma {
-                    let on_chroma_grid = if vertical { x % 16 == 0 } else { y % 16 == 0 };
+                    // chroma edges lie on an 8-sample chroma grid; this luma segment covers 4 luma lines of it
+                    let on_chroma_grid = if vertical { x % (8 << sx) == 0 } else { y % (8 << sy) == 0 };
                     if on_chroma_grid {
                         let (across, along) = if vertical { (1isize, cwidth as isize) } else { (cwidth as isize, 1isize) };
+                        let lines = 4 >> if vertical { sy } else { sx };
                         for c in 1..3 {
                             let off = if c == 1 { pps.cb_qp_offset } else { pps.cr_qp_offset };
                             let qpc = chroma_qp(qpl + off, sps.chroma_format_idc);
-                            chroma_segment(&mut pic.frame.planes[c], (y / 2) * cwidth + x / 2, across, along, 2, qpc, sq.tc_offset_div2, bd_c, no_p, no_q);
+                            chroma_segment(&mut pic.frame.planes[c], (y >> sy) * cwidth + (x >> sx), across, along, lines, qpc, sq.tc_offset_div2, bd_c, no_p, no_q);
                         }
                     }
                 }
@@ -217,7 +220,7 @@ fn sao(pic: &mut CurPic, sps: &Sps, pps: &Pps, geo: &Geometry) {
         if pic.sao.iter().all(|s| s.kind[c] == 0) {
             continue;
         }
-        let (sx, sy) = if c == 0 { (0, 0) } else { (1, 1) };
+        let (sx, sy) = if c == 0 { (0, 0) } else { sps.chroma_shift() };
         let (pw, ph) = if c == 0 { (pic.frame.width, pic.frame.height) } else { (pic.frame.cwidth, pic.frame.cheight) };
         let bd = if c == 0 { sps.bit_depth_luma } else { sps.bit_depth_chroma };
         let src = pic.frame.planes[c].clone();

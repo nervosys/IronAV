@@ -115,7 +115,10 @@ pub struct Dec<'a> {
     cu_bypass: bool,
     pub(super) cu_pred_mode: u8,
     pub(super) part_mode: PartMode,
+    /// The chroma prediction mode of the transform unit being decoded.
     chroma_mode: u32,
+    /// The chroma prediction modes of the coding unit: one per prediction block in 4:4:4, else one.
+    chroma_modes: [u32; 4],
     max_trafo_depth: u32,
     intra_split: bool,
     ctb_x: usize,
@@ -185,6 +188,7 @@ impl<'a> Dec<'a> {
             cu_pred_mode: MODE_INTRA,
             part_mode: PartMode::P2Nx2N,
             chroma_mode: 1,
+            chroma_modes: [1; 4],
             max_trafo_depth: 0,
             intra_split: false,
             ctb_x: 0,
@@ -619,18 +623,22 @@ impl<'a> Dec<'a> {
             modes[p] = mode;
             Self::fill4(&mut self.pic.ipm, w4, xp, yp, pb, pb, mode as u8);
         }
-        if self.sps.chroma_format_idc != 0 {
+        // intra_chroma_pred_mode: one per prediction block in 4:4:4, one per coding unit otherwise
+        let chroma = self.sps.chroma_format_idc;
+        for p in 0..if chroma == 3 { nparts } else { (chroma != 0) as usize } {
             let idc = if self.cab.decision(INTRA_CHROMA_PRED_MODE_OFFSET) == 0 { 4 } else { self.cab.bypass_bits(2) };
-            self.chroma_mode = if idc == 4 {
-                modes[0]
+            let mode = if idc == 4 {
+                modes[p]
             } else {
                 let m = [0, 26, 10, 1][idc as usize];
-                if m == modes[0] {
+                if m == modes[p] {
                     34
                 } else {
                     m
                 }
             };
+            // 4:2:2 chroma is twice as tall as it is wide, so its angles are remapped (Table 8-3)
+            self.chroma_modes[p] = if chroma == 2 { MODE_422[mode as usize] as u32 } else { mode };
         }
         Ok(())
     }
@@ -653,12 +661,13 @@ impl<'a> Dec<'a> {
             }
         }
         if sps.chroma_format_idc != 0 {
-            let (cw, ch) = (n >> 1, n >> 1);
+            let (sx, sy) = sps.chroma_shift();
+            let (cw, ch) = (n >> sx, n >> sy);
             for c in 1..3 {
                 for y in 0..ch {
                     for x in 0..cw {
                         let v = r.bits(bc)? << (sps.bit_depth_chroma - bc);
-                        fr.planes[c][((y0 >> 1) + y) * fr.cwidth + (x0 >> 1) + x] = v as u16;
+                        fr.planes[c][((y0 >> sy) + y) * fr.cwidth + (x0 >> sx) + x] = v as u16;
                     }
                 }
             }
@@ -674,6 +683,11 @@ impl<'a> Dec<'a> {
     fn transform_tree(&mut self, x0: usize, y0: usize, xb: usize, yb: usize, log2: u32, depth: u32, blk: usize, parent_cb: [bool; 2], parent_cr: [bool; 2]) -> Result<()> {
         let sps = self.sps;
         let chroma = sps.chroma_format_idc;
+        if depth == 0 {
+            self.chroma_mode = self.chroma_modes[0];
+        } else if depth == 1 && self.intra_split && chroma == 3 {
+            self.chroma_mode = self.chroma_modes[blk];
+        }
         let split = if log2 <= sps.log2_max_tb && log2 > sps.log2_min_tb && depth < self.max_trafo_depth && !(self.intra_split && depth == 0) {
             self.cab.decision(SPLIT_TRANSFORM_FLAG_OFFSET + (5 - log2 as usize)) == 1
         } else {
@@ -683,11 +697,15 @@ impl<'a> Dec<'a> {
         let mut cbf_cb = [false; 2];
         let mut cbf_cr = [false; 2];
         if (log2 > 2 && chroma != 0) || chroma == 3 {
-            if depth == 0 || parent_cb[0] {
-                cbf_cb[0] = self.cab.decision(CBF_CB_CR_OFFSET + depth as usize) == 1;
-            }
-            if depth == 0 || parent_cr[0] {
-                cbf_cr[0] = self.cab.decision(CBF_CB_CR_OFFSET + depth as usize) == 1;
+            // 4:2:2 chroma blocks are two squares, one above the other, each with its own flag
+            let two = chroma == 2 && (!split || log2 == 3);
+            for (cbf, parent) in [(&mut cbf_cb, parent_cb), (&mut cbf_cr, parent_cr)] {
+                if depth == 0 || parent[0] {
+                    cbf[0] = self.cab.decision(CBF_CB_CR_OFFSET + depth as usize) == 1;
+                    if two {
+                        cbf[1] = self.cab.decision(CBF_CB_CR_OFFSET + depth as usize) == 1;
+                    }
+                }
             }
         } else if chroma != 0 && log2 == 2 && depth > 0 {
             cbf_cb = parent_cb;
@@ -700,13 +718,14 @@ impl<'a> Dec<'a> {
             }
             Ok(())
         } else {
-            let cbf_luma = if self.cu_pred_mode == PRED_INTRA || depth != 0 || cbf_cb[0] || cbf_cr[0] { self.cab.decision(CBF_LUMA_OFFSET + if depth == 0 { 1 } else { 0 }) == 1 } else { true };
-            self.transform_unit(x0, y0, xb, yb, log2, blk, cbf_luma, cbf_cb[0], cbf_cr[0])
+            let any_chroma = cbf_cb[0] || cbf_cr[0] || cbf_cb[1] || cbf_cr[1];
+            let cbf_luma = if self.cu_pred_mode == PRED_INTRA || depth != 0 || any_chroma { self.cab.decision(CBF_LUMA_OFFSET + if depth == 0 { 1 } else { 0 }) == 1 } else { true };
+            self.transform_unit(x0, y0, xb, yb, log2, blk, cbf_luma, cbf_cb, cbf_cr)
         }
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn transform_unit(&mut self, x0: usize, y0: usize, xb: usize, yb: usize, log2: u32, blk: usize, cbf_luma: bool, cbf_cb: bool, cbf_cr: bool) -> Result<()> {
+    fn transform_unit(&mut self, x0: usize, y0: usize, xb: usize, yb: usize, log2: u32, blk: usize, cbf_luma: bool, cbf_cb: [bool; 2], cbf_cr: [bool; 2]) -> Result<()> {
         let sps = self.sps;
         let n = 1usize << log2;
         let intra = self.cu_pred_mode == PRED_INTRA;
@@ -716,7 +735,7 @@ impl<'a> Dec<'a> {
         if cbf_luma {
             Self::fill4(&mut self.pic.nz, w4, x0, y0, n, n, 1);
         }
-        let cbf_chroma = chroma && (cbf_cb || cbf_cr);
+        let cbf_chroma = chroma && (cbf_cb[0] || cbf_cr[0] || cbf_cb[1] || cbf_cr[1]);
         if (cbf_luma || cbf_chroma) && self.pps.cu_qp_delta_enabled && !self.is_cu_qp_delta_coded {
             let mut v = 0;
             while v < 5 && self.cab.decision(CU_QP_DELTA_OFFSET + if v == 0 { 0 } else { 1 }) == 1 {
@@ -754,24 +773,26 @@ impl<'a> Dec<'a> {
         if cbf_luma {
             self.residual_block(0, x0, y0, log2, intra, if intra { self.pic.ipm[self.i4(x0, y0)] as u32 } else { 0 })?;
         }
-        if chroma {
-            if log2 > 2 {
-                let l = log2 - 1;
-                for (c, cbf) in [(1usize, cbf_cb), (2, cbf_cr)] {
+        // chroma: with the luma block, or (4x4 luma outside 4:4:4) once for the four of them, after the last;
+        // 4:2:2 has two square blocks, the second below the first
+        let (sx, sy) = sps.chroma_shift();
+        let at = if log2 > 2 || sps.chroma_format_idc == 3 {
+            Some((x0 >> sx, y0 >> sy, log2 - sx as u32))
+        } else if blk == 3 {
+            Some((xb >> sx, yb >> sy, 2))
+        } else {
+            None
+        };
+        if let (true, Some((xc, yc, l))) = (chroma, at) {
+            let blocks = if sps.chroma_format_idc == 2 { 2 } else { 1 };
+            for (c, cbf) in [(1usize, cbf_cb), (2, cbf_cr)] {
+                for (i, &coded) in cbf.iter().enumerate().take(blocks) {
+                    let y = yc + (i << l);
                     if intra {
-                        self.intra_predict(c, x0 >> 1, y0 >> 1, l, self.chroma_mode);
+                        self.intra_predict(c, xc, y, l, self.chroma_mode);
                     }
-                    if cbf {
-                        self.residual_block(c, x0 >> 1, y0 >> 1, l, intra, self.chroma_mode)?;
-                    }
-                }
-            } else if blk == 3 {
-                for (c, cbf) in [(1usize, cbf_cb), (2, cbf_cr)] {
-                    if intra {
-                        self.intra_predict(c, xb >> 1, yb >> 1, 2, self.chroma_mode);
-                    }
-                    if cbf {
-                        self.residual_block(c, xb >> 1, yb >> 1, 2, intra, self.chroma_mode)?;
+                    if coded {
+                        self.residual_block(c, xc, y, l, intra, self.chroma_mode)?;
                     }
                 }
             }
@@ -784,7 +805,7 @@ impl<'a> Dec<'a> {
     /// Predicts the `1 << log2` square at (`x`, `y`) of component `c` into the picture.
     fn intra_predict(&mut self, c: usize, x: usize, y: usize, log2: u32, mode: u32) {
         let n = 1usize << log2;
-        let (sx, sy) = if c == 0 { (0, 0) } else { (1, 1) };
+        let (sx, sy) = if c == 0 { (0, 0) } else { self.sps.chroma_shift() };
         let bd = if c == 0 { self.bd_y } else { self.bd_c };
         let (xl, yl) = (x << sx, y << sy);
         let (ux, uy) = (4usize >> sx, 4usize >> sy);
@@ -827,7 +848,8 @@ impl<'a> Dec<'a> {
         let len = 4 * n + 1;
         intra::substitute(&mut line[..len], &av[..len], bd);
         let mut out = [0u16; 32 * 32];
-        intra::predict(&line[..len], log2, mode, c == 0, c == 0, c == 0 && self.sps.strong_intra_smoothing, bd, &mut out);
+        let filter = c == 0 || self.sps.chroma_format_idc == 3;
+        intra::predict(&line[..len], log2, mode, filter, c == 0, c == 0 && self.sps.strong_intra_smoothing, bd, &mut out);
         let p = &mut self.pic.frame.planes[plane];
         for yy in 0..n {
             p[(y + yy) * stride + x..(y + yy) * stride + x + n].copy_from_slice(&out[yy * n..yy * n + n]);
@@ -839,7 +861,7 @@ impl<'a> Dec<'a> {
     /// Parses a residual block and adds its reconstruction to the picture.
     fn residual_block(&mut self, c: usize, x: usize, y: usize, log2: u32, intra: bool, pred_mode: u32) -> Result<()> {
         let n = 1usize << log2;
-        let scan_idx = if intra && (log2 == 2 || (log2 == 3 && c == 0)) {
+        let scan_idx = if intra && (log2 == 2 || (log2 == 3 && (c == 0 || self.sps.chroma_format_idc == 3))) {
             match pred_mode {
                 6..=14 => 2,
                 22..=30 => 1,

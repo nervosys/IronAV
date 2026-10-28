@@ -6,7 +6,7 @@ A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so 
 > **Status: foundation (v0.1).** The architecture, agent interface, ontology, hardware model, CLI, MCP server
 > and both GUIs are working and tested. Containers: **WAV, FLAC, Y4M, MP4, Matroska/WebM (read and write), Ogg, ADTS, MP3 and JPEG.**
 > Audio codecs, each decoded and encoded: **PCM, FLAC, AAC-LC (plus HE-AAC v1 decode), MP3, Opus and Vorbis.**
-> Video: **software decoders for H.264, HEVC, VP8 and VP9; JPEG/Motion-JPEG decoded and encoded in software.**
+> Video: **software decoders for H.264, HEVC (including 4:2:2 and 4:4:4), VP8 and VP9; JPEG/Motion-JPEG decoded and encoded in software.**
 > H.264 and HEVC *encoding* needs an NVIDIA GPU (NVENC), and they can also be decoded on NVIDIA GPUs (NVDEC).
 > AV1 is decoded on NVIDIA GPUs only (NVDEC); it has no software decoder and no encoder yet. VP9 and AV1 copy between WebM, Matroska and MP4.
 > IronAV is not yet a drop-in replacement for FFmpeg or HandBrake.
@@ -81,11 +81,17 @@ exact 8.000 s duration, all frames decoded, and seeking lands on the right keyfr
 `ironav probe`, `convert` and the other tools read MP4 (regular files with the index anywhere, and fragmented files). H.264/HEVC video is decoded by NVDEC through the driver's `nvcuvid` library, loaded at run time like NVENC;
 the output is cropped to the display size and returned as planar `yuv420p` in display order, so B-frame streams work.
 8-bit and 10-bit 4:2:0, 4:2:2 (`yuv422p`, `yuv422p10le`) and 4:4:4 (`yuv444p`, `yuv444p10le`; including the lossless transform-bypass mode) and monochrome (8-bit comes back as `gray`) are accepted (10-bit 4:2:0 comes back as `yuv420p10le`); interlaced and 12-bit are refused with a clear error. The GPU cannot take 4:2:2, 4:4:4 or monochrome, so those use the software decoder even with `--hwaccel auto`.
-HEVC also has a software decoder (`--hwaccel off`, or automatically where the GPU cannot take a stream): Main and Main 10 (and monochrome) with I, P and B pictures,
+HEVC also has a software decoder (`--hwaccel off`, or automatically where the GPU cannot take a stream): Main and Main 10 (and monochrome, 4:2:2 and 4:4:4 at 8 and 10 bits) with I, P and B pictures,
 merge and AMVP motion prediction, temporal motion vectors, weighted prediction, wavefronts, multiple slices, default scaling lists, transform skip, lossless (transquant bypass),
 QP deltas, constrained intra, the deblocking filter and sample adaptive offset. These are checked sample-for-sample against FFmpeg on x265 streams (the
 `hevc_streams_decode_to_what_ffmpeg_decodes` test and a wider sweep of encoder settings). Written from the specification but **not yet checked against a reference stream** because x265
-cannot produce them: tiles, PCM, long-term reference pictures, scaling lists sent in the SPS/PPS, 12-bit, and random-access (CRA/RASL) handling. 4:2:2, 4:4:4 and the range extensions are refused.
+cannot produce them: tiles, PCM, long-term reference pictures, scaling lists sent in the SPS/PPS, 12-bit, and random-access (CRA/RASL) handling.
+4:2:2 and 4:4:4 (the range extension profiles' chroma formats) were checked the same way: 60 x265 streams, 4:2:2 and 4:4:4 at 8 and 10 bits,
+covering intra-only and B-frame coding, noise, presets from ultrafast to slow, deep transform trees, AMP, weighted prediction,
+transform skip, lossless and per-CU lossless coding, QP 0 and 51, chroma QP offsets, scaling lists, constrained intra, wavefronts with slices,
+16x16 CTUs and odd sizes. All match on every frame, and four small clips are kept in that test. The range extension *coding tools*
+(implicit and explicit RDPCM, cross-component prediction, extended precision, persistent Rice adaptation, chroma QP offset lists and the rest)
+are not implemented, and x265 does not use them. An SPS or PPS that turns one on is refused with the tool's name. To find those flags the SPS is now read through its VUI.
 10-bit HEVC GPU decoding was compared with FFmpeg's software decoder on a 60-frame 720p Main 10 clip: every sample of every
 frame is identical. 10-bit H.264 (High 10) and 10-bit encoding of H.264 are not offered (consumer NVENC cannot encode it).
 

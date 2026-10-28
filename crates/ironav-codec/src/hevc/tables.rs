@@ -493,6 +493,9 @@ pub const BETA_TABLE: [u8; 52] = [
 /// ChromaArrayType==1 QpC for qPi 30..43 (C qp_c[qPi - 30]); qPi<30 gives QpC=qPi, qPi>43 gives QpC=qPi-6.
 pub const QP_C_TABLE: [u8; 14] = [29, 30, 31, 32, 33, 33, 34, 34, 35, 35, 36, 36, 37, 37];
 
+/// The intra prediction mode of 4:2:2 chroma for each mode derived for it (Table 8-3; C tab_mode_idx).
+pub const MODE_422: [u8; 35] = [0, 1, 2, 2, 2, 2, 3, 5, 7, 8, 10, 12, 13, 15, 17, 18, 19, 20, 21, 22, 23, 23, 24, 24, 25, 25, 26, 27, 27, 28, 28, 29, 29, 30, 31];
+
 /// 32x32 DCT matrix [coefficient row][sample col] (C transform[32][32]); NxN uses rows k*(32/N).
 pub const TRANSFORM: [[i8; 32]; 32] = [
     [

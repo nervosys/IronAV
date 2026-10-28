@@ -1572,12 +1572,13 @@ fn h264_444_422_and_monochrome_decode_to_what_ffmpeg_decodes() {
     }
 }
 
-/// HEVC Main and Main 10 streams from x265 (intra, P and B pictures, weighted prediction, wavefronts,
-/// multiple slices, conformance-window cropping, monochrome) are bit-exact with FFmpeg's decoder.
+/// HEVC Main, Main 10 and range extension streams from x265 (intra, P and B pictures, weighted prediction,
+/// wavefronts, multiple slices, conformance-window cropping, monochrome, 4:2:2 and 4:4:4 at 8 and 10 bits)
+/// are bit-exact with FFmpeg's decoder.
 #[test]
 fn hevc_streams_decode_to_what_ffmpeg_decodes() {
     let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
-    for name in ["intra", "p", "b", "wpp_slices", "p10", "gray", "crop"] {
+    for name in ["intra", "p", "b", "wpp_slices", "p10", "gray", "crop", "422", "444", "422_10", "444_10"] {
         let dir = scratch(&format!("hevc-{name}"));
         let out = dir.join("out.y4m");
         let mut j = job(&data.join(format!("hevc_{name}.mp4")), &out);

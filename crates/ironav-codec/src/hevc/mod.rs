@@ -1,6 +1,8 @@
-//! A software HEVC (H.265) decoder: Main and Main 10 profile video (4:2:0 and monochrome, 8 to 12
-//! bits), with tiles, wavefronts, multiple slices, sample adaptive offset, the deblocking filter and
-//! inter prediction (merge and AMVP, temporal candidates, weighted prediction).
+//! A software HEVC (H.265) decoder: Main, Main 10 and the range extension profiles' chroma formats
+//! (monochrome, 4:2:0, 4:2:2 and 4:4:4, 8 to 12 bits), with tiles, wavefronts, multiple slices, sample
+//! adaptive offset, the deblocking filter and inter prediction (merge and AMVP, temporal candidates,
+//! weighted prediction). The range extension coding tools (RDPCM, cross-component prediction and the
+//! rest) are not implemented; a stream that turns one on is refused, naming it.
 
 #![allow(dead_code)]
 
@@ -309,8 +311,8 @@ impl HevcDecoder {
         if sps.bit_depth_luma != sps.bit_depth_chroma || !(8..=12).contains(&sps.bit_depth_luma) {
             return Err(unsupported("this HEVC decoder handles equal luma and chroma bit depths of 8 to 12 only"));
         }
-        if sps.chroma_format_idc > 1 {
-            return Err(unsupported("this HEVC decoder handles monochrome and 4:2:0 video only"));
+        if let Some(tool) = sps.range_tool.or(pps.range_tool) {
+            return Err(unsupported(&format!("this HEVC decoder does not implement the range extension tool \"{tool}\"")));
         }
         let irap = hdr.irap();
         if irap {
