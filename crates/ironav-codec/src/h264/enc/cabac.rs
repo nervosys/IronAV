@@ -4,6 +4,40 @@
 use super::bitw::BitWriter;
 use crate::h264::cabac::TRANS_LPS;
 use crate::h264::tables::{ABS_OFF, CABAC_INIT_I, CABAC_INIT_PB, LAST_OFF, LPS_RANGE, SIG_OFF};
+use std::sync::OnceLock;
+
+/// Something bins can be given to: the arithmetic coder, or a counter of the bits they would take.
+pub trait Bins {
+    fn decision(&mut self, ctx: usize, bin: bool);
+    fn bypass(&mut self, bin: bool);
+    /// A terminating bin: end_of_slice_flag, or the I_PCM test of an intra mb_type.
+    fn terminate(&mut self, bin: bool);
+
+    /// Bypass-coded k-th order Exp-Golomb suffix (9.3.2.3).
+    fn exp_golomb(&mut self, mut v: u32, mut k: u32) {
+        while v >= 1 << k {
+            self.bypass(true);
+            v -= 1 << k;
+            k += 1;
+        }
+        self.bypass(false);
+        while k > 0 {
+            k -= 1;
+            self.bypass((v >> k) & 1 == 1);
+        }
+    }
+}
+
+/// A context's state (pStateIdx * 2 + valMPS) after coding `bin`.
+fn next_state(s: u8, bin: bool) -> u8 {
+    let (p, mps) = ((s >> 1) as usize, s & 1 == 1);
+    if bin != mps {
+        let nmps = if p == 0 { !mps } else { mps };
+        (TRANS_LPS[p] << 1) | nmps as u8
+    } else {
+        ((if p < 62 { p + 1 } else { p }) as u8) << 1 | mps as u8
+    }
+}
 
 pub struct CabacWriter {
     w: BitWriter,
@@ -26,6 +60,11 @@ impl CabacWriter {
             *s = if pre <= 63 { ((63 - pre) << 1) as u8 } else { (((pre - 64) << 1) | 1) as u8 };
         }
         CabacWriter { w, low: 0, range: 510, outstanding: 0, first: true, state }
+    }
+
+    /// A bit counter starting from the current contexts.
+    pub fn cost(&self) -> CabacCost {
+        CabacCost { state: self.state, bits: 0 }
     }
 
     fn put_bit(&mut self, b: u32) {
@@ -56,7 +95,14 @@ impl CabacWriter {
         }
     }
 
-    pub fn decision(&mut self, ctx: usize, bin: bool) {
+    /// The slice data, after a terminating bin of 1, padded with zeros to a byte.
+    pub fn finish(self) -> Vec<u8> {
+        self.w.into_bytes()
+    }
+}
+
+impl Bins for CabacWriter {
+    fn decision(&mut self, ctx: usize, bin: bool) {
         let s = self.state[ctx];
         let (p, mps) = ((s >> 1) as usize, s & 1 == 1);
         let lps = LPS_RANGE[p][((self.range >> 6) & 3) as usize] as u32;
@@ -64,16 +110,12 @@ impl CabacWriter {
         if bin != mps {
             self.low += self.range;
             self.range = lps;
-            let nmps = if p == 0 { !mps } else { mps };
-            self.state[ctx] = (TRANS_LPS[p] << 1) | nmps as u8;
-        } else {
-            let np = if p < 62 { p + 1 } else { p };
-            self.state[ctx] = ((np as u8) << 1) | mps as u8;
         }
+        self.state[ctx] = next_state(s, bin);
         self.renorm();
     }
 
-    pub fn bypass(&mut self, bin: bool) {
+    fn bypass(&mut self, bin: bool) {
         self.low <<= 1;
         if bin {
             self.low += self.range;
@@ -89,22 +131,7 @@ impl CabacWriter {
         }
     }
 
-    /// Bypass-coded k-th order Exp-Golomb suffix (9.3.2.3).
-    pub fn exp_golomb(&mut self, mut v: u32, mut k: u32) {
-        while v >= 1 << k {
-            self.bypass(true);
-            v -= 1 << k;
-            k += 1;
-        }
-        self.bypass(false);
-        while k > 0 {
-            k -= 1;
-            self.bypass((v >> k) & 1 == 1);
-        }
-    }
-
-    /// A terminating bin: end_of_slice_flag, or the I_PCM test of an intra mb_type.
-    pub fn terminate(&mut self, bin: bool) {
+    fn terminate(&mut self, bin: bool) {
         self.range -= 2;
         if bin {
             self.low += self.range;
@@ -117,17 +144,54 @@ impl CabacWriter {
             self.renorm();
         }
     }
+}
 
-    /// The slice data, after a terminating bin of 1, padded with zeros to a byte.
-    pub fn finish(self) -> Vec<u8> {
-        self.w.into_bytes()
+/// Counts, in 1/256 bits, what bins would cost the arithmetic coder, adapting its own copy of the contexts.
+pub struct CabacCost {
+    state: [u8; 1024],
+    bits: u32,
+}
+
+impl CabacCost {
+    pub fn bits(&self) -> f64 {
+        self.bits as f64 / 256.0
+    }
+}
+
+/// -log2 of the probability of the most and least probable symbol per pStateIdx, in 1/256 bits.
+fn entropy() -> &'static [[u32; 2]; 64] {
+    static T: OnceLock<[[u32; 2]; 64]> = OnceLock::new();
+    T.get_or_init(|| {
+        let mut t = [[0; 2]; 64];
+        for (p, e) in t.iter_mut().enumerate() {
+            // pLPS = 0.5 * alpha^p with alpha = (0.01875 / 0.5)^(1/63) (9.3.1.1)
+            let lps = 0.5 * (0.01875f64 / 0.5).powf(p as f64 / 63.0);
+            *e = [(-(1.0 - lps).log2() * 256.0).round() as u32, (-lps.log2() * 256.0).round() as u32];
+        }
+        t
+    })
+}
+
+impl Bins for CabacCost {
+    fn decision(&mut self, ctx: usize, bin: bool) {
+        let s = self.state[ctx];
+        self.bits += entropy()[(s >> 1) as usize][(bin != (s & 1 == 1)) as usize];
+        self.state[ctx] = next_state(s, bin);
+    }
+
+    fn bypass(&mut self, _: bool) {
+        self.bits += 256;
+    }
+
+    fn terminate(&mut self, bin: bool) {
+        self.bits += if bin { 7 * 256 } else { 1 };
     }
 }
 
 /// Writes one residual block: coded_block_flag (with context `cbf_ctx`, unless `None` because the
 /// block always has one) and the levels, in scan order, of category `cat`. Returns the number of
 /// non-zero levels.
-pub fn write_block(c: &mut CabacWriter, cat: usize, cbf_ctx: usize, levels: &[i32]) -> usize {
+pub fn write_block(c: &mut impl Bins, cat: usize, cbf_ctx: usize, levels: &[i32]) -> usize {
     let max = levels.len();
     let total = levels.iter().filter(|&&l| l != 0).count();
     c.decision(cbf_ctx, total > 0);

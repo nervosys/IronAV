@@ -196,7 +196,8 @@ impl H264Encoder {
     /// The quantiser for the next picture.
     fn next_qp(&self, idr: bool) -> i32 {
         match self.qp {
-            Some(q) => q as i32,
+            // IDR pictures a little finer, as x264 does: later pictures inherit their quality
+            Some(q) => (q as i32 - if idr { 3 } else { 0 }).max(0),
             None => (self.rc_qp.round() as i32 - if idr { 3 } else { 0 }).clamp(1, 51),
         }
     }

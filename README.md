@@ -392,12 +392,14 @@ When a GPU decoder is usable (`--hwaccel auto`) it is still chosen for 4:2:0 H.2
 H.264 can be written without a GPU. The software encoder (`h264/enc/`) produces **Main profile** streams with
 CABAC (it can also write Constrained Baseline with CAVLC, which the tests use): I and P pictures with one reference picture, 8-bit `yuv420p` with even dimensions (other sizes are padded to whole
 macroblocks and cropped in the SPS). Each macroblock is coded as Intra 4x4, Intra 16x16, P_Skip or a P macroblock of one 16x16, two 16x8, two 8x16 or four 8x8
-partitions, chosen by SATD plus an estimate of the bits (16x8 and 8x16 are tried when 8x8 beats 16x16); motion is found by a diamond search from the neighbours' vectors, then refined
+partitions. The partitioning and its vectors are chosen by SATD plus an estimate of the bits (16x8 and 8x16 are tried when 8x8 beats 16x16).
+With CABAC, P_Skip, that inter candidate, Intra 16x16 and Intra 4x4 are then each coded and the one of least squared error plus
+lambda times its bits is kept, the bits counted from a copy of the CABAC contexts (CAVLC still decides by SATD). Motion is found by a diamond search from the neighbours' vectors, then refined
 to half and quarter samples, using half-sample planes of the reference picture computed once per picture. Each picture
 is cut into slices of about eight macroblock rows, coded on separate threads (up to the number of CPUs), then loop
 filtered as a whole. Reconstruction reuses the decoder's prediction, inverse transform and loop filter, so the
 reference the encoder keeps is the one every decoder builds (a unit test decodes each picture and compares). `--qp N`
-holds a quantiser (23 by default); `--vbitrate KBPS` steers the quantiser picture by picture to an average rate.
+holds a quantiser (23 by default; IDR pictures get 3 less, as in x264); `--vbitrate KBPS` steers the quantiser picture by picture to an average rate.
 An IDR picture with SPS and PPS starts every 250 pictures. NVENC is still chosen when a usable GPU is present;
 `--hwaccel off` selects the software encoder.
 
@@ -413,6 +415,11 @@ QP 22-38). 60 frames of that 720p clip take 1.6 s (about 38 frames per second, b
 machine), against 7.0 s on one thread before the slices and half-sample planes; x264 is still much faster. A 240-frame 720p run at 5000 kbit/s came out at 5013 kbit/s.
 The partitions below 16x16 save 17.6 % (BD-rate, QP 22-38) on a synthetic 720p clip of textured shapes moving
 in different directions over a panning background, and 0.3 % on the noisy clip, for about a fifth more encoding time.
+The rate-distortion decisions and the finer IDR pictures together save 10.2 % on the moving-shapes clip and 35 % on the
+noisy clip (BD-rate, 60 frames, QP 22-38, against the build before them), for about 1.8 times the encoding time. Against
+x264 with the Main profile, no B-frames and `tune psnr`, measured the same way (both against that earlier build), IronAV now needs about 4 % fewer bits than
+`veryfast` and 3.5 % more than `medium` on the shapes clip, and about 35 % fewer than `veryfast` and 4 % fewer than `medium` on
+the noisy clip. The figures earlier in this section predate these decisions.
 Not done: B pictures, 8x8 transform (High profile), partitions below 8x8, multiple references, 10-bit.
 
 ## VP8

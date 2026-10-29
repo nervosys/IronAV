@@ -1,9 +1,10 @@
 //! Encoding one picture as one slice: mode decision, motion search, the forward transform and
 //! quantisation, reconstruction (with the decoder's own prediction, inverse transform and loop
-//! filter, so the reference the encoder keeps is the one a decoder builds) and CAVLC macroblock syntax.
+//! filter, so the reference the encoder keeps is the one a decoder builds) and CAVLC or CABAC macroblock
+//! syntax. With CABAC the macroblock type is chosen by rate-distortion cost, with CAVLC by SATD.
 
 use super::bitw::{se_bits, BitWriter};
-use super::cabac::{self, CabacWriter};
+use super::cabac::{self, Bins, CabacWriter};
 use super::cavlc::write_block;
 use crate::h264::idct::{hadamard4, idct4_add};
 use super::subpel::HalfPel;
@@ -458,6 +459,9 @@ impl<'a> FrameCoder<'a> {
         if self.refp.is_some() {
             inter = Some(self.best_inter(mbx, mby));
         }
+        if self.use_cabac {
+            return self.decide_rd(mbx, mby, i16.0, inter);
+        }
         // Intra4x4 is tried by coding it, which leaves its reconstruction in place; it is kept only if it wins
         let try_i4 = inter.is_none_or(|(_, _, c)| best_intra < c);
         let mut i4 = None;
@@ -809,7 +813,6 @@ impl<'a> FrameCoder<'a> {
 
     /// Codes an inter macroblock of partitioning `part` with a vector per partition.
     fn code_inter(&mut self, mbx: usize, mby: usize, part: u8, mvs: [[i16; 2]; 4]) -> MbCode {
-        let refp = self.refp.unwrap();
         let mut code = MbCode::new(Kind::Inter);
         code.part = part;
         code.mvs = mvs;
@@ -818,24 +821,7 @@ impl<'a> FrameCoder<'a> {
             code.mvds[k] = [0, 1].map(|c| mvs[k][c] as i32 - mvps[k][c] as i32);
         }
         let (x0, y0, ls) = (mbx * 16, mby * 16, self.ls());
-        let (cs, parts) = (self.cs(), PARTS[part as usize]);
-        let mut pred = [0u16; 256];
-        let mut cpred = [[0u16; 64]; 2];
-        let mut tmp = [0u16; 256];
-        for (k, &(bx, by, w, h)) in parts.iter().enumerate() {
-            let mv = mvs[k];
-            self.luma_pred(x0 + bx * 4, y0 + by * 4, w * 4, h * 4, mv, &mut tmp);
-            for r in 0..h * 4 {
-                pred[(by * 4 + r) * 16 + bx * 4..][..w * 4].copy_from_slice(&tmp[r * w * 4..][..w * 4]);
-            }
-            // chroma from the same vector, in eighth samples
-            for (c, pr) in cpred.iter_mut().enumerate() {
-                chroma_mc(&refp.planes[1 + c], cs, self.mb_h * 8, (mbx * 8 + bx * 2) as i32, (mby * 8 + by * 2) as i32, mv[0] as i32, mv[1] as i32, w * 2, h * 2, &mut tmp);
-                for r in 0..h * 2 {
-                    pr[(by * 2 + r) * 8 + bx * 2..][..w * 2].copy_from_slice(&tmp[r * w * 2..][..w * 2]);
-                }
-            }
-        }
+        let (pred, cpred) = self.inter_pred(mbx, mby, part, &mvs);
         let mut cos = [[0i32; 16]; 16];
         let mut score = [0i32; 4];
         for b in 0..16 {
@@ -879,6 +865,135 @@ impl<'a> FrameCoder<'a> {
         }
         self.code_chroma(&mut code, mbx, mby, &cpred, false);
         code
+    }
+
+    /// Writes the inter prediction of a macroblock as its reconstruction (P_Skip's).
+    fn put_inter_pred(&mut self, mbx: usize, mby: usize, mv: [i16; 2]) {
+        let (pred, cpred) = self.inter_pred(mbx, mby, 0, &[mv; 4]);
+        let mut rec = [0u16; 384];
+        rec[..256].copy_from_slice(&pred);
+        rec[256..320].copy_from_slice(&cpred[0]);
+        rec[320..].copy_from_slice(&cpred[1]);
+        self.restore_mb(mbx, mby, &rec);
+    }
+
+    /// The reconstructed samples of a macroblock: luma, then Cb and Cr.
+    fn save_mb(&self, mbx: usize, mby: usize) -> [u16; 384] {
+        let (ls, cs) = (self.ls(), self.cs());
+        let mut rec = [0u16; 384];
+        for r in 0..16 {
+            rec[r * 16..r * 16 + 16].copy_from_slice(&self.pic.planes[0][(mby * 16 + r) * ls + mbx * 16..][..16]);
+        }
+        for c in 0..2 {
+            for r in 0..8 {
+                rec[256 + c * 64 + r * 8..][..8].copy_from_slice(&self.pic.planes[1 + c][(mby * 8 + r) * cs + mbx * 8..][..8]);
+            }
+        }
+        rec
+    }
+
+    fn restore_mb(&mut self, mbx: usize, mby: usize, rec: &[u16; 384]) {
+        let (ls, cs) = (self.ls(), self.cs());
+        for r in 0..16 {
+            self.pic.planes[0][(mby * 16 + r) * ls + mbx * 16..][..16].copy_from_slice(&rec[r * 16..r * 16 + 16]);
+        }
+        for c in 0..2 {
+            for r in 0..8 {
+                self.pic.planes[1 + c][(mby * 8 + r) * cs + mbx * 8..][..8].copy_from_slice(&rec[256 + c * 64 + r * 8..][..8]);
+            }
+        }
+    }
+
+    /// Squared error of a macroblock's reconstruction, luma and chroma.
+    fn ssd_mb(&self, mbx: usize, mby: usize) -> i64 {
+        let rec = self.save_mb(mbx, mby);
+        let (ls, cs) = (self.ls(), self.cs());
+        let mut ssd = 0i64;
+        for (i, &v) in rec.iter().enumerate() {
+            let s = match i {
+                0..256 => self.src.planes[0][(mby * 16 + i / 16) * ls + mbx * 16 + i % 16],
+                _ => {
+                    let (c, j) = ((i - 256) / 64, (i - 256) % 64);
+                    self.src.planes[1 + c][(mby * 8 + j / 8) * cs + mbx * 8 + j % 8]
+                }
+            };
+            let d = s as i64 - v as i64;
+            ssd += d * d;
+        }
+        ssd
+    }
+
+    /// Rate-distortion cost of a coded macroblock whose reconstruction is in place: squared error
+    /// plus `lam2` times the bits CABAC would spend on it.
+    fn rd_cost(&self, code: &MbCode, mbx: usize, mby: usize, lam2: f64) -> f64 {
+        let mut c = self.cabac.as_ref().unwrap().cost();
+        self.mb_bins(&mut c, code, mbx, mby);
+        self.ssd_mb(mbx, mby) as f64 + lam2 * c.bits()
+    }
+
+    /// Codes P_Skip, the best inter partitioning (by SATD), Intra16x16 with its best mode and
+    /// Intra4x4, and keeps the one of least rate-distortion cost. SATD is a poor judge between intra
+    /// and inter, so intra is always tried.
+    fn decide_rd(&mut self, mbx: usize, mby: usize, i16: u8, inter: Option<(u8, [[i16; 2]; 4], i32)>) -> MbCode {
+        // larger than the usual 0.85 * 2^((qp - 12) / 3): the residual decisions are not RD optimised
+        let lam2 = 1.6 * 2f64.powf((self.qp as f64 - 12.0) / 3.0);
+        let mut best: Option<(f64, MbCode, [u16; 384])> = None;
+        let mut keep = |this: &Self, j: f64, code: MbCode| {
+            if best.as_ref().is_none_or(|b| j < b.0) {
+                best = Some((j, code, this.save_mb(mbx, mby)));
+            }
+        };
+        if let Some((part, mvs, _)) = inter {
+            let sm = self.skip_mv(mbx, mby);
+            let mut code = MbCode::new(Kind::Inter);
+            code.skip = true;
+            code.mvs = [sm; 4];
+            self.put_inter_pred(mbx, mby, sm);
+            let j = self.rd_cost(&code, mbx, mby, lam2);
+            keep(self, j, code);
+            let code = self.code_inter(mbx, mby, part, mvs);
+            // with nothing coded and the skip vector, this is P_Skip at a higher price
+            if !(code.cbp == 0 && part == 0 && mvs[0] == sm) {
+                let j = self.rd_cost(&code, mbx, mby, lam2);
+                keep(self, j, code);
+            }
+        }
+        let mut code = self.code_i16(mbx, mby, i16);
+        self.code_intra_chroma(&mut code, mbx, mby);
+        let j = self.rd_cost(&code, mbx, mby, lam2);
+        keep(self, j, code);
+        // Intra4x4 predicts from its own reconstruction, block by block, so it can overwrite the others'
+        let mut code = self.code_i4(mbx, mby).0;
+        self.code_intra_chroma(&mut code, mbx, mby);
+        let j = self.rd_cost(&code, mbx, mby, lam2);
+        keep(self, j, code);
+        let (_, code, rec) = best.unwrap();
+        self.restore_mb(mbx, mby, &rec);
+        code
+    }
+
+    /// The luma and chroma prediction of an inter macroblock of partitioning `part`.
+    fn inter_pred(&self, mbx: usize, mby: usize, part: u8, mvs: &[[i16; 2]; 4]) -> ([u16; 256], [[u16; 64]; 2]) {
+        let refp = self.refp.unwrap();
+        let (x0, y0, cs) = (mbx * 16, mby * 16, self.cs());
+        let mut pred = [0u16; 256];
+        let mut cpred = [[0u16; 64]; 2];
+        let mut tmp = [0u16; 256];
+        for (k, &(bx, by, w, h)) in PARTS[part as usize].iter().enumerate() {
+            let mv = mvs[k];
+            self.luma_pred(x0 + bx * 4, y0 + by * 4, w * 4, h * 4, mv, &mut tmp);
+            for r in 0..h * 4 {
+                pred[(by * 4 + r) * 16 + bx * 4..][..w * 4].copy_from_slice(&tmp[r * w * 4..][..w * 4]);
+            }
+            // chroma from the same vector, in eighth samples
+            for (c, pr) in cpred.iter_mut().enumerate() {
+                chroma_mc(&refp.planes[1 + c], cs, self.mb_h * 8, (mbx * 8 + bx * 2) as i32, (mby * 8 + by * 2) as i32, mv[0] as i32, mv[1] as i32, w * 2, h * 2, &mut tmp);
+                for r in 0..h * 2 {
+                    pr[(by * 2 + r) * 8 + bx * 2..][..w * 2].copy_from_slice(&tmp[r * w * 2..][..w * 2]);
+                }
+            }
+        }
+        (pred, cpred)
     }
 
     fn code_intra_chroma(&mut self, code: &mut MbCode, mbx: usize, mby: usize) {
@@ -1084,16 +1199,21 @@ impl<'a> FrameCoder<'a> {
     /// Writes a macroblock with CABAC, followed by end_of_slice_flag; the contexts follow the
     /// decoder's (9.3.3.1.1 and 9.3.3.1.3).
     fn write_mb_cabac(&mut self, code: &MbCode, mbx: usize, mby: usize, last: bool) {
+        let mut c = self.cabac.take().unwrap();
+        self.mb_bins(&mut c, code, mbx, mby);
+        c.terminate(last);
+        self.cabac = Some(c);
+    }
+
+    /// The bins of a macroblock, up to end_of_slice_flag.
+    fn mb_bins(&self, c: &mut impl Bins, code: &MbCode, mbx: usize, mby: usize) {
         let (x, y) = (mbx as i32, mby as i32);
         let left = self.nb_state(x - 1, y).copied();
         let top = self.nb_state(x, y - 1).copied();
-        let mut c = self.cabac.take().unwrap();
         let cond = |n: Option<MbState>, f: &dyn Fn(&MbState) -> bool| n.as_ref().is_some_and(f) as usize;
         if self.p_slice {
             c.decision(11 + cond(left, &|m| !m.skip) + cond(top, &|m| !m.skip), code.skip);
             if code.skip {
-                c.terminate(last);
-                self.cabac = Some(c);
                 return;
             }
         }
@@ -1220,7 +1340,7 @@ impl<'a> FrameCoder<'a> {
             let flag = |n: Option<u8>| n.map_or(un, |v| v > 0) as usize;
             if code.kind == Kind::I16x16 {
                 let dc = |n: Option<MbState>| n.map_or(un, |m| m.cbf_dc & 1 != 0) as usize;
-                cabac::write_block(&mut c, 0, 85 + dc(left) + 2 * dc(top), &code.dc);
+                cabac::write_block(c, 0, 85 + dc(left) + 2 * dc(top), &code.dc);
             }
             let (cat, base) = if code.kind == Kind::I16x16 { (1, 85 + 4) } else { (2, 85 + 8) };
             for n in 0..16 {
@@ -1231,12 +1351,12 @@ impl<'a> FrameCoder<'a> {
                 let a = if bx > 0 { Some(code.nnz[by * 4 + bx - 1]) } else { left.map(|m| m.nnz[by * 4 + 3]) };
                 let b = if by > 0 { Some(code.nnz[(by - 1) * 4 + bx]) } else { top.map(|m| m.nnz[12 + bx]) };
                 let blk = &code.luma[by * 4 + bx];
-                cabac::write_block(&mut c, cat, base + flag(a) + 2 * flag(b), if cat == 1 { &blk[1..] } else { blk });
+                cabac::write_block(c, cat, base + flag(a) + 2 * flag(b), if cat == 1 { &blk[1..] } else { blk });
             }
             if cbpc > 0 {
                 for comp in 0..2 {
                     let dc = |n: Option<MbState>| n.map_or(un, |m| m.cbf_dc & (2 << comp) != 0) as usize;
-                    cabac::write_block(&mut c, 3, 85 + 12 + dc(left) + 2 * dc(top), &code.cdc[comp]);
+                    cabac::write_block(c, 3, 85 + 12 + dc(left) + 2 * dc(top), &code.cdc[comp]);
                 }
             }
             if cbpc == 2 {
@@ -1246,13 +1366,11 @@ impl<'a> FrameCoder<'a> {
                         let cur = &code.cnnz[comp];
                         let a = if bx > 0 { Some(cur[by * 2]) } else { left.map(|m| m.cnnz[comp][by * 2 + 1]) };
                         let b = if by > 0 { Some(cur[bx]) } else { top.map(|m| m.cnnz[comp][2 + bx]) };
-                        cabac::write_block(&mut c, 4, 85 + 16 + flag(a) + 2 * flag(b), &code.cac[comp][blk][1..]);
+                        cabac::write_block(c, 4, 85 + 16 + flag(a) + 2 * flag(b), &code.cac[comp][blk][1..]);
                     }
                 }
             }
         }
-        c.terminate(last);
-        self.cabac = Some(c);
     }
 
     fn finish_mb(&mut self, code: &MbCode, mbx: usize, mby: usize) {
