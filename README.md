@@ -35,6 +35,9 @@ Every CLI command prints one JSON envelope: `{"ok":true,"result":…}` or
 Design choices for agents: declarative JSON jobs; `plan` validates without writing; outputs are atomic
 (`.partial` then rename) and never overwrite unless `overwrite: true`; errors name valid alternatives.
 
+Live sources and analysis (streams, events, digests, sidecar models) are designed but not built yet:
+see [docs/design/agentic-realtime.md](docs/design/agentic-realtime.md).
+
 ## Ontology
 
 Generated from the live registries, never hand-maintained in parallel. Kinds: codec, container, pixel format,
