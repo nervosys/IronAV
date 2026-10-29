@@ -3,7 +3,8 @@
 //! reference picture and, with CABAC, a non-reference B picture between each pair of P pictures.
 //! Macroblocks are coded as Intra4x4, Intra8x8, Intra16x16, P_L0_16x16, P_L0_L0_16x8,
 //! P_L0_L0_8x16, P_8x8 (8x8 sub-macroblocks) or P_Skip, and in B pictures as B_Skip,
-//! B_Direct_16x16 (spatial direct) or 16x16 from list 0, list 1 or both; motion is searched to
+//! B_Direct_16x16 (spatial direct), or 16x16, 16x8, 8x16 or 8x8 (8x8 blocks possibly direct)
+//! partitions each from list 0, list 1 or both; motion is searched to
 //! quarter samples. Pictures are cut into slices of macroblock rows that are coded on separate
 //! threads. Output is Annex B with SPS and PPS ahead of every IDR picture.
 
