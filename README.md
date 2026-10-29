@@ -65,8 +65,33 @@ The kinds and analyzers are listed by `ironav capabilities` and are entities in 
 `observation/…`, related by `emits`).
 
 Checked against EBU Tech 3341/3342 test signals (a -23 dBFS stereo sine reads -23.0 LUFS at 44.1 and 48 kHz; two levels
-10 dB apart give a 10 LU range). Live sources (pipes, sockets, MPEG-TS, RTSP) are designed but not built yet:
-see [docs/design/agentic-realtime.md](docs/design/agentic-realtime.md).
+10 dB apart give a 10 LU range).
+
+## Watching live sources (`watch`, `stream_*`)
+
+The same analyzers run on media as it arrives. A source is a path, `path?follow` (a file that is still growing),
+`path?pace=realtime` (a file played as if live), `-` or `pipe:NAME`, `tcp://host:port` (connect),
+`tcp://:port` (listen, on loopback unless an address is given), or `udp://:port` / `udp://group:port` (multicast).
+Readable as it arrives: Y4M, WAV, ADTS AAC and raw H.264/HEVC (Annex B, which carries no frame rate: give `fps`,
+25 by default).
+
+```sh
+ironav watch udp://:5000 --analyzers scene,black --level events | head -n 20
+some-encoder | ironav watch - --fps 30
+```
+
+`watch` prints each observation as a JSON line as it happens (with `wall`, the UTC time it was logged, and
+`latency_ms`, from the packet's arrival), and then the final status and summary when the source ends or after
+`--duration` seconds.
+
+Over MCP an agent opens a session and polls it. `stream_open` starts reading on its own thread and returns at
+once. `stream_events {session, after, wait_ms}` is a long poll: it returns as soon as something new is logged, so
+waiting costs nothing while the stream is quiet. Pass the returned `next_after` back as `after`. `stream_snapshot`
+returns the newest picture, or the one at `at` seconds, as an image. `stream_clip` writes `from`..`to` of the
+retained media (`retain_seconds`, 60 by default) to a file without re-encoding, starting at a keyframe.
+`stream_status` reports the state, bytes, packets and latency percentiles; `stream_close` returns the summary.
+At most 8 sessions are open at once (error code `busy` past that). MPEG-TS, RTSP and HLS are designed but not built
+yet: see [docs/design/agentic-realtime.md](docs/design/agentic-realtime.md).
 
 ## Ontology
 

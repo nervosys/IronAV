@@ -5,6 +5,7 @@
 
 pub mod analyze;
 pub mod job;
+pub mod live;
 pub mod plan;
 pub mod run;
 mod sessions;

@@ -189,6 +189,93 @@ fn h_analyze(args: &Value, ctx: &Ctx) -> Result<Value> {
     crate::analyze::analyze(&job, ctx, &mut |_| {})
 }
 
+fn session_arg(args: &Value) -> Result<std::sync::Arc<crate::live::Session>> {
+    crate::live::get(need_str(args, "session")?)
+}
+
+fn f64_arg(args: &Value, key: &str) -> Result<Option<f64>> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v.as_f64().map(Some).ok_or_else(|| Error::invalid_arg(format!("'{key}' must be a number"))),
+    }
+}
+
+fn h_stream_open(args: &Value) -> Result<Value> {
+    let a: crate::live::OpenArgs = serde_json::from_value(args.clone())
+        .map_err(|e| Error::invalid_arg(format!("invalid stream_open arguments: {e}")).hint("the schema is in `ironav tools` (tool 'stream_open')"))?;
+    let s = crate::live::open(&a)?;
+    // give a quick source a moment to show its streams
+    let _ = s.events(u64::MAX, &[], ironav_analyze::Level::Digest, 1, std::time::Duration::from_millis(0));
+    let t0 = std::time::Instant::now();
+    while t0.elapsed() < std::time::Duration::from_millis(1000) && s.status()["state"] == "waiting" {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    Ok(s.status())
+}
+
+fn h_stream_events(args: &Value) -> Result<Value> {
+    let s = session_arg(args)?;
+    let after = args.get("after").and_then(Value::as_u64).unwrap_or(0);
+    let kinds: Vec<String> = match args.get("kinds") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(a)) => a.iter().map(|k| k.as_str().map(str::to_string).ok_or_else(|| Error::invalid_arg("'kinds' must be strings"))).collect::<Result<_>>()?,
+        Some(_) => return Err(Error::invalid_arg("'kinds' must be an array of observation kinds")),
+    };
+    for k in &kinds {
+        if ironav_analyze::kind_info(k).is_none() {
+            return Err(Error::invalid_arg(format!("unknown observation kind '{k}'")).alternatives(ironav_analyze::KINDS.iter().map(|k| k.name)));
+        }
+    }
+    let level = match str_arg(args, "level")? {
+        None => ironav_analyze::Level::Events,
+        Some(l) => ironav_analyze::Level::parse(l).ok_or_else(|| Error::invalid_arg(format!("unknown level '{l}'")).alternatives(ironav_analyze::Level::ALL.iter().map(|l| l.name())))?,
+    };
+    let max = args.get("max").and_then(Value::as_u64).unwrap_or(100).clamp(1, 1000) as usize;
+    let wait = args.get("wait_ms").and_then(Value::as_u64).unwrap_or(0).min(crate::live::MAX_WAIT_MS);
+    Ok(s.events(after, &kinds, level, max, std::time::Duration::from_millis(wait)))
+}
+
+fn h_stream_status(args: &Value) -> Result<Value> {
+    match str_arg(args, "session")? {
+        Some(id) => Ok(crate::live::get(id)?.status()),
+        None => Ok(json!({ "sessions": crate::live::list() })),
+    }
+}
+
+fn h_stream_snapshot(args: &Value) -> Result<Value> {
+    let w = args.get("max_width").and_then(Value::as_u64).map(|w| w.clamp(16, 7680) as u32).or(Some(640));
+    session_arg(args)?.snapshot(f64_arg(args, "at")?, w)
+}
+
+fn h_stream_clip(args: &Value) -> Result<Value> {
+    let from = f64_arg(args, "from")?.ok_or_else(|| Error::invalid_arg("missing required argument 'from'"))?;
+    let to = f64_arg(args, "to")?.ok_or_else(|| Error::invalid_arg("missing required argument 'to'"))?;
+    let overwrite = args.get("overwrite").and_then(Value::as_bool).unwrap_or(false);
+    session_arg(args)?.clip(from, to, need_str(args, "output")?, str_arg(args, "format")?, overwrite)
+}
+
+fn h_stream_close(args: &Value) -> Result<Value> {
+    crate::live::close(need_str(args, "session")?)
+}
+
+fn stream_open_schema() -> Value {
+    object(
+        json!({
+            "source": { "type": "string", "description": "What to read: a path (add ?pace=realtime to play a file as if live, ?follow to read it as it grows), '-' or pipe:NAME, tcp://host:port (connect), tcp://:port (listen on loopback), udp://:port or udp://group:port (multicast). Options can follow '?': format, fps, pace, follow, idle, listen." },
+            "analyzers": { "type": "array", "items": { "type": "string", "enum": ironav_analyze::ANALYZERS.iter().map(|a| a.name).collect::<Vec<_>>() }, "description": "All of them when absent." },
+            "level": { "type": "string", "enum": ironav_analyze::Level::ALL.iter().map(|l| l.name()).collect::<Vec<_>>(), "default": "events", "description": "The most detail the session keeps; stream_events can ask for less." },
+            "digest_seconds": { "type": "number", "exclusiveMinimum": 0, "default": 10 },
+            "retain_seconds": { "type": "number", "minimum": 0, "default": 60, "description": "Media kept for stream_snapshot and stream_clip (at most 256 MiB of it)." },
+            "format": { "type": "string", "enum": ironav_formats::stream::STREAM_FORMATS, "description": "The stream's format, when its first bytes do not say (raw H.264 and HEVC usually do)." },
+            "fps": { "type": "number", "exclusiveMinimum": 0, "description": "Frame rate of a raw H.264/HEVC stream, which carries none (25 when absent)." },
+            "pace": { "type": "string", "enum": ["realtime", "none"], "description": "realtime: read no faster than the media plays." },
+            "thumbnail_seconds": { "type": "number", "minimum": 2, "default": 10 },
+            "hwaccel": { "type": "string", "default": "auto" }
+        }),
+        &["source"],
+    )
+}
+
 /// JSON Schema for the `analyze` tool.
 pub fn analyze_schema() -> Value {
     object(
@@ -300,6 +387,70 @@ pub fn tools() -> &'static [Tool] {
                 input_schema: analyze_schema(),
                 read_only: false,
                 handler: Handler::WithCtx(h_analyze),
+            },
+            Tool {
+                name: "stream_open",
+                description: "Start watching a live source (a socket, a pipe, a growing file, or a file played as if live). It is read, demuxed and analyzed on its own thread as it arrives; follow it with stream_events. Readable as it arrives: Y4M, WAV, ADTS AAC and raw H.264/HEVC.",
+                cli: "ironav watch <source> [--analyzers a,b] [--level L] [--format F] [--fps N] [--pace realtime]",
+                input_schema: stream_open_schema(),
+                read_only: true,
+                handler: Handler::Plain(h_stream_open),
+            },
+            Tool {
+                name: "stream_events",
+                description: "What a live session has observed since `after` (a seq from the last call's next_after; 0 for everything kept). With wait_ms it waits up to that long (30 s at most) for something new, so polling costs nothing while the stream is quiet. `missed` counts events dropped from the log before they were read.",
+                cli: "ironav watch <source>  (prints every event)",
+                input_schema: object(
+                    json!({
+                        "session": { "type": "string" },
+                        "after": { "type": "integer", "minimum": 0, "default": 0 },
+                        "kinds": { "type": "array", "items": { "type": "string", "enum": ironav_analyze::KINDS.iter().map(|k| k.name).collect::<Vec<_>>() }, "description": "Only these kinds (all when absent)." },
+                        "level": { "type": "string", "enum": ironav_analyze::Level::ALL.iter().map(|l| l.name()).collect::<Vec<_>>(), "default": "events" },
+                        "max": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 },
+                        "wait_ms": { "type": "integer", "minimum": 0, "maximum": 30000, "default": 0 }
+                    }),
+                    &["session"],
+                ),
+                read_only: true,
+                handler: Handler::Plain(h_stream_events),
+            },
+            Tool {
+                name: "stream_status",
+                description: "A live session's state (waiting, running, ended, failed, closed), streams, bytes and packets in, media time, latency percentiles, log and retained range. Without a session, every open session.",
+                cli: "",
+                input_schema: object(json!({ "session": { "type": "string" } }), &[]),
+                read_only: true,
+                handler: Handler::Plain(h_stream_status),
+            },
+            Tool {
+                name: "stream_snapshot",
+                description: "A picture from a live session as an image: the newest one, or the one shown at `at` seconds (decoded from the retained media; a thumbnail's `t` works).",
+                cli: "",
+                input_schema: object(json!({ "session": { "type": "string" }, "at": { "type": "number", "minimum": 0 }, "max_width": { "type": "integer", "minimum": 16, "default": 640 } }), &["session"]),
+                read_only: true,
+                handler: Handler::Plain(h_stream_snapshot),
+            },
+            Tool {
+                name: "stream_clip",
+                description: "Write the retained media from `from` to `to` seconds (from the keyframe at or before `from`) to a file, without re-encoding. Written atomically; refuses to replace a file unless overwrite is true. The container must hold the stream's codec as received (raw H.264 to .h264 or .mp4, Y4M to .y4m, WAV to .wav, AAC to .aac).",
+                cli: "",
+                input_schema: object(
+                    json!({
+                        "session": { "type": "string" }, "from": { "type": "number" }, "to": { "type": "number" },
+                        "output": { "type": "string" }, "format": { "type": "string" }, "overwrite": { "type": "boolean", "default": false }
+                    }),
+                    &["session", "from", "to", "output"],
+                ),
+                read_only: false,
+                handler: Handler::Plain(h_stream_clip),
+            },
+            Tool {
+                name: "stream_close",
+                description: "Stop a live session and return its final status and summary.",
+                cli: "",
+                input_schema: object(json!({ "session": { "type": "string" } }), &["session"]),
+                read_only: false,
+                handler: Handler::Plain(h_stream_close),
             },
             Tool {
                 name: "ontology_search",

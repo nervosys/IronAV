@@ -57,6 +57,7 @@ fn help() -> Value {
             "probe <path>": "inspect a media file",
             "convert -i IN [-i MORE]... -o OUT [-f FMT] [--acodec C] [--vcodec C] [--abitrate KBPS] [--vbitrate KBPS | --qp N] [--filter name[:k=v,..]]... [--hwaccel P] [-y] [--dry-run] [--progress]": "convert, handbrake/ffmpeg style",
             "analyze FILE [--analyzers a,b] [--level digest|events|raw] [--digest-seconds N] [--from S] [--to S] [--streams 0,1] [--max N] [--thumbnails DIR] [--hwaccel P] [--jsonl]": "what is in a file: loudness, silence, scene cuts, black and frozen pictures, thumbnails, gaps; --jsonl prints each observation as a line as it is found",
+            "watch SOURCE [--analyzers a,b] [--level digest|events|raw] [--digest-seconds N] [--format F] [--fps N] [--pace realtime] [--retain S] [--duration S] [--hwaccel P]": "follow a live source (path, path?follow, -, tcp://host:port, tcp://:port, udp://:port): every observation as a JSON line as it happens, then a summary",
             "plan <job.json|->": "validate a JSON job without writing",
             "run <job.json|->": "execute a JSON job",
             "hw probe | hw select --codec C --direction decode|encode [--policy P]": "hardware acceleration",
@@ -92,6 +93,7 @@ fn dispatch(mut a: Args, progress: bool) -> Result<Value> {
         "plan" => call_tool("plan", &read_job_arg(&mut a)?),
         "run" => run_job(read_job_arg(&mut a)?, progress),
         "analyze" => analyze(a, progress),
+        "watch" => watch(a),
         "convert" => {
             let dry = a.switch(&["--dry-run", "-n"]);
             let overwrite = a.switch(&["-y", "--overwrite"]);
@@ -156,7 +158,7 @@ fn dispatch(mut a: Args, progress: bool) -> Result<Value> {
             .collect::<Vec<_>>())),
         other => Err(Error::invalid_arg(format!("unknown command '{other}'"))
             .hint("run `ironav help`")
-            .alternatives(["capabilities", "probe", "analyze", "convert", "plan", "run", "hw", "ontology", "tools", "mcp", "play", "gui"])),
+            .alternatives(["capabilities", "probe", "analyze", "watch", "convert", "plan", "run", "hw", "ontology", "tools", "mcp", "play", "gui"])),
     }
 }
 
@@ -215,6 +217,56 @@ fn analyze(mut a: Args, progress: bool) -> Result<Value> {
         obj.remove("observations");
     }
     Ok(result)
+}
+
+fn watch(mut a: Args) -> Result<Value> {
+    let source = a.positional("source to watch")?;
+    let num = |name: &str, v: Option<String>| -> Result<Option<f64>> {
+        v.map(|s| s.parse::<f64>().map_err(|_| Error::invalid_arg(format!("{name} must be a number, got '{s}'")))).transpose()
+    };
+    let mut args = json!({ "source": source });
+    if let Some(v) = a.flag(&["--analyzers", "-a"])? {
+        args["analyzers"] = json!(v.split(',').map(str::trim).filter(|s| !s.is_empty()).collect::<Vec<_>>());
+    }
+    for (flag, key) in [("--level", "level"), ("--format", "format"), ("--pace", "pace"), ("--hwaccel", "hwaccel")] {
+        if let Some(v) = a.flag(&[flag])? {
+            args[key] = json!(v);
+        }
+    }
+    for (flag, key) in [("--digest-seconds", "digest_seconds"), ("--fps", "fps"), ("--retain", "retain_seconds")] {
+        if let Some(v) = num(flag, a.flag(&[flag])?)? {
+            args[key] = json!(v);
+        }
+    }
+    let duration = num("--duration", a.flag(&["--duration"])?)?;
+    if let Some(extra) = a.rest.first() {
+        return Err(Error::invalid_arg(format!("unexpected argument '{extra}'")));
+    }
+    let open: ironav_engine::live::OpenArgs = serde_json::from_value(args).map_err(|e| Error::invalid_arg(format!("invalid arguments: {e}")))?;
+    let level = ironav_engine::analyze::Level::parse(&open.level).unwrap_or(ironav_engine::analyze::Level::Events);
+    let s = ironav_engine::live::open(&open)?;
+    let t0 = std::time::Instant::now();
+    let mut after = 0;
+    let mut out = std::io::stdout().lock();
+    loop {
+        let r = s.events(after, &[], level, 1000, std::time::Duration::from_millis(250));
+        after = r["next_after"].as_u64().unwrap_or(after);
+        for e in r["events"].as_array().into_iter().flatten() {
+            let _ = writeln!(out, "{e}");
+        }
+        let _ = out.flush();
+        let done = matches!(r["state"].as_str(), Some("ended" | "failed" | "closed")) && !r["more"].as_bool().unwrap_or(false) && r["events"].as_array().is_none_or(|e| e.is_empty());
+        if done || duration.is_some_and(|d| t0.elapsed().as_secs_f64() >= d) {
+            break;
+        }
+    }
+    let closed = ironav_engine::live::close(&s.id)?;
+    if closed["state"] == "failed" {
+        let e = &closed["error"];
+        let code = ironav_core::ErrorCode::ALL.into_iter().find(|c| json!(c) == e["code"]).unwrap_or(ironav_core::ErrorCode::Internal);
+        return Err(Error::new(code, e["message"].as_str().unwrap_or("the source failed")));
+    }
+    Ok(closed)
 }
 
 fn run_job(v: Value, progress: bool) -> Result<Value> {

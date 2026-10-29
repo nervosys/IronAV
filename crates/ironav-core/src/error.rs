@@ -16,11 +16,13 @@ pub enum ErrorCode {
     NotFound,
     /// The caller asked for the work to stop.
     Cancelled,
+    /// A limit on work running at once was reached; retry after something finishes.
+    Busy,
     Internal,
 }
 
 impl ErrorCode {
-    pub const ALL: [ErrorCode; 11] = [
+    pub const ALL: [ErrorCode; 12] = [
         Self::Io,
         Self::InvalidInput,
         Self::InvalidArgument,
@@ -31,6 +33,7 @@ impl ErrorCode {
         Self::HardwareUnavailable,
         Self::NotFound,
         Self::Cancelled,
+        Self::Busy,
         Self::Internal,
     ];
 
@@ -45,6 +48,7 @@ impl ErrorCode {
             ErrorCode::OutputExists => 7,
             ErrorCode::HardwareUnavailable => 8,
             ErrorCode::Cancelled => 130,
+            ErrorCode::Busy => 75,
             ErrorCode::Internal => 70,
         }
     }

@@ -149,6 +149,9 @@ fn bad_arguments_name_the_alternatives() {
     assert!(e.alternatives.iter().any(|a| a == "loudness"), "{e:?}");
     let e = call_tool("analyze", &json!({ "input": input, "level": "everything" })).unwrap_err();
     assert!(e.alternatives.iter().any(|a| a == "digest"), "{e:?}");
+    // a misspelt option is an error, not ignored
+    let e = call_tool("analyze", &json!({ "input": input, "digest_secs": 5 })).unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidArgument, "{e:?}");
 }
 
 #[test]

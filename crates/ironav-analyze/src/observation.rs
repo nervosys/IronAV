@@ -44,7 +44,10 @@ pub struct Observation {
     pub t: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub t_end: Option<f64>,
-    /// From the arrival of the newest input behind it to its logging (live sources only).
+    /// When it was logged (live sources only), as UTC in RFC 3339 form.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wall: Option<String>,
+    /// From the arrival of the packet behind it to its logging (live sources only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latency_ms: Option<f64>,
     pub data: Value,
@@ -68,7 +71,7 @@ impl std::fmt::Debug for Picture {
 
 impl Observation {
     pub fn new(kind: &'static str, analyzer: &'static str, t: f64, data: Value) -> Self {
-        Observation { seq: 0, kind, analyzer, stream: None, t: crate::round(t, 3), t_end: None, latency_ms: None, data, refs: Map::new(), picture: None }
+        Observation { seq: 0, kind, analyzer, stream: None, t: crate::round(t, 3), t_end: None, wall: None, latency_ms: None, data, refs: Map::new(), picture: None }
     }
 
     pub fn until(mut self, t_end: f64) -> Self {
