@@ -1,0 +1,13 @@
+[package]
+name = "ironav-analyze"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Media understanding for IronAV: analyzers that turn packets and decoded frames into typed observations and digests."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+ironav-core.workspace = true
+ironav-codec.workspace = true

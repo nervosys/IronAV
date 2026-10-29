@@ -13,10 +13,14 @@ pub enum Kind {
     HwBackend,
     Platform,
     Operation,
+    /// Turns packets or decoded frames into observations.
+    Analyzer,
+    /// A kind of observation an analyzer reports.
+    Observation,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 8] = [
+    pub const ALL: [Kind; 10] = [
         Self::Codec,
         Self::Container,
         Self::PixelFormat,
@@ -25,6 +29,8 @@ impl Kind {
         Self::HwBackend,
         Self::Platform,
         Self::Operation,
+        Self::Analyzer,
+        Self::Observation,
     ];
     /// Id prefix: entity ids look like `codec/h264`.
     pub fn prefix(self) -> &'static str {
@@ -37,6 +43,8 @@ impl Kind {
             Self::HwBackend => "hw",
             Self::Platform => "platform",
             Self::Operation => "op",
+            Self::Analyzer => "analyzer",
+            Self::Observation => "observation",
         }
     }
     pub fn class_name(self) -> &'static str {
@@ -49,6 +57,8 @@ impl Kind {
             Self::HwBackend => "HardwareBackend",
             Self::Platform => "Platform",
             Self::Operation => "Operation",
+            Self::Analyzer => "Analyzer",
+            Self::Observation => "ObservationKind",
         }
     }
     pub fn parse(s: &str) -> Option<Kind> {
@@ -81,16 +91,19 @@ pub enum Predicate {
     AcceptsPixelFormat,
     /// filter → pixel format it produces
     ProducesPixelFormat,
+    /// analyzer → kind of observation it reports
+    Emits,
 }
 
 impl Predicate {
-    pub const ALL: [Predicate; 6] = [
+    pub const ALL: [Predicate; 7] = [
         Self::Carries,
         Self::Accelerates,
         Self::AvailableOn,
         Self::UsesSampleFormat,
         Self::AcceptsPixelFormat,
         Self::ProducesPixelFormat,
+        Self::Emits,
     ];
     pub fn name(self) -> &'static str {
         match self {
@@ -100,6 +113,7 @@ impl Predicate {
             Self::UsesSampleFormat => "usesSampleFormat",
             Self::AcceptsPixelFormat => "acceptsPixelFormat",
             Self::ProducesPixelFormat => "producesPixelFormat",
+            Self::Emits => "emits",
         }
     }
     pub fn description(self) -> &'static str {
@@ -110,6 +124,7 @@ impl Predicate {
             Self::UsesSampleFormat => "A PCM codec's payload uses this sample format.",
             Self::AcceptsPixelFormat => "A filter accepts frames in this pixel format.",
             Self::ProducesPixelFormat => "A filter outputs frames in this pixel format.",
+            Self::Emits => "An analyzer reports observations of this kind.",
         }
     }
     /// `(domain, range)` kinds.
@@ -120,6 +135,7 @@ impl Predicate {
             Self::AvailableOn => (Kind::HwBackend, Kind::Platform),
             Self::UsesSampleFormat => (Kind::Codec, Kind::SampleFormat),
             Self::AcceptsPixelFormat | Self::ProducesPixelFormat => (Kind::Filter, Kind::PixelFormat),
+            Self::Emits => (Kind::Analyzer, Kind::Observation),
         }
     }
 }

@@ -20,7 +20,8 @@ A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so 
 | Player (terminal) | `ironav play file` | full-screen TUI on a terminal; JSON lines on stdin/stdout otherwise, for agents |
 | Player (window) | `ironav gui --play [file]` | native player window: seek bar, volume, snapshot, drag and drop |
 | GUI (browser) | `ironav gui --web` | same layout as a loopback-only web app, for machines without a display stack |
-| MCP | `ironav mcp` | agents; resident process, no per-call startup |
+| Analysis | `ironav analyze file [--level digest\|events\|raw] [--jsonl]` | what is in a file, as typed observations (see below) |
+| MCP | `ironav mcp` | agents; resident process, no per-call startup; concurrent calls, progress and cancellation |
 | Tool schemas | `ironav tools` | JSON Schema for function-calling APIs |
 
 Every CLI command prints one JSON envelope: `{"ok":true,"result":…}` or
@@ -31,11 +32,40 @@ Every CLI command prints one JSON envelope: `{"ok":true,"result":…}` or
 1. `ironav capabilities` — what exists in this build, with the workflow spelled out.
 2. `ironav ontology search|describe|convert` — what is implemented vs planned, and why a conversion is or is not feasible.
 3. `ironav probe <file>` → `ironav convert --dry-run …` (or `plan`) → `ironav run job.json`.
+4. `ironav analyze <file>` (the `analyze` tool) to learn what is in a file without looking at its pictures.
 
 Design choices for agents: declarative JSON jobs; `plan` validates without writing; outputs are atomic
 (`.partial` then rename) and never overwrite unless `overwrite: true`; errors name valid alternatives.
 
-Live sources and analysis (streams, events, digests, sidecar models) are designed but not built yet:
+Over MCP every tool call runs on its own thread, so a long `run` or `analyze` does not hold up other requests.
+A call that carries `_meta.progressToken` gets `notifications/progress`, and `notifications/cancelled` stops it
+(error code `cancelled`; a cancelled `run` leaves no output).
+
+## Understanding media (`analyze`)
+
+`analyze` decodes a file and runs analyzers over it, returning small typed observations instead of pixels:
+
+| Analyzer | Reports |
+|---|---|
+| `structure` | bit rate per window, timestamp gaps, jumps backwards (packets only, no decoding) |
+| `levels` | sample peak and RMS (dBFS), clipping |
+| `loudness` | EBU R128 / ITU-R BS.1770: momentary, short-term and integrated loudness (LUFS), loudness range (LU) |
+| `silence` | spans of at least 0.5 s below -50 dBFS |
+| `scene` | scene cuts (the measure the H.264 encoder uses for IDR placement) and how much each window changes |
+| `black`, `freeze` | black spans (0.5 s or more) and unchanging pictures (1 s or more) |
+| `thumbnails` | a small picture when the content changes (64-bit perceptual hash, at most every 2 s) or every 10 s |
+
+Every observation has `seq`, `kind`, `analyzer`, `stream`, `t` (seconds) and, for spans, `t_end`. A `digest` closes every
+`digest_seconds` (10 by default) with each analyzer's figures for that window, and a `summary` comes last. `level`
+chooses how much comes back: `digest` (digests and the summary: the fewest tokens), `events` (the default: plus cuts,
+silences, spans, thumbnails, gaps) or `raw` (plus per-picture change scores and loudness once a second).
+`--jsonl` prints each observation as a line the moment it is found. Thumbnails are written as PNG files with
+`--thumbnails DIR` (`thumbnail_dir`), or returned to MCP clients as image blocks with `inline_thumbnails`.
+The kinds and analyzers are listed by `ironav capabilities` and are entities in the ontology (`analyzer/…`,
+`observation/…`, related by `emits`).
+
+Checked against EBU Tech 3341/3342 test signals (a -23 dBFS stereo sine reads -23.0 LUFS at 44.1 and 48 kHz; two levels
+10 dB apart give a 10 LU range). Live sources (pipes, sockets, MPEG-TS, RTSP) are designed but not built yet:
 see [docs/design/agentic-realtime.md](docs/design/agentic-realtime.md).
 
 ## Ontology

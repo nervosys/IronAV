@@ -8,7 +8,7 @@ mod play;
 use ironav_core::{Error, Result};
 use ironav_engine::{call_tool, ontology, tools, FilterCall, Job};
 use serde_json::{json, Value};
-use std::io::{IsTerminal, Read};
+use std::io::{IsTerminal, Read, Write};
 
 pub(crate) struct Args {
     pub(crate) rest: Vec<String>,
@@ -56,6 +56,7 @@ fn help() -> Value {
             "capabilities": "what this build can do (start here)",
             "probe <path>": "inspect a media file",
             "convert -i IN [-i MORE]... -o OUT [-f FMT] [--acodec C] [--vcodec C] [--abitrate KBPS] [--vbitrate KBPS | --qp N] [--filter name[:k=v,..]]... [--hwaccel P] [-y] [--dry-run] [--progress]": "convert, handbrake/ffmpeg style",
+            "analyze FILE [--analyzers a,b] [--level digest|events|raw] [--digest-seconds N] [--from S] [--to S] [--streams 0,1] [--max N] [--thumbnails DIR] [--hwaccel P] [--jsonl]": "what is in a file: loudness, silence, scene cuts, black and frozen pictures, thumbnails, gaps; --jsonl prints each observation as a line as it is found",
             "plan <job.json|->": "validate a JSON job without writing",
             "run <job.json|->": "execute a JSON job",
             "hw probe | hw select --codec C --direction decode|encode [--policy P]": "hardware acceleration",
@@ -90,6 +91,7 @@ fn dispatch(mut a: Args, progress: bool) -> Result<Value> {
         "probe" => call_tool("probe", &json!({ "path": a.positional("path")? })),
         "plan" => call_tool("plan", &read_job_arg(&mut a)?),
         "run" => run_job(read_job_arg(&mut a)?, progress),
+        "analyze" => analyze(a, progress),
         "convert" => {
             let dry = a.switch(&["--dry-run", "-n"]);
             let overwrite = a.switch(&["-y", "--overwrite"]);
@@ -154,8 +156,65 @@ fn dispatch(mut a: Args, progress: bool) -> Result<Value> {
             .collect::<Vec<_>>())),
         other => Err(Error::invalid_arg(format!("unknown command '{other}'"))
             .hint("run `ironav help`")
-            .alternatives(["capabilities", "probe", "convert", "plan", "run", "hw", "ontology", "tools", "mcp", "play", "gui"])),
+            .alternatives(["capabilities", "probe", "analyze", "convert", "plan", "run", "hw", "ontology", "tools", "mcp", "play", "gui"])),
     }
+}
+
+fn analyze(mut a: Args, progress: bool) -> Result<Value> {
+    let input = a.positional("file to analyze")?;
+    let jsonl = a.switch(&["--jsonl"]);
+    let list = |v: Option<String>| v.map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect::<Vec<_>>());
+    let num = |name: &str, v: Option<String>| -> Result<Option<f64>> {
+        v.map(|s| s.parse::<f64>().map_err(|_| Error::invalid_arg(format!("{name} must be a number, got '{s}'")))).transpose()
+    };
+    let mut args = json!({ "input": input });
+    if let Some(v) = list(a.flag(&["--analyzers", "-a"])?) {
+        args["analyzers"] = json!(v);
+    }
+    if let Some(v) = a.flag(&["--level"])? {
+        args["level"] = json!(v);
+    }
+    if let Some(v) = num("--digest-seconds", a.flag(&["--digest-seconds"])?)? {
+        args["digest_seconds"] = json!(v);
+    }
+    if let Some(v) = num("--from", a.flag(&["--from", "--start"])?)? {
+        args["from"] = json!(v);
+    }
+    if let Some(v) = num("--to", a.flag(&["--to", "--end"])?)? {
+        args["to"] = json!(v);
+    }
+    if let Some(v) = list(a.flag(&["--streams"])?) {
+        let ids = v.iter().map(|s| s.parse::<usize>().map_err(|_| Error::invalid_arg(format!("--streams takes stream numbers, got '{s}'")))).collect::<Result<Vec<_>>>()?;
+        args["streams"] = json!(ids);
+    }
+    if let Some(v) = num("--max", a.flag(&["--max"])?)? {
+        args["max_observations"] = json!(v as usize);
+    }
+    if let Some(v) = a.flag(&["--thumbnails"])? {
+        args["thumbnail_dir"] = json!(v);
+    }
+    if let Some(v) = a.flag(&["--hwaccel"])? {
+        args["hwaccel"] = json!(v);
+    }
+    if let Some(extra) = a.rest.first() {
+        return Err(Error::invalid_arg(format!("unexpected argument '{extra}'")));
+    }
+    let report = |done: f64, total: Option<f64>, message: &str| eprintln!("{}", json!({ "event": "progress", "done": done, "total": total, "message": message }));
+    let ctx = ironav_engine::Ctx { progress: progress.then_some(&report as &(dyn Fn(f64, Option<f64>, &str) + Sync)), cancel: None };
+    if !jsonl {
+        return ironav_engine::call_tool_with("analyze", &args, &ctx);
+    }
+    let job: ironav_engine::AnalyzeJob = serde_json::from_value(args).map_err(|e| Error::invalid_arg(format!("invalid arguments: {e}")))?;
+    let mut out = std::io::stdout().lock();
+    let mut result = ironav_engine::analyze(&job, &ctx, &mut |o| {
+        let _ = writeln!(out, "{}", serde_json::to_string(o).unwrap_or_default());
+        let _ = out.flush();
+    })?;
+    // the observations went out one per line; the closing envelope says how many
+    if let Some(obj) = result.as_object_mut() {
+        obj.remove("observations");
+    }
+    Ok(result)
 }
 
 fn run_job(v: Value, progress: bool) -> Result<Value> {

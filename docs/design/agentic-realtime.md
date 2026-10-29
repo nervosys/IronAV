@@ -1,6 +1,8 @@
 # Design: agentic-first real-time streaming, parsing and understanding
 
-Status: proposal (2026-10-29). Nothing here is implemented yet unless it says so.
+Status: M1 (understanding files) is implemented; the rest is a proposal (2026-10-29). Nothing beyond M1 is
+implemented yet unless it says so. TLS, when the HTTPS transport comes, uses rustls with IronCrypto's `ic-rustls`
+provider.
 
 IronAV already treats agents as first-class for **files**: one tool registry feeds the CLI, the MCP server and the
 GUIs; jobs are declarative JSON; `plan` validates without writing; errors name alternatives; the ontology says what
@@ -332,7 +334,7 @@ Each milestone is usable on its own and passes the test gate.
 
 | # | Delivers | New dependencies |
 |---|---|---|
-| **M1: understand files** | `ironav-analyze` with `structure`, `levels`, `loudness`, `silence`, `scene` (shared with the encoder), `black`, `freeze`, `thumbnails`; the `analyze` tool and CLI; digests; MCP concurrency, progress and cancellation | none |
+| **M1: understand files** (done) | `ironav-analyze` with `structure`, `levels`, `loudness`, `silence`, `scene` (shared with the encoder), `black`, `freeze`, `thumbnails`; the `analyze` tool and CLI; digests; MCP concurrency, progress and cancellation | none |
 | **M2: live bytes** | the `Source` trait; `pipe:`, `?follow`, `?pace=realtime`, `tcp://`, `udp://`; `StreamDemuxer` for Annex B, ADTS, Y4M, WAV, Ogg and MP3; packet metadata; `LiveSession`, the ring buffer, the `stream_*` tools and `ironav watch`; low-delay H.264 and HEVC output | none |
 | **M3: broadcast** | the MPEG-TS demuxer and muxer; live fMP4 and MKV reading; a progressive fMP4/TS recorder; `stream_clip`; segmenting; the `latency: low` encode profile | none |
 | **M4: cameras and the web** | RTSP and RTP depacketizers with a jitter buffer and RTCP; HLS over plain HTTP | none |
@@ -352,7 +354,7 @@ files at once, and it fixes the event model, analyzer trait and MCP plumbing bef
 
 ## 10. Decisions needed before the later milestones
 
-1. **TLS** (HTTPS, RTSPS, HLS from most CDNs): `rustls` behind a feature, or leave TLS to an external proxy?
+1. **TLS**: decided. rustls with IronCrypto (`ic-rustls`) as the crypto provider, behind a cargo feature.
 2. **Async**: this design deliberately uses no async runtime. Confirm that, or choose `tokio` for M4 and later
    (needed only if session counts grow into the hundreds).
 3. **Capture devices**: per-OS native APIs written here, or a crate such as `cpal`, which the player already uses for

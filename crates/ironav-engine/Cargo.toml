@@ -13,4 +13,5 @@ ironav-hwaccel.workspace = true
 ironav-codec.workspace = true
 ironav-formats.workspace = true
 ironav-ontology.workspace = true
+ironav-analyze.workspace = true
 ironav-player.workspace = true

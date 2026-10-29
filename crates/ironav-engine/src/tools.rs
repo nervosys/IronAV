@@ -6,9 +6,10 @@ use ironav_codec::{implemented, is_implemented, FILTERS};
 use ironav_core::{CodecId, Error, ErrorCode, MediaType, Result};
 use ironav_formats::{open_demuxer, FORMATS};
 use ironav_hwaccel::{linked_backends, probe_all, provider_codecs, select, Backend, Direction, HwPolicy, Platform, BACKENDS, PROVIDERS};
-use ironav_ontology::{entity, Kind, Ontology, Status};
+use ironav_ontology::{entity, Kind, Ontology, Predicate, Status};
 use serde_json::{json, Value};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 pub struct Tool {
@@ -19,20 +20,56 @@ pub struct Tool {
     pub input_schema: Value,
     /// Never changes anything on disk.
     pub read_only: bool,
-    handler: fn(&Value) -> Result<Value>,
+    handler: Handler,
+}
+
+enum Handler {
+    Plain(fn(&Value) -> Result<Value>),
+    /// A long-running tool, which reports progress and can be cancelled.
+    WithCtx(fn(&Value, &Ctx) -> Result<Value>),
+}
+
+/// What a long-running tool can use while it works: somewhere to report progress, and a flag
+/// that says the caller wants it to stop.
+#[derive(Default, Clone, Copy)]
+pub struct Ctx<'a> {
+    pub progress: Option<&'a (dyn Fn(f64, Option<f64>, &str) + Sync)>,
+    pub cancel: Option<&'a AtomicBool>,
+}
+
+impl Ctx<'_> {
+    /// `done` out of `total` (when known), in the tool's own unit, with a short message.
+    pub fn progress(&self, done: f64, total: Option<f64>, message: &str) {
+        if let Some(p) = self.progress {
+            p(done, total, message);
+        }
+    }
+    pub fn cancelled(&self) -> bool {
+        self.cancel.is_some_and(|c| c.load(Ordering::Relaxed))
+    }
 }
 
 impl Tool {
     pub fn call(&self, args: &Value) -> Result<Value> {
-        (self.handler)(args)
+        self.call_with(args, &Ctx::default())
+    }
+    pub fn call_with(&self, args: &Value, ctx: &Ctx) -> Result<Value> {
+        match self.handler {
+            Handler::Plain(h) => h(args),
+            Handler::WithCtx(h) => h(args, ctx),
+        }
     }
 }
 
 pub fn call_tool(name: &str, args: &Value) -> Result<Value> {
+    call_tool_with(name, args, &Ctx::default())
+}
+
+pub fn call_tool_with(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
     let t = tools().iter().find(|t| t.name == name).ok_or_else(|| {
         Error::new(ErrorCode::NotFound, format!("unknown tool '{name}'")).alternatives(tools().iter().map(|t| t.name))
     })?;
-    t.call(args)
+    t.call_with(args, ctx)
 }
 
 fn object(props: Value, required: &[&str]) -> Value {
@@ -121,6 +158,8 @@ fn h_capabilities(_: &Value) -> Result<Value> {
             "note": "A backend is usable only if its driver is detected AND a native provider is linked into this build."
         },
         "tools": tools().iter().map(|t| json!({ "name": t.name, "description": t.description, "cli": t.cli, "read_only": t.read_only })).collect::<Vec<_>>(),
+        "analyzers": ironav_analyze::ANALYZERS.iter().map(|a| json!({ "name": a.name, "consumes": a.consumes, "description": a.description, "emits": a.emits })).collect::<Vec<_>>(),
+        "observation_kinds": ironav_analyze::KINDS,
         "error_codes": ErrorCode::ALL,
         "ontology": ontology().summary(),
         "not_implemented": "Implemented: software decoders for H.264, HEVC (Main, Main 10), VP8, VP9 (profiles 0-3), JPEG, AAC-LC (plus HE-AAC v1), MP3, Vorbis, Opus, FLAC and PCM; software encoders for H.264 (High profile: CABAC, the 8x8 transform, I, P and B frames, 8-bit yuv420p with even dimensions), JPEG, AAC-LC, MP3, Vorbis, Opus, FLAC and PCM. NVIDIA GPUs encode H.264 (preferred when usable) and HEVC (NVENC; HEVC has no software encoder); GPU decoding (NVDEC) is also available for them. AV1 is decoded only on NVIDIA GPUs (NVDEC, no software decoder) and cannot be encoded. Not implemented (planned in the ontology): ALAC, ProRes, MPEG-4 Part 2. VP9 and AV1 cannot be written (copied into a file). A video file and an audio file are combined into one output with extra_inputs."
@@ -139,8 +178,39 @@ fn h_plan(args: &Value) -> Result<Value> {
     Ok(serde_json::to_value(crate::plan(&parse_job(args)?)?)?)
 }
 
-fn h_run(args: &Value) -> Result<Value> {
-    Ok(serde_json::to_value(crate::run(&parse_job(args)?, &mut |_| {})?)?)
+fn h_run(args: &Value, ctx: &Ctx) -> Result<Value> {
+    let mut report = |p: &crate::Progress| ctx.progress(p.bytes_in as f64, None, &format!("{} packets read, {} bytes written", p.packets, p.bytes_out));
+    Ok(serde_json::to_value(crate::run::run_with(&parse_job(args)?, &mut report, ctx.cancel)?)?)
+}
+
+fn h_analyze(args: &Value, ctx: &Ctx) -> Result<Value> {
+    let job: crate::analyze::AnalyzeJob = serde_json::from_value(args.clone())
+        .map_err(|e| Error::invalid_arg(format!("invalid analyze arguments: {e}")).hint("the schema is in `ironav tools` (tool 'analyze')"))?;
+    crate::analyze::analyze(&job, ctx, &mut |_| {})
+}
+
+/// JSON Schema for the `analyze` tool.
+pub fn analyze_schema() -> Value {
+    object(
+        json!({
+            "input": { "type": "string", "description": "Path of the media file to analyze." },
+            "analyzers": { "type": "array", "items": { "type": "string", "enum": ironav_analyze::ANALYZERS.iter().map(|a| a.name).collect::<Vec<_>>() },
+                           "description": "Which analyzers to run; all of them when empty or absent." },
+            "level": { "type": "string", "enum": ironav_analyze::Level::ALL.iter().map(|l| l.name()).collect::<Vec<_>>(), "default": "events",
+                       "description": "digest: rolling digests and a summary only (fewest tokens); events: plus cuts, silences, black and frozen spans, thumbnails, gaps; raw: plus per-frame and per-second measurements." },
+            "digest_seconds": { "type": "number", "exclusiveMinimum": 0, "default": 10, "description": "Length of each digest window, in seconds of media." },
+            "from": { "type": "number", "minimum": 0, "description": "Start of the analyzed range, in seconds." },
+            "to": { "type": "number", "description": "End of the analyzed range, in seconds." },
+            "streams": { "type": "array", "items": { "type": "integer", "minimum": 0 }, "description": "Stream indices (from `probe`); every audio and video stream when absent." },
+            "max_observations": { "type": "integer", "minimum": 0, "default": 500, "description": "Events beyond this many are counted in `counts` and `dropped` but not returned; digests always are." },
+            "thumbnail_dir": { "type": "string", "description": "Write each thumbnail there as PNG; observations then carry refs.path." },
+            "inline_thumbnails": { "type": "integer", "minimum": 0, "default": 0, "description": "Return the first N thumbnails as images." },
+            "thumbnail_seconds": { "type": "number", "minimum": 2, "default": 10, "description": "Longest time between thumbnails; new content brings one sooner (at most every 2 s)." },
+            "thumbnail_width": { "type": "integer", "minimum": 16, "default": 320 },
+            "hwaccel": { "type": "string", "default": "auto", "description": "Video decoding: auto, off, require or a backend name, as for jobs." }
+        }),
+        &["input"],
+    )
 }
 
 fn h_search(args: &Value) -> Result<Value> {
@@ -197,7 +267,7 @@ pub fn tools() -> &'static [Tool] {
                 cli: "ironav capabilities",
                 input_schema: object(json!({}), &[]),
                 read_only: true,
-                handler: h_capabilities,
+                handler: Handler::Plain(h_capabilities),
             },
             Tool {
                 name: "probe",
@@ -205,7 +275,7 @@ pub fn tools() -> &'static [Tool] {
                 cli: "ironav probe <path>",
                 input_schema: object(json!({ "path": { "type": "string" } }), &["path"]),
                 read_only: true,
-                handler: h_probe,
+                handler: Handler::Plain(h_probe),
             },
             Tool {
                 name: "plan",
@@ -213,7 +283,7 @@ pub fn tools() -> &'static [Tool] {
                 cli: "ironav plan <job.json|->  or  ironav convert --dry-run ...",
                 input_schema: job_schema(),
                 read_only: true,
-                handler: h_plan,
+                handler: Handler::Plain(h_plan),
             },
             Tool {
                 name: "run",
@@ -221,7 +291,15 @@ pub fn tools() -> &'static [Tool] {
                 cli: "ironav run <job.json|->  or  ironav convert ...",
                 input_schema: job_schema(),
                 read_only: false,
-                handler: h_run,
+                handler: Handler::WithCtx(h_run),
+            },
+            Tool {
+                name: "analyze",
+                description: "Understand a media file without looking at it: runs analyzers (stream structure, audio levels, EBU R128 loudness, silence, scene cuts, black and frozen pictures, thumbnails) and returns typed observations with a digest per window and a summary. Use level 'digest' for the fewest tokens. Writes files only when thumbnail_dir is given.",
+                cli: "ironav analyze <file> [--analyzers a,b] [--level digest|events|raw] [--digest-seconds N] [--from S] [--to S] [--thumbnails DIR] [--jsonl]",
+                input_schema: analyze_schema(),
+                read_only: false,
+                handler: Handler::WithCtx(h_analyze),
             },
             Tool {
                 name: "ontology_search",
@@ -236,7 +314,7 @@ pub fn tools() -> &'static [Tool] {
                     &[],
                 ),
                 read_only: true,
-                handler: h_search,
+                handler: Handler::Plain(h_search),
             },
             Tool {
                 name: "ontology_describe",
@@ -244,7 +322,7 @@ pub fn tools() -> &'static [Tool] {
                 cli: "ironav ontology describe <id>",
                 input_schema: object(json!({ "id": { "type": "string" } }), &["id"]),
                 read_only: true,
-                handler: h_describe,
+                handler: Handler::Plain(h_describe),
             },
             Tool {
                 name: "ontology_explain_conversion",
@@ -252,7 +330,7 @@ pub fn tools() -> &'static [Tool] {
                 cli: "ironav ontology convert <from> <to>",
                 input_schema: object(json!({ "from": { "type": "string" }, "to": { "type": "string" } }), &["from", "to"]),
                 read_only: true,
-                handler: h_explain,
+                handler: Handler::Plain(h_explain),
             },
             Tool {
                 name: "hardware_probe",
@@ -260,7 +338,7 @@ pub fn tools() -> &'static [Tool] {
                 cli: "ironav hw probe",
                 input_schema: object(json!({}), &[]),
                 read_only: true,
-                handler: h_hw_probe,
+                handler: Handler::Plain(h_hw_probe),
             },
             Tool {
                 name: "hardware_select",
@@ -275,7 +353,7 @@ pub fn tools() -> &'static [Tool] {
                     &["codec", "direction"],
                 ),
                 read_only: true,
-                handler: h_hw_select,
+                handler: Handler::Plain(h_hw_select),
             },
             Tool {
                 name: "play_open",
@@ -294,7 +372,7 @@ pub fn tools() -> &'static [Tool] {
                     &["path"],
                 ),
                 read_only: true,
-                handler: crate::sessions::open,
+                handler: Handler::Plain(crate::sessions::open),
             },
             Tool {
                 name: "play_control",
@@ -319,7 +397,7 @@ pub fn tools() -> &'static [Tool] {
                     &["session", "cmd"],
                 ),
                 read_only: false,
-                handler: crate::sessions::control,
+                handler: Handler::Plain(crate::sessions::control),
             },
             Tool {
                 name: "play_status",
@@ -327,7 +405,7 @@ pub fn tools() -> &'static [Tool] {
                 cli: "ironav play <file> --json  then {\"cmd\":\"status\"}",
                 input_schema: object(json!({ "session": { "type": "string" } }), &["session"]),
                 read_only: true,
-                handler: crate::sessions::status,
+                handler: Handler::Plain(crate::sessions::status),
             },
             Tool {
                 name: "play_close",
@@ -335,7 +413,7 @@ pub fn tools() -> &'static [Tool] {
                 cli: "(quit the ironav play process)",
                 input_schema: object(json!({ "session": { "type": "string" } }), &["session"]),
                 read_only: false,
-                handler: crate::sessions::close,
+                handler: Handler::Plain(crate::sessions::close),
             },
         ]
     })
@@ -355,6 +433,19 @@ pub fn ontology() -> &'static Ontology {
                     .with_prop("mcp_tool", t.name)
                     .with_prop("input_schema", t.input_schema.clone()),
             );
+        }
+        for k in ironav_analyze::KINDS {
+            o.add_entity(entity(Kind::Observation, k.name, k.name, k.description, Status::Implemented).with_prop("level", k.level.name()));
+        }
+        for a in ironav_analyze::ANALYZERS {
+            o.add_entity(
+                entity(Kind::Analyzer, a.name, a.name, a.description, Status::Implemented)
+                    .with_prop("consumes", serde_json::to_value(a.consumes).unwrap_or_default())
+                    .with_prop("mcp_tool", "analyze"),
+            );
+            for e in a.emits {
+                o.add_relation(&format!("analyzer/{}", a.name), Predicate::Emits, &format!("observation/{e}"), None);
+            }
         }
         o
     })

@@ -4,6 +4,7 @@
 //! "what can IronAV actually do"; the ontology and the planner both read them.
 
 pub mod aac;
+pub mod change;
 pub mod flac;
 pub mod h264;
 pub mod hevc;

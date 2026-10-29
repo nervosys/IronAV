@@ -1826,6 +1826,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironav-analyze"
+version = "0.1.0"
+dependencies = [
+ "ironav-codec",
+ "ironav-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ironav-cli"
 version = "0.1.0"
 dependencies = [
@@ -1862,6 +1872,7 @@ dependencies = [
 name = "ironav-engine"
 version = "0.1.0"
 dependencies = [
+ "ironav-analyze",
  "ironav-codec",
  "ironav-core",
  "ironav-formats",

@@ -91,6 +91,11 @@ impl Runtime {
 /// Output is written to `<output>.partial` and renamed on success, so a failed or
 /// interrupted run never leaves a truncated file at the real path.
 pub fn run(job: &Job, on_progress: &mut dyn FnMut(&Progress)) -> Result<Report> {
+    run_with(job, on_progress, None)
+}
+
+/// [`run`], stopping with a `cancelled` error (and no output) once `cancel` is set.
+pub fn run_with(job: &Job, on_progress: &mut dyn FnMut(&Progress), cancel: Option<&std::sync::atomic::AtomicBool>) -> Result<Report> {
     let t0 = Instant::now();
     let plan = plan(job)?;
     let demuxes = std::iter::once(&job.input).chain(&job.extra_inputs).map(|p| open_demuxer(Path::new(p))).collect::<Result<Vec<_>>>()?;
@@ -98,7 +103,7 @@ pub fn run(job: &Job, on_progress: &mut dyn FnMut(&Progress)) -> Result<Report> 
     let mux = create_muxer(Path::new(&partial), plan.output.format)?;
 
     let rate = rate_control(&job.video)?;
-    match execute(&plan, rate, demuxes, mux, t0, on_progress) {
+    match execute(&plan, rate, demuxes, mux, t0, on_progress, cancel) {
         Ok((steps, bytes_in, bytes_out)) => {
             std::fs::rename(&partial, &job.output)?;
             let wall = t0.elapsed();
@@ -148,6 +153,7 @@ fn execute(
     mut mux: Box<dyn ironav_core::Muxer>,
     t0: Instant,
     on_progress: &mut dyn FnMut(&Progress),
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<Outcome> {
     let (tx_out, rx_out) = sync_channel::<Packet>(QUEUE_DEPTH);
     let out_streams = &plan.output.streams;
@@ -240,7 +246,7 @@ fn execute(
             mux.finish()
         });
 
-        let processed = process(Merge::new(rx_in, bases), tx_out, &mut runtimes, &by_input, t0, on_progress);
+        let processed = process(Merge::new(rx_in, bases), tx_out, &mut runtimes, &by_input, t0, on_progress, cancel);
 
         let writer = writer.join().map_err(|_| Error::new(ErrorCode::Internal, "writer thread panicked"));
         let readers: Vec<_> = readers.into_iter().map(|r| r.join().map_err(|_| Error::new(ErrorCode::Internal, "reader thread panicked"))).collect();
@@ -294,6 +300,7 @@ fn process(
     by_input: &[Vec<Option<usize>>],
     t0: Instant,
     on_progress: &mut dyn FnMut(&Progress),
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<(u64, u64)> {
     let (mut bytes_in, mut bytes_out, mut count) = (0u64, 0u64, 0u64);
 
@@ -312,6 +319,9 @@ fn process(
     }
 
     while let Some((file, p)) = merge.next() {
+        if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+            return Err(Error::new(ErrorCode::Cancelled, "the job was cancelled; nothing was written"));
+        }
         bytes_in += p.data.len() as u64;
         let Some(&Some(ri)) = by_input[file].get(p.stream) else { continue };
         let rt = &mut runtimes[ri];

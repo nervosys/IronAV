@@ -14,11 +14,13 @@ pub enum ErrorCode {
     OutputExists,
     HardwareUnavailable,
     NotFound,
+    /// The caller asked for the work to stop.
+    Cancelled,
     Internal,
 }
 
 impl ErrorCode {
-    pub const ALL: [ErrorCode; 10] = [
+    pub const ALL: [ErrorCode; 11] = [
         Self::Io,
         Self::InvalidInput,
         Self::InvalidArgument,
@@ -28,6 +30,7 @@ impl ErrorCode {
         Self::OutputExists,
         Self::HardwareUnavailable,
         Self::NotFound,
+        Self::Cancelled,
         Self::Internal,
     ];
 
@@ -41,6 +44,7 @@ impl ErrorCode {
             ErrorCode::UnsupportedFormat | ErrorCode::UnsupportedCodec | ErrorCode::UnsupportedFilter => 6,
             ErrorCode::OutputExists => 7,
             ErrorCode::HardwareUnavailable => 8,
+            ErrorCode::Cancelled => 130,
             ErrorCode::Internal => 70,
         }
     }
