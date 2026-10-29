@@ -3,7 +3,7 @@
 
 use super::bitw::BitWriter;
 use crate::h264::cabac::TRANS_LPS;
-use crate::h264::tables::{ABS_OFF, CABAC_INIT_I, CABAC_INIT_PB, LAST_OFF, LPS_RANGE, SIG_OFF};
+use crate::h264::tables::{ABS_OFF, CABAC_INIT_I, CABAC_INIT_PB, LAST_OFF, LAST_OFF_8X8, LPS_RANGE, SIG_OFF, SIG_OFF_8X8};
 use std::sync::OnceLock;
 
 /// Something bins can be given to: the arithmetic coder, or a counter of the bits they would take.
@@ -191,20 +191,26 @@ impl Bins for CabacCost {
 /// Writes one residual block: coded_block_flag (with context `cbf_ctx`, unless `None` because the
 /// block always has one) and the levels, in scan order, of category `cat`. Returns the number of
 /// non-zero levels.
-pub fn write_block(c: &mut impl Bins, cat: usize, cbf_ctx: usize, levels: &[i32]) -> usize {
+pub fn write_block(c: &mut impl Bins, cat: usize, cbf_ctx: Option<usize>, levels: &[i32]) -> usize {
     let max = levels.len();
     let total = levels.iter().filter(|&&l| l != 0).count();
-    c.decision(cbf_ctx, total > 0);
+    if let Some(ctx) = cbf_ctx {
+        c.decision(ctx, total > 0);
+    }
     if total == 0 {
         return 0;
     }
     let last = levels.iter().rposition(|&l| l != 0).unwrap();
     for (i, &l) in levels.iter().enumerate().take(max - 1) {
-        // 4:2:0 chroma DC has three significance contexts, one per position
-        let inc = if cat == 3 { i.min(2) } else { i };
-        c.decision(SIG_OFF[0][cat] as usize + inc, l != 0);
+        // 4:2:0 chroma DC has three significance contexts, one per position; 8x8 blocks share theirs
+        let (sig, lst) = match cat {
+            3 => (i.min(2), i.min(2)),
+            5 => (SIG_OFF_8X8[0][i] as usize, LAST_OFF_8X8[i] as usize),
+            _ => (i, i),
+        };
+        c.decision(SIG_OFF[0][cat] as usize + sig, l != 0);
         if l != 0 {
-            c.decision(LAST_OFF[0][cat] as usize + inc, i == last);
+            c.decision(LAST_OFF[0][cat] as usize + lst, i == last);
             if i == last {
                 break;
             }

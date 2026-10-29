@@ -1,5 +1,6 @@
-//! A software H.264 encoder: Main profile with CABAC (or Constrained Baseline with CAVLC), I and P
-//! pictures with one reference picture, 8-bit 4:2:0 with even dimensions. Macroblocks are coded as Intra4x4, Intra16x16,
+//! A software H.264 encoder: High profile with CABAC and the 8x8 transform (or Main without it, or
+//! Constrained Baseline with CAVLC), I and P
+//! pictures with one reference picture, 8-bit 4:2:0 with even dimensions. Macroblocks are coded as Intra4x4, Intra8x8, Intra16x16,
 //! P_L0_16x16, P_L0_L0_16x8, P_L0_L0_8x16, P_8x8 (8x8 sub-macroblocks) or P_Skip, chosen by SATD and an
 //! estimate of their bits; motion is searched to quarter samples. Pictures are cut into slices of macroblock rows that are coded on separate
 //! threads. Output is Annex B with SPS and PPS ahead of every IDR picture.
@@ -66,6 +67,8 @@ pub struct H264Encoder {
     slices: usize,
     /// CABAC (Main profile) rather than CAVLC (Constrained Baseline).
     cabac: bool,
+    /// With CABAC, the 8x8 transform too (High profile).
+    transform8: bool,
     count: u64,
     frame_num: u32,
     idr_id: u32,
@@ -108,6 +111,7 @@ impl H264Encoder {
             // a slice per eight rows or so: more slices lose too much prediction across their edges
             slices: std::thread::available_parallelism().map_or(1, |n| n.get()).min((mb_h / 8).max(1)),
             cabac: true,
+            transform8: true,
             count: 0,
             frame_num: 0,
             idr_id: 0,
@@ -121,7 +125,11 @@ impl H264Encoder {
 
     fn sps(&self) -> Vec<u8> {
         let mut w = BitWriter::new();
-        if self.cabac {
+        let high = self.cabac && self.transform8;
+        if high {
+            w.put(8, 100); // High
+            w.put(8, 0);
+        } else if self.cabac {
             w.put(8, 77); // Main
             w.put(8, 0b0100_0000); // constraint_set1: Main
         } else {
@@ -130,6 +138,13 @@ impl H264Encoder {
         }
         w.put(8, self.level as u32);
         w.ue(0); // seq_parameter_set_id
+        if high {
+            w.ue(1); // chroma_format_idc: 4:2:0
+            w.ue(0); // bit_depth_luma_minus8
+            w.ue(0); // bit_depth_chroma_minus8
+            w.flag(false); // qpprime_y_zero_transform_bypass_flag
+            w.flag(false); // seq_scaling_matrix_present_flag
+        }
         w.ue(4); // log2_max_frame_num_minus4: 8 bits
         w.ue(2); // pic_order_cnt_type: output order is decoding order
         w.ue(1); // max_num_ref_frames
@@ -190,6 +205,11 @@ impl H264Encoder {
         w.flag(false); // deblocking_filter_control_present_flag
         w.flag(false); // constrained_intra_pred_flag
         w.flag(false); // redundant_pic_cnt_present_flag
+        if self.cabac && self.transform8 {
+            w.flag(true); // transform_8x8_mode_flag
+            w.flag(false); // pic_scaling_matrix_present_flag
+            w.se(0); // second_chroma_qp_index_offset
+        }
         w.finish()
     }
 
@@ -257,7 +277,7 @@ impl Encoder for H264Encoder {
         }
         let qp = self.next_qp(idr);
         let (frame_num, idr_id) = (self.frame_num, self.idr_id);
-        let (mb_w, mb_h, n, use_cabac) = (self.mb_w, self.mb_h, self.slices.clamp(1, self.mb_h), self.cabac);
+        let (mb_w, mb_h, n, use_cabac, t8) = (self.mb_w, self.mb_h, self.slices.clamp(1, self.mb_h), self.cabac, self.transform8);
         let refp = if idr { None } else { self.refp.as_ref().map(|(p, h)| (p, h)) };
         let header = |w: &mut BitWriter, first_mb: usize| {
             w.ue(first_mb as u32); // first_mb_in_slice
@@ -288,7 +308,7 @@ impl Encoder for H264Encoder {
                 .enumerate()
                 .map(|(i, rows)| {
                     let (src, rows) = (&src, rows.clone());
-                    s.spawn(move || FrameCoder::new(src, refp, mb_w, mb_h, qp, rows.clone(), i as u16 + 1, use_cabac).encode(|w| header(w, rows.start * mb_w)))
+                    s.spawn(move || FrameCoder::new(src, refp, mb_w, mb_h, qp, rows.clone(), i as u16 + 1, use_cabac, t8).encode(|w| header(w, rows.start * mb_w)))
                 })
                 .collect();
             jobs.into_iter().map(|j| j.join().expect("an H.264 slice thread panicked")).collect()
@@ -358,14 +378,17 @@ mod tests {
     }
 
     fn run(w: usize, h: usize, frames: usize, qp: Option<u8>, bitrate: Option<u32>, slices: usize) -> (Vec<VideoFrame>, Vec<VideoFrame>, usize) {
-        run_with(w, h, frames, qp, bitrate, slices, true)
+        run_with(w, h, frames, qp, bitrate, slices, 2)
     }
 
-    fn run_with(w: usize, h: usize, frames: usize, qp: Option<u8>, bitrate: Option<u32>, slices: usize, cabac: bool) -> (Vec<VideoFrame>, Vec<VideoFrame>, usize) {
+    /// `mode`: 0 CAVLC (Constrained Baseline), 1 CABAC (Main), 2 CABAC and the 8x8 transform (High).
+    #[allow(clippy::too_many_arguments)]
+    fn run_with(w: usize, h: usize, frames: usize, qp: Option<u8>, bitrate: Option<u32>, slices: usize, mode: u8) -> (Vec<VideoFrame>, Vec<VideoFrame>, usize) {
         let params = StreamParams::Video { width: w as u32, height: h as u32, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational::new(25, 1) };
         let mut enc = H264Encoder::new(&params, qp, bitrate).unwrap();
         enc.slices = slices;
-        enc.cabac = cabac;
+        enc.cabac = mode > 0;
+        enc.transform8 = mode > 1;
         let mut dec = H264Decoder::new();
         let (mut src, mut out, mut bytes) = (Vec::new(), Vec::new(), 0);
         for t in 0..frames {
@@ -399,9 +422,9 @@ mod tests {
 
     #[test]
     fn decoder_rebuilds_the_encoders_reference() {
-        for (w, h, slices, cabac) in [(64, 48, 1, true), (200, 120, 3, true), (16, 16, 1, true), (34, 18, 2, true), (96, 80, 5, true), (64, 48, 1, false), (200, 120, 3, false)] {
+        for (w, h, slices, mode) in [(64, 48, 1, 2), (200, 120, 3, 2), (16, 16, 1, 2), (34, 18, 2, 2), (96, 80, 5, 2), (64, 48, 1, 1), (200, 120, 3, 1), (64, 48, 1, 0), (200, 120, 3, 0)] {
             for qp in [0, 4, 20, 30, 45, 51] {
-                let (src, out, _) = run_with(w, h, 6, Some(qp), None, slices, cabac);
+                let (src, out, _) = run_with(w, h, 6, Some(qp), None, slices, mode);
                 assert_eq!(out.len(), src.len());
                 if qp == 20 {
                     for (s, d) in src.iter().zip(&out) {

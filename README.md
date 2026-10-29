@@ -6,7 +6,7 @@ A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so 
 > **Status: foundation (v0.1).** The architecture, agent interface, ontology, hardware model, CLI, MCP server
 > and both GUIs are working and tested. Containers: **WAV, FLAC, Y4M, MP4, Matroska/WebM (read and write), Ogg, ADTS, MP3 and JPEG.**
 > Audio codecs, each decoded and encoded: **PCM, FLAC, AAC-LC (plus HE-AAC v1 decode), MP3, Opus and Vorbis.**
-> Video: **software decoders for H.264, HEVC (including 4:2:2 and 4:4:4), VP8 and VP9; a software H.264 encoder (Main profile, CABAC); JPEG/Motion-JPEG decoded and encoded in software.**
+> Video: **software decoders for H.264, HEVC (including 4:2:2 and 4:4:4), VP8 and VP9; a software H.264 encoder (High profile: CABAC and the 8x8 transform); JPEG/Motion-JPEG decoded and encoded in software.**
 > NVIDIA GPUs encode H.264 and HEVC (NVENC, preferred for H.264 when usable; HEVC has no software encoder) and decode H.264, HEVC and AV1 (NVDEC).
 > AV1 is decoded on NVIDIA GPUs only (NVDEC); it has no software decoder and no encoder yet. VP9 and AV1 copy between WebM, Matroska and MP4.
 > IronAV is not yet a drop-in replacement for FFmpeg or HandBrake.
@@ -389,11 +389,11 @@ When a GPU decoder is usable (`--hwaccel auto`) it is still chosen for 4:2:0 H.2
 
 ### H.264 encoder
 
-H.264 can be written without a GPU. The software encoder (`h264/enc/`) produces **Main profile** streams with
-CABAC (it can also write Constrained Baseline with CAVLC, which the tests use): I and P pictures with one reference picture, 8-bit `yuv420p` with even dimensions (other sizes are padded to whole
-macroblocks and cropped in the SPS). Each macroblock is coded as Intra 4x4, Intra 16x16, P_Skip or a P macroblock of one 16x16, two 16x8, two 8x16 or four 8x8
+H.264 can be written without a GPU. The software encoder (`h264/enc/`) produces **High profile** streams with
+CABAC and the 8x8 transform (it can also write Main profile, and Constrained Baseline with CAVLC, which the tests use): I and P pictures with one reference picture, 8-bit `yuv420p` with even dimensions (other sizes are padded to whole
+macroblocks and cropped in the SPS). Each macroblock is coded as Intra 4x4, Intra 8x8, Intra 16x16, P_Skip or a P macroblock of one 16x16, two 16x8, two 8x16 or four 8x8
 partitions. The partitioning and its vectors are chosen by SATD plus an estimate of the bits (16x8 and 8x16 are tried when 8x8 beats 16x16).
-With CABAC, P_Skip, that inter candidate, Intra 16x16 and Intra 4x4 are then each coded and the one of least squared error plus
+With CABAC, P_Skip, that inter candidate (with the 4x4 and with the 8x8 transform), Intra 16x16, Intra 4x4 and Intra 8x8 are then each coded and the one of least squared error plus
 lambda times its bits is kept, the bits counted from a copy of the CABAC contexts (CAVLC still decides by SATD). Motion is found by a diamond search from the neighbours' vectors, then refined
 to half and quarter samples, using half-sample planes of the reference picture computed once per picture. Each picture
 is cut into slices of about eight macroblock rows, coded on separate threads (up to the number of CPUs), then loop
@@ -420,7 +420,11 @@ noisy clip (BD-rate, 60 frames, QP 22-38, against the build before them), for ab
 x264 with the Main profile, no B-frames and `tune psnr`, measured the same way (both against that earlier build), IronAV now needs about 4 % fewer bits than
 `veryfast` and 3.5 % more than `medium` on the shapes clip, and about 35 % fewer than `veryfast` and 4 % fewer than `medium` on
 the noisy clip. The figures earlier in this section predate these decisions.
-Not done: B pictures, 8x8 transform (High profile), partitions below 8x8, multiple references, 10-bit.
+The 8x8 transform (High profile) then saves 3.5 % on a smooth 720p clip of soft shapes over a slowly varying background
+(x264 `medium` gains 4.1 % going from Main to High on it), 1.9 % on the shapes clip and nothing on the noisy one, for about a
+fifth more encoding time. With it IronAV needs about 6 % fewer bits than x264 `veryfast` and 5 % more than `medium`
+(both High profile) on the shapes clip.
+Not done: B pictures, partitions below 8x8, multiple references, 10-bit.
 
 ## VP8
 
