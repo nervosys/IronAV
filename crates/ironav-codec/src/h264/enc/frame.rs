@@ -276,6 +276,8 @@ pub struct FrameCoder<'a> {
     /// For a B slice: the list 1 reference with its half samples.
     refp1: Option<&'a Picture>,
     half1: Option<&'a HalfPel>,
+    /// The picture order distances from the list 0 reference to this picture and to the list 1 reference.
+    dist: (i32, i32),
     b_slice: bool,
     pub pic: Picture,
     /// The macroblock rows of this slice, and its 1-based id.
@@ -310,6 +312,7 @@ impl<'a> FrameCoder<'a> {
             half: refp.map(|r| r.1),
             refp1: None,
             half1: None,
+            dist: (1, 2),
             b_slice: false,
             pic: Picture::new(mb_w, mb_h, 1, 8),
             rows,
@@ -330,10 +333,12 @@ impl<'a> FrameCoder<'a> {
         }
     }
 
-    /// Makes the slice a B slice predicting from the list 0 reference given to `new` and `l1`.
-    pub fn with_b(mut self, l1: (&'a Picture, &'a HalfPel)) -> Self {
+    /// Makes the slice a B slice predicting from the list 0 reference given to `new` and `l1`,
+    /// `dist` picture order counts after the first and before the second.
+    pub fn with_b(mut self, l1: (&'a Picture, &'a HalfPel), dist: (i32, i32)) -> Self {
         self.refp1 = Some(l1.0);
         self.half1 = Some(l1.1);
+        self.dist = dist;
         self.b_slice = true;
         self
     }
@@ -1299,12 +1304,14 @@ impl<'a> FrameCoder<'a> {
         let mut mvs = [[0i16; 2]; 2];
         let mut costs = [0i32; 2];
         let mut preds = [[0u16; 256]; 2];
-        // the co-located vector spans both lists' references
-        let col = self.col_mv(self.refp1.unwrap(), mbx, mby).map(|m| m.map(|v| v / 2));
+        // the co-located vector spans both lists' references, split by the picture's distances from them
+        let (tb, td) = self.dist;
+        let scale = |m: [i16; 2], num: i32, den: i32| m.map(|v| (v as i32 * num / den) as i16);
+        let col = self.col_mv(self.refp1.unwrap(), mbx, mby);
         for l in 0..2 {
-            let mut extra: Vec<_> = col.map(|m| if l == 0 { m } else { m.map(|v| -v) }).into_iter().collect();
+            let mut extra: Vec<_> = col.map(|m| if l == 0 { scale(m, tb, td) } else { scale(m, tb - td, td) }).into_iter().collect();
             if l == 1 {
-                extra.push(mvs[0].map(|v| -v));
+                extra.push(scale(mvs[0], tb - td, tb));
             }
             let (mv, c) = self.motion_search(l, mbx, mby, PARTS[0][0], mvps[l], &extra);
             mvs[l] = mv;

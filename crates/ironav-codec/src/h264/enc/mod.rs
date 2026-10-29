@@ -1,6 +1,6 @@
 //! A software H.264 encoder: High profile with CABAC and the 8x8 transform (or Main without it, or
 //! Constrained Baseline with CAVLC), 8-bit 4:2:0 with even dimensions. Pictures are I and P with one
-//! reference picture and, with CABAC, a non-reference B picture between each pair of P pictures.
+//! reference picture and, with CABAC, two non-reference B pictures between each pair of P pictures.
 //! Macroblocks are coded as Intra4x4, Intra8x8, Intra16x16, P_L0_16x16, P_L0_L0_16x8,
 //! P_L0_L0_8x16, P_8x8 (8x8 sub-macroblocks) or P_Skip, and in B pictures as B_Skip,
 //! B_Direct_16x16 (spatial direct), or 16x16, 16x8, 8x16 or 8x8 (8x8 blocks possibly direct)
@@ -30,6 +30,8 @@ pub const DEFAULT_QP: u8 = 23;
 /// Quantiser offsets of IDR, P and B pictures. B pictures go well above P ones: nothing predicts
 /// from them, so their losses do not spread.
 const QP_OFFSET: [i32; 3] = [-3, 0, 5];
+/// B pictures between each pair of P pictures (with CABAC).
+const BFRAMES: usize = 2;
 
 /// (level_idc, MaxFS in macroblocks, MaxMBPS) from Table A-1.
 const LEVELS: [(u8, u32, u64); 19] = [
@@ -71,9 +73,9 @@ pub struct H264Encoder {
     /// The reference pictures as decoders reconstruct them, with their half samples and picture
     /// order counts, oldest first.
     refs: Vec<(Picture, HalfPel, i32)>,
-    /// B pictures between the P pictures (with CABAC), and a picture waiting to be coded as one.
-    bframes: bool,
-    pending: Option<(Source, i64, u64)>,
+    /// B pictures between the P pictures (with CABAC), and the pictures waiting to be coded as them.
+    bframes: usize,
+    pending: Vec<(Source, i64, u64)>,
     /// Display index of the last IDR picture.
     idr_at: u64,
     /// Every picture's reconstruction by its time stamp.
@@ -124,8 +126,8 @@ impl H264Encoder {
             spent: 0.0,
             allowed: 0.0,
             refs: Vec::new(),
-            bframes: true,
-            pending: None,
+            bframes: BFRAMES,
+            pending: Vec::new(),
             idr_at: 0,
             #[cfg(test)]
             recon: Vec::new(),
@@ -167,7 +169,7 @@ impl H264Encoder {
             w.flag(false); // seq_scaling_matrix_present_flag
         }
         w.ue(4); // log2_max_frame_num_minus4: 8 bits
-        if self.b_frames() {
+        if self.b_frames() > 0 {
             w.ue(0); // pic_order_cnt_type: counted in the slice headers
             w.ue(4); // log2_max_pic_order_cnt_lsb_minus4: 8 bits
             w.ue(2); // max_num_ref_frames
@@ -210,7 +212,8 @@ impl H264Encoder {
         w.ue(0); // max_bits_per_mb_denom
         w.ue(15); // log2_max_mv_length_horizontal
         w.ue(15); // log2_max_mv_length_vertical
-        let b = self.b_frames() as u32;
+        // the P picture after B pictures is shown after them; B pictures are not kept
+        let b = (self.b_frames() > 0) as u32;
         w.ue(b); // max_num_reorder_frames
         w.ue(1 + b); // max_dec_frame_buffering
         w.finish()
@@ -273,8 +276,7 @@ impl H264Encoder {
         // picture's worth when B pictures, which cost much less, lie between them
         let share = match kind {
             0 => 4.0,
-            _ if self.b_frames() => 1.4,
-            _ => 1.0,
+            _ => 1.0 + 0.4 * self.b_frames() as f64,
         };
         let expected = per_frame * share;
         let wanted = (qp - QP_OFFSET[kind as usize]) as f64 + 6.0 * (bits as f64 / expected).max(1e-3).log2();
@@ -306,9 +308,9 @@ impl H264Encoder {
 }
 
 impl H264Encoder {
-    /// Whether pictures are reordered around B pictures (CABAC streams only).
-    fn b_frames(&self) -> bool {
-        self.bframes && self.cabac
+    /// B pictures between P pictures (CABAC streams only).
+    fn b_frames(&self) -> usize {
+        if self.cabac { self.bframes } else { 0 }
     }
 
     /// Codes one picture of `kind` (0 IDR, 1 P, 2 B) shown at display index `d`.
@@ -321,7 +323,7 @@ impl H264Encoder {
         }
         let poc = (2 * (d - self.idr_at)) as i32;
         let qp = self.next_qp(kind);
-        let (frame_num, idr_id, poc_type0) = (self.frame_num, self.idr_id, self.b_frames());
+        let (frame_num, idr_id, poc_type0) = (self.frame_num, self.idr_id, self.b_frames() > 0);
         let (mb_w, mb_h, n, use_cabac, t8) = (self.mb_w, self.mb_h, self.slices.clamp(1, self.mb_h), self.cabac, self.transform8);
         // P: the last reference; B: the references before and after it
         let (l0, l1) = match kind {
@@ -331,6 +333,11 @@ impl H264Encoder {
         };
         let refp = l0.map(|r| (&r.0, &r.1));
         let refp1 = l1.map(|r| (&r.0, &r.1));
+        // a B picture's distances from its list 0 reference and between its references
+        let dist = match (l0, l1) {
+            (Some(a), Some(c)) => (poc - a.2, c.2 - a.2),
+            _ => (1, 2),
+        };
         let header = |w: &mut BitWriter, first_mb: usize| {
             w.ue(first_mb as u32); // first_mb_in_slice
             w.ue([7, 5, 6][kind as usize]); // slice_type: I, P or B, all slices of the picture alike
@@ -373,7 +380,7 @@ impl H264Encoder {
                     s.spawn(move || {
                         let mut coder = FrameCoder::new(src, refp, mb_w, mb_h, qp, rows.clone(), i as u16 + 1, use_cabac, t8);
                         if let Some(r1) = refp1 {
-                            coder = coder.with_b(r1);
+                            coder = coder.with_b(r1, dist);
                         }
                         coder.encode(|w| header(w, rows.start * mb_w))
                     })
@@ -405,7 +412,7 @@ impl H264Encoder {
         self.recon.push((pts, pic.planes.clone()));
         if !b {
             let half = HalfPel::new(&pic.planes[0], mb_w * 16, mb_h * 16);
-            // two references: the pictures either side of a B picture
+            // two references: the pictures either side of the B pictures
             if self.refs.len() == 2 {
                 self.refs.remove(0);
             }
@@ -416,9 +423,24 @@ impl H264Encoder {
     }
 }
 
+impl H264Encoder {
+    /// Codes the waiting pictures with no P picture after them: the last as P, the others as B.
+    fn code_pending(&mut self) -> Vec<Packet> {
+        let mut out = Vec::new();
+        if let Some((s, pts, d)) = self.pending.pop() {
+            out.push(self.code_picture(&s, pts, 1, d));
+        }
+        for (s, pts, d) in std::mem::take(&mut self.pending) {
+            out.push(self.code_picture(&s, pts, 2, d));
+        }
+        out
+    }
+}
+
 impl Encoder for H264Encoder {
-    /// Pictures are coded I P B P B ...: a picture that will be a B picture waits for the P picture
-    /// after it, which is coded first. The picture before an IDR picture is coded as P instead.
+    /// Pictures are coded I P B B P B B ...: pictures that will be B pictures wait for the P picture
+    /// after them, which is coded first. The last picture before an IDR picture, or of the stream,
+    /// is coded as P instead.
     fn encode(&mut self, frame: &Frame) -> Result<Vec<Packet>> {
         let Frame::Video(v) = frame else {
             return Err(Error::invalid_input("the H.264 encoder received an audio frame"));
@@ -428,25 +450,22 @@ impl Encoder for H264Encoder {
         self.count += 1;
         let idr = d % KEYINT == 0;
         let mut out = Vec::new();
-        if idr || !self.b_frames() {
-            if let Some((s, pts, pd)) = self.pending.take() {
-                out.push(self.code_picture(&s, pts, 1, pd));
+        if idr || self.pending.len() == self.b_frames() {
+            if idr {
+                out = self.code_pending();
             }
             out.push(self.code_picture(&src, v.pts, if idr { 0 } else { 1 }, d));
-        } else if let Some((s, pts, pd)) = self.pending.take() {
-            out.push(self.code_picture(&src, v.pts, 1, d));
-            out.push(self.code_picture(&s, pts, 2, pd));
+            for (s, pts, pd) in std::mem::take(&mut self.pending) {
+                out.push(self.code_picture(&s, pts, 2, pd));
+            }
         } else {
-            self.pending = Some((src, v.pts, d));
+            self.pending.push((src, v.pts, d));
         }
         Ok(out)
     }
 
     fn flush(&mut self) -> Result<Vec<Packet>> {
-        Ok(match self.pending.take() {
-            Some((s, pts, d)) => vec![self.code_picture(&s, pts, 1, d)],
-            None => Vec::new(),
-        })
+        Ok(self.code_pending())
     }
 }
 
@@ -500,7 +519,7 @@ mod tests {
         enc.slices = slices;
         enc.cabac = mode > 0;
         enc.transform8 = mode > 1;
-        enc.bframes = mode == 2;
+        enc.bframes = if mode == 2 { BFRAMES } else { 0 };
         let mut dec = H264Decoder::new();
         let (mut src, mut pkts, mut bytes) = (Vec::new(), Vec::new(), 0);
         for t in 0..frames {

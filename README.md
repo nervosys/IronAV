@@ -390,7 +390,7 @@ When a GPU decoder is usable (`--hwaccel auto`) it is still chosen for 4:2:0 H.2
 ### H.264 encoder
 
 H.264 can be written without a GPU. The software encoder (`h264/enc/`) produces **High profile** streams with
-CABAC and the 8x8 transform (it can also write Main profile, and Constrained Baseline with CAVLC, which the tests use): I and P pictures with one reference picture and, with CABAC, a B picture (not used for reference) between each pair of P pictures, 8-bit `yuv420p` with even dimensions (other sizes are padded to whole
+CABAC and the 8x8 transform (it can also write Main profile, and Constrained Baseline with CAVLC, which the tests use): I and P pictures with one reference picture and, with CABAC, two B pictures (not used for reference) between each pair of P pictures, 8-bit `yuv420p` with even dimensions (other sizes are padded to whole
 macroblocks and cropped in the SPS). Each macroblock is coded as Intra 4x4, Intra 8x8, Intra 16x16, P_Skip or a P macroblock of one 16x16, two 16x8, two 8x16 or four 8x8
 partitions; in a B picture it is B_Skip, B_Direct_16x16 (spatial direct), or one 16x16, two 16x8 or two 8x16 partitions each predicted
 from list 0, list 1 or the average of both, or four 8x8 blocks that may also be direct. The partitioning and its vectors are chosen by SATD plus an estimate of the bits (16x8 and 8x16 are tried when 8x8 beats 16x16).
@@ -429,7 +429,8 @@ The B pictures save 0.7 % on the shapes clip, 2.7 % on the smooth clip and 14 % 
 QP 22-38, against the build before them; x264 `medium` gains 0.5 % and 4.3 % from one B picture on the first two) and make encoding
 faster, since a B macroblock tries fewer candidates. They are written with picture order counts, so an MP4 gets
 composition offsets. The B partitions below 16x16 then save 6.1 % on the shapes clip and 4.7 % on the smooth clip,
-cost 0.5 % on the noisy clip, and take about a fifth more encoding time. Not done: more than one B picture in a row, partitions below 8x8,
+cost 0.5 % on the noisy clip, and take about a fifth more encoding time. A second B picture in a row then saves 2.9 %, 1.0 % and 6.6 % and is faster again (a third
+loses most of that). Not done: partitions below 8x8,
 multiple references, 10-bit.
 
 ## VP8
