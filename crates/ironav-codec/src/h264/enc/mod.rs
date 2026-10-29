@@ -23,6 +23,8 @@ use ironav_core::{Encoder, Error, ErrorCode, Frame, Packet, PixelFormat, Rationa
 
 /// Pictures between IDR pictures.
 const KEYINT: u64 = 250;
+/// Bits per pixel at quantiser 26, roughly, for the rate control's first guess.
+const BPP: f64 = 0.1;
 
 /// The quantiser used when neither a quantiser nor a bit rate is set.
 pub const DEFAULT_QP: u8 = 23;
@@ -122,7 +124,9 @@ impl H264Encoder {
             level,
             qp: if bitrate.is_none() { Some(qp.unwrap_or(DEFAULT_QP).min(51)) } else { None },
             bitrate,
-            rc_qp: 26.0,
+            // a first guess from the bits per pixel the rate allows: about a tenth at 26, half as
+            // many for every 7 added (it varies a lot with the content)
+            rc_qp: bitrate.map_or(26.0, |r| (26.0 - 7.0 * (r as f64 / (fps * width as f64 * height as f64) / BPP).log2()).clamp(10.0, 45.0)),
             spent: 0.0,
             allowed: 0.0,
             refs: Vec::new(),
@@ -276,7 +280,7 @@ impl H264Encoder {
         // picture's worth when B pictures, which cost much less, lie between them
         let share = match kind {
             0 => 4.0,
-            _ => 1.0 + 0.4 * self.b_frames() as f64,
+            _ => 1.0 + 0.25 * self.b_frames() as f64,
         };
         let expected = per_frame * share;
         let wanted = (qp - QP_OFFSET[kind as usize]) as f64 + 6.0 * (bits as f64 / expected).max(1e-3).log2();
