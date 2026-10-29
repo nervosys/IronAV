@@ -15,7 +15,7 @@ mod idct;
 mod inter;
 mod intra;
 mod mb;
-mod ps;
+pub(crate) mod ps;
 pub(crate) mod tables;
 
 use bits::{split_annexb, unescape};

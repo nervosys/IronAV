@@ -1919,6 +1919,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironav-live"
+version = "0.1.0"
+dependencies = [
+ "ironav-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ironav-ontology"
 version = "0.1.0"
 dependencies = [

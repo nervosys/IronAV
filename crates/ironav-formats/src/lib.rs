@@ -8,6 +8,7 @@ mod mkvwrite;
 mod mp4;
 mod mp3;
 mod mp4demux;
+pub mod stream;
 mod ogg;
 mod vpxav1;
 mod oggwrite;

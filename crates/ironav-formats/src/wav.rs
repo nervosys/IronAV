@@ -31,20 +31,7 @@ impl<R: Read + Seek + Send> WavDemuxer<R> {
                 b"fmt " => {
                     let mut b = vec![0u8; size as usize];
                     r.read_exact(&mut b)?;
-                    if b.len() < 16 {
-                        return Err(Error::invalid_input("WAV 'fmt ' chunk is too short"));
-                    }
-                    let mut tag = u16::from_le_bytes([b[0], b[1]]);
-                    if tag == 0xFFFE && b.len() >= 26 {
-                        tag = u16::from_le_bytes([b[24], b[25]]);
-                    }
-                    fmt = Some((
-                        tag,
-                        u16::from_le_bytes([b[2], b[3]]),
-                        u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
-                        u16::from_le_bytes([b[12], b[13]]),
-                        u16::from_le_bytes([b[14], b[15]]),
-                    ));
+                    fmt = Some(fmt_fields(&b)?);
                     if size % 2 == 1 {
                         r.seek(SeekFrom::Current(1))?;
                     }
@@ -52,24 +39,7 @@ impl<R: Read + Seek + Send> WavDemuxer<R> {
                 b"data" => {
                     let (tag, channels, rate, align, bits) =
                         fmt.ok_or_else(|| Error::invalid_input("WAV 'data' chunk precedes 'fmt ' chunk"))?;
-                    let codec = match (tag, bits) {
-                        (1, 8) => CodecId::PcmU8,
-                        (1, 16) => CodecId::PcmS16Le,
-                        (1, 24) => CodecId::PcmS24Le,
-                        (1, 32) => CodecId::PcmS32Le,
-                        (3, 32) => CodecId::PcmF32Le,
-                        (3, 64) => CodecId::PcmF64Le,
-                        _ => {
-                            return Err(Error::new(
-                                ErrorCode::UnsupportedCodec,
-                                format!("WAV format tag {tag} with {bits} bits per sample is not supported"),
-                            )
-                            .hint("supported: 8/16/24/32-bit integer PCM and 32/64-bit float PCM"))
-                        }
-                    };
-                    if channels == 0 || rate == 0 || align == 0 {
-                        return Err(Error::invalid_input("WAV header has zero channels, sample rate or block alignment"));
-                    }
+                    let codec = pcm_codec(tag, bits, channels, rate, align)?;
                     let start = r.stream_position()?;
                     // Streaming writers leave 0 / 0xFFFFFFFF here; trust the file length instead.
                     let avail = total.saturating_sub(start);
@@ -101,6 +71,45 @@ impl<R: Read + Seek + Send> WavDemuxer<R> {
             }
         }
     }
+}
+
+/// Format tag (the subformat's, for WAVE_FORMAT_EXTENSIBLE), channels, sample rate, block
+/// alignment and bits per sample from the body of a 'fmt ' chunk.
+pub(crate) fn fmt_fields(b: &[u8]) -> Result<(u16, u16, u32, u16, u16)> {
+    if b.len() < 16 {
+        return Err(Error::invalid_input("WAV 'fmt ' chunk is too short"));
+    }
+    let mut tag = u16::from_le_bytes([b[0], b[1]]);
+    if tag == 0xFFFE && b.len() >= 26 {
+        tag = u16::from_le_bytes([b[24], b[25]]);
+    }
+    Ok((
+        tag,
+        u16::from_le_bytes([b[2], b[3]]),
+        u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+        u16::from_le_bytes([b[12], b[13]]),
+        u16::from_le_bytes([b[14], b[15]]),
+    ))
+}
+
+/// The PCM codec a WAV format describes, after checking it can be read.
+pub(crate) fn pcm_codec(tag: u16, bits: u16, channels: u16, rate: u32, align: u16) -> Result<CodecId> {
+    let codec = match (tag, bits) {
+        (1, 8) => CodecId::PcmU8,
+        (1, 16) => CodecId::PcmS16Le,
+        (1, 24) => CodecId::PcmS24Le,
+        (1, 32) => CodecId::PcmS32Le,
+        (3, 32) => CodecId::PcmF32Le,
+        (3, 64) => CodecId::PcmF64Le,
+        _ => {
+            return Err(Error::new(ErrorCode::UnsupportedCodec, format!("WAV format tag {tag} with {bits} bits per sample is not supported"))
+                .hint("supported: 8/16/24/32-bit integer PCM and 32/64-bit float PCM"))
+        }
+    };
+    if channels == 0 || rate == 0 || align == 0 {
+        return Err(Error::invalid_input("WAV header has zero channels, sample rate or block alignment"));
+    }
+    Ok(codec)
 }
 
 impl<R: Read + Seek + Send> Demuxer for WavDemuxer<R> {

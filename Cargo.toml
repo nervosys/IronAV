@@ -7,6 +7,7 @@ members = [
     "crates/ironav-formats",
     "crates/ironav-ontology",
     "crates/ironav-analyze",
+    "crates/ironav-live",
     "crates/ironav-player",
     "crates/ironav-engine",
     "crates/ironav-webui",
@@ -30,6 +31,7 @@ ironav-codec = { path = "crates/ironav-codec" }
 ironav-formats = { path = "crates/ironav-formats" }
 ironav-ontology = { path = "crates/ironav-ontology" }
 ironav-analyze = { path = "crates/ironav-analyze" }
+ironav-live = { path = "crates/ironav-live" }
 ironav-player = { path = "crates/ironav-player", default-features = false }
 ironav-engine = { path = "crates/ironav-engine" }
 ironav-webui = { path = "crates/ironav-webui" }

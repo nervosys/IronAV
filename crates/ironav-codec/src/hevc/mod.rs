@@ -11,7 +11,7 @@ mod filter;
 mod frame;
 mod inter;
 mod intra;
-mod ps;
+pub(crate) mod ps;
 mod slice;
 mod tables;
 mod transform;

@@ -18,20 +18,20 @@ use std::io::{Read, Seek, SeekFrom};
 /// The largest file whose frames are indexed.
 const MAX_SCAN: u64 = 2 << 30;
 
-const RATES: [u32; 13] = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
+pub(crate) const RATES: [u32; 13] = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
 
 #[derive(Clone, Copy, PartialEq)]
-struct Header {
-    profile: u8,
-    sfi: u8,
-    channels: u8,
+pub(crate) struct Header {
+    pub(crate) profile: u8,
+    pub(crate) sfi: u8,
+    pub(crate) channels: u8,
     /// Header length in bytes (7, or 9 with a CRC).
-    len: usize,
+    pub(crate) len: usize,
     /// Frame length including the header.
-    frame: usize,
+    pub(crate) frame: usize,
 }
 
-fn parse(b: &[u8]) -> Option<Header> {
+pub(crate) fn parse(b: &[u8]) -> Option<Header> {
     if b.len() < 7 || b[0] != 0xFF || b[1] & 0xF6 != 0xF0 {
         return None;
     }

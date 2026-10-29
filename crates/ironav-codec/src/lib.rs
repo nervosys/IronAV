@@ -103,6 +103,24 @@ fn unsupported(codec: CodecId, what: &str) -> Error {
 }
 
 /// A decoder for a stream, including the codec configuration (AAC's AudioSpecificConfig) it carries.
+/// The displayed picture size an H.264 or HEVC sequence parameter set describes; `nal` is the
+/// whole NAL unit, header included. `None` for other NAL units or codecs, or a damaged one.
+pub fn sps_picture_size(codec: CodecId, nal: &[u8]) -> Option<(u32, u32)> {
+    match codec {
+        CodecId::H264 if nal.len() > 1 && nal[0] & 31 == 7 => {
+            let s = h264::ps::parse_sps(&h264::bits::unescape(&nal[1..])).ok()?;
+            let [l, r, t, b] = s.crop;
+            Some(((s.mb_width * 16).checked_sub(l + r)? as u32, (s.mb_height * 16).checked_sub(t + b)? as u32))
+        }
+        CodecId::Hevc if nal.len() > 2 && (nal[0] >> 1) & 63 == 33 => {
+            let s = hevc::ps::parse_sps(&h264::bits::unescape(&nal[2..])).ok()?;
+            let [l, r, t, b] = s.crop;
+            Some((s.width.checked_sub(l + r)? as u32, s.height.checked_sub(t + b)? as u32))
+        }
+        _ => None,
+    }
+}
+
 pub fn new_decoder_for(s: &ironav_core::StreamInfo) -> Result<Box<dyn Decoder>> {
     match s.codec {
         CodecId::Aac => {
