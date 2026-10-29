@@ -23,6 +23,8 @@ use ironav_core::{Encoder, Error, ErrorCode, Frame, Packet, PixelFormat, Rationa
 
 /// Pictures between IDR pictures.
 const KEYINT: u64 = 250;
+/// A picture predicted from the last one this much as badly as from its own block means starts a scene.
+const SCENE_CUT: f64 = 0.8;
 /// Bits per pixel at quantiser 26, roughly, for the rate control's first guess.
 const BPP: f64 = 0.1;
 
@@ -80,6 +82,8 @@ pub struct H264Encoder {
     pending: Vec<(Source, i64, u64)>,
     /// Display index of the last IDR picture.
     idr_at: u64,
+    /// The last picture's luma at a quarter of the size, to find scene cuts.
+    last_low: Option<Vec<i32>>,
     /// Every picture's reconstruction by its time stamp.
     #[cfg(test)]
     recon: Vec<(i64, [Vec<u16>; 3])>,
@@ -133,6 +137,7 @@ impl H264Encoder {
             bframes: BFRAMES,
             pending: Vec::new(),
             idr_at: 0,
+            last_low: None,
             #[cfg(test)]
             recon: Vec::new(),
             // a slice per eight rows or so: more slices lose too much prediction across their edges
@@ -441,6 +446,48 @@ impl H264Encoder {
     }
 }
 
+impl H264Encoder {
+    /// The picture's luma averaged over 4x4 blocks.
+    fn low_res(&self, src: &Source) -> Vec<i32> {
+        let (pw, lw, lh) = (self.mb_w * 16, self.mb_w * 4, self.mb_h * 4);
+        let y = &src.planes[0];
+        let mut out = vec![0; lw * lh];
+        for (i, o) in out.iter_mut().enumerate() {
+            let (x0, y0) = (i % lw * 4, i / lw * 4);
+            *o = (0..16).map(|k| y[(y0 + k / 4) * pw + x0 + k % 4] as i32).sum::<i32>() >> 4;
+        }
+        out
+    }
+
+    /// Whether the picture whose quarter-size luma is `cur` starts a new scene after `prev`: when
+    /// its 8x8 blocks, each moved up to 4 samples, predict from the last picture little better
+    /// than from their own mean.
+    fn scene_cut(&self, prev: &[i32], cur: &[i32]) -> bool {
+        let (lw, lh) = (self.mb_w * 4, self.mb_h * 4);
+        let (mut inter, mut intra) = (0i64, 0i64);
+        for by in (0..lh.saturating_sub(7)).step_by(8) {
+            for bx in (0..lw.saturating_sub(7)).step_by(8) {
+                let at = |x: usize, y: usize| cur[(by + y) * lw + bx + x];
+                let mean = (0..64).map(|k| at(k % 8, k / 8)).sum::<i32>() / 64;
+                intra += (0..64).map(|k| (at(k % 8, k / 8) - mean).abs() as i64).sum::<i64>();
+                let mut best = i64::MAX;
+                for dy in -4i32..=4 {
+                    for dx in -4i32..=4 {
+                        let (ox, oy) = (bx as i32 + dx, by as i32 + dy);
+                        if ox < 0 || oy < 0 || ox as usize + 8 > lw || oy as usize + 8 > lh {
+                            continue;
+                        }
+                        let sad = (0..64).map(|k| (at(k % 8, k / 8) - prev[(oy as usize + k / 8) * lw + ox as usize + k % 8]).abs() as i64).sum::<i64>();
+                        best = best.min(sad);
+                    }
+                }
+                inter += best;
+            }
+        }
+        inter as f64 > SCENE_CUT * intra as f64
+    }
+}
+
 impl Encoder for H264Encoder {
     /// Pictures are coded I P B B P B B ...: pictures that will be B pictures wait for the P picture
     /// after them, which is coded first. The last picture before an IDR picture, or of the stream,
@@ -452,7 +499,10 @@ impl Encoder for H264Encoder {
         let src = self.source(v)?;
         let d = self.count;
         self.count += 1;
-        let idr = d % KEYINT == 0;
+        let low = self.low_res(&src);
+        let cut = self.last_low.as_ref().is_some_and(|prev| self.scene_cut(prev, &low));
+        self.last_low = Some(low);
+        let idr = d == 0 || d - self.idr_at >= KEYINT || cut;
         let mut out = Vec::new();
         if idr || self.pending.len() == self.b_frames() {
             if idr {
@@ -569,6 +619,44 @@ mod tests {
                         assert!(p > 36.0, "{w}x{h} qp {qp}: luma PSNR {p:.1}");
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn a_scene_cut_starts_an_idr_picture() {
+        let (w, h) = (96, 64);
+        let params = StreamParams::Video { width: w as u32, height: h as u32, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational::new(25, 1) };
+        let mut enc = H264Encoder::new(&params, Some(26), None).unwrap();
+        let mut dec = H264Decoder::new();
+        let mut pkts = Vec::new();
+        for t in 0..10 {
+            // from the sixth picture on, a vertical gradient instead
+            let mut f = scene(w, h, t);
+            if t >= 5 {
+                for (i, v) in f.planes[0].iter_mut().enumerate() {
+                    *v = (255 - i / w * 3) as u8;
+                }
+            }
+            pkts.extend(enc.encode(&Frame::Video(f)).unwrap());
+        }
+        pkts.extend(enc.flush().unwrap());
+        // NAL units of type 5 (IDR slices)
+        let idr = |p: &Packet| p.data.windows(4).any(|w| w[..3] == [0, 0, 1] && w[3] & 31 == 5);
+        let idrs: Vec<i64> = pkts.iter().filter(|p| idr(p)).map(|p| p.pts).collect();
+        assert_eq!(idrs, [0, 5]);
+        let mut out = Vec::new();
+        for p in &pkts {
+            out.extend(dec.decode(p).unwrap());
+        }
+        out.extend(dec.flush().unwrap());
+        assert_eq!(out.len(), 10);
+        for f in out {
+            let Frame::Video(d) = f else { unreachable!() };
+            let recon = &enc.recon.iter().find(|r| r.0 == d.pts).unwrap().1;
+            let s = enc.mb_w * 16;
+            for r in 0..h {
+                assert_eq!(&d.planes[0][r * w..r * w + w], recon[0][r * s..r * s + w].iter().map(|&v| v as u8).collect::<Vec<_>>().as_slice(), "frame {} row {r}", d.pts);
             }
         }
     }

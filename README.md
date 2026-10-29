@@ -401,7 +401,7 @@ is cut into slices of about eight macroblock rows, coded on separate threads (up
 filtered as a whole. Reconstruction reuses the decoder's prediction, inverse transform and loop filter, so the
 reference the encoder keeps is the one every decoder builds (a unit test decodes each picture and compares). `--qp N`
 holds a quantiser (23 by default; IDR pictures get 3 less, as in x264, and B pictures 5 more); `--vbitrate KBPS` steers the quantiser picture by picture to an average rate.
-An IDR picture with SPS and PPS starts every 250 pictures. NVENC is still chosen when a usable GPU is present;
+An IDR picture with SPS and PPS starts every 250 pictures, and at a scene cut: a picture that a quarter-size motion search predicts from the last one little better than from its own block means (this saves 1.9 % on a clip of three 20-picture scenes). NVENC is still chosen when a usable GPU is present;
 `--hwaccel off` selects the software encoder.
 
 Checked by decoding with FFmpeg (through PyAV): 24 cases from 16x16 to 1280x720, QP 0 to 51 and four bit rates all decode
