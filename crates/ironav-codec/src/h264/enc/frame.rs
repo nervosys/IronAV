@@ -762,9 +762,13 @@ impl<'a> FrameCoder<'a> {
             self.satd(0, x0, y0, w, h, pred) + lam * mvd_bits(mv, mvp)
         };
         best_cost = cost_sub(best, pred);
-        for step in [2i32, 1] {
+        // the eight half samples around, then the four nearest quarter samples (the diagonal ones
+        // gain nothing for their time)
+        let square: &[(i32, i32)] = &[(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)];
+        let diamond: &[(i32, i32)] = &[(0, -1), (-1, 0), (1, 0), (0, 1)];
+        for (step, pts) in [(2i32, square), (1, diamond)] {
             let centre = best;
-            for (dx, dy) in [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)] {
+            for &(dx, dy) in pts {
                 let c = clamp([centre[0] as i32 + dx * step, centre[1] as i32 + dy * step]);
                 let cost = cost_sub(c, pred);
                 if cost < best_cost {
@@ -1267,7 +1271,7 @@ impl<'a> FrameCoder<'a> {
 
     /// Chooses a B macroblock by rate-distortion cost among B_Skip and B_Direct_16x16 (spatial
     /// direct), the best by SATD of L0, L1 and Bi 16x16, the best smaller partitioning if it beats
-    /// that, and the intra types.
+    /// that, and Intra16x16 and Intra4x4.
     fn decide_b(&mut self, mbx: usize, mby: usize) -> MbCode {
         let lam = self.lambda;
         let lam2 = 1.6 * 2f64.powf((self.qp as f64 - 12.0) / 3.0);
@@ -1361,16 +1365,11 @@ impl<'a> FrameCoder<'a> {
         self.code_intra_chroma(&mut code, mbx, mby);
         let j = self.rd_cost(&code, mbx, mby, lam2);
         keep(self, j, code);
+        // Intra8x8 rarely beats Intra4x4 in a B picture, and costs as much to try
         let mut code = self.code_i4(mbx, mby).0;
         self.code_intra_chroma(&mut code, mbx, mby);
         let j = self.rd_cost(&code, mbx, mby, lam2);
         keep(self, j, code);
-        if self.transform8 {
-            let mut code = self.code_i8(mbx, mby);
-            self.code_intra_chroma(&mut code, mbx, mby);
-            let j = self.rd_cost(&code, mbx, mby, lam2);
-            keep(self, j, code);
-        }
         let (_, code, rec) = best.unwrap();
         self.restore_mb(mbx, mby, &rec);
         code
