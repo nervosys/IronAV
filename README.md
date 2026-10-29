@@ -390,16 +390,17 @@ When a GPU decoder is usable (`--hwaccel auto`) it is still chosen for 4:2:0 H.2
 ### H.264 encoder
 
 H.264 can be written without a GPU. The software encoder (`h264/enc/`) produces **High profile** streams with
-CABAC and the 8x8 transform (it can also write Main profile, and Constrained Baseline with CAVLC, which the tests use): I and P pictures with one reference picture, 8-bit `yuv420p` with even dimensions (other sizes are padded to whole
+CABAC and the 8x8 transform (it can also write Main profile, and Constrained Baseline with CAVLC, which the tests use): I and P pictures with one reference picture and, with CABAC, a B picture (not used for reference) between each pair of P pictures, 8-bit `yuv420p` with even dimensions (other sizes are padded to whole
 macroblocks and cropped in the SPS). Each macroblock is coded as Intra 4x4, Intra 8x8, Intra 16x16, P_Skip or a P macroblock of one 16x16, two 16x8, two 8x16 or four 8x8
-partitions. The partitioning and its vectors are chosen by SATD plus an estimate of the bits (16x8 and 8x16 are tried when 8x8 beats 16x16).
+partitions; in a B picture it is B_Skip, B_Direct_16x16 (spatial direct) or one 16x16 partition predicted from list 0, list 1 or the
+average of both. The partitioning and its vectors are chosen by SATD plus an estimate of the bits (16x8 and 8x16 are tried when 8x8 beats 16x16).
 With CABAC, P_Skip, that inter candidate (with the 4x4 and with the 8x8 transform), Intra 16x16, Intra 4x4 and Intra 8x8 are then each coded and the one of least squared error plus
-lambda times its bits is kept, the bits counted from a copy of the CABAC contexts (CAVLC still decides by SATD). Motion is found by a diamond search from the neighbours' vectors, then refined
+lambda times its bits is kept, the bits counted from a copy of the CABAC contexts (CAVLC still decides by SATD). Motion is found by a diamond search from the neighbours' vectors and the co-located vector of the other reference, then refined
 to half and quarter samples, using half-sample planes of the reference picture computed once per picture. Each picture
 is cut into slices of about eight macroblock rows, coded on separate threads (up to the number of CPUs), then loop
 filtered as a whole. Reconstruction reuses the decoder's prediction, inverse transform and loop filter, so the
 reference the encoder keeps is the one every decoder builds (a unit test decodes each picture and compares). `--qp N`
-holds a quantiser (23 by default; IDR pictures get 3 less, as in x264); `--vbitrate KBPS` steers the quantiser picture by picture to an average rate.
+holds a quantiser (23 by default; IDR pictures get 3 less, as in x264, and B pictures 5 more); `--vbitrate KBPS` steers the quantiser picture by picture to an average rate.
 An IDR picture with SPS and PPS starts every 250 pictures. NVENC is still chosen when a usable GPU is present;
 `--hwaccel off` selects the software encoder.
 
@@ -424,7 +425,11 @@ The 8x8 transform (High profile) then saves 3.5 % on a smooth 720p clip of soft 
 (x264 `medium` gains 4.1 % going from Main to High on it), 1.9 % on the shapes clip and nothing on the noisy one, for about a
 fifth more encoding time. With it IronAV needs about 6 % fewer bits than x264 `veryfast` and 5 % more than `medium`
 (both High profile) on the shapes clip.
-Not done: B pictures, partitions below 8x8, multiple references, 10-bit.
+The B pictures save 0.7 % on the shapes clip, 2.7 % on the smooth clip and 14 % on the noisy one (BD-rate, 60 frames,
+QP 22-38, against the build before them; x264 `medium` gains 0.5 % and 4.3 % from one B picture on the first two) and make encoding
+faster, since a B macroblock tries fewer candidates. They are written with picture order counts, so an MP4 gets
+composition offsets. Not done: B partitions below 16x16, more than one B picture in a row, partitions below 8x8,
+multiple references, 10-bit.
 
 ## VP8
 

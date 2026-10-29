@@ -8,6 +8,9 @@ const PAD: usize = 48;
 
 pub struct HalfPel {
     stride: usize,
+    /// The picture's size.
+    pw: usize,
+    ph: usize,
     /// Integer samples (with the picture's edges repeated), and the half samples to the right (b),
     /// below (h) and diagonally between (j), each at the integer sample's index.
     planes: [Vec<u8>; 4],
@@ -65,7 +68,7 @@ impl HalfPel {
                 j[y * sw + x] = ((v + 512) >> 10).clamp(0, 255) as u8;
             }
         }
-        HalfPel { stride: sw, planes: [g, b, h, j] }
+        HalfPel { stride: sw, pw, ph, planes: [g, b, h, j] }
     }
 
     fn offset(&self, x: i32, y: i32) -> usize {
@@ -75,7 +78,10 @@ impl HalfPel {
     /// The `w` x `h` block at (x, y) displaced by `mv` (quarter samples), as the decoder predicts it.
     pub fn predict(&self, x: i32, y: i32, mv: [i16; 2], w: usize, h: usize, out: &mut [u16]) {
         let (fx, fy) = ((mv[0] & 3) as usize, (mv[1] & 3) as usize);
-        let (ix, iy) = (x + (mv[0] >> 2) as i32, y + (mv[1] >> 2) as i32);
+        // a block wholly beyond an edge (taps included) sees only the edge's samples, however far
+        // beyond it is, so any vector a decoder accepts can be predicted from the border kept
+        let ix = (x + (mv[0] >> 2) as i32).clamp(-(w as i32) - 3, self.pw as i32 + 1);
+        let iy = (y + (mv[1] >> 2) as i32).clamp(-(h as i32) - 3, self.ph as i32 + 1);
         let (pa, ax, ay, pb, bx, by) = MIX[fy][fx];
         let s = self.stride;
         let a = &self.planes[pa][self.offset(ix + ax as i32, iy + ay as i32)..];
@@ -125,6 +131,17 @@ mod tests {
                     hp.predict(x, y, [mx, my], 16, 16, &mut a);
                     luma_mc(&luma, pw, ph, x, y, mx as i32, my as i32, 16, 16, &mut b, 255);
                     assert_eq!(a, b, "block ({x}, {y}) vector ({mx}, {my})");
+                }
+            }
+        }
+        // vectors far outside the picture, as temporal direct prediction can give
+        for (x, y) in [(0, 0), (40, 24), (32, 16)] {
+            for my in [-2049i16, -1203, -300, -1, 2, 299, 1205, 2047] {
+                for mx in [-8191i16, -2001, -401, 3, 398, 1999, 8190] {
+                    let (mut a, mut b) = ([0u16; 64], [0u16; 64]);
+                    hp.predict(x, y, [mx, my], 8, 8, &mut a);
+                    luma_mc(&luma, pw, ph, x, y, mx as i32, my as i32, 8, 8, &mut b, 255);
+                    assert_eq!(a, b, "8x8 block ({x}, {y}) vector ({mx}, {my})");
                 }
             }
         }
