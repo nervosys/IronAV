@@ -1,7 +1,7 @@
 //! A software H.264 encoder: Main profile with CABAC (or Constrained Baseline with CAVLC), I and P
 //! pictures with one reference picture, 8-bit 4:2:0 with even dimensions. Macroblocks are coded as Intra4x4, Intra16x16,
-//! P_L0_16x16 or P_Skip, chosen by SATD and an estimate of their bits; motion is searched to
-//! quarter samples. Pictures are cut into slices of macroblock rows that are coded on separate
+//! P_L0_16x16, P_L0_L0_16x8, P_L0_L0_8x16, P_8x8 (8x8 sub-macroblocks) or P_Skip, chosen by SATD and an
+//! estimate of their bits; motion is searched to quarter samples. Pictures are cut into slices of macroblock rows that are coded on separate
 //! threads. Output is Annex B with SPS and PPS ahead of every IDR picture.
 
 mod bitw;

@@ -95,10 +95,10 @@ impl HalfPel {
         }
     }
 
-    /// The integer-sample 16x16 block at (x, y), row by row.
-    pub fn rows16(&self, x: i32, y: i32) -> impl Iterator<Item = &[u8]> {
+    /// The integer-sample `w` x `h` block at (x, y), row by row.
+    pub fn rows(&self, x: i32, y: i32, w: usize, h: usize) -> impl Iterator<Item = &[u8]> {
         let o = self.offset(x, y);
-        (0..16).map(move |r| &self.planes[0][o + r * self.stride..o + r * self.stride + 16])
+        (0..h).map(move |r| &self.planes[0][o + r * self.stride..o + r * self.stride + w])
     }
 }
 
