@@ -684,6 +684,10 @@ impl<'a> FrameCoder<'a> {
             let (m, c) = self.motion_search(0, mbx, mby, PARTS[3][k], p, &[mv]);
             mvs8[k] = m;
             cost8 += c + lam * mvd_bits(m, p);
+            // costs only add up: once 8x8 costs more than 16x16 it cannot win
+            if cost8 >= best.2 {
+                break;
+            }
         }
         // 16x8 and 8x16 halves, searched from the 8x8 vectors they cover, when 8x8 beats 16x16
         if cost8 < best.2 {
@@ -697,6 +701,9 @@ impl<'a> FrameCoder<'a> {
                     let (m, c) = self.motion_search(0, mbx, mby, PARTS[part as usize][k], p, &cands);
                     mvs[k] = m;
                     cost += c + lam * mvd_bits(m, p);
+                    if cost >= best.2 {
+                        break;
+                    }
                 }
                 if cost < best.2 {
                     best = (part, mvs, cost);
@@ -1410,14 +1417,15 @@ impl<'a> FrameCoder<'a> {
         let mut dirs = [0u8; 4];
         let mut pmv = [[[0i16; 2]; 4]; 2];
         let mut total = lam * 6;
+        // costs only add up, so a partitioning stops being searched once it costs more than the best
         for (k, &rect) in PARTS[3].iter().enumerate() {
             let (d, mv, c) = search(rect, [&[mvs16[0]][..], &[mvs16[1]][..]], true);
             dirs[k] = d;
             (pmv[0][k], pmv[1][k]) = (mv[0], mv[1]);
             total += c;
-        }
-        if total >= cost16 {
-            return None;
+            if total >= cost16 {
+                return None;
+            }
         }
         let mut best = (3u8, dirs, pmv, total);
         for part in 1..3u8 {
@@ -1428,6 +1436,9 @@ impl<'a> FrameCoder<'a> {
                 dirs[k] = d;
                 (mvs[0][k], mvs[1][k]) = (mv[0], mv[1]);
                 total += c;
+                if total >= best.3 {
+                    break;
+                }
             }
             if total < best.3 {
                 best = (part, dirs, mvs, total);
