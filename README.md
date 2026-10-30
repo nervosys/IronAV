@@ -175,6 +175,29 @@ video keyframe with its timestamps from zero, finishes the one running (`stop_tr
 ironav watch udp://:5000 --record live/stream.m3u8 --segment-seconds 4 --keep-segments 10
 ```
 
+Code in the same process (a detector, a speech model) can take decoded pictures or sound from a session with a tap,
+rather than as observations or through a sidecar's pipe:
+
+```rust
+use ironav_engine::tap::{PixelLayout, TapConfig, TapData};
+let session = ironav_engine::live::open(&args)?;
+let tap = session.tap(TapConfig { fps: Some(5.0), width: Some(640), height: Some(640), letterbox: true, layout: PixelLayout::Bgr, ..TapConfig::video() })?;
+while let Some(f) = tap.recv_timeout(Duration::from_secs(5))? {
+    if let TapData::Video { width, height, pixels, .. } = f.data { /* f.seq, f.t, f.decoded_at */ }
+}
+```
+
+A video tap gives at most `fps` pictures a second (every one when not given), scaled to fit `width` x `height` (aspect
+kept) and, with `letterbox`, padded with black to exactly that size, as RGB, BGR or grey bytes. An audio tap
+(`TapConfig::audio()`) gives mono windows of `window_ms` at `rate` (16 kHz unless asked), starting every `hop_ms` (so
+windows overlap when it is shorter). It takes the stream given as `stream` or the first of its kind, starting its
+decoder if nothing else needed one; if none suits, the first `recv_timeout` says why. The session never waits for a
+tap: each keeps `queue` items (1 unless asked: the latest wins) and drops the oldest when full, and `stats()` counts
+what was made, taken and dropped. Each item has a sequence number counting every item made, so a reader sees a gap; the
+media time `t` in seconds from the source's timestamps (for RTSP, the RTP clock from the start of the stream; not yet
+mapped to wall-clock time from RTCP sender reports); and `decoded_at`, the wall-clock time it was decoded. Dropping
+the tap stops it; once the session ends, `recv_timeout` returns an error after the last item.
+
 What is built and what is still planned is in [docs/design/agentic-realtime.md](docs/design/agentic-realtime.md).
 
 ## Ontology

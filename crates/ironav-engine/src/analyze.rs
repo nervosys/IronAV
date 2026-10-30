@@ -4,6 +4,7 @@
 //! drives the same thing from a socket.
 
 use crate::sidecar::Pending;
+use crate::tap::TapFeeder;
 use crate::tools::Ctx;
 pub use ironav_analyze::Level;
 use ironav_analyze::{analyzer, level_of, Analyzer, AnalyzerInfo, Consumes, Input, LowRes, Observation, Settings, ANALYZERS};
@@ -113,6 +114,8 @@ struct Stream {
     wait_key: bool,
     /// Only keyframes are decoded (video, with [`AnalyzeOptions::keyframes_only`]).
     keyframes_only: bool,
+    /// Code in this process shown each decoded frame.
+    taps: Vec<TapFeeder>,
 }
 
 impl Stream {
@@ -332,6 +335,7 @@ impl Analysis {
                 // live demuxers start video at a keyframe already; this guards any that do not
                 wait_key: live,
                 keyframes_only: opts.keyframes_only && media == MediaType::Video,
+                taps: Vec::new(),
             }));
         }
         for car in pending {
@@ -410,7 +414,7 @@ impl Analysis {
                 }
                 s.frame_analyzers.push((info.name, info.make(&s.info, &self.settings)));
             }
-            if s.frame_analyzers.is_empty() && s.decoder.is_some() {
+            if s.frame_analyzers.is_empty() && s.taps.is_empty() && s.decoder.is_some() {
                 (s.decoder, s.decoder_name) = (None, None);
                 (s.audio_next, s.last_video) = (None, None);
             }
@@ -509,6 +513,34 @@ impl Analysis {
         Ok(Some(format!("it wants {m} and no {m} stream is analyzed and decoded")))
     }
 
+    /// Feeds a tap from the stream it asks for, or the first analyzed stream of its kind that can
+    /// be decoded (a video decoder started now waits for a keyframe); tells its reader why not
+    /// when there is none.
+    pub fn add_tap(&mut self, mut f: TapFeeder) {
+        let media = f.config.media_type();
+        let want = f.config.stream;
+        let m = crate::sidecar::media_name(media);
+        let mut why = match want {
+            Some(i) => format!("stream {i} is not an analyzed {m} stream"),
+            None => format!("no {m} stream is analyzed"),
+        };
+        for s in self.streams.iter_mut().flatten() {
+            if s.info.params.media_type() != media || want.is_some_and(|i| i != s.info.index) {
+                continue;
+            }
+            match start_decoder(s, &self.hwaccel, self.live) {
+                Ok(()) => {
+                    f.attach(s.info.index);
+                    s.taps.push(f);
+                    self.changed = true;
+                    return;
+                }
+                Err(w) => why = w,
+            }
+        }
+        f.fail(why);
+    }
+
     /// Whether which analyzers run has changed since this was last asked (a sidecar joined).
     pub fn take_changed(&mut self) -> bool {
         std::mem::take(&mut self.changed)
@@ -538,7 +570,7 @@ impl Analysis {
         self.streams
             .iter()
             .flatten()
-            .map(|s| json!({ "index": s.info.index, "label": s.label, "codec": s.info.codec.name(), "decoder": s.decoder_name, "analyzers": s.names() }))
+            .map(|s| json!({ "index": s.info.index, "label": s.label, "codec": s.info.codec.name(), "decoder": s.decoder_name, "analyzers": s.names(), "taps": s.taps.len() }))
             .collect()
     }
 
@@ -716,6 +748,10 @@ fn feed_frame(s: &mut Stream, f: Frame, from: f64, to: f64, out: &mut Vec<Observ
             for (_, an) in s.frame_analyzers.iter_mut() {
                 an.observe(&Input::Audio { frame: &a, t }, out);
             }
+            s.taps.retain_mut(|tap| tap.open() && {
+                tap.audio(&a, t);
+                true
+            });
             Some(t)
         }
         Frame::Video(v) => {
@@ -741,6 +777,10 @@ fn feed_frame(s: &mut Stream, f: Frame, from: f64, to: f64, out: &mut Vec<Observ
             for (_, an) in s.frame_analyzers.iter_mut() {
                 an.observe(&Input::Video { frame: &v, low: &low, t, dt }, out);
             }
+            s.taps.retain_mut(|tap| tap.open() && {
+                tap.video(&v, t);
+                true
+            });
             *last = Some((t, v));
             Some(t)
         }

@@ -11,6 +11,7 @@ pub mod record;
 pub mod run;
 mod sessions;
 pub mod sidecar;
+pub mod tap;
 pub mod tools;
 pub mod transcode;
 

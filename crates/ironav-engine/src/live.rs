@@ -7,6 +7,7 @@
 
 use crate::analyze::{png_of, AnalyzeOptions, Analysis, Reconfigure};
 use crate::record::{RecordOptions, Recorder};
+use crate::tap::{Tap, TapConfig, TapFeeder};
 use ironav_analyze::{Level, Observation};
 use ironav_core::{Error, ErrorCode, Rational, Result, StreamInfo, VideoFrame};
 use ironav_formats::stream::{stream_demuxer, StreamOptions, StreamPacket, SNIFF_BYTES};
@@ -141,6 +142,8 @@ struct Shared {
     transcoding: Option<String>,
     /// Changes waiting for the session thread, and how many it has applied.
     reconfigure: VecDeque<(Reconfigure, RecordChange)>,
+    /// Taps waiting for the session thread to attach them.
+    taps: Vec<TapFeeder>,
     requested: u64,
     applied: u64,
 }
@@ -350,6 +353,7 @@ pub fn open(args: &OpenArgs) -> Result<Arc<Session>> {
             recording: args.record.clone(),
             transcoding: args.transcode.as_ref().map(|t| t.output.clone()),
             reconfigure: VecDeque::new(),
+            taps: Vec::new(),
             requested: 0,
             applied: 0,
         }),
@@ -388,7 +392,11 @@ pub fn open(args: &OpenArgs) -> Result<Arc<Session>> {
             } else {
                 sh.state = State::Ended;
             }
+            let unattached = std::mem::take(&mut sh.taps);
             drop(sh);
+            for f in unattached {
+                f.fail("the session stopped before the tap could be attached".into());
+            }
             worker.changed.notify_all();
             if worker.idle_expired() {
                 lock(sessions()).1.retain(|_, x| !Arc::ptr_eq(x, &worker));
@@ -451,6 +459,18 @@ impl Session {
 
     fn idle_expired(&self) -> bool {
         self.polling.load(Ordering::Relaxed) == 0 && self.idle.is_some_and(|d| lock(&self.touched).elapsed() > d)
+    }
+
+    /// Taps decoded pictures or sound, in this process: see [`crate::tap`]. The tap is attached
+    /// with the next packet that arrives; if no stream suits it, its first `recv_timeout` says why.
+    pub fn tap(&self, config: TapConfig) -> Result<Tap> {
+        let (tap, feeder) = crate::tap::tap(config)?;
+        let mut sh = lock(&self.shared);
+        if matches!(sh.state, State::Ended | State::Failed | State::Closed) {
+            return Err(Error::invalid_arg(format!("session {} has stopped; there is nothing to tap", self.id)));
+        }
+        sh.taps.push(feeder);
+        Ok(tap)
     }
 
     /// Changes the running analysis and recording; waits up to a second for the session thread
@@ -679,6 +699,11 @@ impl Session {
                             a.warn(format!("configure: {}", e.message));
                         }
                     }
+                    // and taps, so they see the first keyframe
+                    let early = std::mem::take(&mut lock(&self.shared).taps);
+                    for f in early {
+                        a.add_tap(f);
+                    }
                     let mut sh = lock(&self.shared);
                     // a reader that decides late (after an ID3 tag) knows by now
                     sh.format = Some(d.format_name());
@@ -736,6 +761,15 @@ impl Session {
                 sh.media_seconds = sh.media_seconds.max(a.position());
                 if let Some(p) = a.last_picture.take() {
                     sh.picture = Some(p);
+                }
+                if !sh.taps.is_empty() {
+                    let taps = std::mem::take(&mut sh.taps);
+                    drop(sh);
+                    for f in taps {
+                        a.add_tap(f);
+                    }
+                    let mut sh = lock(&self.shared);
+                    sh.analyzed = a.describe();
                 }
             }
         }
