@@ -67,7 +67,8 @@ impl SourceUrl {
     }
 }
 
-/// `url` with any password replaced by `***`, so it can be echoed in observations, statuses and errors.
+/// `url` with any password replaced by `***`, so it can be echoed in observations, statuses and
+/// errors. User information with no `:` may itself be a token, so all of it is replaced.
 pub fn redact(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else { return url.to_string() };
     let (auth, tail) = match rest.find(['/', '?']) {
@@ -75,10 +76,10 @@ pub fn redact(url: &str) -> String {
         None => (rest, ""),
     };
     match auth.rsplit_once('@') {
-        Some((cred, host)) => {
-            let user = cred.split_once(':').map_or(cred, |(u, _)| u);
-            format!("{scheme}://{user}:***@{host}{tail}")
-        }
+        Some((cred, host)) => match cred.split_once(':') {
+            Some((user, _)) => format!("{scheme}://{user}:***@{host}{tail}"),
+            None => format!("{scheme}://***@{host}{tail}"),
+        },
         None => url.to_string(),
     }
 }
@@ -106,5 +107,6 @@ mod tests {
         assert_eq!(redact("tcp://bob:hunter2@cam.local:554/live?x=1"), "tcp://bob:***@cam.local:554/live?x=1");
         assert_eq!(redact("udp://:5000"), "udp://:5000");
         assert_eq!(redact("clip.y4m"), "clip.y4m");
+        assert_eq!(redact("rtsp://3f9aTOKEN@cam/live"), "rtsp://***@cam/live");
     }
 }

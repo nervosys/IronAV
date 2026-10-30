@@ -5,8 +5,10 @@
 //! and pacing, decoding and analysis belong to the session that owns the source. Every read takes
 //! a deadline, so whoever reads can notice in time that it has been asked to stop.
 
+pub mod net;
 mod source;
 mod url;
 
+pub use net::{Allow, ALLOW_VAR};
 pub use source::{open_source, Chunk, Source, SourceInfo};
 pub use url::{redact, SourceUrl};

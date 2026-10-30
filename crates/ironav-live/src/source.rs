@@ -4,7 +4,8 @@ use crate::url::{redact, SourceUrl};
 use ironav_core::{Error, ErrorCode, Result};
 use serde::Serialize;
 use std::io::{ErrorKind, Read};
-use std::net::{Ipv4Addr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
+use crate::net::{self, Allow};
+use std::net::{Ipv4Addr, TcpListener, TcpStream, UdpSocket};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
@@ -74,8 +75,8 @@ pub fn open_source(url: &str) -> Result<Box<dyn Source>> {
                 l.set_nonblocking(true)?;
                 Box::new(TcpSource { info, listener: Some(l), stream: None })
             } else {
-                let addr = (host, port).to_socket_addrs().map_err(|e| unreachable(e, "could not resolve"))?.next().ok_or_else(|| Error::new(ErrorCode::Io, format!("{shown} resolves to no address")))?;
-                let s = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).map_err(|e| unreachable(e, "could not connect to"))?;
+                // only to an address the allow-list permits (see `net`)
+                let s = net::connect(host, port, CONNECT_TIMEOUT, &Allow::from_env()?, &shown)?;
                 Box::new(TcpSource { info, listener: None, stream: Some(s) })
             }
         }
