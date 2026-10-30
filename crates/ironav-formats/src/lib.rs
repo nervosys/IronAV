@@ -13,6 +13,7 @@ pub mod stream;
 mod ogg;
 mod vpxav1;
 mod oggwrite;
+pub mod renditions;
 pub mod rtp;
 pub mod ts;
 mod wav;

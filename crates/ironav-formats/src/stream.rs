@@ -88,6 +88,10 @@ pub const SNIFF_BYTES: usize = 200;
 /// input is shorter), or of the format `opts.format` names.
 pub fn stream_demuxer(magic: &[u8], opts: &StreamOptions) -> Result<Box<dyn StreamDemuxer>> {
     let fps = opts.frame_rate.unwrap_or(Rational::new(25, 1));
+    // made by the HLS source whatever the format named; each part tells its own from its bytes
+    if magic.starts_with(crate::renditions::MAGIC) {
+        return Ok(Box::new(crate::renditions::Renditions::new(opts)));
+    }
     let format = match opts.format.as_deref() {
         Some(f) => f.to_ascii_lowercase(),
         None => sniff(magic)
@@ -111,6 +115,8 @@ pub fn stream_demuxer(magic: &[u8], opts: &StreamOptions) -> Result<Box<dyn Stre
         "matroska" | "mkv" | "webm" => Box::new(crate::mkv::live::MkvStream::default()),
         "mp4" | "fmp4" | "cmaf" => Box::new(crate::mp4demux::live::Mp4Stream::default()),
         "rtp" => Box::new(crate::rtp::RtpStream::default()),
+        // made by the HLS source for a variant with separate audio, never named by a caller
+        "renditions" => Box::new(crate::renditions::Renditions::new(opts)),
         other => {
             return Err(Error::new(ErrorCode::UnsupportedFormat, format!("'{other}' cannot be read as a stream")).alternatives(STREAM_FORMATS));
         }
@@ -118,6 +124,9 @@ pub fn stream_demuxer(magic: &[u8], opts: &StreamOptions) -> Result<Box<dyn Stre
 }
 
 fn sniff(m: &[u8]) -> Option<&'static str> {
+    if m.starts_with(crate::renditions::MAGIC) {
+        return Some("renditions");
+    }
     if m.starts_with(&[b'$', crate::rtp::DESCRIPTION_CHANNEL]) {
         return Some("rtp");
     }
@@ -339,6 +348,24 @@ pub struct AdtsStream {
     id3_checked: bool,
     pts: i64,
     ended: bool,
+    /// Where the first frame falls on a 90 kHz clock, from the ID3 tag in front (HLS packed audio).
+    start_90k: Option<i64>,
+}
+
+/// The time an HLS packed-audio segment's ID3 tag gives its first frame, on a 90 kHz clock: the
+/// PRIV frame `com.apple.streaming.transportStreamTimestamp` (RFC 8216 3.4), 33 bits.
+pub(crate) fn apple_timestamp(tag: &[u8]) -> Option<i64> {
+    const OWNER: &[u8] = b"com.apple.streaming.transportStreamTimestamp\0";
+    let at = tag.windows(OWNER.len()).position(|w| w == OWNER)? + OWNER.len();
+    let b: [u8; 8] = tag.get(at..at + 8)?.try_into().ok()?;
+    Some((u64::from_be_bytes(b) & 0x1_FFFF_FFFF) as i64)
+}
+
+impl AdtsStream {
+    /// An ADTS reader whose clock starts at `start_90k` (90 kHz), when given.
+    pub(crate) fn starting_at(start_90k: Option<i64>) -> Self {
+        AdtsStream { start_90k, ..AdtsStream::default() }
+    }
 }
 
 impl StreamDemuxer for AdtsStream {
@@ -366,6 +393,7 @@ impl StreamDemuxer for AdtsStream {
                 if d.len() < tag {
                     return Ok(None);
                 }
+                self.start_90k = self.start_90k.or(apple_timestamp(&d[..tag]));
                 self.pending.skip(tag);
             }
             self.id3_checked = true;
@@ -374,6 +402,22 @@ impl StreamDemuxer for AdtsStream {
             let d = self.pending.data();
             if d.len() < 7 {
                 return Ok(None);
+            }
+            // a tag between frames: HLS packed audio has one at each segment, with its time
+            if d.starts_with(b"ID3") && self.locked.is_some() {
+                if d.len() < 10 {
+                    return Ok(None);
+                }
+                let size = d[6..10].iter().fold(0usize, |a, &b| (a << 7) | (b & 0x7F) as usize);
+                let tag = 10 + size + if d[5] & 0x10 != 0 { 10 } else { 0 };
+                if d.len() < tag {
+                    return Ok(None);
+                }
+                if let (Some(t), Some(s)) = (apple_timestamp(&d[..tag]), self.streams.first()) {
+                    self.pts = (t as i128 * s.time_base.den as i128 / 90_000) as i64;
+                }
+                self.pending.skip(tag);
+                continue;
             }
             let Some(h) = adts::parse(&d[..7]) else {
                 self.pending.skip(1);
@@ -401,6 +445,9 @@ impl StreamDemuxer for AdtsStream {
                     }
                     self.locked = Some((h.sfi, h.channels));
                     let rate = adts::RATES[h.sfi as usize];
+                    if let Some(t) = self.start_90k {
+                        self.pts = (t as i128 * rate as i128 / 90_000) as i64;
+                    }
                     let asc = ((h.profile as u16 + 1) << 11) | ((h.sfi as u16) << 7) | ((h.channels as u16) << 3);
                     self.streams.push(StreamInfo {
                         index: 0,

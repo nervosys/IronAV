@@ -405,7 +405,10 @@ segment that uses it: concatenated TS segments are a transport stream and fragme
 are a fragmented MP4, so the existing stream demuxers read the result unchanged. Live playlists start three segments
 from the end, reload every target duration (half when nothing was added), and use media sequence numbers so no segment
 is given twice. Every connection and redirect passes the allow-list, and credentials go only to the URL's own server.
-Encrypted playlists and HTTPS segments are refused at open; separate audio renditions are not played. Checked with
+Encrypted playlists and HTTPS segments are refused at open. Separate audio renditions came later: the HLS source
+follows the variant's playlist and its audio rendition's side by side and writes them as tagged pieces of one byte
+stream (`ironav_formats::renditions`), which a merging demuxer splits, reads with a demuxer per part and puts back in
+time order, so the session and everything after it are unchanged. Checked with
 FFmpeg's HLS muxer writing TS and fMP4 segments: both played through `ironav watch`, recorded, and decoded by FFmpeg
 with every frame. M4 is done.
 

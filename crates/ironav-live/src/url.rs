@@ -13,8 +13,9 @@ use std::collections::BTreeMap;
 /// - `follow`: keep reading a file as it grows;
 /// - `idle`: with `follow`, end after this many seconds without new bytes;
 /// - `listen`: wait for a TCP connection on the given address instead of making one;
-/// - `transport=udp`: have an RTSP server send RTP over UDP rather than on its connection.
-pub const OPTIONS: [&str; 7] = ["format", "fps", "pace", "follow", "idle", "listen", "transport"];
+/// - `transport=udp`: have an RTSP server send RTP over UDP rather than on its connection;
+/// - `audio`: the HLS audio rendition to play, by language or name.
+pub const OPTIONS: [&str; 8] = ["format", "fps", "pace", "follow", "idle", "listen", "transport", "audio"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SourceUrl {

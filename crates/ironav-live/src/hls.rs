@@ -1,7 +1,12 @@
 //! `http://` and `https://` sources: HLS (RFC 8216) when the URL names a playlist, a progressive download
 //! otherwise.
 //!
-//! A master playlist's highest-bandwidth variant is played. Its segments are fetched in order and
+//! A master playlist's highest-bandwidth variant is played. When it takes its audio from a separate
+//! rendition (`EXT-X-MEDIA` of `TYPE=AUDIO` in its `AUDIO` group, with a URI), that one is played
+//! with it: the one the `audio` option names by language or name, else the default, else the first.
+//! The two playlists are then followed side by side, the one behind in media time fetched next, and
+//! their bytes go out as a stream of renditions (`ironav_formats::renditions`), which reads each
+//! with its own demuxer and merges the packets. Its segments are fetched in order and
 //! their bytes given one after another, with the initialization section (`EXT-X-MAP`) in front of
 //! the first segment that uses it: concatenated transport stream segments are a transport stream,
 //! and fragments after their initialization section are a fragmented MP4, so the stream demuxers
@@ -9,8 +14,8 @@
 //! segments from its end and is reloaded every target duration (half of one when nothing was
 //! added); media sequence numbers keep a segment from being given twice, and segments that slid
 //! out of the window before they were fetched are skipped. Byte ranges are fetched with Range
-//! requests. Encrypted playlists and separate audio renditions are not supported; the first are
-//! refused when the source is opened, and so is a playlist reached over HTTPS that lists segments
+//! requests. Encrypted playlists are not supported; they are refused when the source is opened, and
+//! so is a playlist reached over HTTPS that lists segments
 //! over plain HTTP, which anyone on the way could change.
 
 use crate::http::{self, join, HttpUrl};
@@ -40,6 +45,8 @@ const MIN_STALL: Duration = Duration::from_secs(30);
 struct Segment {
     seq: u64,
     uri: String,
+    /// Its `EXTINF` duration, in seconds.
+    duration: f64,
     /// Bytes `first..=last` of the URI, from `EXT-X-BYTERANGE`.
     range: Option<(u64, u64)>,
     /// The initialization section in force: its URI and range.
@@ -54,10 +61,29 @@ struct Media {
     encrypted: Option<String>,
 }
 
+/// A variant of a master playlist.
+#[derive(Debug, Clone, PartialEq)]
+struct Variant {
+    bandwidth: u64,
+    uri: String,
+    /// The `GROUP-ID` of the audio renditions it plays with.
+    audio: Option<String>,
+}
+
+/// An audio rendition (`EXT-X-MEDIA` with `TYPE=AUDIO`).
+#[derive(Debug, Clone, PartialEq)]
+struct Rendition {
+    group: String,
+    /// Absent when the audio is in the variant's own segments.
+    uri: Option<String>,
+    language: Option<String>,
+    name: Option<String>,
+    default: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum Playlist {
-    /// Variants: bandwidth and URI.
-    Master(Vec<(u64, String)>),
+    Master(Vec<Variant>, Vec<Rendition>),
     Media(Media),
 }
 
@@ -99,9 +125,11 @@ fn parse(text: &str, base: &str) -> Result<Playlist> {
         return Err(Error::invalid_input("the playlist does not start with #EXTM3U"));
     }
     let mut variants = Vec::new();
+    let mut renditions = Vec::new();
     let mut media = Media { target: 6.0, ..Media::default() };
     let mut seq = 0u64;
-    let mut pending_bw: Option<u64> = None;
+    let mut duration = 0.0;
+    let mut pending_variant: Option<(u64, Option<String>)> = None;
     let mut range: Option<String> = None;
     let mut map: Option<(String, Option<(u64, u64)>)> = None;
     // where the last range of each resource ended, for ranges without an offset
@@ -113,13 +141,35 @@ fn parse(text: &str, base: &str) -> Result<Playlist> {
         if let Some(tag) = line.strip_prefix('#') {
             let (name, value) = tag.split_once(':').unwrap_or((tag, ""));
             match name {
-                "EXT-X-STREAM-INF" => pending_bw = Some(attributes(value).iter().find(|(k, _)| k == "BANDWIDTH").and_then(|(_, v)| v.parse().ok()).unwrap_or(0)),
+                "EXT-X-STREAM-INF" => {
+                    let a = attributes(value);
+                    let get = |key: &str| a.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
+                    pending_variant = Some((get("BANDWIDTH").and_then(|v| v.parse().ok()).unwrap_or(0), get("AUDIO")));
+                }
+                "EXT-X-MEDIA" => {
+                    let a = attributes(value);
+                    let get = |key: &str| a.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
+                    if get("TYPE").is_some_and(|t| t.eq_ignore_ascii_case("AUDIO")) {
+                        if let Some(group) = get("GROUP-ID") {
+                            renditions.push(Rendition {
+                                group,
+                                uri: get("URI").map(|u| join(base, &u)),
+                                language: get("LANGUAGE"),
+                                name: get("NAME"),
+                                default: get("DEFAULT").is_some_and(|d| d.eq_ignore_ascii_case("YES")),
+                            });
+                        }
+                    }
+                }
                 "EXT-X-TARGETDURATION" => {
                     is_media = true;
                     media.target = value.trim().parse::<f64>().ok().filter(|t| *t > 0.0 && *t < 3600.0).unwrap_or(6.0);
                 }
                 "EXT-X-MEDIA-SEQUENCE" => seq = value.trim().parse().unwrap_or(0),
-                "EXTINF" => is_media = true,
+                "EXTINF" => {
+                    is_media = true;
+                    duration = value.split(',').next().and_then(|d| d.trim().parse::<f64>().ok()).filter(|d| d.is_finite() && *d >= 0.0).unwrap_or(0.0);
+                }
                 "EXT-X-BYTERANGE" => range = Some(value.to_string()),
                 "EXT-X-ENDLIST" => media.ended = true,
                 "EXT-X-KEY" => {
@@ -138,8 +188,8 @@ fn parse(text: &str, base: &str) -> Result<Playlist> {
             continue;
         }
         let uri = join(base, line);
-        if let Some(bw) = pending_bw.take() {
-            variants.push((bw, uri));
+        if let Some((bandwidth, audio)) = pending_variant.take() {
+            variants.push(Variant { bandwidth, uri, audio });
             continue;
         }
         let prev = last_end.as_ref().filter(|(u, _)| *u == uri).and_then(|(_, e)| e.checked_add(1));
@@ -156,11 +206,11 @@ fn parse(text: &str, base: &str) -> Result<Playlist> {
         if media.segments.len() == MAX_SEGMENTS {
             return Err(Error::invalid_input(format!("the playlist lists more than {MAX_SEGMENTS} segments")));
         }
-        media.segments.push(Segment { seq, uri, range: r, map: map.clone() });
+        media.segments.push(Segment { seq, uri, duration: std::mem::take(&mut duration), range: r, map: map.clone() });
         seq = seq.saturating_add(1);
     }
     if !variants.is_empty() && !is_media {
-        return Ok(Playlist::Master(variants));
+        return Ok(Playlist::Master(variants, renditions));
     }
     Ok(Playlist::Media(media))
 }
@@ -211,40 +261,91 @@ pub(crate) fn open(u: &SourceUrl, shown: String) -> Result<Box<dyn Source>> {
     text.extend(r.bytes(MAX_PLAYLIST)?);
     let mut playlist = parse(&String::from_utf8_lossy(&text), &at)?;
     let mut playlist_url = at;
-    if let Playlist::Master(variants) = &playlist {
-        let (_, best) = variants.iter().max_by_key(|(bw, _)| *bw).cloned().unwrap();
-        let (at, p) = fetch_playlist(&best, &allow)?;
-        if matches!(p, Playlist::Master(_)) {
+    let mut audio = None;
+    if let Playlist::Master(variants, renditions) = &playlist {
+        let best = variants.iter().max_by_key(|v| v.bandwidth).cloned().unwrap();
+        audio = pick_audio(&best, renditions, u.option("audio"), &shown)?;
+        let (at, p) = fetch_playlist(&best.uri, &allow)?;
+        if matches!(p, Playlist::Master(..)) {
             return Err(Error::invalid_input(format!("{shown}: a variant of the master playlist is itself a master playlist")));
         }
         playlist = p;
         playlist_url = at;
+    } else if u.option("audio").is_some() {
+        return Err(Error::invalid_arg(format!("{shown} is a media playlist: it has no audio renditions to choose from")));
     }
     let Playlist::Media(media) = playlist else { unreachable!() };
-    check(&media, &shown)?;
-    let start = if media.ended { 0 } else { media.segments.len().saturating_sub(LIVE_START) };
-    let reader = HlsReader {
-        allow,
-        playlist_url,
-        shown: shown.clone(),
-        target: media.target,
-        ended: media.ended,
-        // the queue holds everything from `start` on, so only later segments are new
-        next_seq: media.segments.last().map_or(0, |s| s.seq.saturating_add(1)),
-        queue: media.segments[start..].iter().cloned().collect(),
-        current: None,
-        init: std::io::Cursor::new(Vec::new()),
-        map: None,
-        last_load: Instant::now(),
-        grew: true,
-        failures: 0,
-        progress: Instant::now(),
+    let video = HlsReader::new(allow.clone(), playlist_url, shown.clone(), media)?;
+    let info = SourceInfo { url: shown.clone(), kind: "hls", live: true };
+    let Some(audio_url) = audio else {
+        return Ok(Box::new(ThreadSource::new(info, Box::new(video))));
     };
-    Ok(Box::new(ThreadSource::new(SourceInfo { url: shown, kind: "hls", live: true }, Box::new(reader))))
+    let media = match fetch_playlist(&audio_url, &allow)? {
+        (at, Playlist::Media(m)) => (at, m),
+        _ => return Err(Error::invalid_input(format!("{shown}: an audio rendition is a master playlist"))),
+    };
+    let audio = HlsReader::new(allow, media.0, shown, media.1)?;
+    Ok(Box::new(ThreadSource::new(info, Box::new(Renditions { parts: [video, audio], done: [false; 2], out: std::io::Cursor::new(ironav_formats::renditions::MAGIC.to_vec()) }))))
+}
+
+/// The URI of the audio rendition to play with `variant`: the one `wanted` names (by language or
+/// name), else the default, else the first; `None` when its audio is in its own segments.
+fn pick_audio(variant: &Variant, renditions: &[Rendition], wanted: Option<&str>, shown: &str) -> Result<Option<String>> {
+    let group: Vec<&Rendition> = variant.audio.as_ref().map_or(Vec::new(), |g| renditions.iter().filter(|r| &r.group == g).collect());
+    if let Some(w) = wanted {
+        let is = |s: &Option<String>| s.as_ref().is_some_and(|s| s.eq_ignore_ascii_case(w));
+        let found = group.iter().find(|r| is(&r.language)).or_else(|| group.iter().find(|r| is(&r.name)));
+        return match found {
+            Some(r) => Ok(r.uri.clone()),
+            None => {
+                let names = group.iter().filter_map(|r| r.language.clone().or_else(|| r.name.clone()));
+                Err(Error::invalid_arg(format!("{shown} has no audio rendition '{w}'")).alternatives(names))
+            }
+        };
+    }
+    Ok(group.iter().find(|r| r.default).or(group.first()).and_then(|r| r.uri.clone()))
+}
+
+/// Two playlists followed side by side (a variant and its audio rendition), the one behind in media
+/// time read next, their bytes given as pieces of a stream of renditions.
+struct Renditions {
+    parts: [HlsReader; 2],
+    done: [bool; 2],
+    out: std::io::Cursor<Vec<u8>>,
+}
+
+impl Read for Renditions {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            let n = self.out.read(buf)?;
+            if n > 0 {
+                return Ok(n);
+            }
+            let Some(k) = (0..2).filter(|&k| !self.done[k]).min_by(|&a, &b| self.parts[a].fed.total_cmp(&self.parts[b].fed)) else {
+                return Ok(0);
+            };
+            let mut chunk = vec![0u8; 64 << 10];
+            let n = match self.parts[k].read(&mut chunk) {
+                Ok(n) => n,
+                // the audio rendition failing leaves the video playing
+                Err(_) if k == 1 => 0,
+                Err(e) => return Err(e),
+            };
+            if n == 0 {
+                // an empty piece: the part has ended
+                self.done[k] = true;
+                self.out = std::io::Cursor::new(ironav_formats::renditions::piece(k as u8, &[]));
+                continue;
+            }
+            self.out = std::io::Cursor::new(ironav_formats::renditions::piece(k as u8, &chunk[..n]));
+        }
+    }
 }
 
 /// Gives the segments' bytes in order, reloading a live playlist as it goes (on the source's thread).
 struct HlsReader {
+    /// Seconds of media in the segments started so far.
+    fed: f64,
     allow: Allow,
     playlist_url: String,
     shown: String,
@@ -261,6 +362,31 @@ struct HlsReader {
     failures: u32,
     /// When a reload last added a segment.
     progress: Instant,
+}
+
+impl HlsReader {
+    fn new(allow: Allow, playlist_url: String, shown: String, media: Media) -> Result<HlsReader> {
+        check(&media, &shown)?;
+        let start = if media.ended { 0 } else { media.segments.len().saturating_sub(LIVE_START) };
+        Ok(HlsReader {
+            fed: 0.0,
+            allow,
+            playlist_url,
+            shown,
+            target: media.target,
+            ended: media.ended,
+            // the queue holds everything from `start` on, so only later segments are new
+            next_seq: media.segments.last().map_or(0, |s| s.seq.saturating_add(1)),
+            queue: media.segments[start..].iter().cloned().collect(),
+            current: None,
+            init: std::io::Cursor::new(Vec::new()),
+            map: None,
+            last_load: Instant::now(),
+            grew: true,
+            failures: 0,
+            progress: Instant::now(),
+        })
+    }
 }
 
 fn io_err(e: Error) -> std::io::Error {
@@ -326,6 +452,9 @@ impl Read for HlsReader {
                 continue;
             }
             if let Some(seg) = self.queue.pop_front() {
+                // a segment without a usable duration counts as a target duration, so the other
+                // playlist is not starved
+                self.fed += if seg.duration > 0.0 { seg.duration } else { self.target };
                 if seg.map.is_some() && seg.map != self.map {
                     let (uri, range) = seg.map.clone().unwrap();
                     match http::get(&uri, range, &self.allow).and_then(|r| r.bytes(MAX_INIT)) {
@@ -469,6 +598,65 @@ mod tests {
         let port = server(routes, |_, _| {});
         let got = drain(&format!("http://127.0.0.1:{port}/master.m3u8"), Duration::from_secs(10)).unwrap();
         assert!(got == ts, "the segments, in order, are the stream");
+    }
+
+    #[test]
+    fn a_variant_plays_with_its_audio_rendition() {
+        let ts = fixture("h264_aac.ts");
+        let aac = std::fs::read(format!("{}/../ironav-engine/tests/data/aac_stereo_tools.aac", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let routes: Routes = Default::default();
+        {
+            let mut r = routes.lock().unwrap();
+            r.insert(
+                "/master.m3u8".into(),
+                b"#EXTM3U
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"English\",LANGUAGE=\"en\",DEFAULT=YES,URI=\"en/a.m3u8\"
+                  #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"Francais\",LANGUAGE=\"fr\",URI=\"fr/a.m3u8\"
+                  #EXT-X-STREAM-INF:BANDWIDTH=500000,AUDIO=\"aud\"
+v.m3u8
+"
+                    .to_vec(),
+            );
+            r.insert("/v.m3u8".into(), b"#EXTM3U
+#EXT-X-TARGETDURATION:2
+#EXTINF:2.0,
+v0.ts
+#EXT-X-ENDLIST
+".to_vec());
+            r.insert("/v0.ts".into(), ts.clone());
+            for l in ["en", "fr"] {
+                r.insert(format!("/{l}/a.m3u8"), b"#EXTM3U
+#EXT-X-TARGETDURATION:2
+#EXTINF:2.0,
+a0.aac
+#EXT-X-ENDLIST
+".to_vec());
+                r.insert(format!("/{l}/a0.aac"), aac.clone());
+            }
+        }
+        let asked: Arc<Mutex<Vec<String>>> = Default::default();
+        let log = asked.clone();
+        let port = server(routes, move |p, _| log.lock().unwrap().push(p.to_string()));
+        let url = format!("http://127.0.0.1:{port}/master.m3u8");
+        let got = drain(&url, Duration::from_secs(10)).unwrap();
+        // one stream of both: the transport stream's video and audio, then the rendition's audio
+        let mut d = ironav_formats::stream::stream_demuxer(&got[..200], &Default::default()).unwrap();
+        d.feed(&got).unwrap();
+        d.end();
+        let mut n = [0; 3];
+        while let Some(p) = d.next_packet().unwrap() {
+            n[p.packet.stream] += 1;
+        }
+        assert_eq!(d.streams().len(), 3);
+        assert!(n.iter().all(|&k| k > 0), "{n:?}");
+        assert!(asked.lock().unwrap().contains(&"/en/a0.aac".to_string()), "the default rendition");
+        // another, by language or name, and one that is not there
+        asked.lock().unwrap().clear();
+        drain(&format!("{url}?audio=FR"), Duration::from_secs(10)).unwrap();
+        assert!(asked.lock().unwrap().contains(&"/fr/a0.aac".to_string()));
+        let e = drain(&format!("{url}?audio=de"), Duration::from_secs(10)).unwrap_err();
+        assert_eq!(e.code, ErrorCode::InvalidArgument);
+        assert!(e.alternatives.contains(&"en".to_string()), "{e:?}");
     }
 
     #[test]

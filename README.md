@@ -92,7 +92,10 @@ Basic or Digest credentials, keepalives and TEARDOWN, with H.264, HEVC, AAC, Opu
 skipped). The password never appears in output, and with Digest it is never sent.
 `http://host[:port]/path` plays HLS when it names a playlist (the highest-bandwidth variant; TS or fMP4 segments with
 `EXT-X-MAP` and byte ranges; a live playlist is followed from three segments before its end), and downloads anything
-else as it arrives. Encrypted playlists and separate audio renditions are not supported yet.
+else as it arrives. A variant whose audio is a separate rendition (`EXT-X-MEDIA` with `TYPE=AUDIO`) plays with it: the
+default one, or the one `?audio=` names by language or name (`?audio=fr`). The two playlists are fetched side by side
+and their packets merged in time order; packed AAC with Apple's ID3 timestamp lines up with the video. Encrypted
+playlists are not supported.
 `https://` and `rtsps://` (port 322 by default) are the same over TLS 1.3, using IronSocketLayer, with IronPKI checking
 the server's certificate chain and that it names the host in the URL (a DNS name or an IP address). The trusted roots
 are the platform's PEM bundle (`SSL_CERT_FILE`, the usual Linux, BSD and macOS paths, or the one Git for Windows

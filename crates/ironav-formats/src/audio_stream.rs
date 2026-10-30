@@ -444,7 +444,8 @@ impl Id3Stream {
         }
         let rest = &d[tag.min(d.len())..];
         let mut inner: Box<dyn StreamDemuxer> = if adts::looks_like_adts(rest) {
-            Box::new(crate::stream::AdtsStream::default())
+            // HLS packed audio says in the tag where it starts
+            Box::new(crate::stream::AdtsStream::starting_at(crate::stream::apple_timestamp(&d[..tag.min(d.len())])))
         } else if rest.len() >= 4 && parse_header(rest).is_some() {
             Box::new(Mp3Stream::default())
         } else if self.ended {
