@@ -64,7 +64,7 @@ pub(crate) fn open(u: &SourceUrl, shown: String) -> Result<ThreadSource> {
         size: u.option("size").map(parse_size).transpose()?,
         fps: u.option("fps").map(parse_fps).transpose()?,
     };
-    let info = SourceInfo { url: shown, kind: "device", live: true };
+    let info = SourceInfo { url: shown, kind: "device", live: true, synthetic: false };
     let (tx, rx) = sync_channel(4);
     start(&kind, name.map(str::to_string), wants, tx, &rx)?;
     Ok(ThreadSource::from_channel(info, rx))
@@ -108,7 +108,7 @@ pub(crate) fn choose<'a>(list: &'a [Device], name: Option<&str>, kind: &str) -> 
     })
 }
 
-fn parse_size(s: &str) -> Result<(u32, u32)> {
+pub(crate) fn parse_size(s: &str) -> Result<(u32, u32)> {
     let bad = || Error::invalid_arg(format!("size must be WIDTHxHEIGHT, got '{s}'"));
     let (w, h) = s.split_once(['x', 'X']).ok_or_else(bad)?;
     let (w, h) = (w.parse::<u32>().map_err(|_| bad())?, h.parse::<u32>().map_err(|_| bad())?);
@@ -118,7 +118,7 @@ fn parse_size(s: &str) -> Result<(u32, u32)> {
     Ok((w, h))
 }
 
-fn parse_fps(s: &str) -> Result<f64> {
+pub(crate) fn parse_fps(s: &str) -> Result<f64> {
     let f = match s.split_once('/') {
         Some((n, d)) => n.parse::<f64>().ok().zip(d.parse::<f64>().ok()).map(|(n, d)| n / d),
         None => s.parse::<f64>().ok(),

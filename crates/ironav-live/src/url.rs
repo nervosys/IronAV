@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 /// - `listen`: wait for a TCP connection on the given address instead of making one;
 /// - `transport=udp`: have an RTSP server send RTP over UDP rather than on its connection;
 /// - `audio`: the HLS audio rendition to play, by language or name.
-pub const OPTIONS: [&str; 12] = ["format", "fps", "pace", "follow", "idle", "listen", "transport", "audio", "size", "reconnect", "stall", "retries"];
+pub const OPTIONS: [&str; 14] = ["format", "fps", "pace", "follow", "idle", "listen", "transport", "audio", "size", "reconnect", "stall", "retries", "rate", "duration"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SourceUrl {
@@ -53,9 +53,9 @@ impl SourceUrl {
             ("file".to_string(), base.to_string())
         };
         match scheme.as_str() {
-            "file" | "pipe" | "tcp" | "udp" | "rtsp" | "rtsps" | "http" | "https" | "device" => {}
+            "file" | "pipe" | "tcp" | "udp" | "rtsp" | "rtsps" | "http" | "https" | "device" | "test" => {}
             other => {
-                return Err(Error::invalid_arg(format!("'{other}' sources are not supported")).alternatives(["file", "pipe", "tcp", "udp", "rtsp", "rtsps", "http", "https", "device"]));
+                return Err(Error::invalid_arg(format!("'{other}' sources are not supported")).alternatives(["file", "pipe", "tcp", "udp", "rtsp", "rtsps", "http", "https", "device", "test"]));
             }
         }
         if matches!(scheme.as_str(), "tcp" | "udp") && !target.contains(':') {

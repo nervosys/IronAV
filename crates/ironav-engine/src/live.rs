@@ -60,6 +60,12 @@ pub struct OpenArgs {
     pub sidecars: Vec<String>,
     #[serde(default)]
     pub keyframes_only: bool,
+    /// Keep the newest this many keyframe pictures of the first video stream as JPEG (0: none).
+    #[serde(default)]
+    pub keyframe_jpegs: usize,
+    /// Scale them to this width (the source's when absent).
+    #[serde(default)]
+    pub keyframe_width: Option<u32>,
     /// Record the media as it arrives: a file, or an `.m3u8` path for HLS segments and a playlist.
     #[serde(default)]
     pub record: Option<String>,
@@ -146,6 +152,8 @@ struct Shared {
     taps: Vec<TapFeeder>,
     /// How a source that is kept up is doing.
     health: Option<Health>,
+    /// The newest keyframe pictures, oldest first.
+    keyframes: VecDeque<KeyframeJpeg>,
     requested: u64,
     applied: u64,
 }
@@ -190,11 +198,28 @@ fn default_query_max() -> usize {
     100
 }
 
+/// A keyframe's picture, kept by a session opened with `keyframe_jpegs`.
+#[derive(Debug, Clone)]
+pub struct KeyframeJpeg {
+    /// Its media time in seconds.
+    pub t: f64,
+    /// When it was decoded.
+    pub decoded_at: SystemTime,
+    pub width: u32,
+    pub height: u32,
+    pub jpeg: Vec<u8>,
+}
+
+/// Keyframe pictures kept at most.
+pub const MAX_KEYFRAME_JPEGS: usize = 256;
+
 pub struct Session {
     pub id: String,
     pub source: SourceInfo,
     opened: SystemTime,
     retain: f64,
+    keyframe_jpegs: usize,
+    keyframe_width: Option<u32>,
     shared: Mutex<Shared>,
     changed: Condvar,
     stop: AtomicBool,
@@ -267,6 +292,12 @@ fn parse_fps(s: &str) -> Result<Rational> {
 /// Opens a live session on `args.source` and starts reading it.
 pub fn open(args: &OpenArgs) -> Result<Arc<Session>> {
     let url = SourceUrl::parse(&args.source)?;
+    if args.keyframe_jpegs > MAX_KEYFRAME_JPEGS {
+        return Err(Error::invalid_arg(format!("keyframe_jpegs is at most {MAX_KEYFRAME_JPEGS}")));
+    }
+    if args.keyframe_width.is_some_and(|w| !(16..=8192).contains(&w)) {
+        return Err(Error::invalid_arg("keyframe_width must be 16 to 8192"));
+    }
     let opts = AnalyzeOptions {
         analyzers: args.analyzers.clone(),
         level: args.level.clone(),
@@ -332,6 +363,8 @@ pub fn open(args: &OpenArgs) -> Result<Arc<Session>> {
         source: info,
         opened: SystemTime::now(),
         retain: args.retain_seconds,
+        keyframe_jpegs: args.keyframe_jpegs,
+        keyframe_width: args.keyframe_width,
         shared: Mutex::new(Shared {
             state: State::Waiting,
             error: None,
@@ -357,6 +390,7 @@ pub fn open(args: &OpenArgs) -> Result<Arc<Session>> {
             reconfigure: VecDeque::new(),
             taps: Vec::new(),
             health: None,
+            keyframes: VecDeque::new(),
             requested: 0,
             applied: 0,
         }),
@@ -723,6 +757,11 @@ impl Session {
                             a.warn(format!("configure: {}", e.message));
                         }
                     }
+                    if self.keyframe_jpegs > 0 {
+                        if let Err(why) = a.keep_keyframes() {
+                            a.warn(format!("keyframe_jpegs: none kept: {why}"));
+                        }
+                    }
                     // and taps, so they see the first keyframe
                     let early = std::mem::take(&mut lock(&self.shared).taps);
                     for f in early {
@@ -787,6 +826,9 @@ impl Session {
                     rec.packet(&sp.packet, t, sp.key);
                 }
                 a.packet_keyed(&sp.packet, sp.key, &mut |o| self.log(o, Some(arrived)))?;
+                if let Some((t, v)) = a.last_keyframe.take() {
+                    self.keep_keyframe(t, &v);
+                }
                 let changed = a.take_changed();
                 let mut sh = lock(&self.shared);
                 if changed {
@@ -846,6 +888,35 @@ impl Session {
                 sh.ring_bytes -= f.packet.packet.data.len();
             }
         }
+    }
+
+    /// Encodes a keyframe's picture as JPEG into the ring (without the session's lock).
+    fn keep_keyframe(&self, t: f64, v: &VideoFrame) {
+        let mut pic = match self.keyframe_width {
+            Some(w) if w < v.width => {
+                let h = ((v.height as u64 * w as u64 / v.width as u64) as u32).max(2) & !1;
+                ironav_codec::resize_frame(v, w & !1, h)
+            }
+            _ => v.clone(),
+        };
+        if !matches!(pic.pix_fmt, ironav_core::PixelFormat::Yuv420p | ironav_core::PixelFormat::Yuv422p | ironav_core::PixelFormat::Yuv444p | ironav_core::PixelFormat::Gray8) {
+            pic = ironav_codec::convert_pixel_format(pic, ironav_core::PixelFormat::Yuv420p, ironav_codec::Matrix::Bt709);
+        }
+        let Ok(jpeg) = ironav_codec::jpeg::encode_jpeg(&pic, 85) else { return };
+        let k = KeyframeJpeg { t, decoded_at: SystemTime::now(), width: pic.width, height: pic.height, jpeg };
+        let mut sh = lock(&self.shared);
+        sh.keyframes.push_back(k);
+        while sh.keyframes.len() > self.keyframe_jpegs {
+            sh.keyframes.pop_front();
+        }
+    }
+
+    /// The keyframe pictures kept (see `keyframe_jpegs`) after media time `after`, the newest `max`,
+    /// oldest first.
+    pub fn keyframes(&self, after: Option<f64>, max: usize) -> Vec<KeyframeJpeg> {
+        let sh = lock(&self.shared);
+        let found: Vec<&KeyframeJpeg> = sh.keyframes.iter().filter(|k| after.is_none_or(|a| k.t > a)).collect();
+        found[found.len().saturating_sub(max)..].iter().map(|k| (*k).clone()).collect()
     }
 
     /// Publishes the source's health, logging each change of state.

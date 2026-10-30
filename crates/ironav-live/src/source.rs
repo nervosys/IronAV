@@ -27,11 +27,13 @@ pub enum Chunk {
 pub struct SourceInfo {
     /// The URL with any password replaced.
     pub url: String,
-    /// `file`, `pipe`, `tcp`, `udp`, `rtsp`, `hls`, `http` or `device`.
+    /// `file`, `pipe`, `tcp`, `udp`, `rtsp`, `hls`, `http`, `device` or `test`.
     pub kind: &'static str,
     /// Whether the bytes arrive at the pace of the media (a socket, a pipe, a followed file)
     /// rather than as fast as they can be read.
     pub live: bool,
+    /// Made up for testing (`test://`), not captured: never real footage.
+    pub synthetic: bool,
 }
 
 pub trait Source: Send {
@@ -85,7 +87,7 @@ fn open_once(url: &str) -> Result<Box<dyn Source>> {
             })?;
             let follow = u.flag("follow");
             let idle = u.option("idle").map(|s| s.parse::<f64>().map_err(|_| Error::invalid_arg(format!("idle must be a number of seconds, got '{s}'")))).transpose()?;
-            Box::new(FileSource { info: SourceInfo { url: shown, kind: "file", live: follow }, file: f, follow, idle: idle.map(Duration::from_secs_f64), last_data: Instant::now() })
+            Box::new(FileSource { info: SourceInfo { url: shown, kind: "file", live: follow, synthetic: false }, file: f, follow, idle: idle.map(Duration::from_secs_f64), last_data: Instant::now() })
         }
         "pipe" => {
             let reader: Box<dyn Read + Send> = if u.target.is_empty() {
@@ -93,11 +95,11 @@ fn open_once(url: &str) -> Result<Box<dyn Source>> {
             } else {
                 Box::new(std::fs::File::open(&u.target).map_err(|e| unreachable(e, "could not open the pipe"))?)
             };
-            Box::new(ThreadSource::new(SourceInfo { url: shown, kind: "pipe", live: true }, reader))
+            Box::new(ThreadSource::new(SourceInfo { url: shown, kind: "pipe", live: true, synthetic: false }, reader))
         }
         "tcp" => {
             let (host, port) = host_port(&u.target)?;
-            let info = SourceInfo { url: shown.clone(), kind: "tcp", live: true };
+            let info = SourceInfo { url: shown.clone(), kind: "tcp", live: true, synthetic: false };
             if host.is_empty() || u.flag("listen") {
                 // a listener binds to loopback unless an address is given
                 let host = if host.is_empty() { "127.0.0.1" } else { host };
@@ -121,11 +123,12 @@ fn open_once(url: &str) -> Result<Box<dyn Source>> {
                 }
                 _ => UdpSocket::bind((if host.is_empty() { "127.0.0.1" } else { host }, port)).map_err(|e| unreachable(e, "could not bind"))?,
             };
-            Box::new(UdpSource { info: SourceInfo { url: shown, kind: "udp", live: true }, sock })
+            Box::new(UdpSource { info: SourceInfo { url: shown, kind: "udp", live: true, synthetic: false }, sock })
         }
         "rtsp" | "rtsps" => Box::new(crate::rtsp::RtspSource::open(&u, shown)?),
         "http" | "https" => crate::hls::open(&u, shown)?,
         "device" => Box::new(crate::capture::open(&u, shown)?),
+        "test" => Box::new(crate::synthetic::open(&u, shown)?),
         _ => unreachable!("SourceUrl::parse accepts only these schemes"),
     })
 }

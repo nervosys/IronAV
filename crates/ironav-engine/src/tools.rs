@@ -258,6 +258,20 @@ fn h_stream_snapshot(args: &Value) -> Result<Value> {
     session_arg(args)?.snapshot(f64_arg(args, "at")?, w)
 }
 
+fn h_stream_keyframes(args: &Value) -> Result<Value> {
+    let max = args.get("max").and_then(Value::as_u64).unwrap_or(1).clamp(1, 64) as usize;
+    let s = session_arg(args)?;
+    let found: Vec<Value> = s
+        .keyframes(f64_arg(args, "after")?, max)
+        .iter()
+        .map(|k| {
+            let wall = k.decoded_at.duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
+            json!({ "t": (k.t * 1000.0).round() / 1000.0, "decoded_unix": wall, "width": k.width, "height": k.height, "jpeg_base64": ironav_player::base64(&k.jpeg) })
+        })
+        .collect();
+    Ok(json!({ "session": s.id, "keyframes": found }))
+}
+
 fn h_stream_clip(args: &Value) -> Result<Value> {
     let from = f64_arg(args, "from")?.ok_or_else(|| Error::invalid_arg("missing required argument 'from'"))?;
     let to = f64_arg(args, "to")?.ok_or_else(|| Error::invalid_arg("missing required argument 'to'"))?;
@@ -314,7 +328,7 @@ fn h_stream_close(args: &Value) -> Result<Value> {
 fn stream_open_schema() -> Value {
     object(
         json!({
-            "source": { "type": "string", "description": "What to read: a path (add ?pace=realtime to play a file as if live, ?follow to read it as it grows), '-' or pipe:NAME, tcp://host:port (connect), tcp://:port (listen on loopback), udp://:port or udp://group:port (multicast), or rtsp://[user:password@]host[:port]/path (a camera or server; credentials are never echoed; add ?transport=udp for RTP over UDP), or http://host/path (an HLS playlist, or any other stream downloaded as it arrives); https:// and rtsps:// are the same over TLS 1.3, with the server's certificate checked against the platform's roots and IRONAV_CA_FILE. Network addresses must be loopback, private or link-local unless the operator set IRONAV_NET_ALLOW. Options can follow '?': format, fps, pace, follow, idle, listen, reconnect (RTSP is reconnected after a drop or a stall by default; reconnect=0 turns it off, tcp://host:port?reconnect turns it on), stall (seconds without data counted as a stall, twice that as a loss; 5), retries (attempts before giving up; unlimited)." },
+            "source": { "type": "string", "description": "What to read: a path (add ?pace=realtime to play a file as if live, ?follow to read it as it grows), '-' or pipe:NAME, tcp://host:port (connect), tcp://:port (listen on loopback), udp://:port or udp://group:port (multicast), or rtsp://[user:password@]host[:port]/path (a camera or server; credentials are never echoed; add ?transport=udp for RTP over UDP), or http://host/path (an HLS playlist, or any other stream downloaded as it arrives), or test://video / test://audio (made up for testing, marked synthetic in the status; size, fps, rate, duration); https:// and rtsps:// are the same over TLS 1.3, with the server's certificate checked against the platform's roots and IRONAV_CA_FILE. Network addresses must be loopback, private or link-local unless the operator set IRONAV_NET_ALLOW. Options can follow '?': format, fps, pace, follow, idle, listen, reconnect (RTSP is reconnected after a drop or a stall by default; reconnect=0 turns it off, tcp://host:port?reconnect turns it on), stall (seconds without data counted as a stall, twice that as a loss; 5), retries (attempts before giving up; unlimited)." },
             "analyzers": { "type": "array", "items": { "type": "string", "enum": ironav_analyze::ANALYZERS.iter().map(|a| a.name).collect::<Vec<_>>() }, "description": "All of them when absent." },
             "level": { "type": "string", "enum": ironav_analyze::Level::ALL.iter().map(|l| l.name()).collect::<Vec<_>>(), "default": "events", "description": "The most detail the session keeps; stream_events can ask for less." },
             "digest_seconds": { "type": "number", "exclusiveMinimum": 0, "default": 10 },
@@ -326,6 +340,8 @@ fn stream_open_schema() -> Value {
             "hwaccel": { "type": "string", "default": "auto" },
             "keyframes_only": { "type": "boolean", "default": false, "description": "Decode only keyframes (IDR, I and key frames): a fraction of the work, for thumbnails, cuts and black spans at keyframe resolution (a cut is reported at the first keyframe after it). The freeze analyzer does not run." },
             "sidecars": { "type": "array", "items": { "type": "string" }, "description": "Model sidecars to run as well (speech-to-text, detection, ...), by the names the operator configured in IRONAV_SIDECARS; `capabilities` lists them. Each takes the first analyzed stream of the kind it wants." },
+            "keyframe_jpegs": { "type": "integer", "minimum": 0, "maximum": 256, "default": 0, "description": "Keep the pictures of this many of the newest keyframes of the first video stream as JPEG, for stream_keyframes." },
+            "keyframe_width": { "type": "integer", "minimum": 16, "maximum": 8192, "description": "Scale the kept keyframe pictures to this width." },
             "record": { "type": "string", "description": "Also write the media as it arrives, without re-encoding: a file (.ts stays playable even if cut off; .mp4 is complete when the session closes), or an .m3u8 path for HLS: MPEG-TS segments cut at keyframes next to it, and the playlist rewritten after each one." },
             "segment_seconds": { "type": "number", "minimum": 1, "maximum": 600, "default": 6, "description": "HLS segment length (cut at the first keyframe after it)." },
             "transcode": { "type": "object", "required": ["output"], "additionalProperties": false,
@@ -510,6 +526,14 @@ pub fn tools() -> &'static [Tool] {
                 input_schema: object(json!({ "session": { "type": "string" }, "at": { "type": "number", "minimum": 0 }, "max_width": { "type": "integer", "minimum": 16, "default": 640 } }), &["session"]),
                 read_only: true,
                 handler: Handler::Plain(h_stream_snapshot),
+            },
+            Tool {
+                name: "stream_keyframes",
+                description: "The pictures of the newest keyframes of a live session opened with keyframe_jpegs, as JPEG: the newest `max` (1 by default), or those after media time `after`, oldest first, each with its media time and when it was decoded. Cheap evidence for an alert: the session encodes each keyframe as it arrives.",
+                cli: "",
+                input_schema: object(json!({ "session": { "type": "string" }, "after": { "type": "number" }, "max": { "type": "integer", "minimum": 1, "maximum": 64, "default": 1 } }), &["session"]),
+                read_only: true,
+                handler: Handler::Plain(h_stream_keyframes),
             },
             Tool {
                 name: "stream_clip",

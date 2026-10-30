@@ -278,7 +278,7 @@ impl RtspSource {
             // a server that stops reading must not hold a write forever
             conn.tcp().set_write_timeout(Some(REPLY_TIMEOUT))?;
             let mut s = RtspSource {
-                info: SourceInfo { url: shown.clone(), kind: "rtsp", live: true },
+                info: SourceInfo { url: shown.clone(), kind: "rtsp", live: true, synthetic: false },
                 conn,
                 buf: Vec::new(),
                 out: VecDeque::new(),

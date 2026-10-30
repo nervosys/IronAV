@@ -125,6 +125,11 @@ A camera or microphone on this machine is a source too, on Windows so far (Media
 them, and `device://video` (the first camera), `device://video/1` or `device://audio/usb` (by a part of the name) open
 one. `size=1280x720` and `fps=30` ask a camera for its nearest mode. A camera's pictures arrive as Y4M (converted from
 the NV12 or YUY2 it gives to 4:2:0) and are timed at the mode's frame rate; a microphone arrives as 16-bit PCM.
+For testing without either, `test://video` and `test://audio` are made up at the pace they play: a grey ramp with a
+white square crossing it each second and a new colour every 5 s, its frame number in its top row as 32 black or white
+blocks of 8 pixels (`ironav_live::synthetic::frame_number` reads it back, so a test can tell which frame it has and how
+late), and a 440 Hz tone on for half of each second. `size`, `fps`, `rate` and `duration` change them. The session's
+`source` says `"synthetic": true` for them, so nothing downstream takes them for real footage.
 Fragmented MP4 is read the same way: an initialization segment (`moov` with `mvex`), then `moof`+`mdat` pairs, as written by
 LL-HLS and DASH packagers, Safari's MediaRecorder and `ffmpeg -movflags frag_keyframe+empty_moov`. Its packets also match
 the file reader's. An MP4 without fragments cannot be read as it arrives (its index is at the end, or describes data not yet
@@ -205,6 +210,11 @@ what was made, taken and dropped. Each item has a sequence number counting every
 media time `t` in seconds from the source's timestamps (for RTSP, the RTP clock from the start of the stream; not yet
 mapped to wall-clock time from RTCP sender reports); and `decoded_at`, the wall-clock time it was decoded. Dropping
 the tap stops it; once the session ends, `recv_timeout` returns an error after the last item.
+
+With `keyframe_jpegs: N` a session keeps the pictures of the newest N keyframes of its first video stream as JPEG
+(quality 85, scaled to `keyframe_width` if given), encoded as each keyframe is decoded, so the evidence for an alert is
+at hand without decoding anything again: `stream_keyframes` gives the newest `max` (or those after media time `after`)
+with their media time and when they were decoded, and `Session::keyframes` the same in Rust.
 
 What is built and what is still planned is in [docs/design/agentic-realtime.md](docs/design/agentic-realtime.md).
 

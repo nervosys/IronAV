@@ -253,7 +253,7 @@ pub(crate) fn open(u: &SourceUrl, shown: String) -> Result<Box<dyn Source>> {
     }
     // the body decides: a server may call anything a playlist
     if !head.starts_with(b"#EXTM3U") {
-        let info = SourceInfo { url: shown, kind: "http", live: true };
+        let info = SourceInfo { url: shown, kind: "http", live: true, synthetic: false };
         return Ok(Box::new(ThreadSource::new(info, Box::new(std::io::Cursor::new(head).chain(r)))));
     }
     let at = r.url.clone();
@@ -276,7 +276,7 @@ pub(crate) fn open(u: &SourceUrl, shown: String) -> Result<Box<dyn Source>> {
     }
     let Playlist::Media(media) = playlist else { unreachable!() };
     let video = HlsReader::new(allow.clone(), playlist_url, shown.clone(), media)?;
-    let info = SourceInfo { url: shown.clone(), kind: "hls", live: true };
+    let info = SourceInfo { url: shown.clone(), kind: "hls", live: true, synthetic: false };
     let Some(audio_url) = audio else {
         return Ok(Box::new(ThreadSource::new(info, Box::new(video))));
     };

@@ -15,6 +15,7 @@ pub mod net;
 pub mod reconnect;
 mod rtsp;
 mod source;
+pub mod synthetic;
 pub mod tls;
 mod url;
 

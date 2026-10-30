@@ -939,6 +939,11 @@ pub struct JpegEncoder {
     quality: u32,
 }
 
+/// One picture as a baseline JFIF file at `quality` (1 to 100): gray, yuv420p, yuv422p or yuv444p.
+pub fn encode_jpeg(v: &VideoFrame, quality: u32) -> Result<Vec<u8>> {
+    JpegEncoder::new(quality.clamp(1, 100)).encode_image(v)
+}
+
 impl JpegEncoder {
     pub fn new(quality: u32) -> Self {
         Self { quality }

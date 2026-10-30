@@ -174,6 +174,10 @@ pub struct Analysis {
     retiring: Vec<Receiver<Vec<Observation>>>,
     /// Which analyzers run has changed since [`take_changed`](Self::take_changed) last said so.
     changed: bool,
+    /// The stream whose keyframes are kept as pictures, and the newest one decoded, for the
+    /// session to take.
+    keyframe_stream: Option<usize>,
+    pub last_keyframe: Option<(f64, VideoFrame)>,
 }
 
 /// Opens `s`'s decoder if it has none, to wait for a keyframe; why not, when it cannot.
@@ -361,6 +365,8 @@ impl Analysis {
             starting: Vec::new(),
             retiring: Vec::new(),
             changed: false,
+            keyframe_stream: None,
+            last_keyframe: None,
         })
     }
 
@@ -387,6 +393,7 @@ impl Analysis {
         let mut warnings = Vec::new();
         let mut removed: Vec<(usize, &'static str, Box<dyn Analyzer>)> = Vec::new();
         self.starting.retain(|(n, _)| !c.remove.iter().any(|r| r == n));
+        let keyframe_stream = self.keyframe_stream;
         for (i, s) in self.streams.iter_mut().enumerate() {
             let Some(s) = s else { continue };
             for list in [&mut s.packet_analyzers, &mut s.frame_analyzers] {
@@ -414,7 +421,7 @@ impl Analysis {
                 }
                 s.frame_analyzers.push((info.name, info.make(&s.info, &self.settings)));
             }
-            if s.frame_analyzers.is_empty() && s.taps.is_empty() && s.decoder.is_some() {
+            if s.frame_analyzers.is_empty() && s.taps.is_empty() && keyframe_stream != Some(i) && s.decoder.is_some() {
                 (s.decoder, s.decoder_name) = (None, None);
                 (s.audio_next, s.last_video) = (None, None);
             }
@@ -546,6 +553,27 @@ impl Analysis {
         std::mem::take(&mut self.changed)
     }
 
+    /// Keeps the picture of each keyframe of the first video stream that can be decoded in
+    /// [`last_keyframe`](Self::last_keyframe), starting its decoder if nothing else needed one;
+    /// why not, when there is none.
+    pub fn keep_keyframes(&mut self) -> std::result::Result<(), String> {
+        let mut why = "no video stream is analyzed".to_string();
+        for (i, s) in self.streams.iter_mut().enumerate() {
+            let Some(s) = s else { continue };
+            if s.info.params.media_type() != MediaType::Video {
+                continue;
+            }
+            match start_decoder(s, &self.hwaccel, self.live) {
+                Ok(()) => {
+                    self.keyframe_stream = Some(i);
+                    return Ok(());
+                }
+                Err(w) => why = w,
+            }
+        }
+        Err(why)
+    }
+
     /// The source started over (it was lost and is back): each decoder waits for a keyframe again,
     /// and audio and picture timing are taken afresh.
     pub fn restart(&mut self) {
@@ -631,6 +659,13 @@ impl Analysis {
                 Vec::new()
             }
         };
+        // the picture a keyframe decodes to, kept before the analyzers take the frames
+        if key && self.keyframe_stream == Some(p.stream) {
+            let tb = s.info.time_base.as_f64();
+            if let Some(v) = frames.iter().find_map(|f| if let Frame::Video(v) = f { Some(v) } else { None }) {
+                self.last_keyframe = Some((v.pts as f64 * tb, v.clone()));
+            }
+        }
         // Windows close on what the analyzers have been shown: decoded frames, which a decoder
         // can hold back behind its packets, or the packets themselves when nothing is decoded.
         let mut clock = (s.decoder.is_none() && inside).then_some(t);
