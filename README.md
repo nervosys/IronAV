@@ -76,6 +76,9 @@ The same analyzers run on media as it arrives. A source is a path, `path?follow`
 (or over UDP with `?transport=udp`, taken only from the server's address),
 Basic or Digest credentials, keepalives and TEARDOWN, with H.264, HEVC, AAC, Opus, G.711 and L16 tracks (others are
 skipped). The password never appears in output, and with Digest it is never sent.
+`http://host[:port]/path` plays HLS when it names a playlist (the highest-bandwidth variant; TS or fMP4 segments with
+`EXT-X-MAP` and byte ranges; a live playlist is followed from three segments before its end), and downloads anything
+else as it arrives. Encrypted playlists, separate audio renditions and HTTPS are not supported yet.
 Outbound connections go only to loopback, private and link-local addresses (not the cloud metadata endpoints
 169.254.169.254 and 169.254.170.2/.23), checked after the name resolves. Whoever runs IronAV can allow more with `IRONAV_NET_ALLOW`:
 addresses and CIDR ranges separated by commas, or `any`. A request cannot widen it.

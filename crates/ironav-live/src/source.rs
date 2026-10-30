@@ -24,7 +24,7 @@ pub enum Chunk {
 pub struct SourceInfo {
     /// The URL with any password replaced.
     pub url: String,
-    /// `file`, `pipe`, `tcp`, `udp` or `rtsp`.
+    /// `file`, `pipe`, `tcp`, `udp`, `rtsp`, `hls` or `http`.
     pub kind: &'static str,
     /// Whether the bytes arrive at the pace of the media (a socket, a pipe, a followed file)
     /// rather than as fast as they can be read.
@@ -94,6 +94,7 @@ pub fn open_source(url: &str) -> Result<Box<dyn Source>> {
             Box::new(UdpSource { info: SourceInfo { url: shown, kind: "udp", live: true }, sock })
         }
         "rtsp" => Box::new(crate::rtsp::RtspSource::open(&u, shown)?),
+        "http" => crate::hls::open(&u, shown)?,
         _ => unreachable!("SourceUrl::parse accepts only these schemes"),
     })
 }
@@ -137,7 +138,7 @@ impl Source for FileSource {
 }
 
 /// A blocking reader (standard input, a pipe) read on a thread of its own, so reads can time out.
-struct ThreadSource {
+pub(crate) struct ThreadSource {
     info: SourceInfo,
     rx: Receiver<std::io::Result<Vec<u8>>>,
     held: Vec<u8>,
@@ -146,7 +147,7 @@ struct ThreadSource {
 }
 
 impl ThreadSource {
-    fn new(info: SourceInfo, mut r: Box<dyn Read + Send>) -> Self {
+    pub(crate) fn new(info: SourceInfo, mut r: Box<dyn Read + Send>) -> Self {
         let (tx, rx) = sync_channel(16);
         std::thread::Builder::new()
             .name("ironav-source".into())

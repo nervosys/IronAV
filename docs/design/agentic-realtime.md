@@ -348,7 +348,7 @@ Each milestone is usable on its own and passes the test gate.
 | **M1: understand files** (done) | `ironav-analyze` with `structure`, `levels`, `loudness`, `silence`, `scene` (shared with the encoder), `black`, `freeze`, `thumbnails`; the `analyze` tool and CLI; digests; MCP concurrency, progress and cancellation | none |
 | **M2: live bytes** (done in part) | the `Source` trait; `pipe:`, `?follow`, `?pace=realtime`, `tcp://`, `udp://`; `StreamDemuxer` for Annex B, ADTS, Y4M, WAV, Ogg and MP3; packet metadata; `LiveSession`, the ring buffer, the `stream_*` tools and `ironav watch`; low-delay H.264 and HEVC output | none |
 | **M3: broadcast** (done) | the MPEG-TS demuxer and muxer; live fMP4 and MKV reading; a progressive fMP4/TS recorder; `stream_clip`; segmenting; the `latency: low` encode profile | none |
-| **M4: cameras and the web** | RTSP and RTP depacketizers with a jitter buffer and RTCP; HLS over plain HTTP | none |
+| **M4: cameras and the web** (done) | RTSP and RTP depacketizers with a jitter buffer and RTCP; HLS over plain HTTP | none |
 | **M5: models** | the sidecar protocol, voice-activity gating and two reference sidecars kept out of tree (speech-to-text, detection) | none in the core; each sidecar chooses its own |
 | **M6: optional transports** | HTTPS/HLS, RTSPS, SRT, capture devices, WebRTC ingest | each one by decision (§10) |
 
@@ -383,7 +383,15 @@ datagrams only from the server's address (or a `source=` it names that the allow
 way, and sends an RTCP receiver report every 5 s; the order between tracks is not kept, and the demuxer does not need
 it. RTCP sender reports are not used for alignment: nearly every server sends RTP-Info, and rebasing a track once its
 packets have gone out would put a jump in recordings, so a server without RTP-Info leaves each track counting from its
-first packet. Still to do in M4: HLS over plain HTTP.
+first packet. HLS (`ironav-live/src/hls.rs`, over the HTTP/1.1 client in `http.rs`) plays a master playlist's
+highest-bandwidth variant and gives its segments' bytes in order, with the `EXT-X-MAP` section in front of the first
+segment that uses it: concatenated TS segments are a transport stream and fragments after their initialization section
+are a fragmented MP4, so the existing stream demuxers read the result unchanged. Live playlists start three segments
+from the end, reload every target duration (half when nothing was added), and use media sequence numbers so no segment
+is given twice. Every connection and redirect passes the allow-list, and credentials go only to the URL's own server.
+Encrypted playlists and HTTPS segments are refused at open; separate audio renditions are not played. Checked with
+FFmpeg's HLS muxer writing TS and fMP4 segments: both played through `ironav watch`, recorded, and decoded by FFmpeg
+with every frame. M4 is done.
 
 M1 comes first because it needs no new input path. It turns the existing decoders into an understanding tool for
 files at once, and it fixes the event model, analyzer trait and MCP plumbing before anything goes live.

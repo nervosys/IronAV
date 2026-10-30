@@ -64,6 +64,11 @@ impl Allow {
             if len > if ip.is_ipv4() { 32 } else { 128 } {
                 return Err(bad());
             }
+            // an IPv4 range written as IPv4-mapped IPv6 is the IPv4 range
+            let (ip, len) = match ip {
+                IpAddr::V6(v) if len >= 96 && v.to_ipv4_mapped().is_some() => (IpAddr::V4(v.to_ipv4_mapped().unwrap()), len - 96),
+                _ => (ip, len),
+            };
             a.nets.push((ip, len));
         }
         Ok(a)
@@ -108,7 +113,7 @@ fn canonical(ip: IpAddr) -> IpAddr {
 }
 
 fn contains(net: IpAddr, len: u8, ip: IpAddr) -> bool {
-    let (net, ip, bits) = match (canonical(net), ip) {
+    let (net, ip, bits) = match (net, ip) {
         (IpAddr::V4(n), IpAddr::V4(i)) => (u32::from(n) as u128, u32::from(i) as u128, 32u32),
         (IpAddr::V6(n), IpAddr::V6(i)) => (u128::from(n), u128::from(i), 128u32),
         _ => return false,
@@ -175,6 +180,8 @@ mod tests {
         assert!(a.permits(ip("10.0.0.1")), "the default ranges stay");
         assert!(Allow::parse("any").unwrap().permits(ip("8.8.8.8")));
         assert!(Allow::parse("0.0.0.0/0").unwrap().permits(ip("8.8.8.8")));
+        let mapped = Allow::parse("::ffff:203.0.113.0/120,::ffff:0:0/64").unwrap();
+        assert!(mapped.permits(ip("203.0.113.9")) && !mapped.permits(ip("203.0.114.9")));
         for bad in ["8.8.8.8/33", "example.com", "10.0.0.0/x", "::/129"] {
             assert_eq!(Allow::parse(bad).unwrap_err().code, ErrorCode::InvalidArgument, "{bad}");
         }

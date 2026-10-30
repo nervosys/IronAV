@@ -1,4 +1,5 @@
-//! Source URLs: `tcp://host:port`, `udp://:port`, `rtsp://[user:password@]host[:port]/path`, `pipe:`,
+//! Source URLs: `tcp://host:port`, `udp://:port`, `rtsp://[user:password@]host[:port]/path`,
+//! `http://host[:port]/path` (HLS or a download), `pipe:`,
 //! `-`, `file:path` or a bare path, each
 //! optionally followed by `?key=value&...` options.
 
@@ -49,9 +50,9 @@ impl SourceUrl {
             ("file".to_string(), base.to_string())
         };
         match scheme.as_str() {
-            "file" | "pipe" | "tcp" | "udp" | "rtsp" => {}
+            "file" | "pipe" | "tcp" | "udp" | "rtsp" | "http" => {}
             other => {
-                return Err(Error::invalid_arg(format!("'{other}' sources are not supported")).alternatives(["file", "pipe", "tcp", "udp", "rtsp"]));
+                return Err(Error::invalid_arg(format!("'{other}' sources are not supported")).alternatives(["file", "pipe", "tcp", "udp", "rtsp", "http"]));
             }
         }
         if matches!(scheme.as_str(), "tcp" | "udp") && !target.contains(':') {
