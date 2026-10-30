@@ -568,7 +568,7 @@ mod tests {
         while start.elapsed() < limit {
             match s.read(&mut buf, Duration::from_millis(50))? {
                 Chunk::Data(n) => got.extend_from_slice(&buf[..n]),
-                Chunk::Idle => {}
+                Chunk::Idle | Chunk::Restart => {}
                 Chunk::End => break,
             }
         }

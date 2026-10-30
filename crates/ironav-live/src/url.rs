@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 /// - `listen`: wait for a TCP connection on the given address instead of making one;
 /// - `transport=udp`: have an RTSP server send RTP over UDP rather than on its connection;
 /// - `audio`: the HLS audio rendition to play, by language or name.
-pub const OPTIONS: [&str; 9] = ["format", "fps", "pace", "follow", "idle", "listen", "transport", "audio", "size"];
+pub const OPTIONS: [&str; 12] = ["format", "fps", "pace", "follow", "idle", "listen", "transport", "audio", "size", "reconnect", "stall", "retries"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SourceUrl {

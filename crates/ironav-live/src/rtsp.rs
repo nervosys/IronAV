@@ -873,7 +873,7 @@ mod tests {
             match s.read(&mut buf, Duration::from_millis(50)).unwrap() {
                 Chunk::Data(n) => got.extend_from_slice(&buf[..n]),
                 Chunk::Idle if got.len() >= frames.iter().map(Vec::len).sum::<usize>() => break,
-                Chunk::Idle => {}
+                Chunk::Idle | Chunk::Restart => {}
                 Chunk::End => break,
             }
         }

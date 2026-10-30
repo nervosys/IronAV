@@ -18,6 +18,9 @@ pub enum Chunk {
     Idle,
     /// The source has ended and will send nothing more.
     End,
+    /// The source was lost and is back: what follows starts over, as from a new connection (a
+    /// new header or description, timestamps from a new origin).
+    Restart,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -36,6 +39,10 @@ pub trait Source: Send {
     /// Bytes into `buf`, waiting at most `wait` for some to arrive. A datagram source gives one
     /// datagram per read, so `buf` should hold 64 KiB.
     fn read(&mut self, buf: &mut [u8], wait: Duration) -> Result<Chunk>;
+    /// How a source that is kept up is doing (see [`crate::reconnect`]); `None` for the others.
+    fn health(&self) -> Option<crate::reconnect::Health> {
+        None
+    }
 }
 
 /// How long to wait for a TCP connection to be made.
@@ -43,8 +50,31 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often a followed file is checked for new bytes.
 const FOLLOW_POLL: Duration = Duration::from_millis(20);
 
-/// Opens the source a URL names (see [`SourceUrl`]).
+/// Opens the source a URL names (see [`SourceUrl`]). An RTSP source, and a TCP connection with
+/// `?reconnect`, is kept up (see [`crate::reconnect`]): `stall=S` seconds without data is a stall
+/// and twice that a loss (5 by default), `retries=N` attempts after a loss before giving up
+/// (unlimited by default), and `reconnect=0` turns it off.
 pub fn open_source(url: &str) -> Result<Box<dyn Source>> {
+    let u = SourceUrl::parse(url)?;
+    let client = u.scheme == "tcp" && !u.flag("listen") && !u.target.starts_with(':');
+    let keep_up = match u.option("reconnect") {
+        Some(_) => u.flag("reconnect"),
+        None => matches!(u.scheme.as_str(), "rtsp" | "rtsps"),
+    };
+    if keep_up && (client || matches!(u.scheme.as_str(), "rtsp" | "rtsps")) {
+        let num = |key: &str| u.option(key).map(|s| s.parse::<f64>().ok().filter(|v| *v > 0.0 && v.is_finite()).ok_or_else(|| Error::invalid_arg(format!("{key} must be a positive number, got '{s}'")))).transpose();
+        let policy = crate::reconnect::Policy {
+            stall: num("stall")?.map_or(crate::reconnect::Policy::default().stall, Duration::from_secs_f64),
+            retries: num("retries")?.map(|r| r as u32),
+        };
+        let url = url.to_string();
+        return Ok(Box::new(crate::reconnect::Reconnecting::new(move || open_once(&url), policy)?));
+    }
+    open_once(url)
+}
+
+/// Opens the source a URL names, once.
+fn open_once(url: &str) -> Result<Box<dyn Source>> {
     let u = SourceUrl::parse(url)?;
     let shown = redact(url);
     let unreachable = |e: std::io::Error, what: &str| Error::new(ErrorCode::Io, format!("{what} {shown}: {e}")).hint("check the address, and that the sender is running");
@@ -287,7 +317,7 @@ mod tests {
         while out.len() < limit && start.elapsed() < Duration::from_secs(10) {
             match s.read(&mut buf, Duration::from_millis(50)).unwrap() {
                 Chunk::Data(n) => out.extend_from_slice(&buf[..n]),
-                Chunk::Idle => {}
+                Chunk::Idle | Chunk::Restart => {}
                 Chunk::End => break,
             }
         }

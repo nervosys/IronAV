@@ -546,6 +546,15 @@ impl Analysis {
         std::mem::take(&mut self.changed)
     }
 
+    /// The source started over (it was lost and is back): each decoder waits for a keyframe again,
+    /// and audio and picture timing are taken afresh.
+    pub fn restart(&mut self) {
+        for s in self.streams.iter_mut().flatten() {
+            s.wait_key = s.decoder.is_some();
+            (s.audio_next, s.last_video) = (None, None);
+        }
+    }
+
     /// Whether stream `i` is analyzed.
     pub fn wants(&self, i: usize) -> bool {
         matches!(self.streams.get(i), Some(Some(_)))

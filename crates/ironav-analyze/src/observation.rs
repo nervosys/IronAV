@@ -111,6 +111,10 @@ pub const KINDS: &[KindInfo] = &[
     KindInfo { name: "timestamp_gap", level: Level::Events, description: "No packets of the stream between `t` and `t_end`." },
     KindInfo { name: "discontinuity", level: Level::Events, description: "Timestamps jumped backwards at `t` by `data.seconds`." },
     KindInfo { name: "decode_error", level: Level::Events, description: "A packet could not be decoded; analysis continues with the next one." },
+    KindInfo { name: "source_stalled", level: Level::Events, description: "A network source sent nothing for `data.seconds`; it is still connected." },
+    KindInfo { name: "source_lost", level: Level::Events, description: "A network source was lost (`data.reason`); it is being reconnected, with backoff." },
+    KindInfo { name: "source_restored", level: Level::Events, description: "A lost source is back after `data.attempts` attempts (`data.reconnects` in all); decoding resumes at the next keyframe and media time goes on from where it stopped." },
+    KindInfo { name: "source_failed", level: Level::Events, description: "A lost source could not be reconnected (`data.reason`); the session ends." },
     KindInfo { name: "loudness", level: Level::Raw, description: "Momentary and short-term loudness (LUFS), once a second." },
     KindInfo { name: "change", level: Level::Raw, description: "How much each picture differs from the last (`data.score`: 0 still, above 0.8 a cut)." },
 ];

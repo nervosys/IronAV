@@ -11,7 +11,7 @@ use crate::tap::{Tap, TapConfig, TapFeeder};
 use ironav_analyze::{Level, Observation};
 use ironav_core::{Error, ErrorCode, Rational, Result, StreamInfo, VideoFrame};
 use ironav_formats::stream::{stream_demuxer, StreamOptions, StreamPacket, SNIFF_BYTES};
-use ironav_live::{open_source, Chunk, Source, SourceInfo, SourceUrl};
+use ironav_live::{open_source, Chunk, Health, HealthState, Source, SourceInfo, SourceUrl};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -144,6 +144,8 @@ struct Shared {
     reconfigure: VecDeque<(Reconfigure, RecordChange)>,
     /// Taps waiting for the session thread to attach them.
     taps: Vec<TapFeeder>,
+    /// How a source that is kept up is doing.
+    health: Option<Health>,
     requested: u64,
     applied: u64,
 }
@@ -354,6 +356,7 @@ pub fn open(args: &OpenArgs) -> Result<Arc<Session>> {
             transcoding: args.transcode.as_ref().map(|t| t.output.clone()),
             reconfigure: VecDeque::new(),
             taps: Vec::new(),
+            health: None,
             requested: 0,
             applied: 0,
         }),
@@ -643,6 +646,11 @@ impl Session {
         let mut analysis: Option<Analysis> = None;
         let mut pace: Option<(Instant, f64)> = None;
         let mut ended = false;
+        // after the source was lost and came back: the media time its packets should go on from,
+        // and then how far its timestamps are moved to do so
+        let mut resume_at: Option<f64> = None;
+        let mut shift = 0.0f64;
+        let mut last_data = Instant::now();
         while !ended {
             if self.idle_expired() {
                 self.stop.store(true, Ordering::Relaxed);
@@ -651,14 +659,30 @@ impl Session {
                 break;
             }
             self.reconfigure(analysis.as_mut(), &mut deferred, rec, tc);
-            let chunk = source.read(&mut buf, READ_WAIT)?;
+            let chunk = source.read(&mut buf, READ_WAIT);
+            if let Some(h) = source.health() {
+                self.health(h);
+            }
+            let chunk = chunk?;
             let arrival = Instant::now();
             let bytes: &[u8] = match chunk {
                 Chunk::Data(n) => {
                     lock(&self.shared).bytes_in += n as u64;
+                    last_data = arrival;
                     &buf[..n]
                 }
                 Chunk::Idle => continue,
+                Chunk::Restart => {
+                    // a new demuxer reads the new connection; its media time goes on from where the
+                    // old one stopped, plus the time it was gone
+                    if demux.is_some() {
+                        let end = lock(&self.shared).media_seconds;
+                        resume_at = Some(end + last_data.elapsed().as_secs_f64());
+                    }
+                    (demux, pace) = (None, None);
+                    head.clear();
+                    continue;
+                }
                 Chunk::End => {
                     ended = true;
                     &[]
@@ -724,6 +748,19 @@ impl Session {
                 }
                 let a = analysis.as_mut().unwrap();
                 let tb = d.streams().get(sp.packet.stream).map_or(0.0, |s| s.time_base.as_f64());
+                let mut sp = sp;
+                if let Some(at) = resume_at.take() {
+                    let (old, new) = (lock(&self.shared).streams.clone(), d.streams());
+                    let same = old.len() == new.len() && old.iter().zip(new).all(|(o, n)| o.codec == n.codec && o.params.media_type() == n.params.media_type());
+                    if !same {
+                        return Err(Error::new(ErrorCode::UnsupportedFormat, "the source came back with different streams").hint("open a new session on it"));
+                    }
+                    shift = at - sp.packet.pts as f64 * tb;
+                    a.restart();
+                }
+                if shift != 0.0 && tb > 0.0 {
+                    sp.packet.pts += (shift / tb).round() as i64;
+                }
                 let t = sp.packet.pts as f64 * tb;
                 if realtime {
                     // release packets no faster than they play
@@ -811,6 +848,29 @@ impl Session {
         }
     }
 
+    /// Publishes the source's health, logging each change of state.
+    fn health(&self, h: Health) {
+        let mut sh = lock(&self.shared);
+        let was = sh.health.as_ref().map(|o| o.state);
+        if was == Some(h.state) {
+            sh.health = Some(h);
+            return;
+        }
+        let t = sh.media_seconds;
+        sh.health = Some(h.clone());
+        drop(sh);
+        let o = match (was, h.state) {
+            (None, _) => return,
+            (_, HealthState::Stalled) => Observation::new("source_stalled", "source", t, json!({ "since_unix": h.since })),
+            (_, HealthState::Reconnecting) => Observation::new("source_lost", "source", t, json!({ "reason": h.last_error })),
+            (Some(HealthState::Reconnecting), HealthState::Connected) => Observation::new("source_restored", "source", t, json!({ "attempts": h.attempts + 1, "reconnects": h.reconnects })),
+            (_, HealthState::Failed) => Observation::new("source_failed", "source", t, json!({ "reason": h.last_error, "attempts": h.attempts })),
+            (_, HealthState::Connected) => return,
+        };
+        let _ = self.log(o, None);
+        self.changed.notify_all();
+    }
+
     fn log(&self, mut o: Observation, arrival: Option<Instant>) -> Result<()> {
         let mut sh = lock(&self.shared);
         if let Some(p) = o.picture.take() {
@@ -863,6 +923,7 @@ impl Session {
             "retained": { "from": sh.ring.front().map(|k| k.t), "to": sh.ring.back().map(|k| k.t), "bytes": sh.ring_bytes },
             "record": sh.record,
             "transcode": sh.transcode,
+            "source_health": sh.health,
         })
     }
 

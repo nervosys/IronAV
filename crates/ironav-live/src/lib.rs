@@ -12,12 +12,14 @@ mod hls;
 mod http;
 mod md5;
 pub mod net;
+pub mod reconnect;
 mod rtsp;
 mod source;
 pub mod tls;
 mod url;
 
 pub use net::{Allow, ALLOW_VAR};
+pub use reconnect::{Health, HealthState, Policy};
 pub use source::{open_source, Chunk, Source, SourceInfo};
 pub use tls::CA_FILE_VAR;
 pub use url::{redact, SourceUrl};

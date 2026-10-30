@@ -90,6 +90,14 @@ The same analyzers run on media as it arrives. A source is a path, `path?follow`
 (or over UDP with `?transport=udp`, taken only from the server's address),
 Basic or Digest credentials, keepalives and TEARDOWN, with H.264, HEVC, AAC, Opus, G.711 and L16 tracks (others are
 skipped). The password never appears in output, and with Digest it is never sent.
+An RTSP source (and `tcp://host:port?reconnect`) is kept up: when the connection drops, the server ends the stream, or
+nothing arrives for twice `stall` seconds (`?stall=`, 5 by default), it is opened again on its own thread, waiting 0.5 s
+and then twice as long after each failed attempt, up to 30 s, for ever or for `?retries=N` attempts (`?reconnect=0`
+turns this off; a source that cannot be reached when the session opens is an error at once). The session's media time
+goes on from where it stopped plus the time the source was gone, decoders wait for the next keyframe, and a source that
+comes back with different tracks ends the session. `stream_status` has `source_health` (`connected`, `stalled`,
+`reconnecting` or `failed`, since when, how many reconnects and failed attempts, and the last error), and the log has
+`source_stalled`, `source_lost`, `source_restored` and `source_failed` as they happen.
 `http://host[:port]/path` plays HLS when it names a playlist (the highest-bandwidth variant; TS or fMP4 segments with
 `EXT-X-MAP` and byte ranges; a live playlist is followed from three segments before its end), and downloads anything
 else as it arrives. A variant whose audio is a separate rendition (`EXT-X-MEDIA` with `TYPE=AUDIO`) plays with it: the

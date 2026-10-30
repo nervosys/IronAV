@@ -99,7 +99,7 @@ fn drain(url: &str) -> ironav_core::Result<Vec<u8>> {
     while start.elapsed() < Duration::from_secs(20) {
         match s.read(&mut buf, Duration::from_millis(50))? {
             Chunk::Data(n) => got.extend_from_slice(&buf[..n]),
-            Chunk::Idle => {}
+            Chunk::Idle | Chunk::Restart => {}
             Chunk::End => break,
         }
     }
