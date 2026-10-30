@@ -2,6 +2,7 @@
 
 mod adts;
 mod annexb;
+mod audio_stream;
 pub(crate) mod flac;
 mod mkv;
 mod mkvwrite;

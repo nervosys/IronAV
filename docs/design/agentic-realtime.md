@@ -357,7 +357,8 @@ Each milestone is usable on its own and passes the test gate.
 M2 as built: the `Source` trait and every source above; `StreamDemuxer` for Annex B H.264/HEVC, ADTS, Y4M and WAV;
 live sessions with the ring buffer and log; `stream_open`, `stream_events`, `stream_status`, `stream_snapshot`,
 `stream_clip` and `stream_close`; and `ironav watch`. The session limit uses a new error code, `busy` (exit 75),
-and an unreachable source is `io`, so no further codes were added. Left for later: Ogg and MP3 stream demuxers;
+and an unreachable source is `io`, so no further codes were added. Ogg (Opus, Vorbis, FLAC) and MP3 stream demuxers
+followed later (`ironav-formats/src/audio_stream.rs`); their packets match the file readers'. Left for later:
 low-delay H.264 and HEVC output; `stream_query` and `stream_configure`; the idle timeout; and stdin commands for
 `watch`. Packet metadata (keyframe flag and arrival time) is held in the live layer (`StreamPacket`) instead of
 as new `Packet` fields, so §9's migration was not needed.

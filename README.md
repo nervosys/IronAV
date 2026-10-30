@@ -91,8 +91,10 @@ else as it arrives. Encrypted playlists, separate audio renditions and HTTPS are
 Outbound connections go only to loopback, private and link-local addresses (not the cloud metadata endpoints
 169.254.169.254 and 169.254.170.2/.23), checked after the name resolves. Whoever runs IronAV can allow more with `IRONAV_NET_ALLOW`:
 addresses and CIDR ranges separated by commas, or `any`. A request cannot widen it.
-Readable as it arrives: MPEG-TS, Matroska/WebM, fragmented MP4 (CMAF), Y4M, WAV, ADTS AAC and raw H.264/HEVC (Annex B,
-which carries no frame rate: give `fps`, 25 by default). Matroska is read the way a browser's MediaRecorder, OBS or `ffmpeg -f matroska -`
+Readable as it arrives: MPEG-TS, Matroska/WebM, fragmented MP4 (CMAF), Y4M, WAV, ADTS AAC, MP3, Ogg (Opus, Vorbis, FLAC)
+and raw H.264/HEVC (Annex B, which carries no frame rate: give `fps`, 25 by default). Ogg and MP3 are read the way internet
+radio sends them: an ID3v2 tag in front (whatever follows it, MP3 or AAC, decides the reader), chained Ogg streams between
+songs (the timeline carries on), and damaged pages stepped over. Matroska is read the way a browser's MediaRecorder, OBS or `ffmpeg -f matroska -`
 sends it: Segment and Clusters of unknown size, no Cues. The packets are the ones the file reader gives, whatever pieces the
 bytes arrive in. So `ironav watch tcp://:9000` can follow a webcam that a web page streams as WebM.
 Fragmented MP4 is read the same way: an initialization segment (`moov` with `mvex`), then `moof`+`mdat` pairs, as written by

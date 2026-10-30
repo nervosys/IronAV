@@ -55,7 +55,7 @@ fn lame_tag(file: &[u8], at: usize, h: &Header) -> Option<(u32, u32)> {
 }
 
 /// Whether the frame at `at` holds a Xing/Info/VBRI tag instead of audio.
-fn is_info_frame(file: &[u8], at: usize, h: &Header) -> bool {
+pub(crate) fn is_info_frame(file: &[u8], at: usize, h: &Header) -> bool {
     let xing = 4 + if h.crc { 2 } else { 0 } + h.side_len();
     [xing, 4 + 32].iter().any(|&off| file.get(at + off..at + off + 4).is_some_and(|t| matches!(t, b"Xing" | b"Info" | b"VBRI")))
 }

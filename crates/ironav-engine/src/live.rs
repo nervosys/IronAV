@@ -375,6 +375,8 @@ impl Session {
                     let streams = d.streams().to_vec();
                     let a = Analysis::new(&streams, opts, 0.0, f64::INFINITY, true)?;
                     let mut sh = lock(&self.shared);
+                    // a reader that decides late (after an ID3 tag) knows by now
+                    sh.format = Some(d.format_name());
                     sh.state = State::Running;
                     sh.analyzed = a.describe();
                     sh.warnings = a.warnings().to_vec();

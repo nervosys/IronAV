@@ -4,8 +4,8 @@
 //! packets out, `None` meaning "not enough yet".
 //!
 //! The formats here are the self-delimiting ones: Y4M, WAV, ADTS (AAC), Annex B H.264/HEVC and
-//! MPEG-TS ([`crate::ts`]), Matroska/WebM (`mkv::live`), fragmented MP4 (`mp4demux::live`) and RTP
-//! in RTSP's interleaved framing ([`crate::rtp`]).
+//! MPEG-TS ([`crate::ts`]), Matroska/WebM (`mkv::live`), fragmented MP4 (`mp4demux::live`), RTP
+//! in RTSP's interleaved framing ([`crate::rtp`]), and Ogg and MP3 ([`crate::audio_stream`]).
 
 use crate::{adts, wav, y4m};
 use ironav_core::{CodecId, Error, ErrorCode, Packet, PixelFormat, Rational, Result, StreamInfo, StreamParams};
@@ -32,19 +32,19 @@ pub trait StreamDemuxer: Send {
 }
 
 /// Bytes held back waiting for the rest of a header or packet, at most this many.
-const MAX_PENDING: usize = 64 << 20;
+pub(crate) const MAX_PENDING: usize = 64 << 20;
 /// Audio frames per WAV packet: about 21 ms at 48 kHz, so live audio is not held back long.
 const WAV_FRAMES: usize = 1024;
 
 /// Bytes fed but not yet used.
 #[derive(Default)]
-struct Pending {
+pub(crate) struct Pending {
     buf: Vec<u8>,
     pos: usize,
 }
 
 impl Pending {
-    fn push(&mut self, b: &[u8]) -> Result<()> {
+    pub(crate) fn push(&mut self, b: &[u8]) -> Result<()> {
         if self.pos > 0 && self.pos * 2 >= self.buf.len() {
             self.buf.drain(..self.pos);
             self.pos = 0;
@@ -55,15 +55,15 @@ impl Pending {
         self.buf.extend_from_slice(b);
         Ok(())
     }
-    fn data(&self) -> &[u8] {
+    pub(crate) fn data(&self) -> &[u8] {
         &self.buf[self.pos..]
     }
-    fn take(&mut self, n: usize) -> Vec<u8> {
+    pub(crate) fn take(&mut self, n: usize) -> Vec<u8> {
         let v = self.data()[..n].to_vec();
         self.pos += n;
         v
     }
-    fn skip(&mut self, n: usize) {
+    pub(crate) fn skip(&mut self, n: usize) {
         self.pos += n;
     }
 }
@@ -71,14 +71,14 @@ impl Pending {
 /// Options that a bare byte stream cannot carry itself.
 #[derive(Debug, Clone, Default)]
 pub struct StreamOptions {
-    /// `y4m`, `wav`, `aac` or `adts`, `h264`, `hevc`; detected from the first bytes when absent.
+    /// One of [`STREAM_FORMATS`]; detected from the first bytes when absent.
     pub format: Option<String>,
     /// Pictures per second of an Annex B stream, which carries no timing (25 when absent).
     pub frame_rate: Option<Rational>,
 }
 
 /// Formats [`stream_demuxer`] can read.
-pub const STREAM_FORMATS: [&str; 10] = ["y4m", "wav", "aac", "h264", "hevc", "mpegts", "matroska", "webm", "mp4", "rtp"];
+pub const STREAM_FORMATS: [&str; 12] = ["y4m", "wav", "aac", "mp3", "ogg", "h264", "hevc", "mpegts", "matroska", "webm", "mp4", "rtp"];
 
 /// Bytes [`stream_demuxer`] wants to see before it can tell the format.
 /// (A transport stream needs two packets' sync bytes.)
@@ -102,6 +102,9 @@ pub fn stream_demuxer(magic: &[u8], opts: &StreamOptions) -> Result<Box<dyn Stre
         "y4m" => Box::new(Y4mStream::default()),
         "wav" => Box::new(WavStream::default()),
         "aac" | "adts" => Box::new(AdtsStream::default()),
+        "mp3" => Box::new(crate::audio_stream::Mp3Stream::default()),
+        "ogg" | "opus" | "oga" => Box::new(crate::audio_stream::OggStream::default()),
+        "id3" => Box::new(crate::audio_stream::Id3Stream::default()),
         "h264" | "avc" => Box::new(AnnexBStream::new(CodecId::H264, fps)),
         "hevc" | "h265" => Box::new(AnnexBStream::new(CodecId::Hevc, fps)),
         "mpegts" | "ts" | "m2ts" => Box::new(crate::ts::TsStream::default()),
@@ -133,8 +136,18 @@ fn sniff(m: &[u8]) -> Option<&'static str> {
     if m.len() >= 12 && &m[..4] == b"RIFF" && &m[8..12] == b"WAVE" {
         return Some("wav");
     }
-    if m.starts_with(b"ID3") || adts::looks_like_adts(m) {
+    if crate::ogg::looks_like_ogg(m) {
+        return Some("ogg");
+    }
+    // what follows the tag says whether it is MP3 or AAC
+    if m.starts_with(b"ID3") {
+        return Some("id3");
+    }
+    if adts::looks_like_adts(m) {
         return Some("aac");
+    }
+    if ironav_codec::mp3::parse_header(m).is_some() {
+        return Some("mp3");
     }
     let nal = if m.starts_with(&[0, 0, 0, 1]) {
         m.get(4..)
@@ -713,7 +726,8 @@ mod tests {
         assert_eq!(sniff(&[0, 0, 0, 1, 0x67, 0x64, 0, 0x1f]), Some("h264"));
         assert_eq!(sniff(&[0, 0, 0, 1, 0x40, 0x01, 0x0c, 0x01]), Some("hevc"));
         assert_eq!(sniff(b"\x1aE\xdf\xa3 matroska"), Some("matroska"));
-        assert_eq!(sniff(b"OggS\0\x02"), None);
-        assert!(stream_demuxer(b"OggS\0\x02", &StreamOptions::default()).is_err());
+        assert_eq!(sniff(b"OggS\0\x02"), Some("ogg"));
+        // native FLAC has no frames that can be found without its header's help
+        assert!(stream_demuxer(b"fLaC\0\0\0\x22", &StreamOptions::default()).is_err());
     }
 }
