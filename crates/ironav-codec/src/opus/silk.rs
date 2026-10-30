@@ -71,7 +71,7 @@ fn mulh(a: i32, b: i32) -> i32 {
     ((a as i64 * b as i64) >> 32) as i32
 }
 
-fn stabilize_lsf(nlsf: &mut [i16; 16], order: usize, min_delta: &[u16]) {
+pub(super) fn stabilize_lsf(nlsf: &mut [i16; 16], order: usize, min_delta: &[u16]) {
     let md = |i: usize| min_delta[i] as i32;
     for _ in 0..20 {
         let mut min_diff = 0i32;
@@ -197,7 +197,7 @@ fn lsp2poly(lsp: &[i32], pol: &mut [i32], half_order: usize) {
     }
 }
 
-fn lsf2lpc(nlsf: &[i16; 16], order: usize) -> [f32; 16] {
+pub(super) fn lsf2lpc(nlsf: &[i16; 16], order: usize) -> [f32; 16] {
     let mut lsp = [0i32; 16];
     let (mut p, mut q) = ([0i32; 9], [0i32; 9]);
     let mut lpc32 = [0i32; 16];

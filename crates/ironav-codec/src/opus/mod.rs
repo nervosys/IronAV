@@ -12,11 +12,12 @@ mod plc;
 pub(crate) mod mdct;
 mod rc;
 mod silk;
+mod silk_enc;
 mod tables;
 
 use ironav_core::{AudioFrame, Decoder, Error, ErrorCode, Frame, Packet, Result, StreamParams};
 use rc::RangeDecoder;
-pub use encoder::{opus_head, OpusEncoder};
+pub use encoder::{opus_head, OpusEncoder, OpusMode, SILK_PRE_SKIP};
 use std::f64::consts::PI;
 use tables::CELT_WINDOW2;
 

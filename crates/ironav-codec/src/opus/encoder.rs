@@ -1,9 +1,10 @@
-//! An Opus encoder: CELT mode, 48 kHz, frames of 2.5, 5, 10 or 20 ms, constant bit rate, mono or
-//! stereo.
+//! An Opus encoder at 48 kHz, mono or stereo: CELT mode (the default) with frames of 2.5, 5, 10 or
+//! 20 ms at a constant bit rate, or SILK mode for speech, wideband, with frames of 10 or 20 ms at a
+//! variable rate around the one asked for (stereo input is coded as its mono mix).
 //!
-//! The frame coding is in `celt/enc.rs`; this file turns a stream of samples into packets: the
-//! pre-emphasis filter, buffering for the window's look-ahead, the TOC byte, and the end of the
-//! stream. Besides the [`Encoder`] trait, which takes frames of any length, a caller that has its
+//! The frame coding is in `celt/enc.rs` and `silk_enc.rs`; this file turns a stream of samples into
+//! packets: the pre-emphasis filter, or for SILK the resampling to 16 kHz, buffering for the
+//! look-ahead, the TOC byte, and the end of the stream. Besides the [`Encoder`] trait, which takes frames of any length, a caller that has its
 //! own framing (a voice link, say) codes one frame at a time into its own buffer with
 //! [`OpusEncoder::encode_frame_into`], which allocates nothing.
 
@@ -11,6 +12,8 @@ use super::celt::enc::{FRAME, LOOKAHEAD};
 use super::celt::prefilter::Prefilter;
 use super::celt::Celt;
 use super::rc::RangeEncoder;
+use super::silk_enc::{self, SilkEncoder};
+use crate::voice::StreamResampler;
 use ironav_core::{Encoder, Error, ErrorCode, Frame, Packet, Result};
 
 const RATE: u32 = 48_000;
@@ -22,12 +25,43 @@ const INTRA_PERIOD: u64 = 50;
 /// Samples the decoder must drop from the start: the first frame's window has nothing to overlap with.
 pub const PRE_SKIP: usize = LOOKAHEAD;
 
-/// The `OpusHead` that describes a stream from this encoder to a container.
+/// Samples (at 16 kHz) of zeros before the input in SILK mode, so that each frame of input brings
+/// a whole frame with its look-ahead: the look-ahead and the resampler's 1 ms.
+const SILK_LEAD: usize = silk_enc::LOOKAHEAD + 16;
+/// Samples (at 48 kHz) a decoder must drop from the start of a SILK stream: the lead above, and
+/// the decoder's own two samples and its upsampler's eleven (at 16 kHz).
+pub const SILK_PRE_SKIP: usize = 3 * (SILK_LEAD + 2 + 11);
+
+/// What an [`OpusEncoder`] codes with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum OpusMode {
+    /// CELT, full band: music and anything else, at any bit rate.
+    #[default]
+    Celt,
+    /// SILK, wideband (audio up to 8 kHz): speech, at low bit rates (about 8 to 30 kb/s).
+    Silk,
+}
+
+/// The SILK side: the resampler to 16 kHz and the signal waiting to be coded.
+struct SilkPath {
+    enc: SilkEncoder,
+    rs: StreamResampler,
+    /// 16 kHz samples, from `silk_enc::PAST` before the next frame.
+    buf: Vec<f32>,
+    mono: Vec<f32>,
+}
+
+/// The `OpusHead` that describes a stream from a CELT-mode encoder to a container
+/// ([`OpusEncoder::head`] for any mode).
 pub fn opus_head(channels: usize) -> Vec<u8> {
+    head_with(channels, PRE_SKIP)
+}
+
+fn head_with(channels: usize, pre_skip: usize) -> Vec<u8> {
     let mut v = b"OpusHead".to_vec();
     v.push(1);
     v.push(channels as u8);
-    v.extend((PRE_SKIP as u16).to_le_bytes());
+    v.extend((pre_skip as u16).to_le_bytes());
     v.extend(RATE.to_le_bytes());
     v.extend(0i16.to_le_bytes());
     v.push(0); // channel mapping family 0
@@ -54,6 +88,7 @@ pub struct OpusEncoder {
     pub transients: u64,
     /// Samples per channel received.
     input: u64,
+    silk: Option<Box<SilkPath>>,
 }
 
 impl OpusEncoder {
@@ -84,7 +119,52 @@ impl OpusEncoder {
             frames: 0,
             transients: 0,
             input: 0,
+            silk: None,
         })
+    }
+
+    /// Codes in `mode`. Only before any audio; SILK takes frames of 10 or 20 ms.
+    pub fn with_mode(mut self, mode: OpusMode) -> Result<Self> {
+        if self.input > 0 {
+            return Err(Error::invalid_arg("the mode is set before any audio"));
+        }
+        self.silk = match mode {
+            OpusMode::Celt => None,
+            OpusMode::Silk => {
+                if self.size < 2 {
+                    return Err(Error::invalid_arg("SILK frames are 10 or 20 ms").alternatives(["10", "20"]));
+                }
+                let mut buf = Vec::with_capacity(silk_enc::PAST + 2 * 320 + SILK_LEAD);
+                buf.resize(silk_enc::PAST + SILK_LEAD, 0.0);
+                Some(Box::new(SilkPath { enc: SilkEncoder::new(), rs: StreamResampler::new(RATE, 16_000, 1, FRAME)?, buf, mono: Vec::with_capacity(FRAME) }))
+            }
+        };
+        self.bytes = self.max_bytes();
+        Ok(self)
+    }
+
+    /// The mode the encoder codes with.
+    pub fn mode(&self) -> OpusMode {
+        if self.silk.is_some() { OpusMode::Silk } else { OpusMode::Celt }
+    }
+
+    /// The most bytes a packet takes: CELT's are all this size, SILK's twice the bit rate's share
+    /// at most.
+    fn max_bytes(&self) -> usize {
+        match self.silk {
+            None => Self::frame_bytes(self.bitrate, self.frame, self.channels),
+            Some(_) => (2 * self.bitrate as usize * self.frame / RATE as usize / 8 + 1).clamp(80, 1275),
+        }
+    }
+
+    /// Samples (at 48 kHz) a decoder drops from the start of the stream.
+    pub fn pre_skip(&self) -> usize {
+        if self.silk.is_some() { SILK_PRE_SKIP } else { PRE_SKIP }
+    }
+
+    /// The `OpusHead` that describes this encoder's stream to a container.
+    pub fn head(&self) -> Vec<u8> {
+        head_with(self.channels, self.pre_skip())
     }
 
     /// A frame's worth of the bit rate, but never less than a few bytes or more than a frame can hold.
@@ -105,9 +185,12 @@ impl OpusEncoder {
         if self.input > 0 {
             return Err(Error::invalid_arg("the frame length is set before any audio"));
         }
+        if self.silk.is_some() && size < 2 {
+            return Err(Error::invalid_arg(format!("SILK frames are 10 or 20 ms, not {ms}")).alternatives(["10", "20"]));
+        }
         self.size = size;
         self.frame = FRAME >> (3 - size);
-        self.bytes = Self::frame_bytes(self.bitrate, self.frame, self.channels);
+        self.bytes = self.max_bytes();
         Ok(self)
     }
 
@@ -116,7 +199,8 @@ impl OpusEncoder {
         self.frame
     }
 
-    /// Bytes in every packet but those of digital silence (3), TOC included.
+    /// Bytes in every packet but those of digital silence (3), TOC included; in SILK mode, the
+    /// most a packet takes.
     pub fn packet_bytes(&self) -> usize {
         self.bytes
     }
@@ -125,7 +209,7 @@ impl OpusEncoder {
     /// look-ahead (the decoder drops the look-ahead as the stream's pre-skip). A frame passed
     /// to [`encode_frame_into`](Self::encode_frame_into) comes out of a decoder this much later.
     pub fn delay_samples(&self) -> usize {
-        self.frame + LOOKAHEAD
+        self.frame + self.pre_skip()
     }
 
     /// [`delay_samples`](Self::delay_samples) in milliseconds.
@@ -154,6 +238,19 @@ impl OpusEncoder {
         if out.len() < self.bytes {
             return Err(Error::invalid_arg(format!("the packet needs {} bytes, the buffer has {}", self.bytes, out.len())));
         }
+        if let Some(s) = &mut self.silk {
+            if !self.input.is_multiple_of(self.frame as u64) {
+                return Err(Error::invalid_arg("audio from encode() is waiting for the rest of its frame"));
+            }
+            s.mono.clear();
+            for i in 0..self.frame {
+                s.mono.push((0..self.channels).map(|c| get(i * self.channels + c)).sum::<f32>() / self.channels as f32);
+            }
+            s.rs.push(&s.mono)?;
+            Self::pull(s);
+            self.input += self.frame as u64;
+            return self.code_silk(out);
+        }
         if self.sig[0].len() != LOOKAHEAD {
             return Err(Error::invalid_arg("audio from encode() is waiting for the rest of its frame"));
         }
@@ -169,6 +266,74 @@ impl OpusEncoder {
     /// The bit rate used when none is asked for: 64 kb/s per channel.
     pub fn default_bitrate(channels: usize) -> u32 {
         64_000 * channels as u32
+    }
+
+    /// Moves what the resampler has ready to the SILK buffer, within full scale: the decoder's
+    /// output stops there, and an input it cannot follow would make the coder chase it.
+    fn pull(s: &mut SilkPath) {
+        let have = s.buf.len();
+        let n = s.rs.ready();
+        s.buf.resize(have + n, 0.0);
+        s.rs.pull(&mut s.buf[have..]);
+        for v in &mut s.buf[have..] {
+            *v = v.clamp(-1.0, 1.0);
+        }
+    }
+
+    /// Codes the SILK frame at the front of the buffer into `out`, and returns the packet's length.
+    fn code_silk(&mut self, out: &mut [u8]) -> Result<usize> {
+        let s = self.silk.as_mut().expect("SILK mode");
+        let fl = self.frame / 3;
+        let need = silk_enc::PAST + fl + silk_enc::LOOKAHEAD;
+        if s.buf.len() < need {
+            return Err(Error::new(ErrorCode::Internal, "Opus: the SILK frame is not all here"));
+        }
+        let size = self.bytes;
+        self.rc.reset(size - 1);
+        let target = self.bitrate as f64 * self.frame as f64 / RATE as f64 - 8.0;
+        let used = s.enc.encode(&mut self.rc, &s.buf[..need], fl / 80, target, ((size - 1) * 8) as i32);
+        self.rc.finish_in_place().map_err(|_| Error::new(ErrorCode::Internal, "Opus: a frame did not fit its packet"))?;
+        // the frame ends where the coder's bits do: any more would read as a redundancy frame
+        let len = (used as usize).div_ceil(8);
+        debug_assert!(self.rc.bytes()[len..].iter().all(|&b| b == 0));
+        // configurations 8 and 9: SILK, wideband, 10 or 20 ms; one mono frame per packet
+        out[0] = (8 + self.size as u8 - 2) << 3;
+        out[1..1 + len].copy_from_slice(&self.rc.bytes()[..len]);
+        s.buf.drain(..fl);
+        self.frames += 1;
+        Ok(1 + len)
+    }
+
+    /// Whether a whole frame is waiting to be coded.
+    fn frame_ready(&self) -> bool {
+        match &self.silk {
+            Some(s) => s.buf.len() >= silk_enc::PAST + self.frame / 3 + silk_enc::LOOKAHEAD,
+            None => self.sig[0].len() >= self.frame + LOOKAHEAD,
+        }
+    }
+
+    /// Takes `n` frames of interleaved input from `get`.
+    fn take(&mut self, n: usize, get: impl Fn(usize) -> f32) -> Result<()> {
+        match &mut self.silk {
+            Some(s) => {
+                for start in (0..n).step_by(FRAME) {
+                    s.mono.clear();
+                    for i in start..n.min(start + FRAME) {
+                        s.mono.push((0..self.channels).map(|c| get(i * self.channels + c)).sum::<f32>() / self.channels as f32);
+                    }
+                    s.rs.push(&s.mono)?;
+                    Self::pull(s);
+                }
+            }
+            None => {
+                for i in 0..n {
+                    for c in 0..self.channels {
+                        self.push(c, get(i * self.channels + c));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn push(&mut self, c: usize, x: f32) {
@@ -209,7 +374,7 @@ impl OpusEncoder {
     fn emit(&mut self, packets: &mut Vec<Packet>, duration: i64) -> Result<()> {
         let pts = self.frames as i64 * self.frame as i64;
         let mut data = vec![0u8; self.bytes];
-        let len = self.code(&mut data)?;
+        let len = if self.silk.is_some() { self.code_silk(&mut data)? } else { self.code(&mut data)? };
         data.truncate(len);
         packets.push(Packet { stream: 0, pts, duration, data });
         Ok(())
@@ -225,16 +390,17 @@ impl Encoder for OpusEncoder {
             return Err(Error::invalid_input("the audio changed sample rate or channel count mid-stream"));
         }
         let n = a.samples.len() / self.channels;
-        for i in 0..n {
-            for c in 0..self.channels {
-                self.push(c, a.samples[i * self.channels + c] as f32);
+        let mut packets = Vec::new();
+        // a frame at a time, so the SILK buffer never holds more than one and its look-ahead
+        for start in (0..n).step_by(self.frame) {
+            let m = (n - start).min(self.frame);
+            let base = start * self.channels;
+            self.take(m, |i| a.samples[base + i] as f32)?;
+            while self.frame_ready() {
+                self.emit(&mut packets, self.frame as i64)?;
             }
         }
         self.input += n as u64;
-        let mut packets = Vec::new();
-        while self.sig[0].len() >= self.frame + LOOKAHEAD {
-            self.emit(&mut packets, self.frame as i64)?;
-        }
         Ok(packets)
     }
 
@@ -245,16 +411,15 @@ impl Encoder for OpusEncoder {
         }
         // frames until every input sample has come out of the decoder, which is the pre-skip late
         let frame = self.frame;
-        let wanted = (self.input as usize + PRE_SKIP).div_ceil(frame) as u64;
+        let skip = self.pre_skip();
+        let wanted = (self.input as usize + skip).div_ceil(frame) as u64;
         while self.frames < wanted {
-            while self.sig[0].len() < frame + LOOKAHEAD {
-                for c in 0..self.channels {
-                    self.push(c, 0.0);
-                }
+            while !self.frame_ready() {
+                self.take(frame, |_| 0.0)?;
             }
             let last = self.frames + 1 == wanted;
             // the final packet decodes to more than the stream holds; say how much to keep
-            let duration = if last { (self.input as usize + PRE_SKIP - (wanted as usize - 1) * frame) as i64 } else { frame as i64 };
+            let duration = if last { (self.input as usize + skip - (wanted as usize - 1) * frame) as i64 } else { frame as i64 };
             self.emit(&mut packets, duration)?;
         }
         Ok(packets)
@@ -462,5 +627,82 @@ mod attacks {
         let snr = 10.0 * (sig / err).log10();
         eprintln!("hits: {snr:.1} dB, {} short-block frames", enc.transients);
         assert!(snr > 15.0, "{snr}");
+    }
+
+    /// Speech through SILK mode and our decoder: the SNR at the best alignment, that alignment
+    /// (0 when the pre-skip is right), and the bit rate.
+    fn silk_round_trip(channels: usize, ms: f64, bitrate: u32) -> (f64, i64, f64) {
+        let mono = super::super::silk_enc::tests::speechlike(96_000, 48_000.0);
+        let input: Vec<f64> = mono.iter().flat_map(|&v| std::iter::repeat_n(v as f64, channels)).collect();
+        let mut enc = OpusEncoder::new(48_000, channels, bitrate).unwrap().with_mode(OpusMode::Silk).unwrap().with_frame_ms(ms).unwrap();
+        let mut packets = Vec::new();
+        for chunk in input.chunks(1000 * channels) {
+            let f = Frame::Audio(AudioFrame { sample_rate: 48_000, channels: channels as u16, pts: 0, samples: chunk.to_vec() });
+            packets.extend(enc.encode(&f).unwrap());
+        }
+        packets.extend(enc.flush().unwrap());
+        assert!(packets.iter().all(|p| p.data.len() <= enc.packet_bytes() && p.data[0] >> 3 == 8 + (ms == 20.0) as u8));
+        let params = StreamParams::Audio { sample_rate: 48_000, channels: channels as u16 };
+        let mut dec = super::super::OpusDecoder::new(&enc.head(), &params).unwrap();
+        let mut out = Vec::new();
+        for p in &packets {
+            for f in dec.decode(p).unwrap() {
+                let Frame::Audio(a) = f else { panic!() };
+                out.extend(a.samples.iter().step_by(channels).copied());
+            }
+        }
+        assert!(out.len() >= mono.len(), "decoded {} samples for {}", out.len(), mono.len());
+        let snr_at = |lag: i64| {
+            let (mut sig, mut err) = (0f64, 0f64);
+            for n in 100..mono.len() - 100 {
+                let (a, b) = (mono[n] as f64, out[(n as i64 + lag) as usize]);
+                sig += a * a;
+                err += (a - b) * (a - b);
+            }
+            10.0 * (sig / err.max(1e-30)).log10()
+        };
+        let lag = (-30..=30).max_by(|&a, &b| snr_at(a).partial_cmp(&snr_at(b)).unwrap()).unwrap();
+        let bytes: usize = packets.iter().map(|p| p.data.len()).sum();
+        (snr_at(lag), lag, bytes as f64 * 8.0 / 2.0)
+    }
+
+    #[test]
+    fn silk_mode_round_trips_through_our_decoder() {
+        for (channels, ms, rate) in [(1, 20.0, 12_000), (1, 20.0, 20_000), (1, 10.0, 16_000), (2, 20.0, 16_000)] {
+            let (snr, lag, bps) = silk_round_trip(channels, ms, rate);
+            eprintln!("SILK {channels} ch {ms} ms at {rate}: {snr:.1} dB at lag {lag}, {:.1} kb/s", bps / 1000.0);
+            assert_eq!(lag, 0, "the pre-skip is off");
+            assert!(snr > 8.0, "{snr}");
+            assert!((bps / rate as f64 - 1.0).abs() < 0.3, "{bps} for {rate}");
+        }
+    }
+
+    #[test]
+    fn silk_mode_keeps_its_rate_on_clipped_input() {
+        let mut enc = OpusEncoder::new(48_000, 1, 16_000).unwrap().with_mode(OpusMode::Silk).unwrap();
+        let x: Vec<f32> = super::super::silk_enc::tests::speechlike(96_000, 48_000.0).iter().map(|v| v * 4.0).collect();
+        let mut buf = vec![0u8; enc.packet_bytes()];
+        let mut bytes = 0;
+        for f in x.chunks_exact(enc.frame_samples()) {
+            bytes += enc.encode_frame_into(f, &mut buf).unwrap();
+        }
+        let bps = bytes as f64 * 8.0 / 2.0;
+        eprintln!("clipped: {:.1} kb/s", bps / 1000.0);
+        assert!(bps < 16_000.0 * 1.4, "{bps}");
+    }
+
+    #[test]
+    fn silk_mode_frame_at_a_time() {
+        let mut enc = OpusEncoder::new(48_000, 1, 16_000).unwrap().with_mode(OpusMode::Silk).unwrap();
+        assert!(OpusEncoder::new(48_000, 1, 16_000).unwrap().with_frame_ms(5.0).unwrap().with_mode(OpusMode::Silk).is_err());
+        assert_eq!(enc.mode(), OpusMode::Silk);
+        let x = super::super::silk_enc::tests::speechlike(48_000, 48_000.0);
+        let mut buf = vec![0u8; enc.packet_bytes()];
+        let mut sizes = Vec::new();
+        for f in x.chunks_exact(enc.frame_samples()) {
+            sizes.push(enc.encode_frame_into(f, &mut buf).unwrap());
+        }
+        assert_eq!(sizes.len(), 50);
+        assert!(sizes.iter().all(|&n| n > 2 && n <= enc.packet_bytes()), "{sizes:?}");
     }
 }

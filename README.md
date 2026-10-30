@@ -532,7 +532,7 @@ Checked: FFmpeg (through PyAV) opens the Matroska files and decodes them; our de
 83 dB, and both are 20.4 dB SNR against the source on a 6 s, 128 kb/s stereo test signal. Quality grows with the bit
 rate as it should (a tone-and-noise test signal, mono: 10 dB at 16 kb/s, 22 dB at 64, 29 at 128, 39 at 256). This is a first encoder, not libopus: there
 is only a simple transient detector (a frame with a sudden attack is coded as eight short blocks; on a test of decaying hits that is +1.3 dB SNR),
-no band boosts or tuned allocation trim, and no variable bit rate or SILK/hybrid modes, so at the same size it will sound
+no band boosts or tuned allocation trim, and no variable bit rate or hybrid mode, so at the same size it will sound
 worse than libopus. The end of a stream is exact in Ogg (the last page's granule position) and in Matroska/WebM (the last block carries a
 `DiscardPadding`, which our reader honours); FFmpeg decodes both to exactly the source's length.
 
@@ -552,6 +552,22 @@ bytes per channel, and lifted the speech-like test from 18.9 to 21.7 dB at 20 ms
 and 2.5 ms the frames are too small for it to pay its side information). libopus's allocation trim, which follows the
 spectrum's tilt, was tried and measured 1 to 4 dB worse here, so the trim stays even. `cargo test -p ironav-engine --test opus_interop -- --ignored` with
 `IRONAV_OPUS_OUT=dir` writes the streams for such a check.
+
+For speech at low rates there is SILK mode (`OpusEncoder::with_mode(OpusMode::Silk)`): wideband (audio to 8 kHz),
+mono (stereo input is coded as its mix), frames of 10 or 20 ms, at a variable rate that averages the one asked for
+(about 8 to 30 kb/s). It is written from the decoder, like the CELT side: LPC by autocorrelation and Levinson, turned
+into NLSFs and quantized with the two-stage codebook and its backward prediction; an open-loop pitch search on the LPC
+residual, checked against fractions of the lag, with the per-subframe contour chosen jointly; five-tap long-term
+predictors from the three codebooks; subframe gains from the prediction residual and a step size the rate control moves
+(and raises until a frame fits its packet). The pulses are chosen in closed loop by running the decoder's own synthesis,
+so the two never drift apart, with the coding noise fed back so that it follows the spectral envelope (`1/A(z/0.94)`)
+and, for 70 % of the long-term prediction, the pitch harmonics; without that feedback the pulses spend their bits
+cancelling the predictors' own noise and the rate stops falling as the steps grow. The delay is 4.3 ms of look-ahead
+and resampling plus the frame (`delay_ms()`), and `head()` carries the matching pre-skip. On one second of the
+speech-like test signal at 16 kb/s, libopus decodes the stream at 24.3 dB SNR (20 ms frames) and 21.9 dB (10 ms), and
+FFmpeg's decoder at 25.4 and 22.0; the CELT stream at 32 kb/s gets 21.7. Not yet: hybrid mode (SILK below 8 kHz with
+CELT above), in-band redundancy (LBRR), 40 and 60 ms packets, NLSF interpolation, stereo SILK, discontinuous
+transmission, and libopus's rate-distortion pulse search, so silence still costs about 15 bytes a frame.
 
 ### Voice link
 
