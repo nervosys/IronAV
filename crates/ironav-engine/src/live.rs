@@ -653,10 +653,8 @@ impl Session {
         })();
         match written {
             Ok((n, first, last)) => {
-                if overwrite && path.exists() {
-                    std::fs::remove_file(path)?;
-                }
-                std::fs::rename(&partial, path)?;
+                // replaced in one step: the old clip stays whole until the new one takes its place
+                ironav_core::replace_file(Path::new(&partial), path)?;
                 Ok(json!({ "session": self.id, "output": output, "format": fmt.name, "packets": n, "from": (first * 1000.0).round() / 1000.0, "to": (last * 1000.0).round() / 1000.0 }))
             }
             Err(e) => {

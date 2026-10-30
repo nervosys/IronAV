@@ -105,7 +105,7 @@ pub fn run_with(job: &Job, on_progress: &mut dyn FnMut(&Progress), cancel: Optio
     let rate = rate_control(&job.video)?;
     match execute(&plan, rate, demuxes, mux, t0, on_progress, cancel) {
         Ok((steps, bytes_in, bytes_out)) => {
-            std::fs::rename(&partial, &job.output)?;
+            ironav_core::replace_file(Path::new(&partial), Path::new(&job.output))?;
             let wall = t0.elapsed();
             let secs = wall.as_secs_f64().max(1e-9);
             // Y4M and raw streams carry no duration; derive it from the frames actually encoded.

@@ -561,7 +561,7 @@ impl Mp4Muxer {
             let _ = std::fs::remove_file(&tmp);
             return Err(e);
         }
-        std::fs::rename(&tmp, path)?;
+        ironav_core::replace_file(&tmp, path)?;
         Ok(())
     }
 

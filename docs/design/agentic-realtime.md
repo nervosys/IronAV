@@ -310,6 +310,11 @@ against, not claims:
 - Network sources are off unless a source URL asks for them. There are no listening sockets except an explicit `udp://:port`
   or `tcp://:port` listener, which binds to loopback unless the host is given.
 - URLs are redacted (`rtsp://user:***@host/…`) in every observation, status, log and error.
+- Before M4 (RTSP, HTTP), outbound connections get an address allow-list. Agents choose source URLs, and a server that
+  connects anywhere it is told is an SSRF hazard. The planned default allows loopback, private and link-local ranges, and
+  anything wider has to be configured. The address is checked after the name resolves and again on every redirect.
+- Files that readers may hold open (the HLS playlist, clips, job outputs) are replaced with one rename. On Windows a
+  rename over a file that a reader holds fails, so `ironav_core::replace_file` retries it for about a second.
 - Every untrusted-byte parser, which means every `StreamDemuxer`, depacketizer, decoder and the sidecar reader,
   has caps on buffered bytes, NAL/PES/packet size and stream count, and a `cargo fuzz` target. Fuzz targets are
   part of each milestone's definition of done.

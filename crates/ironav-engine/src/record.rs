@@ -256,7 +256,7 @@ impl Recorder {
         }
         // replaced whole, so a reader never sees half a playlist
         let tmp = format!("{}.partial", self.opts.path);
-        let r = std::fs::write(&tmp, m).and_then(|_| std::fs::rename(&tmp, &self.opts.path));
+        let r = std::fs::write(&tmp, m).and_then(|_| ironav_core::replace_file(Path::new(&tmp), Path::new(&self.opts.path)));
         if r.is_err() {
             let _ = std::fs::remove_file(&tmp);
         }
