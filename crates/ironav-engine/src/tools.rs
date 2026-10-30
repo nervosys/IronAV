@@ -266,7 +266,8 @@ fn h_stream_keyframes(args: &Value) -> Result<Value> {
         .iter()
         .map(|k| {
             let wall = k.decoded_at.duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
-            json!({ "t": (k.t * 1000.0).round() / 1000.0, "decoded_unix": wall, "width": k.width, "height": k.height, "jpeg_base64": ironav_player::base64(&k.jpeg) })
+            let captured = k.captured_at.and_then(|c| c.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs_f64());
+            json!({ "t": (k.t * 1000.0).round() / 1000.0, "decoded_unix": wall, "captured_unix": captured, "width": k.width, "height": k.height, "jpeg_base64": ironav_player::base64(&k.jpeg) })
         })
         .collect();
     Ok(json!({ "session": s.id, "keyframes": found }))

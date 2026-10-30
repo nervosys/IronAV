@@ -213,8 +213,11 @@ spectral centroid and 85% roll-off in Hz, spectral flatness (near 1 for noise, n
 decoder if nothing else needed one; if none suits, the first `recv_timeout` says why. The session never waits for a
 tap: each keeps `queue` items (1 unless asked: the latest wins) and drops the oldest when full, and `stats()` counts
 what was made, taken and dropped. Each item has a sequence number counting every item made, so a reader sees a gap; the
-media time `t` in seconds from the source's timestamps (for RTSP, the RTP clock from the start of the stream; not yet
-mapped to wall-clock time from RTCP sender reports); and `decoded_at`, the wall-clock time it was decoded. Dropping
+media time `t` in seconds from the source's timestamps (for RTSP, the RTP clock from the start of the stream);
+`decoded_at`, the wall-clock time it was decoded; and `captured_at`, when it was captured by the sender's clock, for an
+RTSP source whose server sends RTCP sender reports (each report ties the track's RTP clock to its NTP time; the latest
+is used, and `stream_status` shows it as `sender_clock`, the Unix time of media time 0 per stream). Keyframe pictures
+(below) carry the same capture time. Dropping
 the tap stops it; once the session ends, `recv_timeout` returns an error after the last item.
 
 With `keyframe_jpegs: N` a session keeps the pictures of the newest N keyframes of its first video stream as JPEG

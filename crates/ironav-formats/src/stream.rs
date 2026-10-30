@@ -29,6 +29,12 @@ pub trait StreamDemuxer: Send {
     fn next_packet(&mut self) -> Result<Option<StreamPacket>>;
     /// No more bytes will come; what is buffered and complete still comes out of `next_packet`.
     fn end(&mut self);
+    /// When `stream`'s media was captured, if its sender says: a presentation time (in the
+    /// stream's time base) and the Unix time in seconds it stands for. From RTP's RTCP sender
+    /// reports; `None` for formats that carry no such clock.
+    fn wall_clock(&self, _stream: usize) -> Option<(i64, f64)> {
+        None
+    }
 }
 
 /// Bytes held back waiting for the rest of a header or packet, at most this many.

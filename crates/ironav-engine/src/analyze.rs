@@ -116,6 +116,8 @@ struct Stream {
     keyframes_only: bool,
     /// Code in this process shown each decoded frame.
     taps: Vec<TapFeeder>,
+    /// The Unix time of media time 0 by the sender's clock, when it says (RTCP sender reports).
+    clock: Option<f64>,
 }
 
 impl Stream {
@@ -177,7 +179,7 @@ pub struct Analysis {
     /// The stream whose keyframes are kept as pictures, and the newest one decoded, for the
     /// session to take.
     keyframe_stream: Option<usize>,
-    pub last_keyframe: Option<(f64, VideoFrame)>,
+    pub last_keyframe: Option<(f64, Option<f64>, VideoFrame)>,
     /// How long the last packet took to decode, and to show to the analyzers and taps.
     pub timing: (std::time::Duration, std::time::Duration),
 }
@@ -342,6 +344,7 @@ impl Analysis {
                 wait_key: live,
                 keyframes_only: opts.keyframes_only && media == MediaType::Video,
                 taps: Vec::new(),
+                clock: None,
             }));
         }
         for car in pending {
@@ -582,7 +585,15 @@ impl Analysis {
     pub fn restart(&mut self) {
         for s in self.streams.iter_mut().flatten() {
             s.wait_key = s.decoder.is_some();
+            s.clock = None;
             (s.audio_next, s.last_video) = (None, None);
+        }
+    }
+
+    /// Sets the Unix time of stream `i`'s media time 0, by its sender's clock.
+    pub fn set_clock(&mut self, i: usize, unix_at_zero: f64) {
+        if let Some(Some(s)) = self.streams.get_mut(i) {
+            s.clock = Some(unix_at_zero);
         }
     }
 
@@ -669,7 +680,8 @@ impl Analysis {
         if key && self.keyframe_stream == Some(p.stream) {
             let tb = s.info.time_base.as_f64();
             if let Some(v) = frames.iter().find_map(|f| if let Frame::Video(v) = f { Some(v) } else { None }) {
-                self.last_keyframe = Some((v.pts as f64 * tb, v.clone()));
+                let t = v.pts as f64 * tb;
+                self.last_keyframe = Some((t, s.clock.map(|c| c + t), v.clone()));
             }
         }
         // Windows close on what the analyzers have been shown: decoded frames, which a decoder
@@ -800,7 +812,7 @@ fn feed_frame(s: &mut Stream, f: Frame, from: f64, to: f64, out: &mut Vec<Observ
                 an.observe(&Input::Audio { frame: &a, t }, out);
             }
             s.taps.retain_mut(|tap| tap.open() && {
-                tap.audio(&a, t);
+                tap.audio(&a, t, s.clock);
                 true
             });
             Some(t)
@@ -829,7 +841,7 @@ fn feed_frame(s: &mut Stream, f: Frame, from: f64, to: f64, out: &mut Vec<Observ
                 an.observe(&Input::Video { frame: &v, low: &low, t, dt }, out);
             }
             s.taps.retain_mut(|tap| tap.open() && {
-                tap.video(&v, t);
+                tap.video(&v, t, s.clock);
                 true
             });
             *last = Some((t, v));

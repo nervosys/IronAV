@@ -99,3 +99,49 @@ fn a_tap_that_cannot_be_fed_says_why() {
     // a tap let go of is simply no longer fed
     drop(s.tap(TapConfig::audio()).unwrap());
 }
+
+/// Two seconds of a 440 Hz tone as an RTSP source sends it (L16 at 16 kHz, 20 ms a packet), with
+/// a sender report early on saying that media time 1 s was captured at Unix time 1_700_000_000.
+fn rtp_with_sender_report() -> Vec<u8> {
+    use ironav_formats::rtp::{description_frame, frame, Description, TrackSetup};
+    let sdp = "v=0\r\nm=audio 0 RTP/AVP 96\r\na=rtpmap:96 L16/16000/1\r\n".to_string();
+    let base = 7_000u32;
+    let mut out = description_frame(&Description { sdp, tracks: vec![TrackSetup { media: 0, channel: 0, rtptime: Some(base), seq: Some(1) }] }).unwrap();
+    for k in 0..100u32 {
+        let mut p = vec![0x80, 96];
+        p.extend_from_slice(&(k as u16 + 1).to_be_bytes());
+        p.extend_from_slice(&(base + k * 320).to_be_bytes());
+        p.extend_from_slice(&[0, 0, 0, 9]);
+        for i in 0..320u32 {
+            let t = (k * 320 + i) as f64 / 16_000.0;
+            p.extend_from_slice(&(((2.0 * std::f64::consts::PI * 440.0 * t).sin() * 8000.0) as i16).to_be_bytes());
+        }
+        out.extend(frame(0, &p).unwrap());
+        if k == 1 {
+            let mut sr = vec![0x80, 200, 0, 6, 0, 0, 0, 9];
+            sr.extend_from_slice(&(1_700_000_000u32.wrapping_add(2_208_988_800)).to_be_bytes());
+            sr.extend_from_slice(&[0; 4]);
+            sr.extend_from_slice(&(base + 16_000).to_be_bytes());
+            sr.extend_from_slice(&[0; 8]);
+            out.extend(frame(1, &sr).unwrap());
+        }
+    }
+    out
+}
+
+#[test]
+fn a_senders_clock_dates_what_it_captured() {
+    let path = std::env::temp_dir().join(format!("ironav-tap-sr-{}.rtp", std::process::id()));
+    std::fs::write(&path, rtp_with_sender_report()).unwrap();
+    let args: OpenArgs = serde_json::from_value(json!({ "source": format!("{}?pace=realtime", path.display()), "analyzers": ["levels"] })).unwrap();
+    let s = live::open(&args).unwrap();
+    let tap = s.tap(TapConfig { window_ms: 200, queue: 64, ..TapConfig::audio() }).unwrap();
+    let got = drain(&tap);
+    assert!(got.len() >= 9, "{}", got.len());
+    for f in &got {
+        let at = f.captured_at.expect("a capture time").duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
+        assert!((at - (1_699_999_999.0 + f.t)).abs() < 0.002, "{at} for t {}", f.t);
+    }
+    assert_eq!(s.status()["sender_clock"][0]["unix_at_zero"], 1_699_999_999.0);
+    let _ = std::fs::remove_file(path);
+}

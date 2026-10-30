@@ -12,6 +12,10 @@
 //! that costs nothing while they arrive in order and holds at most [`REORDER`] packets waiting for a
 //! late one; a gap it gives up on is counted as loss, and the picture it damaged is dropped.
 //!
+//! A track's RTCP sender reports (on the channel after its RTP) tie its RTP clock to the
+//! sender's wall clock (NTP): [`StreamDemuxer::wall_clock`] gives the latest, so a reader can tell
+//! when each picture was captured.
+//!
 //! Timestamps count from the `rtptime` the PLAY response's RTP-Info gave each track, which is the
 //! same instant for all of them; a track without one counts from its first packet. Video starts at
 //! a keyframe, and the parameter sets from the SDP are put in front of each keyframe that lacks
@@ -292,6 +296,8 @@ struct Track {
     aac_frag: Option<(u32, usize, Vec<u8>)>,
     started: bool,
     lost: u64,
+    /// The latest sender report: a presentation time and the Unix time it stands for.
+    wall: Option<(i64, f64)>,
 }
 
 #[derive(Default)]
@@ -353,6 +359,7 @@ impl RtpStream {
                 aac_frag: None,
                 started: false,
                 lost: 0,
+                wall: None,
             });
         }
         if self.tracks.is_empty() {
@@ -364,7 +371,10 @@ impl RtpStream {
 
     fn rtp(&mut self, channel: u8, body: &[u8]) -> Result<()> {
         let Some(ti) = self.tracks.iter().position(|t| t.channel == channel) else {
-            return Ok(()); // RTCP, or a track that was not set up
+            if let Some(ti) = self.tracks.iter().position(|t| t.channel + 1 == channel) {
+                self.rtcp(ti, body);
+            }
+            return Ok(()); // or a track that was not set up
         };
         if body.len() < 12 || body[0] >> 6 != 2 {
             return Ok(()); // not RTP version 2: dropped like any damaged datagram
@@ -410,6 +420,33 @@ impl RtpStream {
             self.packet(ti, &p)?;
         }
         Ok(())
+    }
+
+    /// A track's RTCP: from each sender report in the compound packet, the presentation time its
+    /// RTP timestamp stands for and the wall-clock time.
+    fn rtcp(&mut self, ti: usize, mut body: &[u8]) {
+        while body.len() >= 4 && body[0] >> 6 == 2 {
+            let len = (u16::from_be_bytes([body[2], body[3]]) as usize + 1) * 4;
+            if len > body.len() {
+                return;
+            }
+            if body[1] == 200 && len >= 28 {
+                let word = |at: usize| u32::from_be_bytes([body[at], body[at + 1], body[at + 2], body[at + 3]]);
+                // NTP counts from 1900
+                let unix = word(8) as f64 - 2_208_988_800.0 + word(12) as f64 / 4_294_967_296.0;
+                let ts = word(16);
+                let t = &self.tracks[ti];
+                let time = match (t.last, t.base) {
+                    (Some((last_ts, last_time)), _) => Some(last_time.saturating_add(ts.wrapping_sub(last_ts) as i32 as i64)),
+                    (None, Some(base)) => Some(ts.wrapping_sub(base) as i32 as i64),
+                    (None, None) => None,
+                };
+                if let Some(time) = time.filter(|_| unix > 0.0) {
+                    self.tracks[ti].wall = Some((time, unix));
+                }
+            }
+            body = &body[len..];
+        }
     }
 
     /// Something was lost: the picture being put together is damaged, and so is the next one if
@@ -780,6 +817,9 @@ impl StreamDemuxer for RtpStream {
     fn next_packet(&mut self) -> Result<Option<StreamPacket>> {
         Ok(self.out.pop_front())
     }
+    fn wall_clock(&self, stream: usize) -> Option<(i64, f64)> {
+        self.tracks.iter().find(|t| t.index == Some(stream)).and_then(|t| t.wall)
+    }
     fn end(&mut self) {
         for ti in 0..self.tracks.len() {
             // what was held for a late packet comes out as it is, and so does the last picture
@@ -1031,6 +1071,34 @@ mod tests {
             assert_eq!(lost, 0);
             check(&src, &streams, &got, 0);
         }
+    }
+
+    #[test]
+    fn sender_reports_tie_the_media_to_the_wall_clock() {
+        let src = source();
+        let mut frames: Vec<Vec<u8>> = src.packets.iter().map(|(c, p)| frame(*c, p).unwrap()).collect();
+        // a receiver report and then a sender report, in one compound packet: the video at 1 s is
+        // 1_700_000_000.5 Unix time
+        let ts = 1000u32.wrapping_add(src.video[0].0 as u32).wrapping_add(90_000);
+        let mut rtcp = vec![0x80, 201, 0, 1, 0, 0, 0, 1];
+        rtcp.extend_from_slice(&[0x80, 200, 0, 6, 0, 0, 0, 1]);
+        rtcp.extend_from_slice(&(1_700_000_000u32.wrapping_add(2_208_988_800)).to_be_bytes());
+        rtcp.extend_from_slice(&(1u32 << 31).to_be_bytes());
+        rtcp.extend_from_slice(&ts.to_be_bytes());
+        rtcp.extend_from_slice(&[0; 8]);
+        frames.insert(10, frame(1, &rtcp).unwrap());
+        // damaged ones change nothing
+        frames.insert(11, frame(1, &[0x80, 200, 0, 40]).unwrap());
+        frames.insert(12, frame(3, &[1, 2, 3]).unwrap());
+        let mut bytes = src.description.clone();
+        for f in &frames {
+            bytes.extend_from_slice(f);
+        }
+        let mut s = RtpStream::default();
+        s.feed(&bytes).unwrap();
+        assert_eq!(s.wall_clock(0), Some((90_000, 1_700_000_000.5)));
+        assert_eq!(s.wall_clock(1), None);
+        assert_eq!(s.wall_clock(7), None);
     }
 
     #[test]

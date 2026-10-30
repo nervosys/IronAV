@@ -157,6 +157,8 @@ struct Shared {
     health: Option<Health>,
     /// The newest keyframe pictures, oldest first.
     keyframes: VecDeque<KeyframeJpeg>,
+    /// Per stream, the Unix time of media time 0 by the sender's clock (RTCP sender reports).
+    clocks: BTreeMap<usize, f64>,
     requested: u64,
     applied: u64,
 }
@@ -208,6 +210,8 @@ pub struct KeyframeJpeg {
     pub t: f64,
     /// When it was decoded.
     pub decoded_at: SystemTime,
+    /// When it was captured, by the sender's clock, when it says (RTCP sender reports).
+    pub captured_at: Option<SystemTime>,
     pub width: u32,
     pub height: u32,
     pub jpeg: Vec<u8>,
@@ -395,6 +399,7 @@ pub fn open(args: &OpenArgs) -> Result<Arc<Session>> {
             taps: Vec::new(),
             health: None,
             keyframes: VecDeque::new(),
+            clocks: BTreeMap::new(),
             requested: 0,
             applied: 0,
         }),
@@ -689,6 +694,7 @@ impl Session {
         let mut resume_at: Option<f64> = None;
         let mut shift = 0.0f64;
         let mut last_data = Instant::now();
+        let mut clocks: BTreeMap<usize, f64> = BTreeMap::new();
         while !ended {
             if self.idle_expired() {
                 self.stop.store(true, Ordering::Relaxed);
@@ -719,6 +725,8 @@ impl Session {
                     }
                     (demux, pace) = (None, None);
                     head.clear();
+                    clocks.clear();
+                    lock(&self.shared).clocks.clear();
                     continue;
                 }
                 Chunk::End => {
@@ -805,6 +813,15 @@ impl Session {
                     sp.packet.pts += (shift / tb).round() as i64;
                 }
                 let t = sp.packet.pts as f64 * tb;
+                // the sender's clock, from its latest report, moved as the timestamps were
+                if let Some((pts, unix)) = d.wall_clock(sp.packet.stream) {
+                    let at_zero = unix - pts as f64 * tb - shift;
+                    if clocks.get(&sp.packet.stream).is_none_or(|c| (c - at_zero).abs() > 1e-4) {
+                        clocks.insert(sp.packet.stream, at_zero);
+                        a.set_clock(sp.packet.stream, at_zero);
+                        lock(&self.shared).clocks.insert(sp.packet.stream, at_zero);
+                    }
+                }
                 if realtime {
                     // release packets no faster than they play
                     let (start, t0) = *pace.get_or_insert((Instant::now(), t));
@@ -831,8 +848,8 @@ impl Session {
                 }
                 let queued = arrived.elapsed();
                 a.packet_keyed(&sp.packet, sp.key, &mut |o| self.log(o, Some(arrived)))?;
-                if let Some((t, v)) = a.last_keyframe.take() {
-                    self.keep_keyframe(t, &v);
+                if let Some((t, captured, v)) = a.last_keyframe.take() {
+                    self.keep_keyframe(t, captured, &v);
                 }
                 let changed = a.take_changed();
                 let mut sh = lock(&self.shared);
@@ -902,7 +919,7 @@ impl Session {
     }
 
     /// Encodes a keyframe's picture as JPEG into the ring (without the session's lock).
-    fn keep_keyframe(&self, t: f64, v: &VideoFrame) {
+    fn keep_keyframe(&self, t: f64, captured: Option<f64>, v: &VideoFrame) {
         let mut pic = match self.keyframe_width {
             Some(w) if w < v.width => {
                 let h = ((v.height as u64 * w as u64 / v.width as u64) as u32).max(2) & !1;
@@ -914,7 +931,8 @@ impl Session {
             pic = ironav_codec::convert_pixel_format(pic, ironav_core::PixelFormat::Yuv420p, ironav_codec::Matrix::Bt709);
         }
         let Ok(jpeg) = ironav_codec::jpeg::encode_jpeg(&pic, 85) else { return };
-        let k = KeyframeJpeg { t, decoded_at: SystemTime::now(), width: pic.width, height: pic.height, jpeg };
+        let captured_at = captured.map(|c| UNIX_EPOCH + Duration::from_secs_f64(c.max(0.0)));
+        let k = KeyframeJpeg { t, decoded_at: SystemTime::now(), captured_at, width: pic.width, height: pic.height, jpeg };
         let mut sh = lock(&self.shared);
         sh.keyframes.push_back(k);
         while sh.keyframes.len() > self.keyframe_jpegs {
@@ -1014,6 +1032,7 @@ impl Session {
             "record": sh.record,
             "transcode": sh.transcode,
             "source_health": sh.health,
+            "sender_clock": sh.clocks.iter().map(|(s, c)| json!({ "stream": s, "unix_at_zero": (c * 1000.0).round() / 1000.0 })).collect::<Vec<_>>(),
         })
     }
 

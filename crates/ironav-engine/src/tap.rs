@@ -163,6 +163,9 @@ pub struct TapFrame {
     pub t: f64,
     /// When it was decoded, as Unix time.
     pub decoded_at: SystemTime,
+    /// When it was captured, by the sender's clock, when the sender says (RTSP with RTCP sender
+    /// reports); `None` otherwise.
+    pub captured_at: Option<SystemTime>,
     pub data: TapData,
 }
 
@@ -300,8 +303,9 @@ impl TapFeeder {
         // dropping it wakes the reader
     }
 
-    fn give(&mut self, t: f64, data: TapData) {
-        let f = TapFrame { seq: self.seq, stream: self.stream, t, decoded_at: SystemTime::now(), data };
+    fn give(&mut self, t: f64, clock: Option<f64>, data: TapData) {
+        let captured_at = clock.map(|c| SystemTime::UNIX_EPOCH + Duration::from_secs_f64((t + c).max(0.0)));
+        let f = TapFrame { seq: self.seq, stream: self.stream, t, decoded_at: SystemTime::now(), captured_at, data };
         self.seq += 1;
         let mut st = lock(&self.shared);
         st.stats.made += 1;
@@ -315,7 +319,8 @@ impl TapFeeder {
     }
 
     /// A decoded picture at `t`.
-    pub(crate) fn video(&mut self, v: &VideoFrame, t: f64) {
+    /// `clock` is the Unix time of media time 0, when the sender says.
+    pub(crate) fn video(&mut self, v: &VideoFrame, t: f64, clock: Option<f64>) {
         if let Some(fps) = self.config.fps {
             let step = 1.0 / fps;
             if let Some(next) = self.next_t {
@@ -356,11 +361,11 @@ impl TapFeeder {
             PixelLayout::Gray => px.chunks_exact(3).map(|p| ((p[0] as u32 * 77 + p[1] as u32 * 150 + p[2] as u32 * 29 + 128) >> 8) as u8).collect(),
         };
         let layout = c.layout;
-        self.give(t, TapData::Video { width: w, height: h, layout, pixels });
+        self.give(t, clock, TapData::Video { width: w, height: h, layout, pixels });
     }
 
     /// Decoded sound starting at `t`.
-    pub(crate) fn audio(&mut self, a: &AudioFrame, t: f64) {
+    pub(crate) fn audio(&mut self, a: &AudioFrame, t: f64, clock: Option<f64>) {
         let ch = a.channels.max(1) as usize;
         let n = a.samples.len() / ch;
         if n == 0 {
@@ -429,7 +434,7 @@ impl TapFeeder {
                 }
                 AudioFeatures { rms_dbfs: s.rms_dbfs, peak_dbfs: s.peak_dbfs, centroid_hz: s.centroid_hz, rolloff_hz: s.rolloff_hz, flatness: s.flatness, speech }
             });
-            self.give(start.max(0.0), TapData::Audio { rate, samples, features });
+            self.give(start.max(0.0), clock, TapData::Audio { rate, samples, features });
         }
     }
 }
