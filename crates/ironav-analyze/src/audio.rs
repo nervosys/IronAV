@@ -132,6 +132,8 @@ fn gated(blocks: &[f64], rel: f64) -> Vec<f64> {
 /// over 4 of them, short-term over 30; integrated loudness gated over every momentary block, and
 /// the loudness range (EBU Tech 3342) from the short-term values.
 pub struct Loudness {
+    /// The rate the filters are tuned for.
+    rate: u32,
     filters: Vec<[Biquad; 2]>,
     weights: Vec<f64>,
     block_len: usize,
@@ -150,20 +152,31 @@ impl Loudness {
             StreamParams::Audio { sample_rate, channels } => (sample_rate.max(1), channels.max(1) as usize),
             _ => (48000, 2),
         };
-        // BS.1770 weights: the surround channels count 1.41 and the LFE not at all. With six
-        // channels the order is taken to be L R C LFE Ls Rs.
-        let weights = (0..channels).map(|c| if channels == 6 { [1.0, 1.0, 1.0, 0.0, 1.41, 1.41][c] } else { 1.0 }).collect();
-        Loudness {
-            filters: vec![k_weighting(rate as f64); channels],
-            weights,
-            block_len: (rate as usize / 10).max(1),
+        let mut l = Loudness {
+            rate: 0,
+            filters: Vec::new(),
+            weights: Vec::new(),
+            block_len: 1,
             acc: 0.0,
             filled: 0,
             blocks: Vec::new(),
             momentary: Vec::new(),
             short_term: Vec::new(),
             window_max_momentary: 0.0,
-        }
+        };
+        l.tune(rate, channels);
+        l
+    }
+
+    /// Filters and weights for `rate` and `channels`.
+    fn tune(&mut self, rate: u32, channels: usize) {
+        // BS.1770 weights: the surround channels count 1.41 and the LFE not at all. With six
+        // channels the order is taken to be L R C LFE Ls Rs.
+        self.weights = (0..channels).map(|c| if channels == 6 { [1.0, 1.0, 1.0, 0.0, 1.41, 1.41][c] } else { 1.0 }).collect();
+        self.filters = vec![k_weighting(rate as f64); channels];
+        self.block_len = (rate as usize / 10).max(1);
+        self.rate = rate;
+        (self.acc, self.filled) = (0.0, 0);
     }
 
     fn block_done(&mut self, t: f64, out: &mut Vec<Observation>) {
@@ -206,10 +219,12 @@ impl Loudness {
 impl Analyzer for Loudness {
     fn observe(&mut self, input: &Input, out: &mut Vec<Observation>) {
         let Input::Audio { frame, t } = input else { return };
-        let ch = self.filters.len();
-        if frame.channels as usize != ch {
-            return;
+        if frame.channels as usize != self.filters.len() || frame.sample_rate.max(1) != self.rate {
+            // a chained stream's next link can change both: the block in progress is dropped,
+            // the blocks measured stay
+            self.tune(frame.sample_rate.max(1), frame.channels.max(1) as usize);
         }
+        let ch = self.filters.len();
         let rate = frame.sample_rate.max(1) as f64;
         for (i, samples) in frame.samples.chunks_exact(ch).enumerate() {
             for (c, &x) in samples.iter().enumerate() {

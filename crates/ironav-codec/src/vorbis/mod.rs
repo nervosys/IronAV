@@ -832,14 +832,13 @@ pub struct VorbisDecoder {
     slopes: [Vec<f32>; 2],
     prev: Option<Prev>,
     legacy: bool,
+    /// Identification and comment headers met among the packets, waiting for their setup header.
+    headers: Vec<Vec<u8>>,
 }
 
 impl VorbisDecoder {
     pub fn new(extradata: &[u8], params: &StreamParams) -> Result<Self> {
-        let setup = Setup::parse(extradata)?;
-        if setup.channels > 8 {
-            return Err(Error::new(ErrorCode::UnsupportedCodec, "Vorbis: more than 8 channels are not supported"));
-        }
+        let setup = Self::setup(extradata)?;
         if let StreamParams::Audio { sample_rate, channels } = params {
             if *sample_rate != setup.rate || *channels as usize != setup.channels {
                 return Err(bad("the container's channel count or rate disagrees with the stream's headers"));
@@ -847,7 +846,35 @@ impl VorbisDecoder {
         }
         let mdct = [Dct4::new(setup.blocksize[0] / 2), Dct4::new(setup.blocksize[1] / 2)];
         let slopes = [slope(setup.blocksize[0] / 2), slope(setup.blocksize[1] / 2)];
-        Ok(VorbisDecoder { setup, mdct, slopes, prev: None, legacy: false })
+        Ok(VorbisDecoder { setup, mdct, slopes, prev: None, legacy: false, headers: Vec::new() })
+    }
+
+    fn setup(extradata: &[u8]) -> Result<Setup> {
+        let setup = Setup::parse(extradata)?;
+        if setup.channels > 8 {
+            return Err(Error::new(ErrorCode::UnsupportedCodec, "Vorbis: more than 8 channels are not supported"));
+        }
+        Ok(setup)
+    }
+
+    /// A header packet among the audio: a chained stream's next link starts with its three
+    /// headers, and the decoder starts over with them (its rate and channels may differ).
+    fn header(&mut self, p: &[u8]) -> Result<()> {
+        match p.first() {
+            Some(1) => self.headers = vec![p.to_vec()],
+            Some(3) if self.headers.len() == 1 => self.headers.push(p.to_vec()),
+            Some(5) if self.headers.len() == 2 => {
+                let extra = join_headers([&self.headers[0][..], &self.headers[1], p]);
+                self.headers.clear();
+                let setup = Self::setup(&extra)?;
+                self.mdct = [Dct4::new(setup.blocksize[0] / 2), Dct4::new(setup.blocksize[1] / 2)];
+                self.slopes = [slope(setup.blocksize[0] / 2), slope(setup.blocksize[1] / 2)];
+                self.setup = setup;
+                self.prev = None;
+            }
+            _ => self.headers.clear(),
+        }
+        Ok(())
     }
 
     /// Undo channel coupling the way FFmpeg's SSE code did until May 2026, treating a magnitude of exactly
@@ -949,7 +976,8 @@ impl Decoder for VorbisDecoder {
     fn decode(&mut self, packet: &Packet) -> Result<Vec<Frame>> {
         let mut b = Bits::new(&packet.data);
         if b.bit() != 0 {
-            return Ok(Vec::new()); // a header packet
+            self.header(&packet.data)?;
+            return Ok(Vec::new());
         }
         let modes = self.setup.modes.len();
         let m = b.get(ilog(modes as u32 - 1)) as usize;

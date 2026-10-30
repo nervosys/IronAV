@@ -106,7 +106,8 @@ addresses and CIDR ranges separated by commas, or `any`. A request cannot widen 
 Readable as it arrives: MPEG-TS, Matroska/WebM, fragmented MP4 (CMAF), Y4M, WAV, ADTS AAC, MP3, Ogg (Opus, Vorbis, FLAC)
 and raw H.264/HEVC (Annex B, which carries no frame rate: give `fps`, 25 by default). Ogg and MP3 are read the way internet
 radio sends them: an ID3v2 tag in front (whatever follows it, MP3 or AAC, decides the reader), chained Ogg streams between
-songs (the timeline carries on), and damaged pages stepped over. Matroska is read the way a browser's MediaRecorder, OBS or `ffmpeg -f matroska -`
+songs (the timeline carries on; a Vorbis song set up differently, even at another rate or channel count, has its
+headers passed to the decoder, which starts over with them), and damaged pages stepped over. Matroska is read the way a browser's MediaRecorder, OBS or `ffmpeg -f matroska -`
 sends it: Segment and Clusters of unknown size, no Cues. The packets are the ones the file reader gives, whatever pieces the
 bytes arrive in. So `ironav watch tcp://:9000` can follow a webcam that a web page streams as WebM.
 Fragmented MP4 is read the same way: an initialization segment (`moov` with `mvex`), then `moof`+`mdat` pairs, as written by

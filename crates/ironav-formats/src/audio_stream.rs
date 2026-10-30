@@ -4,8 +4,10 @@
 //!
 //! Ogg pages are unwrapped as they come, checksum-checked (a bad page is stepped over, not fatal),
 //! and only the first Opus, Vorbis or FLAC stream is read. A chained stream (a new logical stream
-//! after the end of the last, as radio does between songs) of the same codec continues it: its
-//! headers are read and not passed on, and its packets carry on the timeline. Timing comes from the
+//! after the end of the last, as radio does between songs) of the same codec continues it, and its
+//! packets carry on the timeline. Its headers are not passed on, except a Vorbis link's that differ
+//! from the ones in use (other codebooks, rate or channels): those go in front of its audio, the
+//! decoder starts over with them, and its packets are timed in the stream's time base. Timing comes from the
 //! packets, as in the file reader, so the packets are the same; the file reader's end trim needs
 //! the last page and does not apply to a stream.
 //!
@@ -79,6 +81,12 @@ pub struct OggStream {
     max_block: u32,
     out: VecDeque<StreamPacket>,
     pts: i64,
+    /// Vorbis: the headers the decoder has now, and the current link's rate, where its first
+    /// packet falls, and the samples since, so a link at another rate keeps the stream's clock.
+    in_use: Vec<u8>,
+    link_rate: u32,
+    link_start: i64,
+    link_samples: i64,
     unsupported: Option<&'static str>,
     ended: bool,
 }
@@ -221,10 +229,18 @@ impl OggStream {
             if kind == Kind::Vorbis && self.headers.len() == 3 {
                 let extradata = ironav_codec::vorbis::join_headers([&self.headers[0][..], &self.headers[1], &self.headers[2]]);
                 self.timer = Some(ironav_codec::vorbis::PacketTimer::new(&extradata)?);
+                let (channels, rate) = ironav_codec::vorbis::PacketTimer::channels_and_rate(&extradata)?;
+                (self.link_rate, self.link_start, self.link_samples) = (rate, self.pts, 0);
                 if self.streams.is_empty() {
-                    let (channels, rate) = ironav_codec::vorbis::PacketTimer::channels_and_rate(&extradata)?;
-                    self.streams.push(info(CodecId::Vorbis, rate, channels, None, extradata));
+                    self.streams.push(info(CodecId::Vorbis, rate, channels, None, extradata.clone()));
+                } else if extradata != self.in_use {
+                    // a link set up differently (other codebooks, rate or channels): its headers go
+                    // in front of its audio, and the decoder starts over with them
+                    for h in std::mem::take(&mut self.headers) {
+                        self.out.push_back(StreamPacket { packet: Packet { stream: 0, pts: self.pts, duration: 0, data: h }, key: true });
+                    }
                 }
+                self.in_use = extradata;
             }
             if kind == Kind::Opus && self.headers.len() == 2 && self.streams.is_empty() {
                 let hd = &self.headers[0];
@@ -268,8 +284,18 @@ impl OggStream {
             Kind::Flac => ironav_codec::flac::header::parse_header(&pkt).map_or(self.max_block, |h| h.block_size),
         };
         let pts = self.pts;
-        self.pts += len as i64;
-        self.out.push_back(StreamPacket { packet: Packet { stream: 0, pts, duration: len as i64, data: pkt }, key: true });
+        let rate = match &self.streams[0].params {
+            StreamParams::Audio { sample_rate, .. } => *sample_rate,
+            _ => 0,
+        };
+        if kind == Kind::Vorbis && self.link_rate != rate && self.link_rate > 0 {
+            // counted in the link's samples, timed in the stream's
+            self.link_samples += len as i64;
+            self.pts = self.link_start + (self.link_samples as i128 * rate as i128 / self.link_rate as i128) as i64;
+        } else {
+            self.pts += len as i64;
+        }
+        self.out.push_back(StreamPacket { packet: Packet { stream: 0, pts, duration: self.pts - pts, data: pkt }, key: true });
         Ok(())
     }
 }
@@ -514,6 +540,67 @@ mod tests {
                 assert!(got == want, "{name} in pieces of {step}");
             }
         }
+    }
+
+    /// Every audio frame `d` gives for `bytes`, decoded.
+    fn decoded(bytes: &[u8]) -> (StreamInfo, Vec<ironav_core::AudioFrame>) {
+        use ironav_core::Frame;
+        let mut d = OggStream::default();
+        d.feed(bytes).unwrap();
+        d.end();
+        let mut pkts = Vec::new();
+        while let Some(p) = d.next_packet().unwrap() {
+            pkts.push(p.packet);
+        }
+        let s = d.streams()[0].clone();
+        // as the registry gives it, with the end trim that packet durations drive
+        let mut dec = ironav_codec::new_decoder_for(&s).unwrap();
+        let mut out = Vec::new();
+        for p in &pkts {
+            for f in dec.decode(p).unwrap() {
+                let Frame::Audio(a) = f else { unreachable!() };
+                out.push(a);
+            }
+        }
+        (s, out)
+    }
+
+    #[test]
+    fn a_chained_vorbis_link_with_other_parameters_is_decoded_as_itself() {
+        let stereo = std::fs::read(fixture("vorbis_stereo.ogg")).unwrap();
+        let mono = std::fs::read(fixture("vorbis_mono_8k.ogg")).unwrap();
+        let (_, a) = decoded(&stereo);
+        let (_, b) = decoded(&mono);
+        // 44.1 kHz stereo, then 8 kHz mono, as a radio station might chain them
+        let mut chained = stereo.clone();
+        chained.extend_from_slice(&mono);
+        let (info, got) = decoded(&chained);
+        assert_eq!(info.params, StreamParams::Audio { sample_rate: 44100, channels: 2 });
+        assert_eq!(got.len(), a.len() + b.len());
+        for (g, w) in got.iter().zip(a.iter().chain(&b)) {
+            assert_eq!((g.sample_rate, g.channels, &g.samples), (w.sample_rate, w.channels, &w.samples));
+        }
+        // the second link's times follow the first's, in the stream's time base (1/44100)
+        let end = a.last().map(|f| f.pts + f.frames() as i64).unwrap();
+        let start = got[a.len()].pts;
+        assert!((start - end).abs() <= 44100 / 10, "{start} after {end}");
+        let b0 = b[0].pts as f64 / 8000.0;
+        let b_last = b.last().unwrap().pts as f64 / 8000.0;
+        let g_last = got.last().unwrap().pts as f64 / 44100.0;
+        assert!((g_last - start as f64 / 44100.0 - (b_last - b0)).abs() < 0.001, "{g_last}");
+        // and the other way round: a link at a higher rate than the stream's keeps all its samples
+        let mut chained = mono.clone();
+        chained.extend_from_slice(&stereo);
+        let (_, got) = decoded(&chained);
+        assert_eq!(got.len(), a.len() + b.len());
+        for (g, w) in got.iter().zip(b.iter().chain(&a)) {
+            assert_eq!((g.sample_rate, g.channels, &g.samples), (w.sample_rate, w.channels, &w.samples));
+        }
+        // the same link again changes nothing: no headers are passed on
+        let mut twice = stereo.clone();
+        twice.extend_from_slice(&stereo);
+        let (_, pk) = streamed(Box::new(OggStream::default()), &twice, 4096);
+        assert!(!pk.iter().any(|(_, d)| d.first().is_some_and(|b| b & 1 == 1)), "no header packets");
     }
 
     #[test]

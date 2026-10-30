@@ -167,12 +167,18 @@ pub fn new_decoder_for(s: &ironav_core::StreamInfo) -> Result<Box<dyn Decoder>> 
 
 /// Cuts a packet's audio to the packet's duration. The Ogg reader shortens the last packet's
 /// duration to what the final page's granule position allows, which drops the codec's padding.
-struct EndTrim(Box<dyn Decoder>);
+/// The second field is the stream's rate: frames at another rate (a chained Ogg link's, whose
+/// packets are timed in the stream's rate) are not cut, since a duration in the stream's rate cannot
+/// say their length exactly; the padding being cut is a file's last packet's.
+struct EndTrim(Box<dyn Decoder>, i64);
 
 impl EndTrim {
-    fn cut(frames: &mut [ironav_core::Frame], duration: i64) {
+    fn cut(frames: &mut [ironav_core::Frame], duration: i64, rate: i64) {
         for f in frames {
             if let ironav_core::Frame::Audio(a) = f {
+                if a.sample_rate as i64 != rate {
+                    continue;
+                }
                 let keep = duration.max(0) as usize * a.channels.max(1) as usize;
                 if a.samples.len() > keep {
                     a.samples.truncate(keep);
@@ -187,7 +193,7 @@ impl Decoder for EndTrim {
         let mut frames = self.0.decode(packet)?;
         // a duration of 0 means unknown
         if packet.duration > 0 {
-            Self::cut(&mut frames, packet.duration);
+            Self::cut(&mut frames, packet.duration, self.1);
         }
         Ok(frames)
     }
@@ -247,7 +253,7 @@ fn trimmed(s: &ironav_core::StreamInfo, d: Box<dyn Decoder>) -> Box<dyn Decoder>
         _ => 0,
     };
     if s.time_base.num == 1 && s.time_base.den == rate {
-        Box::new(EndTrim(d))
+        Box::new(EndTrim(d, rate))
     } else {
         d
     }
