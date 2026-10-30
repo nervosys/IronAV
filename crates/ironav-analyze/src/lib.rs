@@ -8,11 +8,13 @@
 
 mod audio;
 mod observation;
+mod speech;
 mod structure;
 mod video;
 
 pub use ironav_codec::change::LowRes;
 pub use observation::{kind_info, level_of, KindInfo, Level, Observation, Picture, KINDS};
+pub use speech::VoiceActivity;
 
 use ironav_core::{AudioFrame, MediaType, Packet, StreamInfo, VideoFrame};
 use serde_json::Value;
@@ -119,6 +121,13 @@ pub const ANALYZERS: &[AnalyzerInfo] = &[
         make: |_, _| Box::new(audio::Silence::new()),
     },
     AnalyzerInfo {
+        name: "voice_activity",
+        consumes: Consumes::Audio,
+        description: "Spans of speech, from energy above the noise floor, zero crossings and syllabic modulation: a cheap gate for a transcription model (steady tones, hum and hiss do not count).",
+        emits: &["speech_start", "speech_end"],
+        make: |_, _| Box::new(speech::VoiceActivity::default()),
+    },
+    AnalyzerInfo {
         name: "scene",
         consumes: Consumes::Video,
         description: "Scene cuts (the same measure the H.264 encoder uses to start an IDR picture) and how much the picture changes per window.",
@@ -150,6 +159,26 @@ pub const ANALYZERS: &[AnalyzerInfo] = &[
 
 pub fn analyzer(name: &str) -> Option<&'static AnalyzerInfo> {
     ANALYZERS.iter().find(|a| a.name == name)
+}
+
+/// Distinct names [`intern`] keeps for the life of the process.
+pub const MAX_INTERNED: usize = 512;
+
+/// A `&'static str` for a name made at run time (a sidecar's name, or a kind of observation it
+/// reports), so it fits the observation envelope. Each distinct name is stored once; past
+/// [`MAX_INTERNED`] of them, new names get `None`.
+pub fn intern(name: &str) -> Option<&'static str> {
+    static NAMES: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+    let mut names = NAMES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(n) = names.iter().find(|n| **n == name) {
+        return Some(n);
+    }
+    if names.len() >= MAX_INTERNED {
+        return None;
+    }
+    let n: &'static str = Box::leak(name.to_string().into_boxed_str());
+    names.push(n);
+    Some(n)
 }
 
 /// `x` rounded to `digits` decimals, so observations stay short.

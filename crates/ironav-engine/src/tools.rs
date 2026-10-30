@@ -160,6 +160,10 @@ fn h_capabilities(_: &Value) -> Result<Value> {
         },
         "tools": tools().iter().map(|t| json!({ "name": t.name, "description": t.description, "cli": t.cli, "read_only": t.read_only })).collect::<Vec<_>>(),
         "analyzers": ironav_analyze::ANALYZERS.iter().map(|a| json!({ "name": a.name, "consumes": a.consumes, "description": a.description, "emits": a.emits })).collect::<Vec<_>>(),
+        "sidecars": match crate::sidecar::configured() {
+            Ok(list) => json!(list.keys().collect::<Vec<_>>()),
+            Err(e) => json!({ "error": e.message }),
+        },
         "observation_kinds": ironav_analyze::KINDS,
         "error_codes": ErrorCode::ALL,
         "ontology": ontology().summary(),
@@ -223,7 +227,8 @@ fn h_stream_events(args: &Value) -> Result<Value> {
         Some(_) => return Err(Error::invalid_arg("'kinds' must be an array of observation kinds")),
     };
     for k in &kinds {
-        if ironav_analyze::kind_info(k).is_none() {
+        // a sidecar's kinds are not listed, but have the same form
+        if ironav_analyze::kind_info(k).is_none() && !crate::sidecar::is_kind_name(k) {
             return Err(Error::invalid_arg(format!("unknown observation kind '{k}'")).alternatives(ironav_analyze::KINDS.iter().map(|k| k.name)));
         }
     }
@@ -272,6 +277,7 @@ fn stream_open_schema() -> Value {
             "pace": { "type": "string", "enum": ["realtime", "none"], "description": "realtime: read no faster than the media plays." },
             "thumbnail_seconds": { "type": "number", "minimum": 2, "default": 10 },
             "hwaccel": { "type": "string", "default": "auto" },
+            "sidecars": { "type": "array", "items": { "type": "string" }, "description": "Model sidecars to run as well (speech-to-text, detection, ...), by the names the operator configured in IRONAV_SIDECARS; `capabilities` lists them. Each takes the first analyzed stream of the kind it wants." },
             "record": { "type": "string", "description": "Also write the media as it arrives, without re-encoding: a file (.ts stays playable even if cut off; .mp4 is complete when the session closes), or an .m3u8 path for HLS: MPEG-TS segments cut at keyframes next to it, and the playlist rewritten after each one." },
             "segment_seconds": { "type": "number", "minimum": 1, "maximum": 600, "default": 6, "description": "HLS segment length (cut at the first keyframe after it)." },
             "keep_segments": { "type": "integer", "minimum": 1, "description": "HLS: keep only the newest N segments (a sliding live playlist); all of them when absent." },
@@ -299,7 +305,8 @@ pub fn analyze_schema() -> Value {
             "inline_thumbnails": { "type": "integer", "minimum": 0, "default": 0, "description": "Return the first N thumbnails as images." },
             "thumbnail_seconds": { "type": "number", "minimum": 2, "default": 10, "description": "Longest time between thumbnails; new content brings one sooner (at most every 2 s)." },
             "thumbnail_width": { "type": "integer", "minimum": 16, "default": 320 },
-            "hwaccel": { "type": "string", "default": "auto", "description": "Video decoding: auto, off, require or a backend name, as for jobs." }
+            "hwaccel": { "type": "string", "default": "auto", "description": "Video decoding: auto, off, require or a backend name, as for jobs." },
+            "sidecars": { "type": "array", "items": { "type": "string" }, "description": "Model sidecars to run as well (speech-to-text, detection, ...), by the names the operator configured in IRONAV_SIDECARS; `capabilities` lists them. Each takes the first analyzed stream of the kind it wants." }
         }),
         &["input"],
     )
@@ -387,8 +394,8 @@ pub fn tools() -> &'static [Tool] {
             },
             Tool {
                 name: "analyze",
-                description: "Understand a media file without looking at it: runs analyzers (stream structure, audio levels, EBU R128 loudness, silence, scene cuts, black and frozen pictures, thumbnails) and returns typed observations with a digest per window and a summary. Use level 'digest' for the fewest tokens. Writes files only when thumbnail_dir is given.",
-                cli: "ironav analyze <file> [--analyzers a,b] [--level digest|events|raw] [--digest-seconds N] [--from S] [--to S] [--thumbnails DIR] [--jsonl]",
+                description: "Understand a media file without looking at it: runs analyzers (stream structure, audio levels, EBU R128 loudness, silence, speech, scene cuts, black and frozen pictures, thumbnails, and any model sidecars the operator configured) and returns typed observations with a digest per window and a summary. Use level 'digest' for the fewest tokens. Writes files only when thumbnail_dir is given.",
+                cli: "ironav analyze <file> [--analyzers a,b] [--sidecars a,b] [--level digest|events|raw] [--digest-seconds N] [--from S] [--to S] [--thumbnails DIR] [--jsonl]",
                 input_schema: analyze_schema(),
                 read_only: false,
                 handler: Handler::WithCtx(h_analyze),
@@ -396,7 +403,7 @@ pub fn tools() -> &'static [Tool] {
             Tool {
                 name: "stream_open",
                 description: "Start watching a live source (a socket, a pipe, a growing file, or a file played as if live). It is read, demuxed and analyzed on its own thread as it arrives; follow it with stream_events. Readable as it arrives: MPEG-TS, Matroska/WebM (as MediaRecorder or OBS send it), fragmented MP4 (CMAF), Y4M, WAV, ADTS AAC and raw H.264/HEVC.",
-                cli: "ironav watch <source> [--analyzers a,b] [--level L] [--format F] [--fps N] [--pace realtime]",
+                cli: "ironav watch <source> [--analyzers a,b] [--sidecars a,b] [--level L] [--format F] [--fps N] [--pace realtime]",
                 input_schema: stream_open_schema(),
                 read_only: true,
                 handler: Handler::Plain(h_stream_open),

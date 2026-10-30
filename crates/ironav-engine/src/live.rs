@@ -55,6 +55,8 @@ pub struct OpenArgs {
     pub thumbnail_seconds: Option<f64>,
     #[serde(default = "default_hwaccel")]
     pub hwaccel: String,
+    #[serde(default)]
+    pub sidecars: Vec<String>,
     /// Record the media as it arrives: a file, or an `.m3u8` path for HLS segments and a playlist.
     #[serde(default)]
     pub record: Option<String>,
@@ -182,10 +184,11 @@ pub fn open(args: &OpenArgs) -> Result<Arc<Session>> {
         digest_seconds: args.digest_seconds,
         thumbnail_seconds: args.thumbnail_seconds,
         hwaccel: args.hwaccel.clone(),
+        sidecars: args.sidecars.clone(),
         ..AnalyzeOptions::default()
     };
     // check the analysis options now rather than when the first packet arrives
-    Analysis::new(&[], &opts, 0.0, f64::INFINITY)?;
+    Analysis::new(&[], &opts, 0.0, f64::INFINITY, true)?;
     let stream_opts = StreamOptions {
         format: args.format.clone().or_else(|| url.option("format").map(str::to_string)),
         frame_rate: match args.fps.map(|f| f.to_string()).or_else(|| url.option("fps").map(str::to_string)) {
@@ -370,7 +373,7 @@ impl Session {
                 }
                 if analysis.is_none() {
                     let streams = d.streams().to_vec();
-                    let a = Analysis::new(&streams, opts, 0.0, f64::INFINITY)?;
+                    let a = Analysis::new(&streams, opts, 0.0, f64::INFINITY, true)?;
                     let mut sh = lock(&self.shared);
                     sh.state = State::Running;
                     sh.analyzed = a.describe();

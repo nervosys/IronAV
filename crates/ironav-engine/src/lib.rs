@@ -10,6 +10,7 @@ pub mod plan;
 pub mod record;
 pub mod run;
 mod sessions;
+pub mod sidecar;
 pub mod tools;
 
 pub use job::{FilterCall, Job, Latency, StreamOpts};

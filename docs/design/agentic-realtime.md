@@ -197,6 +197,8 @@ stdin/stdout, the same shape as the player's protocol. IronAV sends it decimated
 s16 or f32) or pictures (JPEG/PNG or raw planes through a temporary file), only when gating observations allow
 (for example, transcription only between `speech_start` and `speech_end`). The sidecar answers with observations.
 This keeps IronAV free of model runtimes, lets users bring any model, and isolates crashes and memory use.
+As built (M5), media goes inline as base64 in the line rather than through temporary files, so no file outlives a crash
+and the child needs no access to IronAV's directories; [docs/sidecars.md](../sidecars.md) has the protocol.
 
 ```json
 {"op":"hello","analyzer":"asr","wants":{"audio":{"rate":16000,"channels":1,"format":"s16"},"gate":"voice_activity"}}
@@ -349,7 +351,7 @@ Each milestone is usable on its own and passes the test gate.
 | **M2: live bytes** (done in part) | the `Source` trait; `pipe:`, `?follow`, `?pace=realtime`, `tcp://`, `udp://`; `StreamDemuxer` for Annex B, ADTS, Y4M, WAV, Ogg and MP3; packet metadata; `LiveSession`, the ring buffer, the `stream_*` tools and `ironav watch`; low-delay H.264 and HEVC output | none |
 | **M3: broadcast** (done) | the MPEG-TS demuxer and muxer; live fMP4 and MKV reading; a progressive fMP4/TS recorder; `stream_clip`; segmenting; the `latency: low` encode profile | none |
 | **M4: cameras and the web** (done) | RTSP and RTP depacketizers with a jitter buffer and RTCP; HLS over plain HTTP | none |
-| **M5: models** | the sidecar protocol, voice-activity gating and two reference sidecars kept out of tree (speech-to-text, detection) | none in the core; each sidecar chooses its own |
+| **M5: models** (done) | the sidecar protocol, voice-activity gating and two reference sidecars kept out of tree (speech-to-text, detection) | none in the core; each sidecar chooses its own |
 | **M6: optional transports** | HTTPS/HLS, RTSPS, SRT, capture devices, WebRTC ingest | each one by decision (§10) |
 
 M2 as built: the `Source` trait and every source above; `StreamDemuxer` for Annex B H.264/HEVC, ADTS, Y4M and WAV;
@@ -393,6 +395,22 @@ Encrypted playlists and HTTPS segments are refused at open; separate audio rendi
 FFmpeg's HLS muxer writing TS and fMP4 segments: both played through `ironav watch`, recorded, and decoded by FFmpeg
 with every frame. M4 is done.
 
+M5 as built: the `voice_activity` analyzer (`ironav-analyze/src/speech.rs`): 20 ms frames, energy at least 10 dB over a
+noise floor that follows the quietest frames, fewer than 0.35 zero crossings per sample, and at least 3 dB of spread
+among the loud frames of the last second (syllables), with speech starting when 10 of 15 frames pass and ending after
+0.5 s without one. A steady tone, white noise and silence do not trigger it. The sidecar runner
+(`ironav-engine/src/sidecar.rs`) starts each requested sidecar from the operator's list (`IRONAV_SIDECARS`; a request
+cannot name a command), waits for its hello, gives it the first analyzed stream of the kind it wants, and runs it as an
+analyzer. A supervisor thread writes to the child and restarts it after a crash or a hang (1, 2, 4, 8 and 16 s, then it
+stays stopped), and a reader thread takes its observations, checking kinds, times and line length. Audio is averaged to one
+channel and resampled with the existing `resample` filter; with the speech gate the runner keeps its own detector and
+sends each utterance with 0.25 s before it, in chunks that join without gaps, the last marked `final`. For files the
+analysis waits for the child; live sessions drop inputs and report `analyzer_lagging`. `ironav-sidecar-example`, built with
+the engine, detects DTMF without a model and provides the test modes. The tests cover keypad tones through resampling and
+downmixing, speech gating, pictures at an interval, a crash and restart, configuration errors and a live session. The two
+model-backed reference sidecars (faster-whisper speech-to-text, YOLOv8 detection on ONNX Runtime) are Python files in
+`examples/sidecars/`, outside the build; they need their packages and models installed. M5 is done.
+
 M1 comes first because it needs no new input path. It turns the existing decoders into an understanding tool for
 files at once, and it fixes the event model, analyzer trait and MCP plumbing before anything goes live.
 
@@ -411,6 +429,6 @@ files at once, and it fixes the event model, analyzer trait and MCP plumbing bef
    (needed only if session counts grow into the hundreds).
 3. **Capture devices**: per-OS native APIs written here, or a crate such as `cpal`, which the player already uses for
    audio *output*, together with a camera crate?
-4. **Reference sidecars**: which models and runtimes (for example whisper.cpp or ONNX Runtime), and whether they live in this
-   repository or beside it.
+4. **Reference sidecars**: decided. faster-whisper for speech-to-text and ONNX Runtime (a YOLOv8 export) for detection,
+   as Python files in `examples/sidecars/`, outside the build, plus a model-free DTMF detector in Rust that the tests use.
 5. **Persistence**: should observation logs and recordings outlive the process (a session directory), or stay in memory only?

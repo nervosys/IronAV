@@ -3,6 +3,7 @@
 //! digest per window and a summary at the end. [`analyze`] drives it over a file; a live session
 //! drives the same thing from a socket.
 
+use crate::sidecar::Pending;
 use crate::tools::Ctx;
 pub use ironav_analyze::Level;
 use ironav_analyze::{analyzer, level_of, Analyzer, AnalyzerInfo, Consumes, Input, LowRes, Observation, Settings, ANALYZERS};
@@ -54,6 +55,9 @@ pub struct AnalyzeOptions {
     pub thumbnail_width: Option<u32>,
     #[serde(default = "default_hwaccel")]
     pub hwaccel: String,
+    /// Model sidecars, by the names the operator gave them in `IRONAV_SIDECARS`.
+    #[serde(default)]
+    pub sidecars: Vec<String>,
 }
 
 impl Default for AnalyzeOptions {
@@ -66,6 +70,7 @@ impl Default for AnalyzeOptions {
             thumbnail_seconds: None,
             thumbnail_width: None,
             hwaccel: default_hwaccel(),
+            sidecars: Vec::new(),
         }
     }
 }
@@ -144,8 +149,9 @@ pub struct Analysis {
 }
 
 impl Analysis {
-    /// Analysis of `infos` (a file's streams, or a live source's) over `from..to` seconds.
-    pub fn new(infos: &[StreamInfo], opts: &AnalyzeOptions, from: f64, to: f64) -> Result<Analysis> {
+    /// Analysis of `infos` (a file's streams, or a live source's) over `from..to` seconds. Sidecars
+    /// start once there are streams; a `live` source drops what a slow one cannot take.
+    pub fn new(infos: &[StreamInfo], opts: &AnalyzeOptions, from: f64, to: f64, live: bool) -> Result<Analysis> {
         let level = Level::parse(&opts.level)
             .ok_or_else(|| Error::invalid_arg(format!("unknown level '{}'", opts.level)).alternatives(Level::ALL.iter().map(|l| l.name())))?;
         if !(opts.digest_seconds > 0.0) {
@@ -173,6 +179,13 @@ impl Analysis {
             }
             opts.streams.clone()
         };
+        let sidecars = crate::sidecar::resolve(&opts.sidecars)?;
+        let mut pending = Vec::new();
+        if !infos.is_empty() {
+            for (name, cfg) in &sidecars {
+                pending.push(Pending::start(name, cfg, live)?);
+            }
+        }
         let mut warnings = Vec::new();
         let mut streams = Vec::new();
         for info in infos {
@@ -184,8 +197,18 @@ impl Analysis {
             let label = format!("{}{}", if media == MediaType::Video { "video" } else { "audio" }, info.index);
             let mine: Vec<&AnalyzerInfo> = chosen.iter().copied().filter(|a| a.consumes.applies_to(media)).collect();
             let (pa, fa): (Vec<_>, Vec<_>) = mine.into_iter().partition(|a| a.consumes == Consumes::Packets);
+            // each sidecar takes the first analyzed stream of the kind it wants
+            let mut cars = Vec::new();
+            let mut k = 0;
+            while k < pending.len() {
+                if pending[k].media() == media {
+                    cars.push(pending.remove(k));
+                } else {
+                    k += 1;
+                }
+            }
             let (mut decoder, mut decoder_name) = (None, None);
-            if !fa.is_empty() {
+            if !fa.is_empty() || !cars.is_empty() {
                 let made = if media == MediaType::Video {
                     ironav_player::open_video_decoder(info, &opts.hwaccel)
                 } else {
@@ -197,18 +220,31 @@ impl Analysis {
                 }
             }
             let fa = if decoder.is_some() { fa } else { Vec::new() };
+            let mut frame_analyzers: Vec<(&'static str, Box<dyn Analyzer>)> = fa.iter().map(|a| (a.name, a.make(info, &settings))).collect();
+            for car in cars {
+                if decoder.is_none() {
+                    warnings.push(format!("sidecar '{}' not run: stream {} is not decoded", car.name(), info.index));
+                    continue;
+                }
+                let name = car.name();
+                frame_analyzers.push((name, Box::new(car.attach(info)?)));
+            }
             streams.push(Some(Stream {
                 info: info.clone(),
                 label,
                 decoder,
                 decoder_name,
                 packet_analyzers: pa.iter().map(|a| (a.name, a.make(info, &settings))).collect(),
-                frame_analyzers: fa.iter().map(|a| (a.name, a.make(info, &settings))).collect(),
+                frame_analyzers,
                 audio_next: None,
                 last_video: None,
                 end: 0.0,
                 decode_errors: 0,
             }));
+        }
+        for car in pending {
+            let media = if car.media() == MediaType::Video { "video" } else { "audio" };
+            warnings.push(format!("sidecar '{}' not run: it wants {media} and no {media} stream is analyzed", car.name()));
         }
         if to <= from {
             return Err(Error::invalid_arg("'to' must be after 'from'"));
@@ -467,7 +503,7 @@ pub fn analyze(job: &AnalyzeJob, ctx: &Ctx, on_observation: &mut dyn FnMut(&Obse
     let mut d = open_demuxer(Path::new(&job.input))?;
     let infos = d.streams().to_vec();
     let from = job.from.unwrap_or(0.0).max(0.0);
-    let mut a = Analysis::new(&infos, &job.opts, from, job.to.unwrap_or(f64::INFINITY))?;
+    let mut a = Analysis::new(&infos, &job.opts, from, job.to.unwrap_or(f64::INFINITY), false)?;
     for i in 0..infos.len() {
         if !a.wants(i) {
             d.discard(i);

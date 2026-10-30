@@ -51,6 +51,7 @@ A call that carries `_meta.progressToken` gets `notifications/progress`, and `no
 | `levels` | sample peak and RMS (dBFS), clipping |
 | `loudness` | EBU R128 / ITU-R BS.1770: momentary, short-term and integrated loudness (LUFS), loudness range (LU) |
 | `silence` | spans of at least 0.5 s below -50 dBFS |
+| `voice_activity` | spans of speech (energy over the noise floor, zero crossings, syllabic modulation; a steady tone, hum or hiss does not count) |
 | `scene` | scene cuts (the measure the H.264 encoder uses for IDR placement) and how much each window changes |
 | `black`, `freeze` | black spans (0.5 s or more) and unchanging pictures (1 s or more) |
 | `thumbnails` | a small picture when the content changes (64-bit perceptual hash, at most every 2 s) or every 10 s |
@@ -63,6 +64,14 @@ silences, spans, thumbnails, gaps) or `raw` (plus per-picture change scores and 
 `--thumbnails DIR` (`thumbnail_dir`), or returned to MCP clients as image blocks with `inline_thumbnails`.
 The kinds and analyzers are listed by `ironav capabilities` and are entities in the ontology (`analyzer/…`,
 `observation/…`, related by `emits`).
+
+Models run beside IronAV, not inside it. A **sidecar** is any program speaking JSON lines that whoever runs IronAV lists
+in the file named by `IRONAV_SIDECARS`. A request names it (`"sidecars": ["asr"]`, `--sidecars asr`) and cannot start
+anything else. A sidecar says what it wants (audio at its rate, optionally only while someone speaks, or a picture every N
+seconds at a given width), receives it decoded, and answers with observations that join the others, with its text
+gathered into the digests. Files wait for it; live sources drop inputs while it is behind, and a crashed or hung sidecar
+is restarted with back-off. The protocol and the reference sidecars (speech-to-text with faster-whisper, object
+detection with ONNX Runtime, and a model-free DTMF detector) are in [docs/sidecars.md](docs/sidecars.md).
 
 Checked against EBU Tech 3341/3342 test signals (a -23 dBFS stereo sine reads -23.0 LUFS at 44.1 and 48 kHz; two levels
 10 dB apart give a 10 LU range).
@@ -120,8 +129,9 @@ audio frames, with no decode errors.
 
 ```sh
 ironav watch udp://:5000 --record live/stream.m3u8 --segment-seconds 4 --keep-segments 10
-``` MPEG-TS, RTSP and HLS are designed but not built
-yet: see [docs/design/agentic-realtime.md](docs/design/agentic-realtime.md).
+```
+
+What is built and what is still planned is in [docs/design/agentic-realtime.md](docs/design/agentic-realtime.md).
 
 ## Ontology
 

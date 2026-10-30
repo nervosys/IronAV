@@ -56,8 +56,8 @@ fn help() -> Value {
             "capabilities": "what this build can do (start here)",
             "probe <path>": "inspect a media file",
             "convert -i IN [-i MORE]... -o OUT [-f FMT] [--acodec C] [--vcodec C] [--abitrate KBPS] [--vbitrate KBPS | --qp N] [--latency low] [--filter name[:k=v,..]]... [--hwaccel P] [-y] [--dry-run] [--progress]": "convert, handbrake/ffmpeg style",
-            "analyze FILE [--analyzers a,b] [--level digest|events|raw] [--digest-seconds N] [--from S] [--to S] [--streams 0,1] [--max N] [--thumbnails DIR] [--hwaccel P] [--jsonl]": "what is in a file: loudness, silence, scene cuts, black and frozen pictures, thumbnails, gaps; --jsonl prints each observation as a line as it is found",
-            "watch SOURCE [--analyzers a,b] [--level digest|events|raw] [--digest-seconds N] [--format F] [--fps N] [--pace realtime] [--retain S] [--duration S] [--hwaccel P] [--record OUT.ts|OUT.m3u8 [--segment-seconds S] [--keep-segments N] [-y]]": "follow a live source (path, path?follow, -, tcp://host:port, tcp://:port, udp://:port): every observation as a JSON line as it happens, then a summary",
+            "analyze FILE [--analyzers a,b] [--sidecars a,b] [--level digest|events|raw] [--digest-seconds N] [--from S] [--to S] [--streams 0,1] [--max N] [--thumbnails DIR] [--hwaccel P] [--jsonl]": "what is in a file: loudness, silence, scene cuts, black and frozen pictures, thumbnails, gaps; --jsonl prints each observation as a line as it is found",
+            "watch SOURCE [--analyzers a,b] [--sidecars a,b] [--level digest|events|raw] [--digest-seconds N] [--format F] [--fps N] [--pace realtime] [--retain S] [--duration S] [--hwaccel P] [--record OUT.ts|OUT.m3u8 [--segment-seconds S] [--keep-segments N] [-y]]": "follow a live source (path, path?follow, -, tcp://host:port, tcp://:port, udp://:port): every observation as a JSON line as it happens, then a summary",
             "plan <job.json|->": "validate a JSON job without writing",
             "run <job.json|->": "execute a JSON job",
             "hw probe | hw select --codec C --direction decode|encode [--policy P]": "hardware acceleration",
@@ -181,6 +181,9 @@ fn analyze(mut a: Args, progress: bool) -> Result<Value> {
     if let Some(v) = list(a.flag(&["--analyzers", "-a"])?) {
         args["analyzers"] = json!(v);
     }
+    if let Some(v) = list(a.flag(&["--sidecars"])?) {
+        args["sidecars"] = json!(v);
+    }
     if let Some(v) = a.flag(&["--level"])? {
         args["level"] = json!(v);
     }
@@ -235,6 +238,9 @@ fn watch(mut a: Args) -> Result<Value> {
     let mut args = json!({ "source": source });
     if let Some(v) = a.flag(&["--analyzers", "-a"])? {
         args["analyzers"] = json!(v.split(',').map(str::trim).filter(|s| !s.is_empty()).collect::<Vec<_>>());
+    }
+    if let Some(v) = a.flag(&["--sidecars"])? {
+        args["sidecars"] = json!(v.split(',').map(str::trim).filter(|s| !s.is_empty()).collect::<Vec<_>>());
     }
     for (flag, key) in [("--level", "level"), ("--format", "format"), ("--pace", "pace"), ("--hwaccel", "hwaccel"), ("--record", "record")] {
         if let Some(v) = a.flag(&[flag])? {
