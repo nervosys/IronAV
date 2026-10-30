@@ -8,6 +8,7 @@
 
 mod celt;
 mod encoder;
+mod plc;
 pub(crate) mod mdct;
 mod rc;
 mod silk;
@@ -279,6 +280,7 @@ pub struct OpusDecoder {
     red_out: [Vec<f32>; 2],
     /// The last frame decoded: its length and whether it was CELT only, for concealment.
     last: Option<(usize, bool)>,
+    plc: plc::Plc,
 }
 
 /// Samples per channel in the longest packet (120 ms).
@@ -321,6 +323,7 @@ impl OpusDecoder {
             celt_out: [vec![0.0; 960], vec![0.0; 960]],
             red_out: [vec![0.0; 240], vec![0.0; 240]],
             last: None,
+            plc: plc::Plc::new(ch),
         })
     }
 
@@ -352,16 +355,20 @@ impl OpusDecoder {
                     p[..t.duration].fill(0.0);
                 }
             }
+            self.plc.decoded(&mut self.planes, t.duration);
             self.last = Some((t.duration, t.mode == Mode::Celt));
             w = self.put(t.duration, out, w);
         }
         Ok(w / ch)
     }
 
-    /// A frame standing in for a lost packet, of the last frame's length: for CELT, noise shaped
-    /// like the last frame's bands and fading (9 dB, then 3 dB a frame), joined to the frames on
-    /// either side without a click; after SILK or hybrid frames, or before any, silence. Written
-    /// to `out` as [`decode_into`](Self::decode_into) writes; returns the samples per channel.
+    /// A frame standing in for a lost packet, of the last frame's length. In voiced speech, the
+    /// last pitch period repeated: at full level for 10 ms, then 3 dB quieter each 10 ms, gone
+    /// after 100 ms, and the next frame that arrives cross-fades in from it over 2.5 ms; this
+    /// follows any mode. Otherwise, for CELT, noise shaped like the last frame's bands and fading
+    /// (9 dB, then 3 dB a frame), joined to the frames on either side without a click; after SILK
+    /// or hybrid frames, or before any, silence. Written to `out` as
+    /// [`decode_into`](Self::decode_into) writes; returns the samples per channel.
     pub fn conceal_into(&mut self, out: &mut [f32]) -> Result<usize> {
         let ch = self.channels;
         let (n, celt) = self.last.unwrap_or((960, false));
@@ -378,6 +385,7 @@ impl OpusDecoder {
             self.silk.flush();
             self.celt.flush();
         }
+        self.plc.conceal(&mut planes, n);
         self.planes = planes;
         Ok(self.put(n, out, 0) / ch)
     }

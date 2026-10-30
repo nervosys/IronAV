@@ -510,13 +510,15 @@ down. `depth_ms()` is the delay it adds at that moment, and `stats()` counts wha
 `OpusDecoder::decode_into(packet, out)` decodes into the caller's buffer (interleaved, 48 kHz, after the gain and the
 pre-skip), allocating nothing once the stream's bandwidth has been seen, and gives the same samples as the `Decoder`
 path. For a `Missing` or `Underrun` it conceals (`conceal_into(out)`, or `decode_into` with an empty packet, as libopus
-takes a null one): a CELT frame of the last frame's length made of noise shaped like the last frame's bands, 9 dB quieter
-for the first frame lost and 3 dB for each one after, through the same synthesis, so it joins the frames on either side
-without a click and the next real frame overlaps it as it would its own predecessor. On a speech-like test with one
-10 ms packet in 17 lost and once three in a row, each concealed frame keeps between 5% and 120% of the level before it,
-and a few frames on the decode is back within 31 dB of the lossless one. Not done yet: libopus's pitch-based
-concealment, which repeats the last pitch period for voiced speech before fading to noise, and concealment after
-SILK or hybrid frames (silence for now).
+takes a null one). In voiced speech (the latest 15 ms of output matches itself a pitch period of 2 to 10 ms earlier
+with a correlation of 0.6 or more) it repeats the last period, as libopus does, but on the decoded output, so after any
+mode: at full level for 10 ms, then 3 dB quieter each 10 ms, gone after 100 ms, and the next frame that arrives is
+cross-faded in from it over 2.5 ms. Otherwise, after CELT, a frame of the last frame's length made of noise shaped like
+the last frame's bands, 9 dB quieter for the first frame lost and 3 dB for each one after, through the same synthesis,
+so it joins the frames on either side without a click and the next real frame overlaps it as it would its own
+predecessor; after SILK or hybrid, silence. On a speech-like test with one 10 ms packet in 17 lost and once three in a
+row, a single lost frame comes out within 10 dB of the clean decode (2 dB with the noise alone), no frame jumps at its
+join, and a few frames on the decode is back within 31 dB of the lossless one.
 
 Before the encoder, mono `f32` frames at any rate can go through `Vad::new(frame_ms, hangover_ms)` (a frame is speech
 when it stands 10 dB above a noise floor that follows the quietest frames down and creeps up 1 dB a second and is not

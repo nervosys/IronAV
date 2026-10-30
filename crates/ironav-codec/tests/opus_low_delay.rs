@@ -202,6 +202,11 @@ fn decoding_into_a_buffer_matches_and_allocates_nothing() {
             COUNTING.with(|c| c.set(true));
         }
     }
+    // nor does concealing lost packets, or recovering from them
+    COUNTING.with(|c| c.set(true));
+    for p in [&[][..], &[], &pk[5]] {
+        a.decode_into(p, &mut out).unwrap();
+    }
     COUNTING.with(|c| c.set(false));
     assert_eq!(ALLOCS.with(Cell::get), 0);
     assert!(a.decode_into(&pk[3], &mut out[..100]).is_err(), "a buffer too small");
@@ -238,6 +243,17 @@ fn a_lost_packet_is_concealed_without_a_gap_and_the_stream_recovers() {
         let biggest = b[at - 240..at - 1].windows(2).map(|w| (w[1] - w[0]).abs()).fold(0f32, f32::max);
         assert!(step <= 2.0 * biggest + 0.01, "frame {k}: step {step} against {biggest}");
     }
+    // in voiced speech a single lost frame is the last pitch period carried on, close to what was lost
+    let (mut sig, mut err) = (0f64, 0f64);
+    for k in (1..pk.len()).filter(|&k| lost(k) && !lost(k - 1) && !lost(k + 1)) {
+        for (x, y) in frame(&a, k).iter().zip(frame(&b, k)) {
+            sig += (*x as f64).powi(2);
+            err += (*x as f64 - y as f64).powi(2);
+        }
+    }
+    let concealed = 10.0 * (sig / err.max(1e-30)).log10();
+    eprintln!("a lost frame is concealed to {concealed:.1} dB of the clean decode");
+    assert!(concealed > 6.0, "{concealed}");
     // a few frames after each loss the lossy decode is the clean one again, near enough
     let mut err = 0f64;
     let mut sig = 0f64;
