@@ -110,6 +110,10 @@ pub struct Recorder {
     bytes: u64,
     error: Option<Error>,
     finished: bool,
+    /// Started on a session already running: a single file waits for a video keyframe, and its
+    /// timestamps start at zero there (`base`, in seconds, once it has started).
+    late: bool,
+    base: Option<f64>,
 }
 
 impl Recorder {
@@ -129,7 +133,17 @@ impl Recorder {
             bytes: 0,
             error: None,
             finished: false,
+            late: false,
+            base: None,
         }
+    }
+
+    /// [`start`](Self::start) on a session already running. A single file begins at the next
+    /// video keyframe (any packet, without video) with its timestamps from zero; HLS segments
+    /// always begin at a keyframe and keep the session's timestamps.
+    pub fn start_late(&mut self, streams: &[StreamInfo]) {
+        self.late = true;
+        self.start(streams);
     }
 
     /// The streams are known: checks they fit, and opens the output (HLS waits for a keyframe).
@@ -203,6 +217,21 @@ impl Recorder {
                 return Ok(());
             }
         }
+        let rebased;
+        let p = if self.late && !self.opts.hls() {
+            let base = match self.base {
+                Some(b) if t + 1e-6 < b => return Ok(()),
+                Some(b) => b,
+                // without video, any packet can start it
+                None if self.video.is_none_or(|v| v == p.stream && key) => *self.base.insert(t),
+                None => return Ok(()),
+            };
+            let tb = self.streams[p.stream].time_base.as_f64();
+            rebased = Packet { pts: p.pts - (base / tb).round() as i64, ..p.clone() };
+            &rebased
+        } else {
+            p
+        };
         if let Some(m) = self.mux.as_mut() {
             m.write_packet(p)?;
             self.packets += 1;
@@ -289,6 +318,12 @@ impl Recorder {
                     self.write_playlist(true)
                 }
             })
+        } else if self.late && self.packets == 0 {
+            // only a file this recorder made is removed
+            if self.mux.take().is_some() {
+                let _ = std::fs::remove_file(&self.opts.path);
+            }
+            Err(Error::new(ErrorCode::NotFound, "nothing was recorded: no keyframe arrived to start the file"))
         } else {
             self.mux.take().map_or(Ok(()), |mut m| m.finish())
         };
@@ -304,6 +339,7 @@ impl Recorder {
             "bytes": self.bytes,
             "segments": if self.opts.hls() { json!({ "written": self.index, "listed": self.listed.len(), "first_seq": self.first_seq }) } else { Value::Null },
             "finished": self.finished,
+            "started_at": self.base,
             "error": self.error,
         })
     }

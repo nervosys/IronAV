@@ -129,10 +129,21 @@ struct Shared {
     thumbnails: VecDeque<(f64, VideoFrame)>,
     /// The recorder's status, as last published by the session thread.
     record: Option<Value>,
+    /// The recording asked for (at open or by `configure`) and not yet asked to stop, so a second
+    /// start is refused even before the session thread has taken the first.
+    recording: Option<String>,
     /// Changes waiting for the session thread, and how many it has applied.
-    reconfigure: VecDeque<Reconfigure>,
+    reconfigure: VecDeque<(Reconfigure, RecordChange)>,
     requested: u64,
     applied: u64,
+}
+
+/// A change to a session's recording, from `stream_configure`: stop the one running, start
+/// another, or both (to go on in a new file).
+#[derive(Debug, Clone, Default)]
+pub struct RecordChange {
+    pub stop: bool,
+    pub start: Option<RecordOptions>,
 }
 
 /// A search of a session's log.
@@ -319,6 +330,7 @@ pub fn open(args: &OpenArgs) -> Result<Arc<Session>> {
             summary: None,
             thumbnails: VecDeque::new(),
             record: None,
+            recording: args.record.clone(),
             reconfigure: VecDeque::new(),
             requested: 0,
             applied: 0,
@@ -335,7 +347,7 @@ pub fn open(args: &OpenArgs) -> Result<Arc<Session>> {
         .name(format!("ironav-live-{id}"))
         .spawn(move || {
             let mut rec = record.map(Recorder::new);
-            let r = worker.run(source, &opts, &stream_opts, realtime, rec.as_mut());
+            let r = worker.run(source, &opts, &stream_opts, realtime, &mut rec);
             // a recording is closed however the session ended
             if let Some(rec) = rec.as_mut() {
                 let end = lock(&worker.shared).media_seconds;
@@ -416,15 +428,28 @@ impl Session {
         self.polling.load(Ordering::Relaxed) == 0 && self.idle.is_some_and(|d| lock(&self.touched).elapsed() > d)
     }
 
-    /// Changes the running analysis; waits up to a second for the session thread to apply it.
-    pub fn configure(&self, c: Reconfigure) -> Result<Value> {
+    /// Changes the running analysis and recording; waits up to a second for the session thread
+    /// to apply them.
+    pub fn configure(&self, c: Reconfigure, r: RecordChange) -> Result<Value> {
         c.check()?;
+        if let Some(o) = &r.start {
+            o.check()?;
+        }
         let deadline = Instant::now() + Duration::from_secs(1);
         let mut sh = lock(&self.shared);
         if matches!(sh.state, State::Ended | State::Failed | State::Closed) {
             return Err(Error::invalid_arg(format!("session {} has stopped; nothing is left to configure", self.id)));
         }
-        sh.reconfigure.push_back(c);
+        if let (Some(_), false, Some(cur)) = (&r.start, r.stop, &sh.recording) {
+            return Err(Error::invalid_arg(format!("already recording to {cur}")).hint("pass stop_recording: true as well to go on in the new file"));
+        }
+        if r.stop {
+            sh.recording = None;
+        }
+        if let Some(o) = &r.start {
+            sh.recording = Some(o.path.clone());
+        }
+        sh.reconfigure.push_back((c, r));
         sh.requested += 1;
         let mine = sh.requested;
         while sh.applied < mine && !matches!(sh.state, State::Ended | State::Failed | State::Closed) {
@@ -441,10 +466,10 @@ impl Session {
         Ok(v)
     }
 
-    /// Applies waiting changes to the analysis, or keeps them in `deferred` for it until there is one.
-    /// Opening a decoder can be slow, so it is done without the session's lock.
-    fn reconfigure(&self, analysis: Option<&mut Analysis>, deferred: &mut Vec<Reconfigure>) {
-        let changes: Vec<Reconfigure> = {
+    /// Applies waiting changes to the analysis, or keeps them in `deferred` for it until there is one,
+    /// and to the recording. Opening a decoder can be slow, so it is done without the session's lock.
+    fn reconfigure(&self, analysis: Option<&mut Analysis>, deferred: &mut Vec<Reconfigure>, rec: &mut Option<Recorder>) {
+        let changes: Vec<(Reconfigure, RecordChange)> = {
             let mut sh = lock(&self.shared);
             if sh.reconfigure.is_empty() {
                 return;
@@ -452,6 +477,11 @@ impl Session {
             sh.reconfigure.drain(..).collect()
         };
         let n = changes.len() as u64;
+        let (changes, records): (Vec<Reconfigure>, Vec<RecordChange>) = changes.into_iter().unzip();
+        let mut rec_warnings = Vec::new();
+        for r in records {
+            self.change_recording(r, rec, &mut rec_warnings);
+        }
         let mut warnings = Vec::new();
         let mut analyzed = None;
         match analysis {
@@ -471,9 +501,35 @@ impl Session {
             sh.analyzed = v;
             sh.warnings = warnings;
         }
+        sh.warnings.extend(rec_warnings);
         sh.applied += n;
         drop(sh);
         self.changed.notify_all();
+    }
+
+    /// Stops and starts recordings as `r` asks. A recording started once media is flowing begins
+    /// at the next keyframe.
+    fn change_recording(&self, r: RecordChange, rec: &mut Option<Recorder>, warnings: &mut Vec<String>) {
+        if r.stop {
+            if let Some(mut old) = rec.take() {
+                let end = lock(&self.shared).media_seconds;
+                old.finish(end);
+                let st = old.status();
+                lock(&self.shared).record = Some(st);
+            }
+        }
+        let Some(o) = r.start else { return };
+        if rec.as_ref().is_some_and(|r| !r.status()["finished"].as_bool().unwrap_or(true)) {
+            warnings.push(format!("record: not started on {}: a recording is running", o.path));
+            return;
+        }
+        let mut new = Recorder::new(o);
+        let streams = lock(&self.shared).streams.clone();
+        if !streams.is_empty() {
+            new.start_late(&streams);
+        }
+        lock(&self.shared).record = Some(new.status());
+        *rec = Some(new);
     }
 
     /// Observations in the log that match `q`, oldest first unless asked otherwise.
@@ -501,7 +557,7 @@ impl Session {
         })
     }
 
-    fn run(&self, mut source: Box<dyn Source>, opts: &AnalyzeOptions, sopts: &StreamOptions, realtime: bool, mut rec: Option<&mut Recorder>) -> Result<()> {
+    fn run(&self, mut source: Box<dyn Source>, opts: &AnalyzeOptions, sopts: &StreamOptions, realtime: bool, rec: &mut Option<Recorder>) -> Result<()> {
         let mut deferred = Vec::new();
         let mut published = Instant::now();
         let mut buf = vec![0u8; 64 << 10];
@@ -517,7 +573,7 @@ impl Session {
             if self.stop.load(Ordering::Relaxed) {
                 break;
             }
-            self.reconfigure(analysis.as_mut(), &mut deferred);
+            self.reconfigure(analysis.as_mut(), &mut deferred, rec);
             let chunk = source.read(&mut buf, READ_WAIT)?;
             let arrival = Instant::now();
             let bytes: &[u8] = match chunk {
@@ -556,7 +612,7 @@ impl Session {
                     break;
                 }
                 // a paced source spends long in here: changes are taken between packets too
-                self.reconfigure(analysis.as_mut(), &mut deferred);
+                self.reconfigure(analysis.as_mut(), &mut deferred, rec);
                 if analysis.is_none() {
                     let streams = d.streams().to_vec();
                     let mut a = Analysis::new(&streams, opts, 0.0, f64::INFINITY, true)?;
@@ -572,7 +628,7 @@ impl Session {
                     sh.state = State::Running;
                     sh.analyzed = a.describe();
                     sh.warnings = a.warnings().to_vec();
-                    if let Some(rec) = rec.as_deref_mut() {
+                    if let Some(rec) = rec.as_mut() {
                         rec.start(&streams);
                         sh.record = Some(rec.status());
                     }
@@ -594,7 +650,7 @@ impl Session {
                 let arrived = if realtime { Instant::now() } else { arrival };
                 self.keep(&sp, t);
                 // written before the shared state is locked: a slow disk holds up only this thread
-                if let Some(rec) = rec.as_deref_mut() {
+                if let Some(rec) = rec.as_mut() {
                     rec.packet(&sp.packet, t, sp.key);
                     if published.elapsed() >= Duration::from_millis(250) {
                         published = Instant::now();

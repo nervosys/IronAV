@@ -276,7 +276,26 @@ fn h_stream_configure(args: &Value) -> Result<Value> {
         }
     };
     let c = crate::analyze::Reconfigure { level: str_arg(args, "level")?.map(str::to_string), digest_seconds: f64_arg(args, "digest_seconds")?, add: list("add")?, remove: list("remove")? };
-    s.configure(c)
+    let flag = |key: &str| -> Result<bool> {
+        match args.get(key) {
+            None | Some(Value::Null) => Ok(false),
+            Some(Value::Bool(b)) => Ok(*b),
+            Some(_) => Err(Error::invalid_arg(format!("'{key}' must be true or false"))),
+        }
+    };
+    let keep = match args.get("keep_segments") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(v.as_u64().ok_or_else(|| Error::invalid_arg("'keep_segments' must be a whole number"))? as usize),
+    };
+    let start = match str_arg(args, "record")? {
+        Some(path) => Some(crate::record::RecordOptions { path: path.to_string(), segment_seconds: f64_arg(args, "segment_seconds")?, keep_segments: keep, overwrite: flag("overwrite")? }),
+        None => None,
+    };
+    let given = |key: &str| args.get(key).is_some_and(|v| !v.is_null());
+    if start.is_none() && (given("segment_seconds") || given("keep_segments") || given("overwrite")) {
+        return Err(Error::invalid_arg("segment_seconds, keep_segments and overwrite go with record"));
+    }
+    s.configure(c, crate::live::RecordChange { stop: flag("stop_recording")?, start })
 }
 
 fn h_stream_close(args: &Value) -> Result<Value> {
@@ -501,7 +520,7 @@ pub fn tools() -> &'static [Tool] {
             },
             Tool {
                 name: "stream_configure",
-                description: "Change a running session: the most detail it keeps (level), the digest interval (from the next window), and which analyzers and sidecars run (add, remove: built-in analyzer names, or the operator's sidecar names from `capabilities`). An added video analyzer starts at the next keyframe. An added sidecar starts in the background and joins the first stream of its kind once ready (its name then shows in the status; a failure is an analyzer_failed observation). A removed one finishes in the background, and its closing observations follow. Returns the status with `applied` once the session has taken the change (within a second).",
+                description: "Change a running session: the most detail it keeps (level), the digest interval (from the next window), and which analyzers and sidecars run (add, remove: built-in analyzer names, or the operator's sidecar names from `capabilities`). An added video analyzer starts at the next keyframe. An added sidecar starts in the background and joins the first stream of its kind once ready (its name then shows in the status; a failure is an analyzer_failed observation). A removed one finishes in the background, and its closing observations follow. It can also start a recording (record), finish the running one (stop_recording), or both to go on in a new file. Returns the status with `applied` once the session has taken the change (within a second).",
                 cli: "",
                 input_schema: object(
                     json!({
@@ -509,7 +528,12 @@ pub fn tools() -> &'static [Tool] {
                         "level": { "type": "string", "enum": ironav_analyze::Level::ALL.iter().map(|l| l.name()).collect::<Vec<_>>() },
                         "digest_seconds": { "type": "number", "exclusiveMinimum": 0 },
                         "add": { "type": "array", "items": { "type": "string" }, "description": format!("Analyzers ({}) or configured sidecars.", ironav_analyze::ANALYZERS.iter().map(|a| a.name).collect::<Vec<_>>().join(", ")) },
-                        "remove": { "type": "array", "items": { "type": "string" } }
+                        "remove": { "type": "array", "items": { "type": "string" } },
+                        "stop_recording": { "type": "boolean", "description": "Finish the recording running now (its file or playlist is then complete)." },
+                        "record": { "type": "string", "description": "Start recording, as stream_open's record: a file begins at the next video keyframe with its timestamps from zero; an .m3u8 path writes HLS segments. With stop_recording, the old recording is finished first, so this goes on in a new file." },
+                        "segment_seconds": { "type": "number", "minimum": 1, "maximum": 600 },
+                        "keep_segments": { "type": "integer", "minimum": 1 },
+                        "overwrite": { "type": "boolean", "description": "Replace an existing recording at that path." }
                     }),
                     &["session"],
                 ),

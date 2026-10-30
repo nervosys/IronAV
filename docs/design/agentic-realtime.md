@@ -372,7 +372,7 @@ later as an analysis option (`keyframes_only`, `--keyframes-only`) rather than a
 the decoder only pictures that need no other, told from the bitstream (`ironav_formats::is_keyframe`: H.264 IDR and
 all-intra pictures, so open-GOP I pictures count; HEVC IRAP; VP8, VP9 and AV1 key frames; MPEG-4 I-VOPs), drains a
 software decoder after each, and leaves out `freeze`, which compares neighbouring pictures. Stdin commands for `watch` (`--commands`), `stream_query`, `stream_configure` (level, digest
-interval, adding and removing analyzers and sidecars; not recording yet) and the idle timeout (`idle_timeout_seconds`,
+interval, adding and removing analyzers and sidecars, starting and stopping recordings) and the idle timeout (`idle_timeout_seconds`,
 300 by default, counted from the last call that names the session) came later. Packet metadata (keyframe flag and arrival time) is held in the live layer (`StreamPacket`) instead of
 as new `Packet` fields, so §9's migration was not needed.
 

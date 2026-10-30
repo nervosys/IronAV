@@ -122,3 +122,44 @@ fn a_change_before_the_first_packet_is_kept_for_the_analysis() {
     assert_eq!(analyzers(&st), ["levels"], "{st}");
     call_tool("stream_close", &json!({ "session": id })).unwrap();
 }
+
+#[test]
+fn a_recording_is_started_and_moved_to_a_new_file_while_a_session_runs() {
+    let dir = scratch("record");
+    let src = concat!(env!("CARGO_MANIFEST_DIR"), "/../ironav-formats/tests/data/h264_aac.ts");
+    // two seconds of H.264 and AAC, a keyframe about every 0.44 s
+    let s = call_tool("stream_open", &json!({ "source": format!("{src}?pace=realtime"), "analyzers": ["structure"] })).unwrap();
+    let id = s["session"].as_str().unwrap().to_string();
+    let (a, b) = (dir.join("a.ts"), dir.join("b.mp4"));
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let c = call_tool("stream_configure", &json!({ "session": id, "record": a.to_str().unwrap() })).unwrap();
+    assert_eq!(c["applied"], true, "{c}");
+    assert_eq!(c["record"]["path"], a.to_str().unwrap(), "{c}");
+    // a second recording needs the first stopped
+    let e = call_tool("stream_configure", &json!({ "session": id, "record": b.to_str().unwrap() })).unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidArgument, "{e:?}");
+    let e = call_tool("stream_configure", &json!({ "session": id, "keep_segments": 2 })).unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidArgument, "{e:?}");
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    let c = call_tool("stream_configure", &json!({ "session": id, "stop_recording": true, "record": b.to_str().unwrap() })).unwrap();
+    assert_eq!(c["applied"], true, "{c}");
+    wait_end(&id);
+    let st = call_tool("stream_status", &json!({ "session": id })).unwrap();
+    assert_eq!(st["record"]["path"], b.to_str().unwrap(), "{st}");
+    assert_eq!(st["record"]["finished"], true, "{st}");
+    assert_eq!(st["record"]["error"], Value::Null, "{st}");
+    call_tool("stream_close", &json!({ "session": id })).unwrap();
+    // each file starts at a video keyframe, with its timestamps from zero, and holds part of the source
+    for f in [&a, &b] {
+        let mut d = ironav_formats::open_demuxer(f).unwrap();
+        let streams = d.streams().to_vec();
+        let (mut first, mut last, mut n) = (f64::INFINITY, 0f64, 0);
+        while let Some(p) = d.read_packet().unwrap() {
+            let t = p.pts as f64 * streams[p.stream].time_base.as_f64();
+            first = first.min(t);
+            last = last.max(t);
+            n += 1;
+        }
+        assert!(n > 5 && first.abs() < 0.05 && last < 1.6, "{}: {n} packets from {first} to {last}", f.display());
+    }
+}

@@ -57,7 +57,7 @@ fn help() -> Value {
             "probe <path>": "inspect a media file",
             "convert -i IN [-i MORE]... -o OUT [-f FMT] [--acodec C] [--vcodec C] [--abitrate KBPS] [--vbitrate KBPS | --qp N] [--latency low] [--filter name[:k=v,..]]... [--hwaccel P] [-y] [--dry-run] [--progress]": "convert, handbrake/ffmpeg style",
             "analyze FILE [--analyzers a,b] [--sidecars a,b] [--level digest|events|raw] [--digest-seconds N] [--from S] [--to S] [--streams 0,1] [--max N] [--thumbnails DIR] [--hwaccel P] [--keyframes-only] [--jsonl]": "what is in a file: loudness, silence, scene cuts, black and frozen pictures, thumbnails, gaps; --jsonl prints each observation as a line as it is found",
-            "watch SOURCE [--analyzers a,b] [--sidecars a,b] [--level digest|events|raw] [--digest-seconds N] [--format F] [--fps N] [--pace realtime] [--retain S] [--duration S] [--hwaccel P] [--keyframes-only] [--record OUT.ts|OUT.m3u8 [--segment-seconds S] [--keep-segments N] [-y]] [--commands]": "follow a live source (path, path?follow, -, tcp://host:port, tcp://:port, udp://:port): every observation as a JSON line as it happens, then a summary; with --commands, stdin takes one command per line (status, query kinds=speech_end newest_first=true, configure add=silence, snapshot, clip from=1 to=5 output=c.ts, close, or the same as JSON) and each reply is a line {\"reply\":...}",
+            "watch SOURCE [--analyzers a,b] [--sidecars a,b] [--level digest|events|raw] [--digest-seconds N] [--format F] [--fps N] [--pace realtime] [--retain S] [--duration S] [--hwaccel P] [--keyframes-only] [--record OUT.ts|OUT.m3u8 [--segment-seconds S] [--keep-segments N] [-y]] [--commands]": "follow a live source (path, path?follow, -, tcp://host:port, tcp://:port, udp://:port): every observation as a JSON line as it happens, then a summary; with --commands, stdin takes one command per line (status, query kinds=speech_end newest_first=true, configure add=silence, configure stop_recording=true record=next.ts, snapshot, clip from=1 to=5 output=c.ts, close, or the same as JSON) and each reply is a line {\"reply\":...}",
             "plan <job.json|->": "validate a JSON job without writing",
             "run <job.json|->": "execute a JSON job",
             "hw probe | hw select --codec C --direction decode|encode [--policy P]": "hardware acceleration",
@@ -351,7 +351,7 @@ fn watch_command(session: &str, line: &str) -> (Value, bool) {
             let Some((k, val)) = w.split_once('=').filter(|(k, _)| !matches!(*k, "cmd" | "id")) else {
                 return (json!({ "reply": v["cmd"], "ok": false, "error": Error::invalid_arg(format!("'{w}' is not key=value")) }), false);
             };
-            let text = matches!(k, "text" | "analyzer" | "output" | "format" | "level");
+            let text = matches!(k, "text" | "analyzer" | "output" | "format" | "level" | "record");
             v[k] = match serde_json::from_str::<Value>(val) {
                 _ if text => json!(val),
                 Ok(j) if !WATCH_LISTS.contains(&k) || j.is_array() => j,

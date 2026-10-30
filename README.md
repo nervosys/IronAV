@@ -150,7 +150,9 @@ closes. It can also be HLS: give an `.m3u8` path, and MPEG-TS segments are cut a
 player can follow the recording live. With `keep_segments: N` the playlist is a sliding window and older segments are
 deleted; otherwise it keeps them all and is closed with `#EXT-X-ENDLIST` when the session ends. A source that the recording
 format cannot hold, such as Y4M into `.ts`, leaves the analysis running and reports the reason under `record.error` in the
-status. FFmpeg plays the playlists: a 12 s H.264/AAC stream recorded as three segments gives back all 300 pictures and 564
+status. `stream_configure` starts a recording on a running session (`record`, with the same options), finishes the
+one running (`stop_recording: true`), or both at once to go on in a new file; a single file started this way begins at
+the next video keyframe, with its timestamps from zero. FFmpeg plays the playlists: a 12 s H.264/AAC stream recorded as three segments gives back all 300 pictures and 564
 audio frames, with no decode errors.
 
 ```sh
