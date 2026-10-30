@@ -328,3 +328,85 @@ impl Denoiser {
         }
     }
 }
+
+/// What a stretch of sound is like, for a detector deciding whether to look closer.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Spectrum {
+    /// Root-mean-square and peak level, in dBFS (a full-scale square wave is 0).
+    pub rms_dbfs: f32,
+    pub peak_dbfs: f32,
+    /// The power-weighted mean frequency, in Hz: low for a hum, high for hiss.
+    pub centroid_hz: f32,
+    /// Below this frequency lies 85% of the power.
+    pub rolloff_hz: f32,
+    /// Geometric over arithmetic mean of the power spectrum: near 1 for noise, near 0 for a tone.
+    pub flatness: f32,
+}
+
+/// Measures [`Spectrum`]s: the power spectrum is averaged over Hann-windowed blocks of 512
+/// samples, half overlapping.
+pub struct SpectrumMeter {
+    fft: Fft,
+    window: Vec<f32>,
+    work: Vec<[f32; 2]>,
+    spec: Vec<[f32; 2]>,
+    power: Vec<f32>,
+}
+
+const SPECTRUM_BLOCK: usize = 512;
+
+impl Default for SpectrumMeter {
+    fn default() -> Self {
+        let n = SPECTRUM_BLOCK;
+        Self {
+            fft: Fft::new(n),
+            window: (0..n).map(|i| (0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / n as f64).cos()) as f32).collect(),
+            work: vec![[0.0; 2]; n],
+            spec: vec![[0.0; 2]; n],
+            power: vec![0.0; n / 2 + 1],
+        }
+    }
+}
+
+impl SpectrumMeter {
+    /// The spectrum of `x`, mono at `rate`. Shorter than a block, it is padded with silence.
+    pub fn measure(&mut self, x: &[f32], rate: u32) -> Spectrum {
+        let n = SPECTRUM_BLOCK;
+        let level = |e: f32| 10.0 * (e + 1e-12).log10();
+        let peak = x.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let mut out = Spectrum { rms_dbfs: level(x.iter().map(|v| v * v).sum::<f32>() / x.len().max(1) as f32), peak_dbfs: level(peak * peak), ..Spectrum::default() };
+        self.power.fill(0.0);
+        let mut start = 0;
+        loop {
+            for i in 0..n {
+                self.work[i] = [x.get(start + i).copied().unwrap_or(0.0) * self.window[i], 0.0];
+            }
+            self.fft.run(&self.work, &mut self.spec);
+            for (p, [re, im]) in self.power.iter_mut().zip(&self.spec) {
+                *p += re * re + im * im;
+            }
+            start += n / 2;
+            if start + n > x.len() {
+                break;
+            }
+        }
+        let total: f32 = self.power.iter().sum();
+        if total <= 1e-12 {
+            return out;
+        }
+        let hz = rate as f32 / n as f32;
+        out.centroid_hz = self.power.iter().enumerate().map(|(b, p)| b as f32 * hz * p).sum::<f32>() / total;
+        let mut run = 0.0;
+        for (b, p) in self.power.iter().enumerate() {
+            run += p;
+            if run >= 0.85 * total {
+                out.rolloff_hz = b as f32 * hz;
+                break;
+            }
+        }
+        let bins = self.power.len() as f32;
+        let log_mean = self.power.iter().map(|p| (p + 1e-20).ln()).sum::<f32>() / bins;
+        out.flatness = (log_mean.exp() / (total / bins)).min(1.0);
+        out
+    }
+}

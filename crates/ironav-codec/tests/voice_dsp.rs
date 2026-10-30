@@ -1,7 +1,7 @@
 //! Speech processing before a voice link's encoder: detection, push-to-talk trimming, level
 //! control and noise suppression, at 16 kHz in 20 ms frames.
 
-use ironav_codec::voice::{Agc, Denoiser, Gate, Vad};
+use ironav_codec::voice::{Agc, Denoiser, Gate, SpectrumMeter, Vad};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
@@ -218,4 +218,18 @@ fn nothing_allocates_per_frame() {
     COUNTING.with(|c| c.set(false));
     assert_eq!(ALLOCS.with(Cell::get), 0);
     assert!(sent > 0);
+}
+
+#[test]
+fn the_spectrum_tells_a_tone_from_hiss() {
+    let mut m = SpectrumMeter::default();
+    let tone: Vec<f32> = (0..4000).map(|i| 0.5 * (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / 16_000.0).sin()).collect();
+    let s = m.measure(&tone, 16_000);
+    assert!((s.rms_dbfs - -9.0).abs() < 0.2 && (s.peak_dbfs - -6.0).abs() < 0.1, "{s:?}");
+    assert!((s.centroid_hz - 1000.0).abs() < 60.0 && s.flatness < 0.05 && s.rolloff_hz < 1100.0, "{s:?}");
+    let hiss = noise(4000, 0.5, 11);
+    let s = m.measure(&hiss, 16_000);
+    assert!((s.centroid_hz - 4000.0).abs() < 400.0 && s.flatness > 0.5 && s.rolloff_hz > 6000.0, "{s:?}");
+    let s = m.measure(&[0.0; 100], 16_000);
+    assert!(s.rms_dbfs < -100.0 && s.centroid_hz == 0.0, "{s:?}");
 }

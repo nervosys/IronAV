@@ -30,6 +30,13 @@ fn a_test_picture_numbers_its_frames_and_says_it_is_synthetic() {
     let st = s.status();
     assert_eq!(st["source"]["synthetic"], true, "{st}");
     assert_eq!(st["source"]["kind"], "test");
+    // each stage's time per packet
+    assert_eq!(st["stage_ms"]["packets"], 20, "{st}");
+    for stage in ["demux", "decode", "analyze"] {
+        let p95 = st["stage_ms"][stage]["p95"].as_f64().unwrap();
+        assert!((0.0..500.0).contains(&p95), "{stage}: {st}");
+    }
+    assert!(st["stage_ms"]["decode"]["max"].as_f64().unwrap() > 0.0, "{st}");
 }
 
 #[test]
@@ -72,4 +79,30 @@ fn keyframe_pictures_are_kept_as_jpeg() {
     assert_eq!(list.len(), 2, "{r}");
     assert_eq!(list[1]["t"], 1.4);
     assert!(list[1]["jpeg_base64"].as_str().unwrap().starts_with("/9j/"), "a JPEG's first bytes");
+}
+
+#[test]
+fn an_audio_tap_measures_its_windows() {
+    let s = open("test://audio?duration=2");
+    let tap = s.tap(TapConfig { window_ms: 250, features: true, queue: 64, ..TapConfig::audio() }).unwrap();
+    let mut seen = 0;
+    while let Ok(Some(f)) = tap.recv_timeout(Duration::from_secs(10)) {
+        let TapData::Audio { features: Some(x), .. } = f.data else { panic!("no features") };
+        seen += 1;
+        if (f.t + 0.01).fract() < 0.5 {
+            // the 440 Hz tone at 0.3
+            assert!((x.rms_dbfs - -13.5).abs() < 0.5 && (x.peak_dbfs - -10.5).abs() < 0.3, "{x:?} at {}", f.t);
+            assert!((x.centroid_hz - 440.0).abs() < 60.0 && x.flatness < 0.05, "{x:?} at {}", f.t);
+            if f.t > 0.9 {
+                assert!(x.speech > 0.5, "{x:?} at {}", f.t);
+            }
+        } else {
+            assert!(x.rms_dbfs < -90.0, "{x:?} at {}", f.t);
+            // the detector's hangover covers the start of a pause, not its second half
+            if (f.t + 0.01).fract() > 0.7 {
+                assert_eq!(x.speech, 0.0, "{x:?} at {}", f.t);
+            }
+        }
+    }
+    assert!(seen >= 7);
 }

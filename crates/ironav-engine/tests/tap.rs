@@ -71,7 +71,7 @@ fn sound_comes_as_overlapping_mono_windows() {
     assert!((4..=7).contains(&got.len()), "{} windows", got.len());
     for (k, f) in got.iter().enumerate() {
         assert_eq!(f.stream, 1);
-        let TapData::Audio { rate, samples } = &f.data else { panic!("not sound") };
+        let TapData::Audio { rate, samples, .. } = &f.data else { panic!("not sound") };
         assert_eq!((*rate, samples.len()), (16_000, 3200));
         assert!((f.t - 0.1 * k as f64 - got[0].t).abs() < 0.002, "window {k} at {}", f.t);
         assert!(samples.iter().all(|v| v.abs() <= 1.0));

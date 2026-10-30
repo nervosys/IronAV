@@ -178,6 +178,8 @@ pub struct Analysis {
     /// session to take.
     keyframe_stream: Option<usize>,
     pub last_keyframe: Option<(f64, VideoFrame)>,
+    /// How long the last packet took to decode, and to show to the analyzers and taps.
+    pub timing: (std::time::Duration, std::time::Duration),
 }
 
 /// Opens `s`'s decoder if it has none, to wait for a keyframe; why not, when it cannot.
@@ -367,6 +369,7 @@ impl Analysis {
             changed: false,
             keyframe_stream: None,
             last_keyframe: None,
+            timing: Default::default(),
         })
     }
 
@@ -619,6 +622,7 @@ impl Analysis {
 
     /// [`packet`](Self::packet), saying whether a decoder can start at it (as a live source knows).
     pub fn packet_keyed(&mut self, p: &Packet, key: bool, sink: &mut dyn FnMut(Observation) -> Result<()>) -> Result<()> {
+        self.timing = Default::default();
         if !self.starting.is_empty() || !self.retiring.is_empty() {
             self.collect();
         }
@@ -641,6 +645,7 @@ impl Analysis {
         // decoder is drained; no later picture can come before it)
         let skip = s.keyframes_only && !ironav_formats::is_keyframe(s.info.codec, &p.data).unwrap_or(key);
         let drain = s.keyframes_only && s.decoder_name == Some("software");
+        let decode_start = Instant::now();
         let decoded = s.decoder.as_mut().filter(|_| !s.wait_key && !skip).map(|dec| {
             let mut f = dec.decode(p)?;
             if drain {
@@ -659,6 +664,7 @@ impl Analysis {
                 Vec::new()
             }
         };
+        let decode_time = decode_start.elapsed();
         // the picture a keyframe decodes to, kept before the analyzers take the frames
         if key && self.keyframe_stream == Some(p.stream) {
             let tb = s.info.time_base.as_f64();
@@ -674,6 +680,7 @@ impl Analysis {
                 clock = Some(clock.map_or(ft, |c: f64| c.max(ft)));
             }
         }
+        self.timing = (decode_time, decode_start.elapsed() - decode_time);
         self.emit(p.stream, sink)?;
         if let Some(c) = clock {
             self.latest = self.latest.max(c);

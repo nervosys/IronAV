@@ -513,7 +513,7 @@ pub fn tools() -> &'static [Tool] {
             },
             Tool {
                 name: "stream_status",
-                description: "A live session's state (waiting, running, ended, failed, closed), streams, bytes and packets in, media time, latency percentiles, log and retained range. Without a session, every open session.",
+                description: "A live session's state (waiting, running, ended, failed, closed), streams (with the decoder each uses: software or GPU), bytes and packets in, media time, latency percentiles, per-stage times (stage_ms: demux, decode, analyze), source health, log and retained range. Without a session, every open session.",
                 cli: "",
                 input_schema: object(json!({ "session": { "type": "string" } }), &[]),
                 read_only: true,

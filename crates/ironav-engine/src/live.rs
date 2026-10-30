@@ -134,6 +134,9 @@ struct Shared {
     packets: u64,
     media_seconds: f64,
     latencies: VecDeque<f64>,
+    /// Per packet, in milliseconds: from its bytes' arrival to the start of its analysis
+    /// (demuxing, keeping, recording), decoding, and showing it to the analyzers and taps.
+    stages: [VecDeque<f64>; 3],
     summary: Option<Value>,
     /// Thumbnails since the last snapshot of them was read, newest last (at most a few).
     thumbnails: VecDeque<(f64, VideoFrame)>,
@@ -381,6 +384,7 @@ pub fn open(args: &OpenArgs) -> Result<Arc<Session>> {
             packets: 0,
             media_seconds: 0.0,
             latencies: VecDeque::new(),
+            stages: Default::default(),
             summary: None,
             thumbnails: VecDeque::new(),
             record: None,
@@ -825,6 +829,7 @@ impl Session {
                 if let Some(rec) = rec.as_mut() {
                     rec.packet(&sp.packet, t, sp.key);
                 }
+                let queued = arrived.elapsed();
                 a.packet_keyed(&sp.packet, sp.key, &mut |o| self.log(o, Some(arrived)))?;
                 if let Some((t, v)) = a.last_keyframe.take() {
                     self.keep_keyframe(t, &v);
@@ -837,6 +842,12 @@ impl Session {
                     sh.warnings = a.warnings().to_vec();
                 }
                 sh.packets += 1;
+                for (q, d) in sh.stages.iter_mut().zip([queued, a.timing.0, a.timing.1]) {
+                    q.push_back((d.as_secs_f64() * 1e4).round() / 10.0);
+                    if q.len() > LATENCY_SAMPLES {
+                        q.pop_front();
+                    }
+                }
                 sh.media_seconds = sh.media_seconds.max(a.position());
                 if let Some(p) = a.last_picture.take() {
                     sh.picture = Some(p);
@@ -976,6 +987,13 @@ impl Session {
         let mut lat: Vec<f64> = sh.latencies.iter().copied().collect();
         lat.sort_by(f64::total_cmp);
         let pct = |p: f64| lat.get(((lat.len().max(1) - 1) as f64 * p).round() as usize).copied();
+        let stage = |q: &VecDeque<f64>| {
+            let mut v: Vec<f64> = q.iter().copied().collect();
+            v.sort_by(f64::total_cmp);
+            let at = |p: f64| v.get(((v.len().max(1) - 1) as f64 * p).round() as usize).copied();
+            json!({ "p50": at(0.5), "p95": at(0.95), "max": v.last() })
+        };
+        let stages = json!({ "demux": stage(&sh.stages[0]), "decode": stage(&sh.stages[1]), "analyze": stage(&sh.stages[2]), "packets": sh.stages[0].len() });
         json!({
             "session": self.id,
             "source": self.source,
@@ -990,6 +1008,7 @@ impl Session {
             "packets": sh.packets,
             "media_seconds": (sh.media_seconds * 1000.0).round() / 1000.0,
             "latency_ms": { "p50": pct(0.5), "p95": pct(0.95), "samples": lat.len() },
+            "stage_ms": stages,
             "log": { "first_seq": sh.log.front().map(|o| o.seq), "last_seq": sh.log.back().map(|o| o.seq) },
             "retained": { "from": sh.ring.front().map(|k| k.t), "to": sh.ring.back().map(|k| k.t), "bytes": sh.ring_bytes },
             "record": sh.record,

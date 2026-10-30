@@ -1,14 +1,15 @@
 //! Taps: decoded pictures or sound from a live session, handed to code in the same process (a
 //! detector, a speech model) as they are decoded, rather than as observations or over a sidecar's
 //! pipe. A tap takes pictures at a chosen rate, scaled and converted to RGB, BGR or grey (letterboxed
-//! to an exact size if asked), or mono sound at a chosen rate in windows of a chosen length.
+//! to an exact size if asked), or mono sound at a chosen rate in windows of a chosen length, with
+//! its level, spectrum and share of speech if asked.
 //!
 //! The session never waits for a tap: each keeps a short queue, and when its reader falls behind
 //! the oldest item is dropped and counted (`queue` 1 is "latest wins"). Each item carries a
 //! sequence number, so a gap is visible, its media time (from the source's timestamps: for RTSP,
 //! the RTP clock from the start of the stream) and the wall-clock time it was decoded.
 
-use ironav_codec::voice::StreamResampler;
+use ironav_codec::voice::{SpectrumMeter, StreamResampler, Vad};
 use ironav_core::{AudioFrame, Error, ErrorCode, MediaType, Result, VideoFrame};
 use serde::Deserialize;
 use std::collections::VecDeque;
@@ -57,6 +58,9 @@ pub struct TapConfig {
     pub window_ms: u32,
     #[serde(default)]
     pub hop_ms: Option<u32>,
+    /// Sound: measure each window's [`AudioFeatures`].
+    #[serde(default)]
+    pub features: bool,
     /// Items kept for a slow reader before the oldest is dropped.
     #[serde(default = "default_queue")]
     pub queue: usize,
@@ -84,7 +88,7 @@ fn default_queue() -> usize {
 
 impl TapConfig {
     pub fn video() -> Self {
-        Self { media: TapMedia::Video, stream: None, fps: None, width: None, height: None, letterbox: false, layout: PixelLayout::Rgb, rate: 16_000, window_ms: 1000, hop_ms: None, queue: 1 }
+        Self { media: TapMedia::Video, stream: None, fps: None, width: None, height: None, letterbox: false, layout: PixelLayout::Rgb, rate: 16_000, window_ms: 1000, hop_ms: None, features: false, queue: 1 }
     }
 
     pub fn audio() -> Self {
@@ -130,8 +134,24 @@ impl TapConfig {
 pub enum TapData {
     /// Rows top to bottom, no padding, in the layout asked for.
     Video { width: u32, height: u32, layout: PixelLayout, pixels: Vec<u8> },
-    /// Mono samples in -1 to 1.
-    Audio { rate: u32, samples: Vec<f32> },
+    /// Mono samples in -1 to 1, and what they are like when the tap measures it.
+    Audio { rate: u32, samples: Vec<f32>, features: Option<AudioFeatures> },
+}
+
+/// What a window of sound is like.
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize)]
+pub struct AudioFeatures {
+    pub rms_dbfs: f32,
+    pub peak_dbfs: f32,
+    /// The power-weighted mean frequency: low for a hum or a voice, high for hiss or breaking glass.
+    pub centroid_hz: f32,
+    /// Below this frequency lies 85% of the power.
+    pub rolloff_hz: f32,
+    /// Near 1 for noise, near 0 for a tone.
+    pub flatness: f32,
+    /// The share of the window's 20 ms frames a speech detector (energy over an adaptive noise
+    /// floor, not hiss) took for speech, from 0 to 1.
+    pub speech: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -246,13 +266,20 @@ pub struct TapFeeder {
     pending_t: Option<f64>,
     mono: Vec<f32>,
     pulled: Vec<f32>,
+    /// Audio features: the spectrum, and the speech detector run over 20 ms frames as they come,
+    /// with each frame's start time and verdict.
+    meter: Option<SpectrumMeter>,
+    vad: Option<Vad>,
+    vad_buf: Vec<f32>,
+    vad_t: f64,
+    flags: VecDeque<(f64, bool)>,
 }
 
 /// A tap and its feeder, unattached.
 pub fn tap(config: TapConfig) -> Result<(Tap, TapFeeder)> {
     config.check()?;
     let shared = Arc::new(Shared { state: Mutex::new(State { cap: config.queue, ..State::default() }), ready: Condvar::new() });
-    let feeder = TapFeeder { config, shared: shared.clone(), stream: 0, seq: 0, next_t: None, resampler: None, pending: VecDeque::new(), pending_t: None, mono: Vec::new(), pulled: Vec::new() };
+    let feeder = TapFeeder { config, shared: shared.clone(), stream: 0, seq: 0, next_t: None, resampler: None, pending: VecDeque::new(), pending_t: None, mono: Vec::new(), pulled: Vec::new(), meter: None, vad: None, vad_buf: Vec::new(), vad_t: 0.0, flags: VecDeque::new() };
     Ok((Tap { shared }, feeder))
 }
 
@@ -358,7 +385,12 @@ impl TapFeeder {
         if expect.is_none_or(|e| (e - (t - delay)).abs() > 0.1) {
             self.pending.clear();
             self.pending_t = Some(t);
+            self.vad_buf.clear();
+            self.flags.clear();
+            self.vad_t = t;
         }
+        let features = self.config.features;
+        let vad_frame = rate as usize / 50;
         for chunk in self.mono.chunks(4096) {
             if r.push(chunk).is_err() {
                 return;
@@ -366,6 +398,17 @@ impl TapFeeder {
             self.pulled.resize(r.ready(), 0.0);
             let got = r.pull(&mut self.pulled);
             self.pending.extend(&self.pulled[..got]);
+            if features {
+                let vad = self.vad.get_or_insert_with(|| Vad::new(20.0, 200.0));
+                for &v in &self.pulled[..got] {
+                    self.vad_buf.push(v);
+                    if self.vad_buf.len() == vad_frame {
+                        self.flags.push_back((self.vad_t, vad.process(&self.vad_buf)));
+                        self.vad_buf.clear();
+                        self.vad_t += 0.02;
+                    }
+                }
+            }
         }
         let window = (rate as u64 * self.config.window_ms as u64 / 1000) as usize;
         let hop = (rate as u64 * self.config.hop_ms.unwrap_or(self.config.window_ms) as u64 / 1000).max(1) as usize;
@@ -375,7 +418,18 @@ impl TapFeeder {
             let drop = hop.min(self.pending.len());
             self.pending.drain(..drop);
             self.pending_t = Some(start + drop as f64 / rate as f64);
-            self.give(start.max(0.0), TapData::Audio { rate, samples });
+            let features = features.then(|| {
+                let s = self.meter.get_or_insert_with(SpectrumMeter::default).measure(&samples, rate);
+                let end = start + window as f64 / rate as f64;
+                let inside: Vec<bool> = self.flags.iter().filter(|(ft, _)| *ft >= start - 0.001 && *ft + 0.02 <= end + 0.001).map(|f| f.1).collect();
+                let speech = if inside.is_empty() { 0.0 } else { inside.iter().filter(|s| **s).count() as f32 / inside.len() as f32 };
+                let next = start + drop as f64 / rate as f64;
+                while self.flags.front().is_some_and(|(ft, _)| *ft < next - 0.001) {
+                    self.flags.pop_front();
+                }
+                AudioFeatures { rms_dbfs: s.rms_dbfs, peak_dbfs: s.peak_dbfs, centroid_hz: s.centroid_hz, rolloff_hz: s.rolloff_hz, flatness: s.flatness, speech }
+            });
+            self.give(start.max(0.0), TapData::Audio { rate, samples, features });
         }
     }
 }

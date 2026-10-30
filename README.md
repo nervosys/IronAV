@@ -157,7 +157,11 @@ once. `stream_events {session, after, wait_ms}` is a long poll: it returns as so
 waiting costs nothing while the stream is quiet. Pass the returned `next_after` back as `after`. `stream_snapshot`
 returns the newest picture, or the one at `at` seconds, as an image. `stream_clip` writes `from`..`to` of the
 retained media (`retain_seconds`, 60 by default) to a file without re-encoding, starting at a keyframe.
-`stream_status` reports the state, bytes, packets and latency percentiles; `stream_close` returns the summary.
+`stream_status` reports the state, bytes, packets and latency percentiles, and in `stage_ms` where the time goes: for
+the last 512 packets, the 50th and 95th percentile and the longest time from a packet's bytes arriving to the start of
+its analysis (`demux`: demuxing, keeping it for clips, recording), decoding it (`decode`), and showing what it decodes
+to to the analyzers and taps (`analyze`); each stream's `decoder` in `analyzed` says whether it is `software` or a GPU
+decoder. `stream_close` returns the summary.
 `stream_query` searches the log (the newest 20000 observations) by kind, analyzer, stream, media time and text, newest
 first if asked ("when was speech last heard"). `stream_configure` changes a running session's level, digest interval,
 analyzers and sidecars (an added sidecar starts in the background and joins once ready; a removed one finishes and
@@ -203,7 +207,9 @@ while let Some(f) = tap.recv_timeout(Duration::from_secs(5))? {
 A video tap gives at most `fps` pictures a second (every one when not given), scaled to fit `width` x `height` (aspect
 kept) and, with `letterbox`, padded with black to exactly that size, as RGB, BGR or grey bytes. An audio tap
 (`TapConfig::audio()`) gives mono windows of `window_ms` at `rate` (16 kHz unless asked), starting every `hop_ms` (so
-windows overlap when it is shorter). It takes the stream given as `stream` or the first of its kind, starting its
+windows overlap when it is shorter); with `features: true` each window comes with its RMS and peak level in dBFS,
+spectral centroid and 85% roll-off in Hz, spectral flatness (near 1 for noise, near 0 for a tone) and the share of its
+20 ms frames a speech detector took for speech (`ironav_codec::voice::SpectrumMeter` and `Vad`). It takes the stream given as `stream` or the first of its kind, starting its
 decoder if nothing else needed one; if none suits, the first `recv_timeout` says why. The session never waits for a
 tap: each keeps `queue` items (1 unless asked: the latest wins) and drops the oldest when full, and `stats()` counts
 what was made, taken and dropped. Each item has a sequence number counting every item made, so a reader sees a gap; the
