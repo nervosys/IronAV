@@ -166,3 +166,91 @@ fn a_16_khz_link_allocates_nothing_per_frame() {
     eprintln!("resampler {} ms + encoder {} ms", up.delay_ms(), enc.delay_ms());
     assert!(up.delay_ms() + enc.delay_ms() <= 13.5);
 }
+
+/// 10 ms packets of `input`.
+fn packets(input: &[f32]) -> Vec<Vec<u8>> {
+    let mut enc = OpusEncoder::new(48_000, 1, 32_000).unwrap().with_frame_ms(10.0).unwrap();
+    let mut buf = vec![0u8; enc.packet_bytes()];
+    input.chunks_exact(480).map(|f| { let n = enc.encode_frame_into(f, &mut buf).unwrap(); buf[..n].to_vec() }).collect()
+}
+
+fn rms(x: &[f32]) -> f64 {
+    (x.iter().map(|&v| v as f64 * v as f64).sum::<f64>() / x.len().max(1) as f64).sqrt()
+}
+
+#[test]
+fn decoding_into_a_buffer_matches_and_allocates_nothing() {
+    let pk = packets(&voice(48_000));
+    let head = opus_head(1);
+    let params = StreamParams::Audio { sample_rate: 48_000, channels: 1 };
+    let (mut a, mut b) = (OpusDecoder::new(&head, &params).unwrap(), OpusDecoder::new(&head, &params).unwrap());
+    let mut out = vec![0f32; 960];
+    for (k, p) in pk.iter().enumerate() {
+        if k == 2 {
+            ALLOCS.with(|a| a.set(0));
+            COUNTING.with(|c| c.set(true));
+        }
+        let n = a.decode_into(p, &mut out).unwrap();
+        COUNTING.with(|c| c.set(false));
+        let want: Vec<f64> = b.decode(&Packet { stream: 0, pts: 0, duration: 480, data: p.clone() }).unwrap().into_iter().flat_map(|f| match f {
+            Frame::Audio(a) => a.samples,
+            _ => unreachable!(),
+        }).collect();
+        assert_eq!(n, want.len());
+        assert!(out[..n].iter().zip(&want).all(|(x, y)| (*x as f64 - y).abs() < 1e-6), "packet {k}");
+        if k >= 2 {
+            COUNTING.with(|c| c.set(true));
+        }
+    }
+    COUNTING.with(|c| c.set(false));
+    assert_eq!(ALLOCS.with(Cell::get), 0);
+    assert!(a.decode_into(&pk[3], &mut out[..100]).is_err(), "a buffer too small");
+}
+
+#[test]
+fn a_lost_packet_is_concealed_without_a_gap_and_the_stream_recovers() {
+    let input = voice(48_000);
+    let pk = packets(&input);
+    let head = opus_head(1);
+    let params = StreamParams::Audio { sample_rate: 48_000, channels: 1 };
+    let (mut clean, mut lossy) = (OpusDecoder::new(&head, &params).unwrap(), OpusDecoder::new(&head, &params).unwrap());
+    let mut buf = vec![0f32; 480];
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    // lose one packet now and then, and three in a row once
+    let lost = |k: usize| k % 17 == 9 || (60..63).contains(&k);
+    for (k, p) in pk.iter().enumerate() {
+        let n = clean.decode_into(p, &mut buf).unwrap();
+        a.extend_from_slice(&buf[..n]);
+        let n = if lost(k) { lossy.decode_into(&[], &mut buf).unwrap() } else { lossy.decode_into(p, &mut buf).unwrap() };
+        assert_eq!(n, if k == 0 { 360 } else { 480 });
+        b.extend_from_slice(&buf[..n]);
+    }
+    let frame = |x: &[f32], k: usize| x[(k * 480).saturating_sub(120)..(k * 480 + 360).min(x.len())].to_vec();
+    for k in (1..pk.len()).filter(|&k| lost(k)) {
+        let (before, now) = (rms(&frame(&a, k - 1)), rms(&frame(&b, k)));
+        // a concealed frame keeps something of the level of the speech it stands in for, quieter
+        if before > 0.02 && !lost(k - 1) {
+            assert!(now > 0.05 * before && now < 1.2 * before, "frame {k}: {now:.4} after {before:.4}");
+        }
+        // and joins the frame before it without a step: no jump bigger than the signal makes
+        let at = k * 480 - 120;
+        let step = (b[at] - b[at - 1]).abs();
+        let biggest = b[at - 240..at - 1].windows(2).map(|w| (w[1] - w[0]).abs()).fold(0f32, f32::max);
+        assert!(step <= 2.0 * biggest + 0.01, "frame {k}: step {step} against {biggest}");
+    }
+    // a few frames after each loss the lossy decode is the clean one again, near enough
+    let mut err = 0f64;
+    let mut sig = 0f64;
+    for k in 0..pk.len() {
+        if (1..=6).any(|d| k >= d && lost(k - d)) || lost(k) {
+            continue;
+        }
+        for (x, y) in frame(&a, k).iter().zip(frame(&b, k)) {
+            sig += (*x as f64).powi(2);
+            err += (*x as f64 - y as f64).powi(2);
+        }
+    }
+    let snr = 10.0 * (sig / err.max(1e-30)).log10();
+    eprintln!("away from the losses the lossy decode is {snr:.1} dB from the clean one");
+    assert!(snr > 20.0, "{snr}");
+}

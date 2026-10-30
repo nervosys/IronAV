@@ -126,6 +126,8 @@ pub struct Celt {
     p: Params,
     dct: Vec<Dct4>,
     flushed: bool,
+    /// Frames concealed in a row since the last one decoded.
+    lost: u32,
     tmp: Vec<f32>,
     norm: Vec<f32>,
     enc_amp: [[f32; MAX_BANDS]; 2],
@@ -838,6 +840,7 @@ impl Celt {
             },
             dct: [120, 240, 480, 960].iter().map(|&n| Dct4::new(n)).collect(),
             flushed: false,
+            lost: 0,
             tmp: vec![0.0; MAX_FRAME],
             norm: vec![0.0; 2 * 8 * 100],
             enc_amp: [[0.0; MAX_BANDS]; 2],
@@ -1580,7 +1583,87 @@ impl Celt {
             }
         }
 
-        // transform and output for each output channel
+        self.synthesize(out, frame_size, imdct_idx, downmix);
+
+        if channels == 1 {
+            let e = self.block[0].energy;
+            self.block[1].energy = e;
+        }
+
+        for b in self.block.iter_mut() {
+            if !self.p.transient {
+                b.prev_energy[1] = b.prev_energy[0];
+                b.prev_energy[0] = b.energy;
+            } else {
+                for j in 0..MAX_BANDS {
+                    b.prev_energy[0][j] = b.prev_energy[0][j].min(b.energy[j]);
+                }
+            }
+            for j in 0..start_band {
+                b.prev_energy[0][j] = ENERGY_SILENCE;
+                b.energy[j] = 0.0;
+            }
+            for j in end_band..MAX_BANDS {
+                b.prev_energy[0][j] = ENERGY_SILENCE;
+                b.energy[j] = 0.0;
+            }
+        }
+
+        self.p.seed = rc.range();
+        self.lost = 0;
+        Ok(())
+    }
+
+    /// A frame of `frame_size` samples standing in for one that was lost: noise in each band at
+    /// the last frame's energy, made 1.5 log2 units (9 dB) quieter for the first frame lost and 0.5
+    /// (3 dB) for each one after, through the same synthesis as a decoded frame, so the next one
+    /// that arrives joins it without a click. Before anything is decoded it is silence.
+    pub fn conceal(&mut self, out: &mut [Vec<f32>; 2], frame_size: usize) -> Result<()> {
+        let size = (frame_size / SHORT_BLOCK).checked_ilog2().unwrap_or(0) as i32;
+        if size > 3 || frame_size != SHORT_BLOCK << size {
+            return Err(bad("invalid CELT frame size"));
+        }
+        if self.flushed {
+            for o in out.iter_mut() {
+                o[..frame_size].fill(0.0);
+            }
+            return Ok(());
+        }
+        let decay = if self.lost == 0 { 1.5 } else { 0.5 };
+        self.lost = self.lost.saturating_add(1);
+        let end = if self.p.end_band == 0 { MAX_BANDS } else { self.p.end_band };
+        {
+            let p = &mut self.p;
+            (p.size, p.transient, p.blocks, p.blocksize) = (size, false, 1, frame_size);
+            (p.start_band, p.end_band, p.coded_channels) = (0, end, self.output_channels as i32);
+        }
+        for c in 0..self.output_channels {
+            self.block[c].coeffs.fill(0.0);
+            for i in 0..end {
+                let e = &mut self.block[c].energy[i];
+                *e = (*e - decay).max(ENERGY_SILENCE);
+                let (off, w) = ((CELT_FREQ_BANDS[i] as usize) << size, (CELT_FREQ_RANGE[i] as usize) << size);
+                for j in 0..w {
+                    let r = self.p.rng();
+                    self.block[c].coeffs[off + j] = if r & 0x8000 != 0 { 1.0 } else { -1.0 };
+                }
+                renormalize(&mut self.block[c].coeffs[off..off + w], 1.0);
+            }
+            self.denormalize(c);
+            // the pitch post-filter fades out
+            self.block[c].pf_gains_new = [0.0; 3];
+        }
+        self.synthesize(out, frame_size, size as usize, false);
+        for b in self.block.iter_mut() {
+            b.prev_energy[1] = b.prev_energy[0];
+            b.prev_energy[0] = b.energy;
+        }
+        Ok(())
+    }
+
+    /// The inverse transform, overlap-add, post-filter and de-emphasis of the coefficients in
+    /// each output channel's block, into `out`.
+    fn synthesize(&mut self, out: &mut [Vec<f32>; 2], frame_size: usize, imdct_idx: usize, downmix: bool) {
         let blocks = self.p.blocks as usize;
         let blocksize = self.p.blocksize;
         for i in 0..self.output_channels {
@@ -1629,33 +1712,6 @@ impl Celt {
             }
             block.emph_coeff = if coeff.is_normal() { coeff } else { 0.0 };
         }
-
-        if channels == 1 {
-            let e = self.block[0].energy;
-            self.block[1].energy = e;
-        }
-
-        for b in self.block.iter_mut() {
-            if !self.p.transient {
-                b.prev_energy[1] = b.prev_energy[0];
-                b.prev_energy[0] = b.energy;
-            } else {
-                for j in 0..MAX_BANDS {
-                    b.prev_energy[0][j] = b.prev_energy[0][j].min(b.energy[j]);
-                }
-            }
-            for j in 0..start_band {
-                b.prev_energy[0][j] = ENERGY_SILENCE;
-                b.energy[j] = 0.0;
-            }
-            for j in end_band..MAX_BANDS {
-                b.prev_energy[0][j] = ENERGY_SILENCE;
-                b.energy[j] = 0.0;
-            }
-        }
-
-        self.p.seed = rc.range();
-        Ok(())
     }
 
     fn postfilter(&mut self, ch: usize, frame_size: usize) {

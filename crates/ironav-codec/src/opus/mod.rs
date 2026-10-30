@@ -91,15 +91,36 @@ fn lacing16(d: &[u8], p: &mut usize) -> Result<usize> {
     Ok(v)
 }
 
+/// A packet's frames: offset and length into it, at most 48.
+struct Frames {
+    at: [(usize, usize); 48],
+    n: usize,
+}
+
+impl Frames {
+    fn push(&mut self, f: (usize, usize)) {
+        self.at[self.n] = f;
+        self.n += 1;
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &(usize, usize)> {
+        self.at[..self.n].iter()
+    }
+
+    fn len(&self) -> usize {
+        self.n
+    }
+}
+
 /// Split a packet into its frames (offset and length into `d`).
-fn frames_of(d: &[u8]) -> Result<Vec<(usize, usize)>> {
+fn frames_of(d: &[u8]) -> Result<Frames> {
     if d.is_empty() {
         return Err(bad("empty packet"));
     }
     let code = d[0] & 3;
     let mut p = 1;
     let mut end = d.len();
-    let mut out = Vec::new();
+    let mut out = Frames { at: [(0, 0); 48], n: 0 };
     match code {
         0 => out.push((p, end - p)),
         1 => {
@@ -140,20 +161,20 @@ fn frames_of(d: &[u8]) -> Result<Vec<(usize, usize)>> {
             }
             end -= padding;
             if vbr {
-                let mut sizes = Vec::new();
+                // the sizes first, then the offsets once the sizes' end is known
                 let mut total = 0;
                 for _ in 0..count - 1 {
                     let s = lacing16(d, &mut p)?;
                     total += s;
-                    sizes.push(s);
+                    out.push((0, s));
                 }
                 if p > end || total > end - p {
                     return Err(bad("frame sizes exceed the packet"));
                 }
-                sizes.push(end - p - total);
-                for s in sizes {
-                    out.push((p, s));
-                    p += s;
+                out.push((0, end - p - total));
+                for f in out.at[..count].iter_mut() {
+                    f.0 = p;
+                    p += f.1;
                 }
             } else {
                 let n = end - p;
@@ -188,6 +209,8 @@ struct Upsampler {
     taps: Vec<f32>,
     per_phase: usize,
     hist: Vec<f32>,
+    /// The history and the input, together.
+    buf: Vec<f32>,
 }
 
 impl Upsampler {
@@ -215,12 +238,13 @@ impl Upsampler {
                 taps[r * per_phase + k] = (h[r + ratio * k] / sum) as f32;
             }
         }
-        Self { ratio, taps, per_phase, hist: vec![0.0; per_phase - 1] }
+        Self { ratio, taps, per_phase, hist: vec![0.0; per_phase - 1], buf: Vec::with_capacity(per_phase + 960) }
     }
 
     fn process(&mut self, x: &[f32], out: &mut [f32]) {
         let keep = self.per_phase - 1;
-        let mut buf = Vec::with_capacity(keep + x.len());
+        let mut buf = std::mem::take(&mut self.buf);
+        buf.clear();
         buf.extend_from_slice(&self.hist);
         buf.extend_from_slice(x);
         for i in 0..x.len() {
@@ -235,6 +259,7 @@ impl Upsampler {
             }
         }
         self.hist.copy_from_slice(&buf[buf.len() - keep..]);
+        self.buf = buf;
     }
 }
 
@@ -247,7 +272,17 @@ pub struct OpusDecoder {
     celt: celt::Celt,
     up: [Option<Upsampler>; 2],
     up_bandwidth: usize,
+    /// Scratch planes, sized once: a frame's output, SILK's, CELT's, and a redundancy frame's.
+    planes: [Vec<f32>; 2],
+    silk_out: [Vec<f32>; 2],
+    celt_out: [Vec<f32>; 2],
+    red_out: [Vec<f32>; 2],
+    /// The last frame decoded: its length and whether it was CELT only, for concealment.
+    last: Option<(usize, bool)>,
 }
+
+/// Samples per channel in the longest packet (120 ms).
+pub const MAX_PACKET_SAMPLES: usize = 5760;
 
 fn parse_head(extradata: &[u8], channels: u16) -> Result<(usize, usize, f32)> {
     if extradata.is_empty() {
@@ -281,7 +316,84 @@ impl OpusDecoder {
             celt: celt::Celt::new(ch, true),
             up: [None, None],
             up_bandwidth: 9,
+            planes: [vec![0.0; 2880], vec![0.0; 2880]],
+            silk_out: [vec![0.0; 960], vec![0.0; 960]],
+            celt_out: [vec![0.0; 960], vec![0.0; 960]],
+            red_out: [vec![0.0; 240], vec![0.0; 240]],
+            last: None,
         })
+    }
+
+    pub fn channels(&self) -> usize {
+        self.channels
+    }
+
+    /// Decodes a packet into `out` as interleaved samples at 48 kHz, after the stream's gain and
+    /// pre-skip, and returns the samples per channel written. `out` must hold the packet's
+    /// duration (at most [`MAX_PACKET_SAMPLES`] per channel). An empty packet means a lost one:
+    /// it is concealed as [`conceal_into`](Self::conceal_into) does. Allocates nothing once the
+    /// stream's bandwidth has been seen. A damaged frame comes out as silence.
+    pub fn decode_into(&mut self, packet: &[u8], out: &mut [f32]) -> Result<usize> {
+        if packet.is_empty() {
+            return self.conceal_into(out);
+        }
+        let frames = frames_of(packet)?;
+        let t = toc(packet[0]);
+        let ch = self.channels;
+        let total = frames.len() * t.duration;
+        if out.len() < total * ch {
+            return Err(Error::invalid_arg(format!("the packet decodes to {total} samples per channel; the buffer holds {}", out.len() / ch)));
+        }
+        let mut w = 0;
+        for &(off, len) in frames.iter() {
+            if self.decode_frame(&t, &packet[off..off + len]).is_err() {
+                // a damaged or empty frame is replaced by silence rather than ending the stream
+                for p in self.planes.iter_mut() {
+                    p[..t.duration].fill(0.0);
+                }
+            }
+            self.last = Some((t.duration, t.mode == Mode::Celt));
+            w = self.put(t.duration, out, w);
+        }
+        Ok(w / ch)
+    }
+
+    /// A frame standing in for a lost packet, of the last frame's length: for CELT, noise shaped
+    /// like the last frame's bands and fading (9 dB, then 3 dB a frame), joined to the frames on
+    /// either side without a click; after SILK or hybrid frames, or before any, silence. Written
+    /// to `out` as [`decode_into`](Self::decode_into) writes; returns the samples per channel.
+    pub fn conceal_into(&mut self, out: &mut [f32]) -> Result<usize> {
+        let ch = self.channels;
+        let (n, celt) = self.last.unwrap_or((960, false));
+        if out.len() < n * ch {
+            return Err(Error::invalid_arg(format!("a concealed frame is {n} samples per channel; the buffer holds {}", out.len() / ch)));
+        }
+        let mut planes = std::mem::take(&mut self.planes);
+        if celt && n <= 960 {
+            self.celt.conceal(&mut planes, n)?;
+        } else {
+            for p in planes.iter_mut() {
+                p[..n].fill(0.0);
+            }
+            self.silk.flush();
+            self.celt.flush();
+        }
+        self.planes = planes;
+        Ok(self.put(n, out, 0) / ch)
+    }
+
+    /// Interleaves `n` samples of the planes into `out` from `w`, after the gain and pre-skip;
+    /// returns the new end.
+    fn put(&mut self, n: usize, out: &mut [f32], mut w: usize) -> usize {
+        let skip = self.skip_left.min(n);
+        self.skip_left -= skip;
+        for i in skip..n {
+            for c in 0..self.channels {
+                out[w] = (self.planes[c][i] * self.gain).clamp(-1.0, 1.0);
+                w += 1;
+            }
+        }
+        w
     }
 
     fn decode_redundancy(&mut self, t: &Toc, data: &[u8], out: &mut [Vec<f32>; 2]) -> Result<()> {
@@ -290,9 +402,22 @@ impl OpusDecoder {
         self.celt.decode_frame(&mut rc, out, t.stereo as usize + 1, 240, 0, BAND_END[t.bandwidth])
     }
 
-    fn decode_frame(&mut self, t: &Toc, data: &[u8]) -> Result<[Vec<f32>; 2]> {
+    /// Decodes one frame into the scratch planes.
+    fn decode_frame(&mut self, t: &Toc, data: &[u8]) -> Result<()> {
+        let mut out = std::mem::take(&mut self.planes);
+        let mut silk = std::mem::take(&mut self.silk_out);
+        let mut celt = std::mem::take(&mut self.celt_out);
+        let mut red = std::mem::take(&mut self.red_out);
+        let r = self.decode_frame_to(t, data, &mut out, &mut silk, &mut celt, &mut red);
+        (self.planes, self.silk_out, self.celt_out, self.red_out) = (out, silk, celt, red);
+        r
+    }
+
+    fn decode_frame_to(&mut self, t: &Toc, data: &[u8], out: &mut [Vec<f32>; 2], silk_out: &mut [Vec<f32>; 2], celt_out: &mut [Vec<f32>; 2], red_out: &mut [Vec<f32>; 2]) -> Result<()> {
         let n = t.duration;
-        let mut out = [vec![0f32; n], vec![0f32; n]];
+        for o in out.iter_mut() {
+            o[..n].fill(0.0);
+        }
         let mut size = data.len();
         if size < 2 {
             return Err(bad("frame too short"));
@@ -305,14 +430,13 @@ impl OpusDecoder {
                 self.up = [Some(Upsampler::new(sbw)), Some(Upsampler::new(sbw))];
                 self.up_bandwidth = sbw;
             }
-            let mut silk_out = [vec![0f32; 960], vec![0f32; 960]];
-            let got = self.silk.decode_superframe(&mut rc, &mut silk_out, sbw, t.stereo as usize + 1, SILK_FRAME_MS[t.config]);
+            let got = self.silk.decode_superframe(&mut rc, silk_out, sbw, t.stereo as usize + 1, SILK_FRAME_MS[t.config]);
             let ratio = [6, 4, 3][sbw];
             if got * ratio != n {
                 return Err(bad("SILK frame length does not match the TOC"));
             }
             for c in 0..self.channels {
-                self.up[c].as_mut().unwrap().process(&silk_out[c][..got], &mut out[c]);
+                self.up[c].as_mut().unwrap().process(&silk_out[c][..got], &mut out[c][..n]);
             }
         } else {
             self.silk.flush();
@@ -329,7 +453,6 @@ impl OpusDecoder {
             redundancy = true;
         }
         let (mut red_pos, mut red_size) = (false, 0usize);
-        let mut red_out = [vec![0f32; 240], vec![0f32; 240]];
         if redundancy {
             red_pos = rc.log(1) != 0;
             red_size = if t.mode == Mode::Hybrid { rc.uint(256) as usize + 2 } else { size.saturating_sub(((consumed + 7) / 8) as usize) };
@@ -338,18 +461,17 @@ impl OpusDecoder {
             }
             size -= red_size;
             if red_pos {
-                self.decode_redundancy(t, &data[size..size + red_size], &mut red_out)?;
+                self.decode_redundancy(t, &data[size..size + red_size], red_out)?;
                 self.celt.flush();
             }
         }
 
         if t.mode != Mode::Silk {
             rc.set_raw(size, size);
-            let mut celt_out = [vec![0f32; n], vec![0f32; n]];
             let start = if t.mode == Mode::Hybrid { 17 } else { 0 };
-            self.celt.decode_frame(&mut rc, &mut celt_out, t.stereo as usize + 1, n, start, BAND_END[t.bandwidth])?;
+            self.celt.decode_frame(&mut rc, celt_out, t.stereo as usize + 1, n, start, BAND_END[t.bandwidth])?;
             for c in 0..self.channels {
-                for (o, v) in out[c].iter_mut().zip(&celt_out[c]) {
+                for (o, v) in out[c][..n].iter_mut().zip(&celt_out[c][..n]) {
                     *o += *v;
                 }
             }
@@ -360,7 +482,7 @@ impl OpusDecoder {
         if redundancy {
             if !red_pos {
                 self.celt.flush();
-                self.decode_redundancy(t, &data[size..size + red_size], &mut red_out)?;
+                self.decode_redundancy(t, &data[size..size + red_size], red_out)?;
                 for c in 0..self.channels {
                     for i in 0..120 {
                         let w = CELT_WINDOW2[i];
@@ -379,7 +501,7 @@ impl OpusDecoder {
                 }
             }
         }
-        Ok(out)
+        Ok(())
     }
 }
 
@@ -389,24 +511,11 @@ impl Decoder for OpusDecoder {
         let frames = frames_of(d)?;
         let t = toc(d[0]);
         let ch = self.channels;
-        let mut pcm: Vec<f32> = Vec::with_capacity(frames.len() * t.duration * ch);
-        for (off, len) in frames {
-            let planes = match self.decode_frame(&t, &d[off..off + len]) {
-                Ok(p) => p,
-                // a damaged or empty frame is replaced by silence rather than ending the stream
-                Err(_) => [vec![0f32; t.duration], vec![0f32; t.duration]],
-            };
-            for i in 0..t.duration {
-                for c in 0..ch {
-                    pcm.push(planes[c][i]);
-                }
-            }
-        }
-        let total = pcm.len() / ch;
-        let skip = self.skip_left.min(total);
-        self.skip_left -= skip;
-        let g = self.gain as f64;
-        let samples: Vec<f64> = pcm[skip * ch..].iter().map(|&v| (v as f64 * g).clamp(-1.0, 1.0)).collect();
+        let before = self.skip_left;
+        let mut pcm = vec![0f32; frames.len() * t.duration * ch];
+        let n = self.decode_into(d, &mut pcm)?;
+        let skip = before - self.skip_left;
+        let samples: Vec<f64> = pcm[..n * ch].iter().map(|&v| v as f64).collect();
         if samples.is_empty() {
             return Ok(Vec::new());
         }
@@ -434,11 +543,11 @@ mod tests {
 
     #[test]
     fn framing_codes() {
-        assert_eq!(frames_of(&[0x00, 1, 2, 3]).unwrap(), vec![(1, 3)]);
-        assert_eq!(frames_of(&[0x01, 1, 2, 3, 4]).unwrap(), vec![(1, 2), (3, 2)]);
-        assert_eq!(frames_of(&[0x02, 1, 9, 8, 7]).unwrap(), vec![(2, 1), (3, 2)]);
+        assert_eq!(frames_of(&[0x00, 1, 2, 3]).unwrap().iter().copied().collect::<Vec<_>>(), vec![(1, 3)]);
+        assert_eq!(frames_of(&[0x01, 1, 2, 3, 4]).unwrap().iter().copied().collect::<Vec<_>>(), vec![(1, 2), (3, 2)]);
+        assert_eq!(frames_of(&[0x02, 1, 9, 8, 7]).unwrap().iter().copied().collect::<Vec<_>>(), vec![(2, 1), (3, 2)]);
         // code 3, CBR, three frames of two bytes
-        assert_eq!(frames_of(&[0x03, 3, 1, 2, 3, 4, 5, 6]).unwrap(), vec![(2, 2), (4, 2), (6, 2)]);
+        assert_eq!(frames_of(&[0x03, 3, 1, 2, 3, 4, 5, 6]).unwrap().iter().copied().collect::<Vec<_>>(), vec![(2, 2), (4, 2), (6, 2)]);
         assert_eq!(packet_samples(&[19 << 3 | 3, 3, 0, 0, 0, 0, 0, 0]), Some(3 * 960));
     }
 

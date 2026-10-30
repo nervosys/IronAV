@@ -500,6 +500,16 @@ frame period, which gives the next packet in order, `Missing` for a gap that lat
 `Underrun` when it runs dry (it then fills to the target again before playing), or `Buffering`. After a stall and a late
 burst that leaves more than `max_ms` waiting, the oldest packets are dropped down to the target, so the delay comes back
 down. `depth_ms()` is the delay it adds at that moment, and `stats()` counts what was played, missing, late and dropped.
+`OpusDecoder::decode_into(packet, out)` decodes into the caller's buffer (interleaved, 48 kHz, after the gain and the
+pre-skip), allocating nothing once the stream's bandwidth has been seen, and gives the same samples as the `Decoder`
+path. For a `Missing` or `Underrun` it conceals (`conceal_into(out)`, or `decode_into` with an empty packet, as libopus
+takes a null one): a CELT frame of the last frame's length made of noise shaped like the last frame's bands, 9 dB quieter
+for the first frame lost and 3 dB for each one after, through the same synthesis, so it joins the frames on either side
+without a click and the next real frame overlaps it as it would its own predecessor. On a speech-like test with one
+10 ms packet in 17 lost and once three in a row, each concealed frame keeps between 5% and 120% of the level before it,
+and a few frames on the decode is back within 31 dB of the lossless one. Not done yet: libopus's pitch-based
+concealment, which repeats the last pitch period for voiced speech before fading to noise, and concealment after
+SILK or hybrid frames (silence for now).
 
 ## Vorbis
 
