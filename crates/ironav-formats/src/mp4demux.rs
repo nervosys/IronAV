@@ -114,15 +114,13 @@ impl Config {
     /// The format the stream is declared as. Monochrome 8-bit is declared gray so the GPU, which cannot
     /// decode it, is not chosen.
     pub(crate) fn pix_fmt(&self) -> PixelFormat {
-        match (self.chroma, self.bits) {
-            (2, 10) => PixelFormat::Yuv422p10,
-            (2, _) => PixelFormat::Yuv422p,
-            (3, 10) => PixelFormat::Yuv444p10,
-            (3, _) => PixelFormat::Yuv444p,
-            (0, 8) => PixelFormat::Gray8,
-            (_, 10) => PixelFormat::Yuv420p10,
+        let layout = match self.chroma {
+            0 if self.bits == 8 => return PixelFormat::Gray8,
+            2 => PixelFormat::Yuv422p,
+            3 => PixelFormat::Yuv444p,
             _ => PixelFormat::Yuv420p,
-        }
+        };
+        layout.with_depth(self.bits).unwrap_or(layout)
     }
 }
 
@@ -689,7 +687,7 @@ pub(crate) fn parse_avcc(c: &[u8]) -> Result<Config> {
     if matches!(c[1], 100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134) {
         if let Some(ext) = c.get(at..at + 3) {
             let (cf, luma, chroma_bits) = (ext[0] & 3, ext[1] & 7, ext[2] & 7);
-            bits = supported_depth(cf, luma, chroma_bits)?;
+            bits = supported_depth(cf, luma, chroma_bits, 10)?;
             chroma = cf;
         } else if matches!(c[1], 110 | 122 | 244) {
             return Err(Error::new(ErrorCode::UnsupportedCodec, "H.264 high-bit-depth profile without a stated bit depth; only 8-bit and 10-bit 4:2:0 are supported"));
@@ -703,8 +701,8 @@ pub(crate) fn parse_hvcc(c: &[u8]) -> Result<Config> {
         return Err(corrupt("hvcC is malformed"));
     }
     let (chroma, luma, chroma_bits) = (c[16] & 3, c[17] & 7, c[18] & 7);
-    // the HEVC decoder takes monochrome as well as 4:2:0
-    let bits = supported_depth(chroma, luma, chroma_bits)?;
+    // the HEVC decoder takes monochrome as well as 4:2:0, and 12 bits
+    let bits = supported_depth(chroma, luma, chroma_bits, 12)?;
     let mut prefix = Vec::new();
     let mut at = 23;
     for _ in 0..c[22] {
@@ -719,20 +717,22 @@ pub(crate) fn parse_hvcc(c: &[u8]) -> Result<Config> {
     Ok(Config { prefix, nal_length: (c[21] & 3) as usize + 1, bits, chroma })
 }
 
-/// 8-bit or 10-bit video (monochrome, 4:2:0, 4:2:2 or 4:4:4) with the same depth for luma and
-/// chroma; anything else is refused.
-fn supported_depth(chroma: u8, luma_minus8: u8, chroma_minus8: u8) -> Result<u8> {
+/// 8-bit, 10-bit or (up to `max`) 12-bit video (monochrome, 4:2:0, 4:2:2 or 4:4:4) with the same
+/// depth for luma and chroma; anything else is refused.
+fn supported_depth(chroma: u8, luma_minus8: u8, chroma_minus8: u8, max: u8) -> Result<u8> {
     match (luma_minus8, chroma_minus8) {
         (0, 0) => Ok(8),
         (2, 2) => Ok(10),
-        _ => Err(unsupported_format(chroma, luma_minus8 + 8)),
+        (4, 4) if max >= 12 => Ok(12),
+        _ => Err(unsupported_format(chroma, luma_minus8 + 8, max)),
     }
 }
 
-fn unsupported_format(chroma: u8, bits: u8) -> Error {
+fn unsupported_format(chroma: u8, bits: u8, max: u8) -> Error {
     let chroma = ["4:0:0", "4:2:0", "4:2:2", "4:4:4"][chroma as usize & 3];
-    Error::new(ErrorCode::UnsupportedCodec, format!("the video is {bits}-bit {chroma}; only 8-bit and 10-bit video with the same depth for luma and chroma is supported"))
-        .hint("convert the source to an 8-bit or 10-bit format first")
+    let depths = if max >= 12 { "8-bit, 10-bit and 12-bit" } else { "8-bit and 10-bit" };
+    Error::new(ErrorCode::UnsupportedCodec, format!("the video is {bits}-bit {chroma}; only {depths} video with the same depth for luma and chroma is supported"))
+        .hint("convert the source to one of those depths first")
 }
 
 impl<R: Read + Seek + Send> Demuxer for Mp4Demuxer<R> {

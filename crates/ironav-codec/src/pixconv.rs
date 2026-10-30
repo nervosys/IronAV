@@ -1,5 +1,5 @@
 //! The `format` video filter: convert between the supported pixel formats (gray8, yuv420p,
-//! yuv422p, yuv444p, rgb24).
+//! yuv422p, yuv444p, rgb24, and the same YUV layouts at 10 and 12 bits).
 //!
 //! Everything goes through full-resolution Y/U/V planes. Chroma is resampled with the same
 //! triangle filter as `scale`, and RGB conversion uses limited-range ("TV") BT.601 or BT.709
@@ -50,7 +50,9 @@ fn to_yuv444(v: &VideoFrame, m: Matrix) -> [Vec<u8>; 3] {
     match v.pix_fmt {
         PixelFormat::Gray8 => [v.planes[0].clone(), vec![128; w * h], vec![128; w * h]],
         PixelFormat::Yuv444p => [v.planes[0].clone(), v.planes[1].clone(), v.planes[2].clone()],
-        PixelFormat::Yuv420p10 | PixelFormat::Yuv422p10 | PixelFormat::Yuv444p10 => unreachable!("10-bit frames are narrowed before conversion"),
+        PixelFormat::Yuv420p10 | PixelFormat::Yuv422p10 | PixelFormat::Yuv444p10 | PixelFormat::Yuv420p12 | PixelFormat::Yuv422p12 | PixelFormat::Yuv444p12 => {
+            unreachable!("deep frames are narrowed before conversion")
+        }
         PixelFormat::Yuv420p | PixelFormat::Yuv422p => {
             let (cw, ch, _) = layout[1];
             [v.planes[0].clone(), resize_plane(&v.planes[1], cw, ch, w, h, 1), resize_plane(&v.planes[2], cw, ch, w, h, 1)]
@@ -72,53 +74,41 @@ fn to_yuv444(v: &VideoFrame, m: Matrix) -> [Vec<u8>; 3] {
     }
 }
 
-/// 10-bit to 8-bit with the same subsampling by rounding away the two low bits.
-fn narrow(v: VideoFrame) -> VideoFrame {
+/// The same layout at `depth` bits (8, 10 or 12): fewer bits by rounding, more by replicating the
+/// top bits, so that the largest value stays the largest (255 becomes 1023 or 4095).
+fn redepth(v: VideoFrame, depth: u8) -> VideoFrame {
+    let from = v.pix_fmt.bit_depth() as u32;
+    let to = depth as u32;
+    let pix_fmt = v.pix_fmt.with_depth(depth).expect("a planar YUV layout at 8, 10 or 12 bits");
+    let get: fn(&[u8]) -> Vec<u32> = if from == 8 { |p| p.iter().map(|&b| b as u32).collect() } else { |p| p.chunks_exact(2).map(|w| u16::from_le_bytes([w[0], w[1]]) as u32).collect() };
+    let max = (1u32 << to) - 1;
     let planes = v
         .planes
         .iter()
-        .map(|p| p.chunks_exact(2).map(|w| ((u16::from_le_bytes([w[0], w[1]]) as u32 + 2) >> 2).min(255) as u8).collect())
+        .map(|p| {
+            let samples = get(p).into_iter().map(|x| if to > from { (x << (to - from)) | (x >> (2 * from - to)) } else { ((x + (1 << (from - to) >> 1)) >> (from - to)).min(max) });
+            if to == 8 { samples.map(|x| x as u8).collect() } else { samples.flat_map(|x| (x as u16).to_le_bytes()).collect() }
+        })
         .collect();
-    let pix_fmt = match v.pix_fmt {
-        PixelFormat::Yuv422p10 => PixelFormat::Yuv422p,
-        PixelFormat::Yuv444p10 => PixelFormat::Yuv444p,
-        _ => PixelFormat::Yuv420p,
-    };
     VideoFrame { pix_fmt, planes, ..v }
 }
 
-/// 8-bit to 10-bit with the same subsampling by replicating the top bits, so that 255 becomes 1023.
-fn widen(v: VideoFrame) -> VideoFrame {
-    let planes = v
-        .planes
-        .iter()
-        .map(|p| p.iter().flat_map(|&b| (((b as u16) << 2) | (b as u16 >> 6)).to_le_bytes()).collect())
-        .collect();
-    let pix_fmt = match v.pix_fmt {
-        PixelFormat::Yuv422p => PixelFormat::Yuv422p10,
-        PixelFormat::Yuv444p => PixelFormat::Yuv444p10,
-        _ => PixelFormat::Yuv420p10,
-    };
-    VideoFrame { pix_fmt, planes, ..v }
-}
-
-/// Convert a frame to another pixel format. Conversions to or from 10-bit go through 8-bit
-/// (4:2:0) unless both ends are 10-bit, so they lose the extra precision except 10-bit to 10-bit.
+/// Convert a frame to another pixel format. A change of depth alone keeps the layout and loses no
+/// more than the bits it drops; anything else goes through 8 bits, so a deep frame loses its extra
+/// precision.
 pub fn convert(v: VideoFrame, to: PixelFormat, m: Matrix) -> VideoFrame {
     if v.pix_fmt == to {
         return v;
     }
-    if matches!(v.pix_fmt, PixelFormat::Yuv420p10 | PixelFormat::Yuv422p10 | PixelFormat::Yuv444p10) {
-        return convert(narrow(v), to, m);
+    if v.pix_fmt.with_depth(to.bit_depth()) == Some(to) {
+        return redepth(v, to.bit_depth());
     }
-    if to == PixelFormat::Yuv420p10 {
-        return widen(convert8(v, PixelFormat::Yuv420p, m));
+    if v.pix_fmt.bit_depth() > 8 {
+        return convert(redepth(v, 8), to, m);
     }
-    if to == PixelFormat::Yuv422p10 {
-        return widen(convert8(v, PixelFormat::Yuv422p, m));
-    }
-    if to == PixelFormat::Yuv444p10 {
-        return widen(convert8(v, PixelFormat::Yuv444p, m));
+    if to.bit_depth() > 8 {
+        let eight = to.with_depth(8).expect("deep formats are planar YUV");
+        return redepth(convert8(v, eight, m), to.bit_depth());
     }
     convert8(v, to, m)
 }
@@ -129,7 +119,9 @@ fn convert8(v: VideoFrame, to: PixelFormat, m: Matrix) -> VideoFrame {
     let planes = match to {
         PixelFormat::Gray8 => vec![y],
         PixelFormat::Yuv444p => vec![y, u, vv],
-        PixelFormat::Yuv420p10 | PixelFormat::Yuv422p10 | PixelFormat::Yuv444p10 => unreachable!("10-bit output is widened from 8-bit"),
+        PixelFormat::Yuv420p10 | PixelFormat::Yuv422p10 | PixelFormat::Yuv444p10 | PixelFormat::Yuv420p12 | PixelFormat::Yuv422p12 | PixelFormat::Yuv444p12 => {
+            unreachable!("deep output is widened from 8-bit")
+        }
         PixelFormat::Yuv420p | PixelFormat::Yuv422p => {
             let (cw, ch, _) = to.planes(w, h)[1];
             vec![y, resize_plane(&u, w, h, cw, ch, 1), resize_plane(&vv, w, h, cw, ch, 1)]
@@ -249,5 +241,33 @@ mod tests {
         assert_eq!(w8.planes[0], vec![255; 8]);
         let w10 = convert(w8, PixelFormat::Yuv420p10, Matrix::Bt709);
         assert_eq!(&w10.planes[0][..2], &1023u16.to_le_bytes());
+    }
+
+    #[test]
+    fn twelve_bit_changes_depth_and_keeps_its_layout() {
+        let bytes = |v: &[u16]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let words = |b: &[u8]| b.chunks_exact(2).map(|w| u16::from_le_bytes([w[0], w[1]])).collect::<Vec<u16>>();
+        let luma = [0u16, 1, 2, 2047, 2048, 4093, 4094, 4095];
+        let f = VideoFrame { width: 4, height: 2, pix_fmt: PixelFormat::Yuv422p12, pts: 0, planes: vec![bytes(&luma), bytes(&[2048; 4]), bytes(&[100, 4095, 0, 1])] };
+        // to 10 bits in the same layout: rounded, never past the top
+        let ten = convert(f.clone(), PixelFormat::Yuv422p10, Matrix::Bt709);
+        assert_eq!(ten.pix_fmt, PixelFormat::Yuv422p10);
+        assert_eq!(words(&ten.planes[0]), [0, 0, 1, 512, 512, 1023, 1023, 1023]);
+        assert_eq!(words(&ten.planes[2]), [25, 1023, 0, 0]);
+        // and back: the top bits are replicated, so full scale stays full scale, and a round trip
+        // moves a sample by one step at most
+        let back = convert(ten.clone(), PixelFormat::Yuv422p12, Matrix::Bt709);
+        assert_eq!(words(&back.planes[0])[7], 4095);
+        let again = convert(back, PixelFormat::Yuv422p10, Matrix::Bt709);
+        for (a, b) in words(&again.planes[0]).iter().zip(words(&ten.planes[0])) {
+            assert!(a.abs_diff(b) <= 1, "{a} {b}");
+        }
+        // 8 bits: 255 is 4095
+        let eight = convert(f, PixelFormat::Yuv422p, Matrix::Bt709);
+        assert_eq!(eight.planes[0], [0, 0, 0, 128, 128, 255, 255, 255]);
+        assert_eq!(words(&convert(eight.clone(), PixelFormat::Yuv422p12, Matrix::Bt709).planes[0])[7], 4095);
+        // another layout goes through 8 bits
+        let c420 = convert(eight, PixelFormat::Yuv420p12, Matrix::Bt709);
+        assert_eq!((c420.pix_fmt, c420.planes[1].len()), (PixelFormat::Yuv420p12, 4));
     }
 }

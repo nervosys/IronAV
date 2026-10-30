@@ -156,15 +156,12 @@ impl HevcDecoder {
                 planes.push(v);
             }
         }
-        let pix_fmt = match (f.chroma_format, wide) {
-            _ if gray => PixelFormat::Gray8,
-            (0 | 1, false) => PixelFormat::Yuv420p,
-            (0 | 1, true) => PixelFormat::Yuv420p10,
-            (2, false) => PixelFormat::Yuv422p,
-            (2, true) => PixelFormat::Yuv422p10,
-            (_, false) => PixelFormat::Yuv444p,
-            (_, true) => PixelFormat::Yuv444p10,
+        let layout = match f.chroma_format {
+            0 | 1 => PixelFormat::Yuv420p,
+            2 => PixelFormat::Yuv422p,
+            _ => PixelFormat::Yuv444p,
         };
+        let pix_fmt = if gray { PixelFormat::Gray8 } else { layout.with_depth(f.bit_depth as u8).expect("8, 10 or 12 bits") };
         self.out.push(OutFrame::Video(VideoFrame { width: w as u32, height: h as u32, pix_fmt, pts: f.pts, planes }));
     }
 

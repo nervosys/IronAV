@@ -286,8 +286,8 @@ exact 8.000 s duration, all frames decoded, and seeking lands on the right keyfr
 
 `ironav probe`, `convert` and the other tools read MP4 (regular files with the index anywhere, and fragmented files). H.264/HEVC video is decoded by NVDEC through the driver's `nvcuvid` library, loaded at run time like NVENC;
 the output is cropped to the display size and returned as planar `yuv420p` in display order, so B-frame streams work.
-8-bit and 10-bit 4:2:0, 4:2:2 (`yuv422p`, `yuv422p10le`) and 4:4:4 (`yuv444p`, `yuv444p10le`; including the lossless transform-bypass mode) and monochrome (8-bit comes back as `gray`) are accepted (10-bit 4:2:0 comes back as `yuv420p10le`); interlaced and 12-bit are refused with a clear error. The GPU cannot take 4:2:2, 4:4:4 or monochrome, so those use the software decoder even with `--hwaccel auto`.
-HEVC also has a software decoder (`--hwaccel off`, or automatically where the GPU cannot take a stream): Main and Main 10 (and monochrome, 4:2:2 and 4:4:4 at 8 and 10 bits) with I, P and B pictures,
+8-bit and 10-bit 4:2:0, 4:2:2 (`yuv422p`, `yuv422p10le`) and 4:4:4 (`yuv444p`, `yuv444p10le`; including the lossless transform-bypass mode) and monochrome (8-bit comes back as `gray`) are accepted (10-bit 4:2:0 comes back as `yuv420p10le`); 12-bit HEVC (`yuv420p12le`, `yuv422p12le`, `yuv444p12le`) goes to the software decoder; interlaced video is refused with a clear error. The GPU cannot take 4:2:2, 4:4:4 or monochrome, so those use the software decoder even with `--hwaccel auto`.
+HEVC also has a software decoder (`--hwaccel off`, or automatically where the GPU cannot take a stream): Main and Main 10 (and monochrome, 4:2:2 and 4:4:4 at 8, 10 and 12 bits) with I, P and B pictures,
 merge and AMVP motion prediction, temporal motion vectors, weighted prediction, wavefronts, multiple slices, default scaling lists, transform skip, lossless (transquant bypass),
 QP deltas, constrained intra, the deblocking filter and sample adaptive offset. These are checked sample-for-sample against FFmpeg on x265 streams (the
 `hevc_streams_decode_to_what_ffmpeg_decodes` test and a wider sweep of encoder settings), and on NVENC streams too (Main and Main 10,
@@ -295,8 +295,9 @@ B pictures used as references, intra refresh, weighted prediction, 4:4:4, ultra-
 the SPS (an x265 matrix file, at 8 and 10 bits and 4:4:4) match as well, and so does joining an open-GOP stream at a CRA picture: its
 RASL pictures are dropped and the rest are the pictures the whole stream gives from there (the `hevc_joined_at_a_cra_picture_drops_its_rasl_pictures`
 test, checked against NVDEC too). Written from the specification but **not yet checked against a reference stream** because neither
-encoder here produces them: tiles, PCM and long-term reference pictures. 12-bit streams are decoded but refused at the output, which
-has no 12-bit pixel format.
+encoder here produces them: tiles, PCM and long-term reference pictures. 12-bit 4:2:0, 4:2:2, 4:4:4 and monochrome x265 streams
+(with B pictures, weighted prediction and scaling lists) match FFmpeg too; checking them found SAO offsets scaled by the first
+edition's `bitDepth - 10` rule, which the range extensions (the only profiles with 12 bits) replaced, and that is fixed.
 4:2:2 and 4:4:4 (the range extension profiles' chroma formats) were checked the same way: 60 x265 streams, 4:2:2 and 4:4:4 at 8 and 10 bits,
 covering intra-only and B-frame coding, noise, presets from ultrafast to slow, deep transform trees, AMP, weighted prediction,
 transform skip, lossless and per-CU lossless coding, QP 0 and 51, chroma QP offsets, scaling lists, constrained intra, wavefronts with slices,
@@ -370,10 +371,11 @@ cannot take directly (4:4:4, 4:2:2, grey) can be fed to it. RGB uses limited-ran
 chroma is resampled with the same triangle filter as `scale`. Tested for known colour values, round trips and plane
 layouts; not compared against FFmpeg's converter.
 
-**10-bit.** `yuv420p10le` (16-bit little-endian words, value in the low 10 bits) is a pixel format in its own right: Y4M
-(`C420p10`), `scale`, `hflip`, `format`, the MP4 reader and writer (`hvcC` carries the depth) and the player all handle it.
-`format` converts to or from 10-bit by going through 8-bit 4:2:0, so only 10-bit to 10-bit keeps the extra precision,
-and converting to RGB or another layout loses it. `gray` does not take 10-bit input. An NVENC Main 10 encode of the
+**10-bit and 12-bit.** `yuv420p10le` (16-bit little-endian words, value in the low 10 bits) is a pixel format in its own right: Y4M
+(`C420p10`), `scale`, `hflip`, `format`, the MP4 reader and writer (`hvcC` carries the depth) and the player all handle it, and
+so are the 4:2:2 and 4:4:4 layouts and the same three at 12 bits (`yuv420p12le`, `yuv422p12le`, `yuv444p12le`, Y4M `C420p12` and so
+on). `format` changes depth within a layout directly (rounding down, replicating the top bits up, so full scale stays full scale);
+anything else goes through 8-bit, so converting to RGB or another layout loses the extra precision. `gray` does not take 10-bit input. An NVENC Main 10 encode of the
 decoded test clip came back with luma PSNR 58.9 dB against the source (a smooth synthetic gradient, so a high figure
 says the bit alignment is right, not how the encoder performs on real footage).
 

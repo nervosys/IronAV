@@ -1572,12 +1572,13 @@ fn h264_444_422_and_monochrome_decode_to_what_ffmpeg_decodes() {
 }
 
 /// HEVC Main, Main 10 and range extension streams from x265 (intra, P and B pictures, weighted prediction,
-/// wavefronts, multiple slices, conformance-window cropping, monochrome, 4:2:2 and 4:4:4 at 8 and 10 bits)
+/// wavefronts, multiple slices, conformance-window cropping, monochrome, 4:2:2 and 4:4:4 at 8 and 10 bits,
+/// and 12-bit 4:2:0 and 4:2:2)
 /// are bit-exact with FFmpeg's decoder.
 #[test]
 fn hevc_streams_decode_to_what_ffmpeg_decodes() {
     let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
-    for name in ["intra", "p", "b", "wpp_slices", "p10", "gray", "crop", "422", "444", "422_10", "444_10"] {
+    for name in ["intra", "p", "b", "wpp_slices", "p10", "gray", "crop", "422", "444", "422_10", "444_10", "420_12", "422_12"] {
         let dir = scratch(&format!("hevc-{name}"));
         let out = dir.join("out.y4m");
         let mut j = job(&data.join(format!("hevc_{name}.mp4")), &out);
@@ -1747,11 +1748,11 @@ fn y4m_frames_any(path: &std::path::Path) -> Vec<Vec<u8>> {
     let head = String::from_utf8_lossy(&d[..hdr]).to_string();
     let get = |p: char| head.split_whitespace().find(|t| t.starts_with(p)).unwrap()[1..].parse::<usize>().unwrap();
     let (w, h) = (get('W'), get('H'));
-    let size = if head.contains("C420p10") {
+    let size = if head.contains("C420p10") || head.contains("C420p12") {
         2 * (w * h + 2 * w.div_ceil(2) * h.div_ceil(2))
-    } else if head.contains("C422p10") {
+    } else if head.contains("C422p10") || head.contains("C422p12") {
         2 * (w * h + 2 * w.div_ceil(2) * h)
-    } else if head.contains("C444p10") {
+    } else if head.contains("C444p10") || head.contains("C444p12") {
         6 * w * h
     } else if head.contains("C422") {
         w * h + 2 * w.div_ceil(2) * h

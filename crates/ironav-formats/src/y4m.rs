@@ -66,8 +66,11 @@ pub(crate) fn parse_header(line: &[u8]) -> Result<(u32, u32, Rational, PixelForm
                     "420p10" => PixelFormat::Yuv420p10,
                     "422p10" => PixelFormat::Yuv422p10,
                     "444p10" => PixelFormat::Yuv444p10,
+                    "420p12" => PixelFormat::Yuv420p12,
+                    "422p12" => PixelFormat::Yuv422p12,
+                    "444p12" => PixelFormat::Yuv444p12,
                     v if v.starts_with("420p") && v != "420p" => {
-                        return Err(Error::new(ErrorCode::UnsupportedFormat, format!("Y4M colour space '{v}' is not supported (only 8-bit, 420p10, 422p10 and 444p10)")))
+                        return Err(Error::new(ErrorCode::UnsupportedFormat, format!("Y4M colour space '{v}' is not supported (only 8-bit, 10-bit and 12-bit)")))
                     }
                     v if v.starts_with("420") => PixelFormat::Yuv420p,
                     "422" => PixelFormat::Yuv422p,
@@ -143,6 +146,9 @@ impl Muxer for Y4mMuxer {
             PixelFormat::Yuv420p10 => "420p10",
             PixelFormat::Yuv422p10 => "422p10",
             PixelFormat::Yuv444p10 => "444p10",
+            PixelFormat::Yuv420p12 => "420p12",
+            PixelFormat::Yuv422p12 => "422p12",
+            PixelFormat::Yuv444p12 => "444p12",
             PixelFormat::Yuv422p => "422",
             PixelFormat::Yuv444p => "444",
             PixelFormat::Gray8 => "mono",

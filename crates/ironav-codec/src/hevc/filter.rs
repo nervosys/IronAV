@@ -225,7 +225,9 @@ fn sao(pic: &mut CurPic, sps: &Sps, pps: &Pps, geo: &Geometry) {
         let bd = if c == 0 { sps.bit_depth_luma } else { sps.bit_depth_chroma };
         let src = pic.frame.planes[c].clone();
         let maxv = (1i32 << bd) - 1;
-        let scale = bd - bd.min(10);
+        // log2_sao_offset_scale: 0 unless the PPS range extension sets it, which is refused. (The first
+        // edition's `bitDepth - Min(bitDepth, 10)` predates the profiles that allow 12 bits.)
+        let scale = 0;
         let (cw_ctb, ch_ctb) = ((1usize << l) >> sx, (1usize << l) >> sy);
         for ry in 0..sps.ctb_h {
             for rx in 0..sps.ctb_w {
