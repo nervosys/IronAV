@@ -113,6 +113,10 @@ songs (the timeline carries on; a Vorbis song set up differently, even at anothe
 headers passed to the decoder, which starts over with them), and damaged pages stepped over. Matroska is read the way a browser's MediaRecorder, OBS or `ffmpeg -f matroska -`
 sends it: Segment and Clusters of unknown size, no Cues. The packets are the ones the file reader gives, whatever pieces the
 bytes arrive in. So `ironav watch tcp://:9000` can follow a webcam that a web page streams as WebM.
+A camera or microphone on this machine is a source too, on Windows so far (Media Foundation): `ironav devices` lists
+them, and `device://video` (the first camera), `device://video/1` or `device://audio/usb` (by a part of the name) open
+one. `size=1280x720` and `fps=30` ask a camera for its nearest mode. A camera's pictures arrive as Y4M (converted from
+the NV12 or YUY2 it gives to 4:2:0) and are timed at the mode's frame rate; a microphone arrives as 16-bit PCM.
 Fragmented MP4 is read the same way: an initialization segment (`moov` with `mvex`), then `moof`+`mdat` pairs, as written by
 LL-HLS and DASH packagers, Safari's MediaRecorder and `ffmpeg -movflags frag_keyframe+empty_moov`. Its packets also match
 the file reader's. An MP4 without fragments cannot be read as it arrives (its index is at the end, or describes data not yet

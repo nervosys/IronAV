@@ -1,5 +1,6 @@
 //! Source URLs: `tcp://host:port`, `udp://:port`, `rtsp://[user:password@]host[:port]/path`,
-//! `http://host[:port]/path` (HLS or a download), `pipe:`,
+//! `http://host[:port]/path` (HLS or a download), `device://video[/NAME]` or
+//! `device://audio[/NAME]` (a camera or microphone), `pipe:`,
 //! `-`, `file:path` or a bare path, each
 //! optionally followed by `?key=value&...` options.
 
@@ -8,14 +9,15 @@ use std::collections::BTreeMap;
 
 /// Options a source URL can carry:
 /// - `format`: the stream's format when it cannot be told from its first bytes;
-/// - `fps`: the frame rate of a raw H.264/HEVC stream (`30` or `30000/1001`);
+/// - `fps`: the frame rate of a raw H.264/HEVC stream (`30` or `30000/1001`), or to ask a camera for;
+/// - `size`: the picture size to ask a camera for (`1280x720`);
 /// - `pace=realtime`: read a file no faster than it plays, as if it were live;
 /// - `follow`: keep reading a file as it grows;
 /// - `idle`: with `follow`, end after this many seconds without new bytes;
 /// - `listen`: wait for a TCP connection on the given address instead of making one;
 /// - `transport=udp`: have an RTSP server send RTP over UDP rather than on its connection;
 /// - `audio`: the HLS audio rendition to play, by language or name.
-pub const OPTIONS: [&str; 8] = ["format", "fps", "pace", "follow", "idle", "listen", "transport", "audio"];
+pub const OPTIONS: [&str; 9] = ["format", "fps", "pace", "follow", "idle", "listen", "transport", "audio", "size"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SourceUrl {
@@ -51,9 +53,9 @@ impl SourceUrl {
             ("file".to_string(), base.to_string())
         };
         match scheme.as_str() {
-            "file" | "pipe" | "tcp" | "udp" | "rtsp" | "rtsps" | "http" | "https" => {}
+            "file" | "pipe" | "tcp" | "udp" | "rtsp" | "rtsps" | "http" | "https" | "device" => {}
             other => {
-                return Err(Error::invalid_arg(format!("'{other}' sources are not supported")).alternatives(["file", "pipe", "tcp", "udp", "rtsp", "rtsps", "http", "https"]));
+                return Err(Error::invalid_arg(format!("'{other}' sources are not supported")).alternatives(["file", "pipe", "tcp", "udp", "rtsp", "rtsps", "http", "https", "device"]));
             }
         }
         if matches!(scheme.as_str(), "tcp" | "udp") && !target.contains(':') {

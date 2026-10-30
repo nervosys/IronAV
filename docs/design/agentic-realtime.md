@@ -94,7 +94,7 @@ Source URLs, in rough order of delivery:
 | `http://` | HLS and progressive download over plain HTTP using `std::net` |
 | `https://`, `rtsps://` | the same over TLS 1.3: IronSocketLayer, with IronPKI checking the chain and name against the platform's PEM bundle and `IRONAV_CA_FILE` (`ironav-live/src/tls.rs`) |
 | `srt://` | needs a dependency decision (§10) |
-| `device:audio/default`, `device:video/0` | capture (WASAPI/Media Foundation, V4L2, AVFoundation); feature-gated, last |
+| `device://video[/N]`, `device://audio[/NAME]` | capture through each platform's own API, written here (`ironav-live/src/capture/`): Media Foundation on Windows (done); V4L2 and AVFoundation to follow. A camera arrives as Y4M (NV12/YUY2 converted to 4:2:0), a microphone as open-ended 16-bit WAV, so the stream demuxers read them like any other bytes |
 
 ### 3.2 Incremental demux (L1)
 
@@ -450,8 +450,8 @@ files at once, and it fixes the event model, analyzer trait and MCP plumbing bef
    holds no roots. Not behind a feature: both are first-party crates.
 2. **Async**: this design deliberately uses no async runtime. Confirm that, or choose `tokio` for M4 and later
    (needed only if session counts grow into the hundreds).
-3. **Capture devices**: per-OS native APIs written here, or a crate such as `cpal`, which the player already uses for
-   audio *output*, together with a camera crate?
+3. **Capture devices**: decided. Each platform's own API, written here: Media Foundation through the `windows` crate
+   already in the lockfile (done), then V4L2 and AVFoundation. `ironav devices` and the `devices` tool list them.
 4. **Reference sidecars**: decided. faster-whisper for speech-to-text and ONNX Runtime (a YOLOv8 export) for detection,
    as Python files in `examples/sidecars/`, outside the build, plus a model-free DTMF detector in Rust that the tests use.
 5. **Persistence**: should observation logs and recordings outlive the process (a session directory), or stay in memory only?

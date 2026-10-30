@@ -24,7 +24,7 @@ pub enum Chunk {
 pub struct SourceInfo {
     /// The URL with any password replaced.
     pub url: String,
-    /// `file`, `pipe`, `tcp`, `udp`, `rtsp`, `hls` or `http`.
+    /// `file`, `pipe`, `tcp`, `udp`, `rtsp`, `hls`, `http` or `device`.
     pub kind: &'static str,
     /// Whether the bytes arrive at the pace of the media (a socket, a pipe, a followed file)
     /// rather than as fast as they can be read.
@@ -95,6 +95,7 @@ pub fn open_source(url: &str) -> Result<Box<dyn Source>> {
         }
         "rtsp" | "rtsps" => Box::new(crate::rtsp::RtspSource::open(&u, shown)?),
         "http" | "https" => crate::hls::open(&u, shown)?,
+        "device" => Box::new(crate::capture::open(&u, shown)?),
         _ => unreachable!("SourceUrl::parse accepts only these schemes"),
     })
 }
@@ -169,6 +170,11 @@ impl ThreadSource {
                 }
             })
             .expect("spawning a thread");
+        Self::from_channel(info, rx)
+    }
+
+    /// Bytes another thread sends, in order; the source ends when it stops sending.
+    pub(crate) fn from_channel(info: SourceInfo, rx: Receiver<std::io::Result<Vec<u8>>>) -> Self {
         ThreadSource { info, rx, held: Vec::new(), at: 0, ended: false }
     }
 }

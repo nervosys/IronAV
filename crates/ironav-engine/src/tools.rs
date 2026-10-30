@@ -135,6 +135,11 @@ fn need_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
     str_arg(args, key)?.ok_or_else(|| Error::invalid_arg(format!("missing required argument '{key}'")))
 }
 
+fn h_devices(_: &Value) -> Result<Value> {
+    let list = ironav_live::capture::devices()?;
+    Ok(json!({ "devices": list, "platform_supported": cfg!(windows) }))
+}
+
 fn h_capabilities(_: &Value) -> Result<Value> {
     let probes = probe_all();
     Ok(json!({
@@ -423,6 +428,14 @@ pub fn tools() -> &'static [Tool] {
                 input_schema: object(json!({}), &[]),
                 read_only: true,
                 handler: Handler::Plain(h_capabilities),
+            },
+            Tool {
+                name: "devices",
+                description: "The cameras and microphones this machine has, each with the index and name a live source names it by: stream_open with device://video/INDEX or device://audio/NAME (a part of the name, any case; without one, the first device). Listing does not open any device. Capture is supported on Windows (Media Foundation) so far.",
+                cli: "ironav devices",
+                input_schema: object(json!({}), &[]),
+                read_only: true,
+                handler: Handler::Plain(h_devices),
             },
             Tool {
                 name: "probe",

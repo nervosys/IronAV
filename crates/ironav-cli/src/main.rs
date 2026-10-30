@@ -54,10 +54,11 @@ fn help() -> Value {
         "usage": "ironav <command> [args]   (all output is JSON; add --pretty for indentation)",
         "commands": {
             "capabilities": "what this build can do (start here)",
+            "devices": "the cameras and microphones to watch (device://video/N, device://audio/NAME)",
             "probe <path>": "inspect a media file",
             "convert -i IN [-i MORE]... -o OUT [-f FMT] [--acodec C] [--vcodec C] [--abitrate KBPS] [--vbitrate KBPS | --qp N] [--latency low] [--filter name[:k=v,..]]... [--hwaccel P] [-y] [--dry-run] [--progress]": "convert, handbrake/ffmpeg style",
             "analyze FILE [--analyzers a,b] [--sidecars a,b] [--level digest|events|raw] [--digest-seconds N] [--from S] [--to S] [--streams 0,1] [--max N] [--thumbnails DIR] [--hwaccel P] [--keyframes-only] [--jsonl]": "what is in a file: loudness, silence, scene cuts, black and frozen pictures, thumbnails, gaps; --jsonl prints each observation as a line as it is found",
-            "watch SOURCE [--analyzers a,b] [--sidecars a,b] [--level digest|events|raw] [--digest-seconds N] [--format F] [--fps N] [--pace realtime] [--retain S] [--duration S] [--hwaccel P] [--keyframes-only] [--record OUT.ts|OUT.m3u8 [--segment-seconds S] [--keep-segments N] [-y]] [--transcode OUT.ts|OUT.m3u8 [--width N] [--qp N | --vbitrate KBPS]] [--commands]": "follow a live source (path, path?follow, -, tcp://host:port, tcp://:port, udp://:port): every observation as a JSON line as it happens, then a summary; with --commands, stdin takes one command per line (status, query kinds=speech_end newest_first=true, configure add=silence, configure stop_recording=true record=next.ts, snapshot, clip from=1 to=5 output=c.ts, close, or the same as JSON) and each reply is a line {\"reply\":...}",
+            "watch SOURCE [--analyzers a,b] [--sidecars a,b] [--level digest|events|raw] [--digest-seconds N] [--format F] [--fps N] [--pace realtime] [--retain S] [--duration S] [--hwaccel P] [--keyframes-only] [--record OUT.ts|OUT.m3u8 [--segment-seconds S] [--keep-segments N] [-y]] [--transcode OUT.ts|OUT.m3u8 [--width N] [--qp N | --vbitrate KBPS]] [--commands]": "follow a live source (path, path?follow, -, tcp://host:port, tcp://:port, udp://:port, device://video[/N]?size=1280x720&fps=30, device://audio): every observation as a JSON line as it happens, then a summary; with --commands, stdin takes one command per line (status, query kinds=speech_end newest_first=true, configure add=silence, configure stop_recording=true record=next.ts, snapshot, clip from=1 to=5 output=c.ts, close, or the same as JSON) and each reply is a line {\"reply\":...}",
             "plan <job.json|->": "validate a JSON job without writing",
             "run <job.json|->": "execute a JSON job",
             "hw probe | hw select --codec C --direction decode|encode [--policy P]": "hardware acceleration",
@@ -89,6 +90,7 @@ fn dispatch(mut a: Args, progress: bool) -> Result<Value> {
         "help" | "--help" | "-h" => Ok(help()),
         "version" | "--version" | "-V" => Ok(json!({ "name": "ironav", "version": env!("CARGO_PKG_VERSION") })),
         "capabilities" => call_tool("capabilities", &json!({})),
+        "devices" => call_tool("devices", &json!({})),
         "probe" => call_tool("probe", &json!({ "path": a.positional("path")? })),
         "plan" => call_tool("plan", &read_job_arg(&mut a)?),
         "run" => run_job(read_job_arg(&mut a)?, progress),
@@ -166,7 +168,7 @@ fn dispatch(mut a: Args, progress: bool) -> Result<Value> {
             .collect::<Vec<_>>())),
         other => Err(Error::invalid_arg(format!("unknown command '{other}'"))
             .hint("run `ironav help`")
-            .alternatives(["capabilities", "probe", "analyze", "watch", "convert", "plan", "run", "hw", "ontology", "tools", "mcp", "play", "gui"])),
+            .alternatives(["capabilities", "devices", "probe", "analyze", "watch", "convert", "plan", "run", "hw", "ontology", "tools", "mcp", "play", "gui"])),
     }
 }
 
