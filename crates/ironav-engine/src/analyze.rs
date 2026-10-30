@@ -13,6 +13,7 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::time::Instant;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -148,9 +149,38 @@ pub struct Analysis {
     /// The newest decoded picture and its time, kept for snapshots.
     pub last_picture: Option<(f64, VideoFrame)>,
     out: Vec<Observation>,
+    /// Observations from `configure`'s threads, whose stream is already right (or none): they go
+    /// out with the next packet of any stream.
+    loose: Vec<Observation>,
     /// What `configure` needs to add analyzers later.
     settings: Settings,
     hwaccel: String,
+    live: bool,
+    /// Sidecars `configure` added, starting on their own threads.
+    starting: Vec<(&'static str, Receiver<Result<Pending>>)>,
+    /// Analyzers `configure` removed, finishing on their own threads: their last observations.
+    retiring: Vec<Receiver<Vec<Observation>>>,
+    /// Which analyzers run has changed since [`take_changed`](Self::take_changed) last said so.
+    changed: bool,
+}
+
+/// Opens `s`'s decoder if it has none, to wait for a keyframe; why not, when it cannot.
+fn start_decoder(s: &mut Stream, hwaccel: &str) -> std::result::Result<(), String> {
+    if s.decoder.is_some() {
+        return Ok(());
+    }
+    let made = if s.info.params.media_type() == MediaType::Video {
+        ironav_player::open_video_decoder(&s.info, hwaccel)
+    } else {
+        ironav_codec::new_decoder_for(&s.info).map(|d| (d, "software"))
+    };
+    match made {
+        Ok((dec, n)) => {
+            (s.decoder, s.decoder_name, s.wait_key) = (Some(dec), Some(n), true);
+            Ok(())
+        }
+        Err(e) => Err(format!("{} is not decoded: {}", s.info.codec.name(), e.message)),
+    }
 }
 
 /// A change to a running analysis.
@@ -172,7 +202,10 @@ impl Reconfigure {
             return Err(Error::invalid_arg("digest_seconds must be above 0"));
         }
         for n in self.add.iter().chain(&self.remove) {
-            analyzer(n).ok_or_else(|| Error::invalid_arg(format!("unknown analyzer '{n}'")).alternatives(ANALYZERS.iter().map(|a| a.name)))?;
+            if analyzer(n).is_none() && crate::sidecar::resolve(std::slice::from_ref(n)).is_err() {
+                let sidecars: Vec<String> = crate::sidecar::configured().map(|l| l.into_keys().collect()).unwrap_or_default();
+                return Err(Error::invalid_arg(format!("unknown analyzer or sidecar '{n}'")).alternatives(ANALYZERS.iter().map(|a| a.name.to_string()).chain(sidecars)));
+            }
         }
         if let Some(n) = self.add.iter().find(|n| self.remove.contains(n)) {
             return Err(Error::invalid_arg(format!("'{n}' is both added and removed")));
@@ -294,8 +327,13 @@ impl Analysis {
             warnings,
             last_picture: None,
             out: Vec::new(),
+            loose: Vec::new(),
             settings,
             hwaccel: opts.hwaccel.clone(),
+            live,
+            starting: Vec::new(),
+            retiring: Vec::new(),
+            changed: false,
         })
     }
 
@@ -304,11 +342,15 @@ impl Analysis {
     }
 
     /// Changes a running analysis: its level, its digest interval (from the next window), and
-    /// which built-in analyzers run. An added analyzer starts with what arrives next (a video
-    /// decoder started now waits for a keyframe); a removed one is dropped without a summary, and
-    /// a stream left with no frame analyzer stops being decoded. Returns warnings.
+    /// which analyzers and sidecars run. An added analyzer starts with what arrives next (a video
+    /// decoder started now waits for a keyframe); an added sidecar starts on its own thread and
+    /// joins the first stream of its kind once it has said hello. A removed analyzer or sidecar
+    /// finishes on its own thread, and its closing observations follow. A stream left with no frame
+    /// analyzer stops being decoded. Nothing here waits for a child process. Returns warnings.
     pub fn configure(&mut self, c: &Reconfigure) -> Result<Vec<String>> {
         c.check()?;
+        let sidecars: Vec<String> = c.add.iter().filter(|n| analyzer(n).is_none()).cloned().collect();
+        let sidecars = crate::sidecar::resolve(&sidecars)?;
         if let Some(l) = &c.level {
             self.level = Level::parse(l).unwrap();
         }
@@ -316,13 +358,18 @@ impl Analysis {
             self.digest_seconds = d;
         }
         let mut warnings = Vec::new();
-        for s in self.streams.iter_mut().flatten() {
-            let keep = |(n, _): &(&'static str, Box<dyn Analyzer>)| !c.remove.iter().any(|r| r == n);
-            s.packet_analyzers.retain(keep);
-            s.frame_analyzers.retain(keep);
+        let mut removed: Vec<(usize, &'static str, Box<dyn Analyzer>)> = Vec::new();
+        self.starting.retain(|(n, _)| !c.remove.iter().any(|r| r == n));
+        for (i, s) in self.streams.iter_mut().enumerate() {
+            let Some(s) = s else { continue };
+            for list in [&mut s.packet_analyzers, &mut s.frame_analyzers] {
+                let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(list).into_iter().partition(|(n, _)| c.remove.iter().any(|r| r == n));
+                *list = kept;
+                removed.extend(gone.into_iter().map(|(n, a)| (i, n, a)));
+            }
             let media = s.info.params.media_type();
             for name in &c.add {
-                let info = analyzer(name).unwrap();
+                let Some(info) = analyzer(name) else { continue };
                 if !info.consumes.applies_to(media) || s.names().contains(&info.name) {
                     continue;
                 }
@@ -330,19 +377,9 @@ impl Analysis {
                     s.packet_analyzers.push((info.name, info.make(&s.info, &self.settings)));
                     continue;
                 }
-                if s.decoder.is_none() {
-                    let made = if media == MediaType::Video {
-                        ironav_player::open_video_decoder(&s.info, &self.hwaccel)
-                    } else {
-                        ironav_codec::new_decoder_for(&s.info).map(|d| (d, "software"))
-                    };
-                    match made {
-                        Ok((dec, n)) => (s.decoder, s.decoder_name, s.wait_key) = (Some(dec), Some(n), true),
-                        Err(e) => {
-                            warnings.push(format!("stream {}: '{name}' not added: {} is not decoded: {}", s.info.index, s.info.codec.name(), e.message));
-                            continue;
-                        }
-                    }
+                if let Err(why) = start_decoder(s, &self.hwaccel) {
+                    warnings.push(format!("stream {}: '{name}' not added: {why}", s.info.index));
+                    continue;
                 }
                 s.frame_analyzers.push((info.name, info.make(&s.info, &self.settings)));
             }
@@ -351,8 +388,103 @@ impl Analysis {
                 (s.audio_next, s.last_video) = (None, None);
             }
         }
+        // each on its own thread, so one slow child does not hold up the others
+        for (i, _, mut a) in removed {
+            let (tx, rx) = channel();
+            let t = self.latest;
+            std::thread::spawn(move || {
+                let mut out = Vec::new();
+                a.finish(t, &mut out);
+                for o in &mut out {
+                    o.stream.get_or_insert(i);
+                }
+                let _ = tx.send(out);
+            });
+            self.retiring.push(rx);
+        }
+        for (name, cfg) in sidecars {
+            if let Some(m) = cfg.media.map(|m| m.media_type()) {
+                if !self.streams.iter().flatten().any(|s| s.info.params.media_type() == m) {
+                    let m = crate::sidecar::media_name(m);
+                    warnings.push(format!("sidecar '{name}' not run: it wants {m} and no {m} stream is analyzed"));
+                    continue;
+                }
+            }
+            let running = self.streams.iter().flatten().any(|s| s.frame_analyzers.iter().any(|(n, _)| *n == name));
+            if running || self.starting.iter().any(|(n, _)| *n == name) {
+                continue;
+            }
+            let (tx, rx) = channel();
+            let live = self.live;
+            std::thread::spawn(move || {
+                let _ = tx.send(Pending::start(name, &cfg, live));
+            });
+            self.starting.push((name, rx));
+        }
         self.warnings.extend(warnings.iter().cloned());
         Ok(warnings)
+    }
+
+    /// Adds a warning to the ones [`warnings`](Self::warnings) gives.
+    pub fn warn(&mut self, w: String) {
+        self.warnings.push(w);
+    }
+
+    /// Takes in what the threads `configure` started have finished: sidecars ready to attach (or
+    /// that failed to start), and the last observations of removed analyzers.
+    fn collect(&mut self) {
+        let mut ready = Vec::new();
+        self.starting.retain(|(name, rx)| match rx.try_recv() {
+            Ok(r) => {
+                ready.push((*name, r));
+                false
+            }
+            Err(TryRecvError::Empty) => true,
+            Err(TryRecvError::Disconnected) => {
+                ready.push((*name, Err(Error::new(ErrorCode::Internal, "its start failed unexpectedly"))));
+                false
+            }
+        });
+        for (name, r) in ready {
+            match r.and_then(|p| self.attach(p)) {
+                Ok(None) => {}
+                Ok(Some(why)) | Err(Error { message: why, .. }) => {
+                    let msg = format!("sidecar '{name}' not added: {why}");
+                    self.loose.push(Observation::new("analyzer_failed", name, self.latest, json!({ "message": msg, "restarting": false })));
+                    self.warnings.push(msg);
+                }
+            }
+            self.changed = true;
+        }
+        self.retiring.retain(|rx| match rx.try_recv() {
+            Ok(obs) => {
+                self.loose.extend(obs);
+                false
+            }
+            Err(TryRecvError::Empty) => true,
+            Err(TryRecvError::Disconnected) => false,
+        });
+    }
+
+    /// Gives a started sidecar the first analyzed stream of its kind that can be decoded; the
+    /// reason when there is none.
+    fn attach(&mut self, p: Pending) -> Result<Option<String>> {
+        let media = p.media();
+        for s in self.streams.iter_mut().flatten() {
+            if s.info.params.media_type() != media || start_decoder(s, &self.hwaccel).is_err() {
+                continue;
+            }
+            let name = p.name();
+            s.frame_analyzers.push((name, Box::new(p.attach(&s.info)?)));
+            return Ok(None);
+        }
+        let m = crate::sidecar::media_name(media);
+        Ok(Some(format!("it wants {m} and no {m} stream is analyzed and decoded")))
+    }
+
+    /// Whether which analyzers run has changed since this was last asked (a sidecar joined).
+    pub fn take_changed(&mut self) -> bool {
+        std::mem::take(&mut self.changed)
     }
 
     /// Whether stream `i` is analyzed.
@@ -391,6 +523,10 @@ impl Analysis {
 
     /// [`packet`](Self::packet), saying whether a decoder can start at it (as a live source knows).
     pub fn packet_keyed(&mut self, p: &Packet, key: bool, sink: &mut dyn FnMut(Observation) -> Result<()>) -> Result<()> {
+        if !self.starting.is_empty() || !self.retiring.is_empty() {
+            self.collect();
+        }
+        self.emit_loose(sink)?;
         let Some(Some(s)) = self.streams.get_mut(p.stream) else { return Ok(()) };
         if s.wait_key && key {
             s.wait_key = false;
@@ -432,6 +568,15 @@ impl Analysis {
         Ok(())
     }
 
+    fn emit_loose(&mut self, sink: &mut dyn FnMut(Observation) -> Result<()>) -> Result<()> {
+        for o in std::mem::take(&mut self.loose) {
+            if o.level() <= self.level {
+                sink(o)?;
+            }
+        }
+        Ok(())
+    }
+
     fn emit(&mut self, stream: usize, sink: &mut dyn FnMut(Observation) -> Result<()>) -> Result<()> {
         for mut o in std::mem::take(&mut self.out) {
             o.stream.get_or_insert(stream);
@@ -468,6 +613,14 @@ impl Analysis {
     /// The end of the input: decoders are flushed, the last window closes and a summary comes last.
     /// Returns the end time.
     pub fn finish(&mut self, sink: &mut dyn FnMut(Observation) -> Result<()>) -> Result<f64> {
+        // removed analyzers' last words; sidecars still starting are not waited for
+        for rx in std::mem::take(&mut self.retiring) {
+            if let Ok(obs) = rx.recv() {
+                self.loose.extend(obs);
+            }
+        }
+        self.starting.clear();
+        self.emit_loose(sink)?;
         let (from, to) = (self.from, self.to);
         for i in 0..self.streams.len() {
             let Some(s) = self.streams[i].as_mut() else { continue };

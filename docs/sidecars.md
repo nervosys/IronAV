@@ -29,7 +29,10 @@ A request's sidecars start side by side, so a slow model load does not hold up t
 A request names sidecars from that list (`"sidecars": ["asr"]` on `analyze` or `stream_open`, `--sidecars asr` on the
 CLI). `capabilities` lists the configured names. A request cannot start any other program. Names are up to 32 lowercase
 letters, digits, `_` or `-`, and cannot be a built-in analyzer's name. Each sidecar takes the first analyzed stream of the
-kind it asks for (use `streams` to choose).
+kind it asks for (use `streams` to choose). A live session can also gain or lose a sidecar while it runs
+(`stream_configure` with `add` or `remove`): it starts in the background and joins the first stream of its kind once it
+has said hello, so the media is never held up by a model loading, and a removed one gets `end` and its usual time to
+finish.
 
 ## Protocol (version 1)
 

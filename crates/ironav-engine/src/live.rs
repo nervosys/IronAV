@@ -559,7 +559,9 @@ impl Session {
                     let mut a = Analysis::new(&streams, opts, 0.0, f64::INFINITY, true)?;
                     // changes asked for before the first packet
                     for c in deferred.drain(..) {
-                        a.configure(&c)?;
+                        if let Err(e) = a.configure(&c) {
+                            a.warn(format!("configure: {}", e.message));
+                        }
                     }
                     let mut sh = lock(&self.shared);
                     // a reader that decides late (after an ID3 tag) knows by now
@@ -597,7 +599,13 @@ impl Session {
                     }
                 }
                 a.packet_keyed(&sp.packet, sp.key, &mut |o| self.log(o, Some(arrived)))?;
+                let changed = a.take_changed();
                 let mut sh = lock(&self.shared);
+                if changed {
+                    // a sidecar joined or failed to
+                    sh.analyzed = a.describe();
+                    sh.warnings = a.warnings().to_vec();
+                }
                 sh.packets += 1;
                 sh.media_seconds = sh.media_seconds.max(a.position());
                 if let Some(p) = a.last_picture.take() {

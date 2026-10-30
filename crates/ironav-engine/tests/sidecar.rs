@@ -29,6 +29,7 @@ fn configure() -> &'static Path {
             "mute": { "command": [exe, "mute"], "start_seconds": 5 },
             "absent": { "command": ["ironav-no-such-sidecar-program"], "media": "video" },
             "liar": { "command": [exe, "dtmf"], "media": "video" },
+            "missing": { "command": ["ironav-no-such-sidecar-program"] },
         });
         let path = dir.join("sidecars.json");
         std::fs::write(&path, list.to_string()).unwrap();
@@ -56,15 +57,61 @@ fn write_wav(path: &Path, samples: &[f64], channels: u16, rate: u32) {
     std::fs::write(path, f).unwrap();
 }
 
+#[test]
+fn a_sidecar_is_added_to_a_running_session_and_removed() {
+    configure();
+    let dir = scratch("added");
+    let wav = dir.join("late-keys.wav");
+    dtmf_wav_at(&wav, 2.0, 4.0);
+    let s = call_tool("stream_open", &json!({ "source": format!("{}?pace=realtime", wav.display()), "analyzers": ["levels"] })).unwrap();
+    let id = s["session"].as_str().unwrap().to_string();
+    let e = call_tool("stream_configure", &json!({ "session": id, "add": ["nope"] })).unwrap_err();
+    assert!(e.alternatives.iter().any(|a| a == "dtmf") && e.alternatives.iter().any(|a| a == "silence"), "{e:?}");
+    // one that wants video is not started for audio alone; one that cannot start says so in the log
+    let c = call_tool("stream_configure", &json!({ "session": id, "add": ["dtmf", "absent", "missing"] })).unwrap();
+    assert_eq!(c["applied"], true, "{c}");
+    assert!(c["warnings"].to_string().contains("sidecar 'absent' not run"), "{c}");
+    let mut digits = Vec::new();
+    let mut after = 0;
+    let mut joined = false;
+    for _ in 0..40 {
+        let ev = call_tool("stream_events", &json!({ "session": id, "after": after, "kinds": ["dtmf"], "wait_ms": 500 })).unwrap();
+        for o in ev["events"].as_array().unwrap() {
+            digits.push(o["data"]["digit"].as_str().unwrap().to_string());
+        }
+        after = ev["next_after"].as_u64().unwrap();
+        let st = call_tool("stream_status", &json!({ "session": id })).unwrap();
+        joined |= st["analyzed"][0]["analyzers"].as_array().unwrap().contains(&json!("dtmf"));
+        if digits.len() == 3 {
+            break;
+        }
+    }
+    assert_eq!(digits, ["1", "5", "#"]);
+    assert!(joined, "the status names the sidecar once it has joined");
+    let failed = call_tool("stream_query", &json!({ "session": id, "kinds": ["analyzer_failed"] })).unwrap();
+    assert_eq!(failed["matched"], 1, "{failed}");
+    assert_eq!(failed["events"][0]["analyzer"], "missing", "{failed}");
+    assert!(failed["events"][0].get("stream").is_none_or(|s| s.is_null()), "a failure to start belongs to no stream: {failed}");
+    let c = call_tool("stream_configure", &json!({ "session": id, "remove": ["dtmf"] })).unwrap();
+    assert_eq!(c["applied"], true, "{c}");
+    assert!(!c["analyzed"][0]["analyzers"].as_array().unwrap().contains(&json!("dtmf")), "{c}");
+    let _ = call_tool("stream_close", &json!({ "session": id }));
+}
+
 /// Keys 1, 5 and # for 120 ms each, 120 ms apart, from 0.5 s, in 48 kHz stereo.
 fn dtmf_wav(path: &Path) {
+    dtmf_wav_at(path, 0.5, 1.5);
+}
+
+/// The same keys from `start` seconds, in `secs` of audio.
+fn dtmf_wav_at(path: &Path, start: f64, secs: f64) {
     let rate = 48000.0;
     let tones = [(697.0, 1209.0), (770.0, 1336.0), (941.0, 1477.0)];
-    let x: Vec<f64> = (0..(rate * 1.5) as usize)
+    let x: Vec<f64> = (0..(rate * secs) as usize)
         .flat_map(|i| {
             let t = i as f64 / rate;
-            let k = ((t - 0.5) / 0.24).floor();
-            let on = t >= 0.5 && k < 3.0 && (t - 0.5 - k * 0.24) < 0.12;
+            let k = ((t - start) / 0.24).floor();
+            let on = t >= start && k < 3.0 && (t - start - k * 0.24) < 0.12;
             let v = if on {
                 let (a, b) = tones[k as usize];
                 0.3 * ((2.0 * PI * a * t).sin() + (2.0 * PI * b * t).sin())

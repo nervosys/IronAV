@@ -499,15 +499,15 @@ pub fn tools() -> &'static [Tool] {
             },
             Tool {
                 name: "stream_configure",
-                description: "Change a running session: the most detail it keeps (level), the digest interval (from the next window), and which built-in analyzers run (add, remove). An added video analyzer starts at the next keyframe. Returns the status with `applied` once the session has taken the change (within a second).",
+                description: "Change a running session: the most detail it keeps (level), the digest interval (from the next window), and which analyzers and sidecars run (add, remove: built-in analyzer names, or the operator's sidecar names from `capabilities`). An added video analyzer starts at the next keyframe. An added sidecar starts in the background and joins the first stream of its kind once ready (its name then shows in the status; a failure is an analyzer_failed observation). A removed one finishes in the background, and its closing observations follow. Returns the status with `applied` once the session has taken the change (within a second).",
                 cli: "",
                 input_schema: object(
                     json!({
                         "session": { "type": "string" },
                         "level": { "type": "string", "enum": ironav_analyze::Level::ALL.iter().map(|l| l.name()).collect::<Vec<_>>() },
                         "digest_seconds": { "type": "number", "exclusiveMinimum": 0 },
-                        "add": { "type": "array", "items": { "type": "string", "enum": ironav_analyze::ANALYZERS.iter().map(|a| a.name).collect::<Vec<_>>() } },
-                        "remove": { "type": "array", "items": { "type": "string", "enum": ironav_analyze::ANALYZERS.iter().map(|a| a.name).collect::<Vec<_>>() } }
+                        "add": { "type": "array", "items": { "type": "string" }, "description": format!("Analyzers ({}) or configured sidecars.", ironav_analyze::ANALYZERS.iter().map(|a| a.name).collect::<Vec<_>>().join(", ")) },
+                        "remove": { "type": "array", "items": { "type": "string" } }
                     }),
                     &["session"],
                 ),

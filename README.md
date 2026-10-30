@@ -133,8 +133,9 @@ returns the newest picture, or the one at `at` seconds, as an image. `stream_cli
 retained media (`retain_seconds`, 60 by default) to a file without re-encoding, starting at a keyframe.
 `stream_status` reports the state, bytes, packets and latency percentiles; `stream_close` returns the summary.
 `stream_query` searches the log (the newest 20000 observations) by kind, analyzer, stream, media time and text, newest
-first if asked ("when was speech last heard"). `stream_configure` changes a running session's level, digest interval and
-built-in analyzers. At most 8 sessions are open at once (error code `busy` past that), and one that no call has asked
+first if asked ("when was speech last heard"). `stream_configure` changes a running session's level, digest interval,
+analyzers and sidecars (an added sidecar starts in the background and joins once ready; a removed one finishes and
+says its last). At most 8 sessions are open at once (error code `busy` past that), and one that no call has asked
 about for `idle_timeout_seconds` (300 by default; 0 for never) is closed and forgotten.
 
 A session can also record what arrives, without re-encoding (`record`, or `--record` for `watch`). The recording can be a
