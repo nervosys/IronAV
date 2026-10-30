@@ -56,6 +56,14 @@ pub struct Dpb {
     prev_frame_num: u32,
     max_long_idx: Option<u32>,
     next_id: i32,
+    /// Live use: when the SPS does not say how deep reordering goes, start at none and learn it.
+    pub low_delay: bool,
+    /// The depth learned so far in low-delay mode.
+    learned: usize,
+    /// The order count of the last picture output since the last IDR (or memory reset).
+    last_out: Option<i32>,
+    /// Pictures dropped from the output in low-delay mode because they came after a later one.
+    pub late: u64,
 }
 
 /// MaxDpbMbs for a level_idc (Table A-1).
@@ -268,6 +276,7 @@ impl Dpb {
         if h.idr {
             // everything before an IDR picture goes out first
             out.extend(self.drain_all());
+            self.last_out = None;
             self.refs.clear();
             self.max_long_idx = None;
         }
@@ -287,6 +296,7 @@ impl Dpb {
             }
             if has_mmco5 {
                 out.extend(self.drain_all());
+                self.last_out = None;
             }
             self.refs.push(Stored { pic: pic.clone(), frame_num: if has_mmco5 { 0 } else { h.frame_num }, long_idx });
         }
@@ -294,10 +304,19 @@ impl Dpb {
             self.prev_frame_num = 0;
             self.prev_frame_num_offset = 0;
             self.prev_poc_msb = 0;
-            self.prev_poc_lsb = pic.poc.max(0);
+            // the picture's top field order count once 8.2.1 has rebased it: 0 for a frame
+            self.prev_poc_lsb = 0;
+        }
+        let learning = self.low_delay && sps.num_reorder_frames.is_none() && sps.poc_type != 2;
+        if learning && self.last_out.is_some_and(|l| pic.poc < l) {
+            // a picture to be shown before one already shown: the stream reorders deeper than
+            // assumed. It stays a reference but is not output, so the order shown stays right.
+            self.learned = (self.learned + 1).min(16);
+            self.late += 1;
+            return out;
         }
         self.pending.push(Pending { pic, pts });
-        let depth = Self::reorder_depth(sps);
+        let depth = if learning { self.learned } else { Self::reorder_depth(sps) };
         while self.pending.len() > depth {
             out.push(self.take_min());
         }
@@ -306,7 +325,9 @@ impl Dpb {
 
     fn take_min(&mut self) -> Pending {
         let k = self.pending.iter().enumerate().min_by_key(|(_, p)| p.pic.poc).map(|(i, _)| i).unwrap_or(0);
-        self.pending.remove(k)
+        let p = self.pending.remove(k);
+        self.last_out = Some(p.pic.poc);
+        p
     }
 
     pub fn drain_all(&mut self) -> Vec<Pending> {

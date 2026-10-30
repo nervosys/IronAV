@@ -361,8 +361,14 @@ M2 as built: the `Source` trait and every source above; `StreamDemuxer` for Anne
 live sessions with the ring buffer and log; `stream_open`, `stream_events`, `stream_status`, `stream_snapshot`,
 `stream_clip` and `stream_close`; and `ironav watch`. The session limit uses a new error code, `busy` (exit 75),
 and an unreachable source is `io`, so no further codes were added. Ogg (Opus, Vorbis, FLAC) and MP3 stream demuxers
-followed later (`ironav-formats/src/audio_stream.rs`); their packets match the file readers'. Left for later:
-low-delay H.264 and HEVC output. Stdin commands for `watch` (`--commands`), `stream_query`, `stream_configure` (level, digest
+followed later (`ironav-formats/src/audio_stream.rs`); their packets match the file readers'. Low-delay output
+came later as `DecoderOptions { low_delay }` (`ironav_codec::new_decoder_with`), which live sessions use: HEVC already
+outputs by its mandatory `sps_max_num_reorder_pics`, and H.264 honours VUI `max_num_reorder_frames`; when H.264
+does not declare it (common from cameras), low delay starts at no reordering instead of the level's DPB size and grows
+the depth each time a picture arrives that should have been shown before one already shown (that picture is not
+output, so a stream with two B pictures loses two pictures once). This is the software decoder's: when NVDEC
+decodes a live H.264 stream (`hwaccel` auto on an NVIDIA machine), its own reordering applies. Keyframes-only decoding
+is not done. Stdin commands for `watch` (`--commands`), `stream_query`, `stream_configure` (level, digest
 interval, adding and removing analyzers and sidecars; not recording yet) and the idle timeout (`idle_timeout_seconds`,
 300 by default, counted from the last call that names the session) came later. Packet metadata (keyframe flag and arrival time) is held in the live layer (`StreamPacket`) instead of
 as new `Packet` fields, so §9's migration was not needed.

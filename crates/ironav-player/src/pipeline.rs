@@ -23,20 +23,25 @@ const VIDEO_BYTES_AHEAD: usize = 256 << 20;
 
 /// A decoder for the video stream: software if one exists, otherwise a GPU decoder.
 pub fn open_video_decoder(s: &StreamInfo, hwaccel: &str) -> Result<(Box<dyn Decoder>, &'static str)> {
+    open_video_decoder_with(s, hwaccel, &ironav_codec::DecoderOptions::default())
+}
+
+/// [`open_video_decoder`] with options for a software decoder.
+pub fn open_video_decoder_with(s: &StreamInfo, hwaccel: &str, o: &ironav_codec::DecoderOptions) -> Result<(Box<dyn Decoder>, &'static str)> {
     let soft = is_implemented(s.codec, false);
     let policy = HwPolicy::parse(hwaccel)?;
     if soft && (!ironav_codec::prefers_hardware_decode(s.codec, &s.params) || matches!(policy, HwPolicy::Off)) {
-        return Ok((ironav_codec::new_decoder_for(s)?, "software"));
+        return Ok((ironav_codec::new_decoder_with(s, o)?, "software"));
     }
     let sel = select(s.codec, Direction::Decode, policy, &probe_all())?;
     match sel.chosen {
         Some(backend) => match new_video_decoder(backend, s.codec, &s.params, &s.extradata) {
             Ok(d) => Ok((d, backend.name())),
             // the GPU cannot take this stream (for example 10-bit H.264); the software decoder can
-            Err(_) if soft && !matches!(policy, HwPolicy::Require(_) | HwPolicy::RequireAny) => Ok((ironav_codec::new_decoder_for(s)?, "software")),
+            Err(_) if soft && !matches!(policy, HwPolicy::Require(_) | HwPolicy::RequireAny) => Ok((ironav_codec::new_decoder_with(s, o)?, "software")),
             Err(e) => Err(e),
         },
-        None if soft && !matches!(policy, HwPolicy::Require(_) | HwPolicy::RequireAny) => Ok((ironav_codec::new_decoder_for(s)?, "software")),
+        None if soft && !matches!(policy, HwPolicy::Require(_) | HwPolicy::RequireAny) => Ok((ironav_codec::new_decoder_with(s, o)?, "software")),
         None => {
             let why = sel.considered.iter().map(|c| format!("{}: {}", c.backend.name(), c.reason)).collect::<Vec<_>>().join("; ");
             Err(Error::new(ErrorCode::HardwareUnavailable, format!("{} needs a hardware decoder and none is usable ({why})", s.codec.name()))

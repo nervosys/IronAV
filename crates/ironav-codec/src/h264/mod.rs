@@ -52,6 +52,20 @@ impl H264Decoder {
         H264Decoder { sps: vec![None; 32], pps: vec![None; 256], cur: None, dpb: Dpb::default(), out: Vec::new() }
     }
 
+    /// For live sources: when the stream does not declare how deep its reordering goes (VUI
+    /// `num_reorder_frames`), pictures are output at once, and the depth grows only when a picture
+    /// turns up that should have been shown earlier (that one is not output). Otherwise, as `new`.
+    pub fn low_delay() -> Self {
+        let mut d = Self::new();
+        d.dpb.low_delay = true;
+        d
+    }
+
+    /// Pictures low-delay mode left out because they came after a later one.
+    pub fn late_pictures(&self) -> u64 {
+        self.dpb.late
+    }
+
     /// Whether a slice starts a new picture (7.4.1.2.4, for frame pictures).
     fn new_picture(prev: &SliceHeader, h: &SliceHeader) -> bool {
         prev.frame_num != h.frame_num
@@ -117,6 +131,9 @@ impl H264Decoder {
         deblock::deblock_picture(&mut c.pic, bd);
         let sps = self.sps[c.sps_id].as_ref().expect("the sequence parameter set outlives its picture");
         let id = self.dpb.new_id();
+        // memory_management_control_operation 5 makes the picture's order count 0 (8.2.1): its
+        // frame order count is the lesser of its fields', which is subtracted from both
+        let mmco5 = c.hdr.nal_ref_idc != 0 && c.hdr.marking.adaptive && c.hdr.marking.ops.iter().any(|o| o.0 == 5);
         let pic = Arc::new(DecodedPic {
             planes: std::mem::take(&mut c.pic.planes),
             mb_w: c.pic.mb_w,
@@ -124,7 +141,7 @@ impl H264Decoder {
             cf: c.pic.cf,
             cw: c.pic.cw,
             mbs: std::mem::take(&mut c.pic.mbs),
-            poc: c.poc,
+            poc: if mmco5 { 0 } else { c.poc },
             id,
             crop: sps.crop,
             bit_depth: sps.bit_depth_luma,

@@ -121,6 +121,23 @@ pub fn sps_picture_size(codec: CodecId, nal: &[u8]) -> Option<(u32, u32)> {
     }
 }
 
+/// How a decoder from [`new_decoder_with`] behaves.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct DecoderOptions {
+    /// Output each picture as soon as nothing earlier can still arrive, for live sources. H.264
+    /// that does not declare its reordering depth then starts with none and learns it (see
+    /// [`h264::H264Decoder::low_delay`]); HEVC always declares it, and other codecs do not reorder.
+    pub low_delay: bool,
+}
+
+/// [`new_decoder_for`] with options.
+pub fn new_decoder_with(s: &ironav_core::StreamInfo, o: &DecoderOptions) -> Result<Box<dyn Decoder>> {
+    if o.low_delay && s.codec == CodecId::H264 {
+        return Ok(Box::new(h264::H264Decoder::low_delay()));
+    }
+    new_decoder_for(s)
+}
+
 pub fn new_decoder_for(s: &ironav_core::StreamInfo) -> Result<Box<dyn Decoder>> {
     match s.codec {
         CodecId::Aac => {

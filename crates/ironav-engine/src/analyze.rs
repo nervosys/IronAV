@@ -165,12 +165,12 @@ pub struct Analysis {
 }
 
 /// Opens `s`'s decoder if it has none, to wait for a keyframe; why not, when it cannot.
-fn start_decoder(s: &mut Stream, hwaccel: &str) -> std::result::Result<(), String> {
+fn start_decoder(s: &mut Stream, hwaccel: &str, live: bool) -> std::result::Result<(), String> {
     if s.decoder.is_some() {
         return Ok(());
     }
     let made = if s.info.params.media_type() == MediaType::Video {
-        ironav_player::open_video_decoder(&s.info, hwaccel)
+        ironav_player::open_video_decoder_with(&s.info, hwaccel, &ironav_codec::DecoderOptions { low_delay: live })
     } else {
         ironav_codec::new_decoder_for(&s.info).map(|d| (d, "software"))
     };
@@ -275,7 +275,8 @@ impl Analysis {
             let (mut decoder, mut decoder_name) = (None, None);
             if !fa.is_empty() || wants_car {
                 let made = if media == MediaType::Video {
-                    ironav_player::open_video_decoder(info, &opts.hwaccel)
+                    // a live source wants each picture as soon as it can be shown
+                    ironav_player::open_video_decoder_with(info, &opts.hwaccel, &ironav_codec::DecoderOptions { low_delay: live })
                 } else {
                     ironav_codec::new_decoder_for(info).map(|d| (d, "software"))
                 };
@@ -309,7 +310,8 @@ impl Analysis {
                 last_video: None,
                 end: 0.0,
                 decode_errors: 0,
-                wait_key: false,
+                // live demuxers start video at a keyframe already; this guards any that do not
+                wait_key: live,
             }));
         }
         for car in pending {
@@ -377,7 +379,7 @@ impl Analysis {
                     s.packet_analyzers.push((info.name, info.make(&s.info, &self.settings)));
                     continue;
                 }
-                if let Err(why) = start_decoder(s, &self.hwaccel) {
+                if let Err(why) = start_decoder(s, &self.hwaccel, self.live) {
                     warnings.push(format!("stream {}: '{name}' not added: {why}", s.info.index));
                     continue;
                 }
@@ -471,7 +473,7 @@ impl Analysis {
     fn attach(&mut self, p: Pending) -> Result<Option<String>> {
         let media = p.media();
         for s in self.streams.iter_mut().flatten() {
-            if s.info.params.media_type() != media || start_decoder(s, &self.hwaccel).is_err() {
+            if s.info.params.media_type() != media || start_decoder(s, &self.hwaccel, self.live).is_err() {
                 continue;
             }
             let name = p.name();

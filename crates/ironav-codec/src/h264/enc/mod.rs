@@ -81,6 +81,9 @@ pub struct H264Encoder {
     pending: Vec<(Source, i64, u64)>,
     /// Pictures between IDR pictures, and the seconds of bits the spending may run ahead or behind.
     keyint: u64,
+    /// Leaves the reordering depth out of the VUI, as many cameras do.
+    #[cfg(test)]
+    no_reorder_info: bool,
     rc_window: f64,
     /// Display index of the last IDR picture.
     idr_at: u64,
@@ -144,6 +147,8 @@ impl H264Encoder {
             last_low: None,
             #[cfg(test)]
             recon: Vec::new(),
+            #[cfg(test)]
+            no_reorder_info: false,
             // a slice per eight rows or so: more slices lose too much prediction across their edges
             slices: std::thread::available_parallelism().map_or(1, |n| n.get()).min((mb_h / 8).max(1)),
             cabac: true,
@@ -231,16 +236,22 @@ impl H264Encoder {
         w.flag(false); // nal_hrd_parameters_present_flag
         w.flag(false); // vcl_hrd_parameters_present_flag
         w.flag(false); // pic_struct_present_flag
-        w.flag(true); // bitstream_restriction_flag
-        w.flag(true); // motion_vectors_over_pic_boundaries_flag
-        w.ue(0); // max_bytes_per_pic_denom
-        w.ue(0); // max_bits_per_mb_denom
-        w.ue(15); // log2_max_mv_length_horizontal
-        w.ue(15); // log2_max_mv_length_vertical
-        // the P picture after B pictures is shown after them; B pictures are not kept
-        let b = (self.b_frames() > 0) as u32;
-        w.ue(b); // max_num_reorder_frames
-        w.ue(1 + b); // max_dec_frame_buffering
+        #[cfg(not(test))]
+        let restrict = true;
+        #[cfg(test)]
+        let restrict = !self.no_reorder_info;
+        w.flag(restrict); // bitstream_restriction_flag
+        if restrict {
+            w.flag(true); // motion_vectors_over_pic_boundaries_flag
+            w.ue(0); // max_bytes_per_pic_denom
+            w.ue(0); // max_bits_per_mb_denom
+            w.ue(15); // log2_max_mv_length_horizontal
+            w.ue(15); // log2_max_mv_length_vertical
+            // the P picture after B pictures is shown after them; B pictures are not kept
+            let b = (self.b_frames() > 0) as u32;
+            w.ue(b); // max_num_reorder_frames
+            w.ue(1 + b); // max_dec_frame_buffering
+        }
         w.finish()
     }
 
@@ -607,6 +618,42 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn low_delay_decoding_learns_the_reordering_a_stream_does_not_declare() {
+        let (w, h) = (64, 48);
+        let params = StreamParams::Video { width: w as u32, height: h as u32, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational::new(25, 1) };
+        // B pictures, as cameras send them, without saying how deep the reordering goes
+        let mut enc = H264Encoder::new(&params, Some(26), None).unwrap();
+        enc.no_reorder_info = true;
+        let mut pkts = Vec::new();
+        for t in 0..20 {
+            pkts.extend(enc.encode(&Frame::Video(scene(w, h, t))).unwrap());
+        }
+        pkts.extend(enc.flush().unwrap());
+        assert!(pkts.iter().any(|p| p.data.windows(5).any(|b| b[..3] == [0, 0, 1] && b[3] & 0x1F == 1 && b[3] >> 5 == 0)), "the stream has unreferenced (B) pictures");
+        let run = |mut dec: H264Decoder| {
+            let (mut early, mut all) = (0, Vec::new());
+            for p in &pkts {
+                let shown = dec.decode(p).unwrap();
+                early += shown.len();
+                all.extend(shown);
+            }
+            all.extend(dec.flush().unwrap());
+            let pts: Vec<i64> = all.iter().map(|f| match f { Frame::Video(v) => v.pts, _ => unreachable!() }).collect();
+            (early, pts, dec.late_pictures())
+        };
+        // as the level allows, the usual decoder holds many pictures back (all 20, at this size)
+        let (early, pts, _) = run(H264Decoder::new());
+        assert_eq!(pts, (0..20).collect::<Vec<i64>>());
+        assert!(early <= 4, "{early} shown before the end");
+        // low delay shows them at once, and leaves out the first B pictures, which taught it the depth
+        let (early, pts, late) = run(H264Decoder::low_delay());
+        assert_eq!(late, BFRAMES as u64);
+        assert_eq!(pts.len(), 20 - BFRAMES);
+        assert!(pts.windows(2).all(|p| p[0] < p[1]), "shown in order: {pts:?}");
+        assert!(early >= 20 - BFRAMES - 2, "only {early} shown before the end");
     }
 
     #[test]

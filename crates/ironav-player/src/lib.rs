@@ -17,7 +17,7 @@ mod snapshot;
 pub use output::{AudioOutput, NullOutput};
 #[cfg(feature = "audio")]
 pub use output::{device_description, CpalOutput};
-pub use pipeline::open_video_decoder;
+pub use pipeline::{open_video_decoder, open_video_decoder_with};
 pub use snapshot::{base64, rgb_frame, to_png};
 
 use ironav_core::{CodecId, Error, ErrorCode, MediaType, Result, StreamInfo, StreamParams, VideoFrame};
