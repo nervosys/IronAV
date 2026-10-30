@@ -15,6 +15,8 @@
 //! chapters, tags, cues and attachments, which are skipped; and a track's start offset, since a
 //! copy re-bases each track to its own first timestamp.
 
+pub(crate) mod live;
+
 use crate::mp4demux::{av1c_config, gcd, parse_avcc, parse_hvcc, Config, Mp4Demuxer, Sample, TrackInfo};
 use ironav_core::{CodecId, Error, ErrorCode, Rational, Result, StreamInfo, StreamParams};
 use std::io::{BufReader, Read, Seek, SeekFrom};

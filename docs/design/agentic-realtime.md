@@ -341,7 +341,7 @@ Each milestone is usable on its own and passes the test gate.
 |---|---|---|
 | **M1: understand files** (done) | `ironav-analyze` with `structure`, `levels`, `loudness`, `silence`, `scene` (shared with the encoder), `black`, `freeze`, `thumbnails`; the `analyze` tool and CLI; digests; MCP concurrency, progress and cancellation | none |
 | **M2: live bytes** (done in part) | the `Source` trait; `pipe:`, `?follow`, `?pace=realtime`, `tcp://`, `udp://`; `StreamDemuxer` for Annex B, ADTS, Y4M, WAV, Ogg and MP3; packet metadata; `LiveSession`, the ring buffer, the `stream_*` tools and `ironav watch`; low-delay H.264 and HEVC output | none |
-| **M3: broadcast** (in progress: MPEG-TS, recording and HLS segmenting done) | the MPEG-TS demuxer and muxer; live fMP4 and MKV reading; a progressive fMP4/TS recorder; `stream_clip`; segmenting; the `latency: low` encode profile | none |
+| **M3: broadcast** (in progress: MPEG-TS, live Matroska/WebM, recording and HLS segmenting done) | the MPEG-TS demuxer and muxer; live fMP4 and MKV reading; a progressive fMP4/TS recorder; `stream_clip`; segmenting; the `latency: low` encode profile | none |
 | **M4: cameras and the web** | RTSP and RTP depacketizers with a jitter buffer and RTCP; HLS over plain HTTP | none |
 | **M5: models** | the sidecar protocol, voice-activity gating and two reference sidecars kept out of tree (speech-to-text, detection) | none in the core; each sidecar chooses its own |
 | **M6: optional transports** | HTTPS/HLS, RTSPS, SRT, capture devices, WebRTC ingest | each one by decision (§10) |
@@ -357,8 +357,9 @@ as new `Packet` fields, so §9's migration was not needed.
 M3 so far: the MPEG-TS reader and writer (`ironav-formats/src/ts.rs`). One push parser serves files and live sources,
 and the writer's output has been checked against FFmpeg. Recording (`record` on `stream_open` and `--record` on `watch`,
 in `engine/src/record.rs`) writes one file, or HLS segments cut at keyframes plus a playlist that is replaced whole after
-each segment (an EVENT playlist, or a sliding window with `keep_segments`). Still to do in M3: reading fMP4 and Matroska
-as they arrive, and the `latency: low` encode profile.
+each segment (an EVENT playlist, or a sliding window with `keep_segments`). Matroska and WebM are read as they arrive
+(`ironav-formats/src/mkv/live.rs`), and the packets match the file reader's. Still to do in M3: reading fMP4 as it
+arrives, and the `latency: low` encode profile.
 
 M1 comes first because it needs no new input path. It turns the existing decoders into an understanding tool for
 files at once, and it fixes the event model, analyzer trait and MCP plumbing before anything goes live.

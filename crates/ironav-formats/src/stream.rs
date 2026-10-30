@@ -4,7 +4,7 @@
 //! packets out, `None` meaning "not enough yet".
 //!
 //! The formats here are the self-delimiting ones: Y4M, WAV, ADTS (AAC), Annex B H.264/HEVC and
-//! MPEG-TS ([`crate::ts`]).
+//! MPEG-TS ([`crate::ts`]), and Matroska/WebM (`mkv::live`).
 
 use crate::{adts, wav, y4m};
 use ironav_core::{CodecId, Error, ErrorCode, Packet, PixelFormat, Rational, Result, StreamInfo, StreamParams};
@@ -77,7 +77,7 @@ pub struct StreamOptions {
 }
 
 /// Formats [`stream_demuxer`] can read.
-pub const STREAM_FORMATS: [&str; 6] = ["y4m", "wav", "aac", "h264", "hevc", "mpegts"];
+pub const STREAM_FORMATS: [&str; 8] = ["y4m", "wav", "aac", "h264", "hevc", "mpegts", "matroska", "webm"];
 
 /// Bytes [`stream_demuxer`] wants to see before it can tell the format.
 /// (A transport stream needs two packets' sync bytes.)
@@ -104,6 +104,7 @@ pub fn stream_demuxer(magic: &[u8], opts: &StreamOptions) -> Result<Box<dyn Stre
         "h264" | "avc" => Box::new(AnnexBStream::new(CodecId::H264, fps)),
         "hevc" | "h265" => Box::new(AnnexBStream::new(CodecId::Hevc, fps)),
         "mpegts" | "ts" | "m2ts" => Box::new(crate::ts::TsStream::default()),
+        "matroska" | "mkv" | "webm" => Box::new(crate::mkv::live::MkvStream::default()),
         other => {
             return Err(Error::new(ErrorCode::UnsupportedFormat, format!("'{other}' cannot be read as a stream")).alternatives(STREAM_FORMATS));
         }
@@ -113,6 +114,9 @@ pub fn stream_demuxer(magic: &[u8], opts: &StreamOptions) -> Result<Box<dyn Stre
 fn sniff(m: &[u8]) -> Option<&'static str> {
     if crate::ts::packet_size(m).is_some() {
         return Some("mpegts");
+    }
+    if crate::mkv::looks_like_mkv(m) {
+        return Some("matroska");
     }
     if m.starts_with(b"YUV4MPEG2") {
         return Some("y4m");
@@ -699,7 +703,8 @@ mod tests {
         assert_eq!(sniff(b"RIFF\0\0\0\0WAVEfmt "), Some("wav"));
         assert_eq!(sniff(&[0, 0, 0, 1, 0x67, 0x64, 0, 0x1f]), Some("h264"));
         assert_eq!(sniff(&[0, 0, 0, 1, 0x40, 0x01, 0x0c, 0x01]), Some("hevc"));
-        assert_eq!(sniff(b"\x1aE\xdf\xa3 matroska"), None);
-        assert!(stream_demuxer(b"\x1aE\xdf\xa3", &StreamOptions::default()).is_err());
+        assert_eq!(sniff(b"\x1aE\xdf\xa3 matroska"), Some("matroska"));
+        assert_eq!(sniff(b"OggS\0\x02"), None);
+        assert!(stream_demuxer(b"OggS\0\x02", &StreamOptions::default()).is_err());
     }
 }
