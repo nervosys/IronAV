@@ -137,7 +137,19 @@ fn need_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
 
 fn h_devices(_: &Value) -> Result<Value> {
     let list = ironav_live::capture::devices()?;
-    Ok(json!({ "devices": list, "platform_supported": cfg!(windows) }))
+    Ok(json!({ "devices": list, "platform_supported": cfg!(any(windows, all(target_os = "linux", target_pointer_width = "64"))) }))
+}
+
+fn h_onvif_discover(args: &Value) -> Result<Value> {
+    let ms = args.get("timeout_ms").and_then(Value::as_u64).unwrap_or(2000).clamp(100, 10_000);
+    let found = ironav_live::onvif::discover(ironav_live::onvif::DISCOVERY, std::time::Duration::from_millis(ms))?;
+    Ok(json!({ "cameras": found }))
+}
+
+fn h_onvif_profiles(args: &Value) -> Result<Value> {
+    let allow = ironav_live::Allow::from_env()?;
+    let dev = ironav_live::onvif::profiles(need_str(args, "url")?, str_arg(args, "user")?, str_arg(args, "password")?, &allow)?;
+    Ok(serde_json::to_value(dev)?)
 }
 
 fn h_capabilities(_: &Value) -> Result<Value> {
@@ -448,11 +460,27 @@ pub fn tools() -> &'static [Tool] {
             },
             Tool {
                 name: "devices",
-                description: "The cameras and microphones this machine has, each with the index and name a live source names it by: stream_open with device://video/INDEX or device://audio/NAME (a part of the name, any case; without one, the first device). Listing does not open any device. Capture is supported on Windows (Media Foundation) so far.",
+                description: "The cameras and microphones this machine has, each with the index and name a live source names it by: stream_open with device://video/INDEX or device://audio/NAME (a part of the name, any case; without one, the first device). Listing does not open any device. Capture is supported on Windows (Media Foundation) and 64-bit Linux (Video4Linux2, ALSA).",
                 cli: "ironav devices",
                 input_schema: object(json!({}), &[]),
                 read_only: true,
                 handler: Handler::Plain(h_devices),
+            },
+            Tool {
+                name: "onvif_discover",
+                description: "Find ONVIF cameras on the local network (a WS-Discovery probe for video transmitters on the machine's default interface), each with its endpoint, device service URLs (xaddrs, for onvif_profiles) and scopes (name, hardware, location). Waits timeout_ms for answers.",
+                cli: "ironav onvif [--timeout-ms N]",
+                input_schema: object(json!({ "timeout_ms": { "type": "integer", "minimum": 100, "maximum": 10000, "default": 2000 } }), &[]),
+                read_only: true,
+                handler: Handler::Plain(h_onvif_discover),
+            },
+            Tool {
+                name: "onvif_profiles",
+                description: "Ask an ONVIF camera (its device service URL, from onvif_discover, or http://HOST) what it is and what it streams: manufacturer, model, firmware, and each media profile's encoding, size, frame rate and bitrate, with its RTSP stream URI and JPEG snapshot URI. Open a stream with stream_open on the stream URI, adding the credentials (rtsp://USER:PASSWORD@...). Credentials go as a WS-Security password digest; connections are limited like any source's (IRONAV_NET_ALLOW).",
+                cli: "ironav onvif URL [--user U] [--password P]",
+                input_schema: object(json!({ "url": { "type": "string" }, "user": { "type": "string" }, "password": { "type": "string" } }), &["url"]),
+                read_only: true,
+                handler: Handler::Plain(h_onvif_profiles),
             },
             Tool {
                 name: "probe",

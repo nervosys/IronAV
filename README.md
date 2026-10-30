@@ -98,6 +98,14 @@ goes on from where it stopped plus the time the source was gone, decoders wait f
 comes back with different tracks ends the session. `stream_status` has `source_health` (`connected`, `stalled`,
 `reconnecting` or `failed`, since when, how many reconnects and failed attempts, and the last error), and the log has
 `source_stalled`, `source_lost`, `source_restored` and `source_failed` as they happen.
+
+An ONVIF camera need not be known in advance. `onvif_discover` (`ironav onvif`) sends a WS-Discovery probe for video
+transmitters and lists those that answer, with their device service URLs and their scopes (name, hardware, location).
+`onvif_profiles` (`ironav onvif URL --user U --password P`) asks one camera for its maker, model and firmware and for
+each media profile (Media service version 1, or version 2 when that is all the camera offers): the encoding, size,
+frame rate and bitrate, the RTSP URI for `stream_open` (add the credentials to it) and a JPEG snapshot URI. Credentials
+go as a WS-Security password digest dated by the camera's own clock, which it is asked for first; a camera that wants
+HTTP digest authentication instead is not supported yet. Its connections go through the same allow-list as a source's.
 `http://host[:port]/path` plays HLS when it names a playlist (the highest-bandwidth variant; TS or fMP4 segments with
 `EXT-X-MAP` and byte ranges; a live playlist is followed from three segments before its end), and downloads anything
 else as it arrives. A variant whose audio is a separate rendition (`EXT-X-MEDIA` with `TYPE=AUDIO`) plays with it: the

@@ -55,6 +55,7 @@ fn help() -> Value {
         "commands": {
             "capabilities": "what this build can do (start here)",
             "devices": "the cameras and microphones to watch (device://video/N, device://audio/NAME)",
+            "onvif [URL] [--user U] [--password P] [--timeout-ms N]": "ONVIF cameras: without a URL, those on the local network; with one, its profiles and their RTSP and snapshot URIs",
             "probe <path>": "inspect a media file",
             "convert -i IN [-i MORE]... -o OUT [-f FMT] [--acodec C] [--vcodec C] [--abitrate KBPS] [--vbitrate KBPS | --qp N] [--latency low] [--filter name[:k=v,..]]... [--hwaccel P] [-y] [--dry-run] [--progress]": "convert, handbrake/ffmpeg style",
             "analyze FILE [--analyzers a,b] [--sidecars a,b] [--level digest|events|raw] [--digest-seconds N] [--from S] [--to S] [--streams 0,1] [--max N] [--thumbnails DIR] [--hwaccel P] [--keyframes-only] [--jsonl]": "what is in a file: loudness, silence, scene cuts, black and frozen pictures, thumbnails, gaps; --jsonl prints each observation as a line as it is found",
@@ -91,6 +92,13 @@ fn dispatch(mut a: Args, progress: bool) -> Result<Value> {
         "version" | "--version" | "-V" => Ok(json!({ "name": "ironav", "version": env!("CARGO_PKG_VERSION") })),
         "capabilities" => call_tool("capabilities", &json!({})),
         "devices" => call_tool("devices", &json!({})),
+        "onvif" => {
+            let (user, password, ms) = (a.flag(&["--user", "-u"])?, a.flag(&["--password", "-p"])?, a.flag(&["--timeout-ms"])?);
+            match a.rest.first().cloned() {
+                Some(url) => call_tool("onvif_profiles", &json!({ "url": url, "user": user, "password": password })),
+                None => call_tool("onvif_discover", &json!({ "timeout_ms": ms.map(|m| m.parse::<u64>()).transpose().map_err(|_| Error::invalid_arg("--timeout-ms must be a whole number"))? })),
+            }
+        }
         "probe" => call_tool("probe", &json!({ "path": a.positional("path")? })),
         "plan" => call_tool("plan", &read_job_arg(&mut a)?),
         "run" => run_job(read_job_arg(&mut a)?, progress),
@@ -168,7 +176,7 @@ fn dispatch(mut a: Args, progress: bool) -> Result<Value> {
             .collect::<Vec<_>>())),
         other => Err(Error::invalid_arg(format!("unknown command '{other}'"))
             .hint("run `ironav help`")
-            .alternatives(["capabilities", "devices", "probe", "analyze", "watch", "convert", "plan", "run", "hw", "ontology", "tools", "mcp", "play", "gui"])),
+            .alternatives(["capabilities", "devices", "onvif", "probe", "analyze", "watch", "convert", "plan", "run", "hw", "ontology", "tools", "mcp", "play", "gui"])),
     }
 }
 

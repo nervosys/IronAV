@@ -1,5 +1,5 @@
-//! A small HTTP/1.1 client for sources: GET over plain TCP, every connection (and every redirect)
-//! through the address allow-list, one request per connection, bodies by length, chunked or until
+//! A small HTTP/1.1 client for sources: GET (and POST, for ONVIF) over plain TCP, every connection
+//! (and every redirect) through the address allow-list, one request per connection, bodies by length, chunked or until
 //! the connection closes, byte ranges, and timeouts on every read and write. HTTPS goes through
 //! [`tls`](crate::tls), and a redirect from it to plain HTTP is refused.
 
@@ -228,6 +228,17 @@ impl Read for Response {
 /// GETs `url` (bytes `first..=last` of it when `range` is given), following redirects; each
 /// connection goes only where `allow` permits, and credentials only to the URL's own server.
 pub(crate) fn get(url: &str, range: Option<(u64, u64)>, allow: &Allow) -> Result<Response> {
+    request(url, "GET", None, range, allow, true).map(|(_, r)| r)
+}
+
+/// POSTs `body` of type `content_type` to `url`, as [`get`] fetches; the status and the answer's
+/// body (at most `max` bytes) come back whatever the status, since a SOAP fault comes as an error.
+pub(crate) fn post(url: &str, content_type: &str, body: &[u8], allow: &Allow, max: usize) -> Result<(u16, Vec<u8>)> {
+    let (status, r) = request(url, "POST", Some((content_type, body)), None, allow, false)?;
+    Ok((status, r.bytes(max)?))
+}
+
+fn request(url: &str, method: &str, payload: Option<(&str, &[u8])>, range: Option<(u64, u64)>, allow: &Allow, errors: bool) -> Result<(u16, Response)> {
     let mut u = HttpUrl::parse(url)?;
     for _ in 0..=MAX_REDIRECTS {
         let shown = redact(&u.plain());
@@ -235,7 +246,10 @@ pub(crate) fn get(url: &str, range: Option<(u64, u64)>, allow: &Allow) -> Result
         let mut conn = if u.tls { tls::connect(tcp, &u.host, Some(b"http/1.1"), &shown)? } else { Conn::Plain(tcp) };
         conn.tcp().set_read_timeout(Some(IO_TIMEOUT))?;
         conn.tcp().set_write_timeout(Some(IO_TIMEOUT))?;
-        let mut req = format!("GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {USER_AGENT}\r\nAccept: */*\r\nConnection: close\r\n", u.path, u.authority);
+        let mut req = format!("{method} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {USER_AGENT}\r\nAccept: */*\r\nConnection: close\r\n", u.path, u.authority);
+        if let Some((ct, body)) = payload {
+            req += &format!("Content-Type: {ct}\r\nContent-Length: {}\r\n", body.len());
+        }
         if let Some((user, pass)) = &u.user {
             req += &format!("Authorization: Basic {}\r\n", base64(format!("{user}:{pass}").as_bytes()));
         }
@@ -244,6 +258,9 @@ pub(crate) fn get(url: &str, range: Option<(u64, u64)>, allow: &Allow) -> Result
         }
         req += "\r\n";
         conn.write_all(req.as_bytes())?;
+        if let Some((_, body)) = payload {
+            conn.write_all(body)?;
+        }
         let mut conn = BufReader::new(conn);
         let mut size = 0;
         // interim answers (100 Continue, 103 Early Hints) come before the real one
@@ -273,6 +290,10 @@ pub(crate) fn get(url: &str, range: Option<(u64, u64)>, allow: &Allow) -> Result
         };
         let header = |n: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.clone());
         if matches!(status, 301 | 302 | 303 | 307 | 308) {
+            // only 307 and 308 keep the method and body
+            if payload.is_some() && status < 307 {
+                return Err(Error::new(ErrorCode::Io, format!("{shown} answered {method} with a {status} redirect")));
+            }
             let loc = header("location").ok_or_else(|| Error::new(ErrorCode::Io, format!("{shown} redirects without saying where")))?;
             let next = HttpUrl::parse(&join(&u.plain(), &loc))?;
             if u.tls && !next.tls {
@@ -282,7 +303,7 @@ pub(crate) fn get(url: &str, range: Option<(u64, u64)>, allow: &Allow) -> Result
             u = HttpUrl { user: if next.user.is_some() { next.user.clone() } else if same { u.user.clone() } else { None }, ..next };
             continue;
         }
-        if status >= 400 {
+        if status >= 400 && errors {
             let code = if status == 404 || status == 410 { ErrorCode::NotFound } else { ErrorCode::Io };
             return Err(Error::new(code, format!("{shown} answered {status}")));
         }
@@ -302,7 +323,7 @@ pub(crate) fn get(url: &str, range: Option<(u64, u64)>, allow: &Allow) -> Result
         } else {
             Body::Close
         };
-        return Ok(Response { url: u.full(), conn, body });
+        return Ok((status, Response { url: u.full(), conn, body }));
     }
     Err(Error::new(ErrorCode::Io, format!("{} redirects more than {MAX_REDIRECTS} times", redact(url))))
 }
