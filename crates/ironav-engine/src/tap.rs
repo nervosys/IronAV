@@ -267,6 +267,8 @@ pub struct TapFeeder {
     pending: VecDeque<f32>,
     /// The media time of `pending`'s first sample.
     pending_t: Option<f64>,
+    /// How many of `pending`'s first samples a window has already carried (they overlap the next).
+    carried: usize,
     mono: Vec<f32>,
     pulled: Vec<f32>,
     /// Audio features: the spectrum, and the speech detector run over 20 ms frames as they come,
@@ -282,7 +284,7 @@ pub struct TapFeeder {
 pub fn tap(config: TapConfig) -> Result<(Tap, TapFeeder)> {
     config.check()?;
     let shared = Arc::new(Shared { state: Mutex::new(State { cap: config.queue, ..State::default() }), ready: Condvar::new() });
-    let feeder = TapFeeder { config, shared: shared.clone(), stream: 0, seq: 0, next_t: None, resampler: None, pending: VecDeque::new(), pending_t: None, mono: Vec::new(), pulled: Vec::new(), meter: None, vad: None, vad_buf: Vec::new(), vad_t: 0.0, flags: VecDeque::new() };
+    let feeder = TapFeeder { config, shared: shared.clone(), stream: 0, seq: 0, next_t: None, resampler: None, pending: VecDeque::new(), pending_t: None, carried: 0, mono: Vec::new(), pulled: Vec::new(), meter: None, vad: None, vad_buf: Vec::new(), vad_t: 0.0, flags: VecDeque::new() };
     Ok((Tap { shared }, feeder))
 }
 
@@ -379,6 +381,7 @@ impl TapFeeder {
             }
             self.pending.clear();
             self.pending_t = None;
+            self.carried = 0;
         }
         self.mono.clear();
         self.mono.extend(a.samples.chunks_exact(ch).map(|s| (s.iter().sum::<f64>() / ch as f64) as f32));
@@ -390,6 +393,7 @@ impl TapFeeder {
         if expect.is_none_or(|e| (e - (t - delay)).abs() > 0.1) {
             self.pending.clear();
             self.pending_t = Some(t);
+            self.carried = 0;
             self.vad_buf.clear();
             self.flags.clear();
             self.vad_t = t;
@@ -415,13 +419,32 @@ impl TapFeeder {
                 }
             }
         }
+        self.windows(t, clock, false);
+    }
+
+    /// The end of the stream: the resampler's last samples, and a last window, shorter than the
+    /// others, with what no window has carried yet.
+    pub(crate) fn flush(&mut self, clock: Option<f64>) {
+        let Some(r) = self.resampler.as_mut() else { return };
+        self.pulled.resize(r.ready() + r.delay_input_samples() + 64, 0.0);
+        let got = r.flush(&mut self.pulled);
+        self.pending.extend(&self.pulled[..got]);
+        let t = self.pending_t.unwrap_or(0.0);
+        self.windows(t, clock, true);
+    }
+
+    /// Gives the whole windows waiting in `pending`; with `last`, also the rest.
+    fn windows(&mut self, t: f64, clock: Option<f64>, last: bool) {
+        let rate = self.config.rate;
+        let features = self.config.features;
         let window = (rate as u64 * self.config.window_ms as u64 / 1000) as usize;
         let hop = (rate as u64 * self.config.hop_ms.unwrap_or(self.config.window_ms) as u64 / 1000).max(1) as usize;
-        while self.pending.len() >= window {
+        while self.pending.len() >= window || (last && self.pending.len() > self.carried) {
             let start = self.pending_t.unwrap_or(t);
             let samples: Vec<f32> = self.pending.iter().take(window).copied().collect();
             let drop = hop.min(self.pending.len());
             self.pending.drain(..drop);
+            self.carried = samples.len() - drop;
             self.pending_t = Some(start + drop as f64 / rate as f64);
             let features = features.then(|| {
                 let s = self.meter.get_or_insert_with(SpectrumMeter::default).measure(&samples, rate);

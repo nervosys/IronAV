@@ -68,11 +68,16 @@ fn sound_comes_as_overlapping_mono_windows() {
     let s = open();
     let tap = s.tap(TapConfig { rate: 16_000, window_ms: 200, hop_ms: Some(100), queue: 64, ..TapConfig::audio() }).unwrap();
     let got = drain(&tap);
-    assert!((4..=7).contains(&got.len()), "{} windows", got.len());
+    assert!((5..=8).contains(&got.len()), "{} windows", got.len());
     for (k, f) in got.iter().enumerate() {
         assert_eq!(f.stream, 1);
         let TapData::Audio { rate, samples, .. } = &f.data else { panic!("not sound") };
-        assert_eq!((*rate, samples.len()), (16_000, 3200));
+        // the last, at the end of the stream, may be short
+        if k + 1 < got.len() {
+            assert_eq!((*rate, samples.len()), (16_000, 3200));
+        } else {
+            assert!(*rate == 16_000 && !samples.is_empty() && samples.len() <= 3200, "{}", samples.len());
+        }
         assert!((f.t - 0.1 * k as f64 - got[0].t).abs() < 0.002, "window {k} at {}", f.t);
         assert!(samples.iter().all(|v| v.abs() <= 1.0));
     }
@@ -80,6 +85,20 @@ fn sound_comes_as_overlapping_mono_windows() {
     let (TapData::Audio { samples: x, .. }, TapData::Audio { samples: y, .. }) = (&got[0].data, &got[1].data) else { panic!() };
     assert_eq!(&x[1600..], &y[..1600]);
     assert!(got[0].t < 0.05, "{}", got[0].t);
+}
+
+#[test]
+fn the_end_of_the_stream_closes_a_last_short_window() {
+    let s = open();
+    let tap = s.tap(TapConfig { rate: 16_000, window_ms: 500, queue: 64, ..TapConfig::audio() }).unwrap();
+    let got = drain(&tap);
+    // 0.8 s of sound: one whole window, then the 0.3 s after it
+    assert_eq!(got.len(), 2, "{} windows", got.len());
+    let TapData::Audio { samples: first, .. } = &got[0].data else { panic!() };
+    let TapData::Audio { samples: last, .. } = &got[1].data else { panic!() };
+    assert_eq!(first.len(), 8000);
+    assert!((0.25..0.4).contains(&(last.len() as f64 / 16_000.0)), "{} samples", last.len());
+    assert!((got[1].t - got[0].t - 0.5).abs() < 0.002);
 }
 
 #[test]

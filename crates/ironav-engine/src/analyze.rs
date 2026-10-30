@@ -762,6 +762,9 @@ impl Analysis {
                     feed_frame(s, f, from, to, &mut self.out, &mut self.last_picture);
                 }
             }
+            for tap in s.taps.iter_mut() {
+                tap.flush(s.clock);
+            }
             self.emit(i, sink)?;
         }
         let end = self.streams.iter().flatten().map(|s| s.end).fold(self.latest, f64::max).min(to);

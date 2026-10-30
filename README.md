@@ -217,7 +217,7 @@ while let Some(f) = tap.recv_timeout(Duration::from_secs(5))? {
 A video tap gives at most `fps` pictures a second (every one when not given), scaled to fit `width` x `height` (aspect
 kept) and, with `letterbox`, padded with black to exactly that size, as RGB, BGR or grey bytes. An audio tap
 (`TapConfig::audio()`) gives mono windows of `window_ms` at `rate` (16 kHz unless asked), starting every `hop_ms` (so
-windows overlap when it is shorter); with `features: true` each window comes with its RMS and peak level in dBFS,
+windows overlap when it is shorter), and at the end of the stream a last, shorter window with what is left; with `features: true` each window comes with its RMS and peak level in dBFS,
 spectral centroid and 85% roll-off in Hz, spectral flatness (near 1 for noise, near 0 for a tone) and the share of its
 20 ms frames a speech detector took for speech (`ironav_codec::voice::SpectrumMeter` and `Vad`). It takes the stream given as `stream` or the first of its kind, starting its
 decoder if nothing else needed one; if none suits, the first `recv_timeout` says why. The session never waits for a
