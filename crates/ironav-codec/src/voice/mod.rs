@@ -4,11 +4,15 @@
 //!
 //! - [`StreamResampler`]: rate conversion (16 kHz to and from 24 and 48 kHz, or any other pair).
 //! - [`Playout`]: a jitter buffer that gives one packet per frame period, in order.
+//! - [`Vad`], [`Gate`], [`Agc`] and [`Denoiser`]: speech detection, push-to-talk trimming,
+//!   level control and noise suppression before the encoder.
 //!
 //! The Opus encoder's frame-at-a-time path is `crate::opus::OpusEncoder::encode_frame_into`.
 
+mod dsp;
 mod playout;
 mod resample;
 
+pub use dsp::{Agc, Denoiser, Gate, Vad};
 pub use playout::{Playout, PlayoutStats, Pop};
 pub use resample::StreamResampler;

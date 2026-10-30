@@ -518,6 +518,19 @@ and a few frames on the decode is back within 31 dB of the lossless one. Not don
 concealment, which repeats the last pitch period for voiced speech before fading to noise, and concealment after
 SILK or hybrid frames (silence for now).
 
+Before the encoder, mono `f32` frames at any rate can go through `Vad::new(frame_ms, hangover_ms)` (a frame is speech
+when it stands 10 dB above a noise floor that follows the quietest frames down and creeps up 1 dB a second and is not
+hiss; speech starts after two such frames and ends after the hangover), `Gate::new(frame, frame_ms, preroll,
+hangover_ms)` (trims a push-to-talk press: `push(frame)` says how many frames to send now and `next()` gives them, the
+`preroll` frames before the start of speech going out with it so a soft first sound is not cut; `reset()` for a new
+press), `Agc::new(target_dbfs, max_gain_db)` (`process(frame, speech)` measures only speech frames, so pauses are not
+pumped up; the gain falls fast, rises about 6 dB a second at 20 ms frames, ramps within a frame and is held down so no
+sample clips) and `Denoiser::new(rate, hop, floor_db)` (each `hop` samples, a square-root-Hann spectrum of the last two
+hops is scaled bin by bin by the square root of a decision-directed Wiener gain against each bin's smoothed minimum,
+never below `floor_db`, and overlap-added; it delays by one hop, 5 ms at `hop` 80 at 16 kHz). On a speech-like test at
+16 kHz with 5 ms hops and a -12 dB floor, white noise 10 dB below the speech comes out about 14 dB below it, and clean
+speech comes out within 26 dB of itself. None of them allocates per frame.
+
 ## Vorbis
 
 Vorbis I is decoded (floor type 1; residue types 0, 1 and 2; any channel count up to 8 in the standard layouts, reordered to

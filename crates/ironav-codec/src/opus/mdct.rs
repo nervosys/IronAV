@@ -9,7 +9,7 @@ fn mul(a: C, b: C) -> C {
     [a[0] * b[0] - a[1] * b[1], a[0] * b[1] + a[1] * b[0]]
 }
 
-struct Fft {
+pub(crate) struct Fft {
     m: usize,
     factors: Vec<usize>,
     /// `exp(-2 pi i t / m)` for `t` in `0..m`.
@@ -17,7 +17,7 @@ struct Fft {
 }
 
 impl Fft {
-    fn new(m: usize) -> Self {
+    pub(crate) fn new(m: usize) -> Self {
         let mut factors = Vec::new();
         let mut rest = m;
         for p in [5, 3, 2] {
@@ -36,7 +36,7 @@ impl Fft {
         Self { m, factors, tw: tw.collect() }
     }
 
-    fn run(&self, input: &[C], out: &mut [C]) {
+    pub(crate) fn run(&self, input: &[C], out: &mut [C]) {
         self.rec(input, 1, self.m, out, 0);
     }
 
