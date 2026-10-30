@@ -429,6 +429,13 @@ impl RangeEncoder {
         (self.range, self.value, self.rem, self.ext, self.error) = (TOP, 0, -1, 0, false);
     }
 
+    /// Makes the frame `size` bytes long, once its size is known: only before any raw bits, and
+    /// never shorter than what is written.
+    pub fn shrink(&mut self, size: usize) {
+        debug_assert!(self.end_offs == 0 && self.nend_bits == 0 && self.offs <= size);
+        self.buf.resize(size, 0);
+    }
+
     /// Finish the frame: flush the range coder and merge in the raw bits. Fails if the frame
     /// overflowed.
     #[cfg(test)]

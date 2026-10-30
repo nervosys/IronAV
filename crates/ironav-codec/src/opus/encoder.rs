@@ -11,7 +11,7 @@
 use super::celt::enc::{FRAME, LOOKAHEAD};
 use super::celt::prefilter::Prefilter;
 use super::celt::Celt;
-use super::rc::RangeEncoder;
+use super::rc::{Coder, RangeEncoder};
 use super::silk_enc::{self, SilkEncoder};
 use crate::voice::StreamResampler;
 use ironav_core::{Encoder, Error, ErrorCode, Frame, Packet, Result};
@@ -32,6 +32,11 @@ const SILK_LEAD: usize = silk_enc::LOOKAHEAD + 16;
 /// the decoder's own two samples and its upsampler's eleven (at 16 kHz).
 pub const SILK_PRE_SKIP: usize = 3 * (SILK_LEAD + 2 + 11);
 
+/// How much the CELT input of a hybrid frame waits, so that its delay is the SILK side's.
+const HYBRID_SHIFT: usize = SILK_PRE_SKIP - PRE_SKIP;
+/// The first CELT band of a hybrid frame: 8 kHz, where SILK's wideband ends.
+const HYBRID_START: usize = 17;
+
 /// What an [`OpusEncoder`] codes with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum OpusMode {
@@ -40,6 +45,9 @@ pub enum OpusMode {
     Celt,
     /// SILK, wideband (audio up to 8 kHz): speech, at low bit rates (about 8 to 30 kb/s).
     Silk,
+    /// Hybrid, full band: SILK up to 8 kHz and CELT above, at a variable rate; speech with its
+    /// high frequencies (about 16 to 40 kb/s).
+    Hybrid,
 }
 
 /// The SILK side: the resampler to 16 kHz and the signal waiting to be coded.
@@ -89,6 +97,7 @@ pub struct OpusEncoder {
     /// Samples per channel received.
     input: u64,
     silk: Option<Box<SilkPath>>,
+    mode: OpusMode,
 }
 
 impl OpusEncoder {
@@ -120,6 +129,7 @@ impl OpusEncoder {
             transients: 0,
             input: 0,
             silk: None,
+            mode: OpusMode::Celt,
         })
     }
 
@@ -128,32 +138,40 @@ impl OpusEncoder {
         if self.input > 0 {
             return Err(Error::invalid_arg("the mode is set before any audio"));
         }
+        if mode != OpusMode::Celt && self.size < 2 {
+            return Err(Error::invalid_arg("SILK and hybrid frames are 10 or 20 ms").alternatives(["10", "20"]));
+        }
         self.silk = match mode {
             OpusMode::Celt => None,
-            OpusMode::Silk => {
-                if self.size < 2 {
-                    return Err(Error::invalid_arg("SILK frames are 10 or 20 ms").alternatives(["10", "20"]));
-                }
+            OpusMode::Silk | OpusMode::Hybrid => {
                 let mut buf = Vec::with_capacity(silk_enc::PAST + 2 * 320 + SILK_LEAD);
                 buf.resize(silk_enc::PAST + SILK_LEAD, 0.0);
                 Some(Box::new(SilkPath { enc: SilkEncoder::new(), rs: StreamResampler::new(RATE, 16_000, 1, FRAME)?, buf, mono: Vec::with_capacity(FRAME) }))
             }
         };
+        // a hybrid frame's CELT side is mono (the TOC's stereo flag would ask for stereo SILK too)
+        let (cch, lead) = match mode {
+            OpusMode::Hybrid => (1, LOOKAHEAD + HYBRID_SHIFT),
+            _ => (self.channels, LOOKAHEAD),
+        };
+        self.celt = Celt::new(cch, true);
+        self.sig = vec![vec![0.0; lead]; cch];
+        self.mode = mode;
         self.bytes = self.max_bytes();
         Ok(self)
     }
 
     /// The mode the encoder codes with.
     pub fn mode(&self) -> OpusMode {
-        if self.silk.is_some() { OpusMode::Silk } else { OpusMode::Celt }
+        self.mode
     }
 
-    /// The most bytes a packet takes: CELT's are all this size, SILK's twice the bit rate's share
-    /// at most.
+    /// The most bytes a packet takes: CELT's are all this size, SILK's and hybrid's twice the bit
+    /// rate's share at most.
     fn max_bytes(&self) -> usize {
-        match self.silk {
-            None => Self::frame_bytes(self.bitrate, self.frame, self.channels),
-            Some(_) => (2 * self.bitrate as usize * self.frame / RATE as usize / 8 + 1).clamp(80, 1275),
+        match self.mode {
+            OpusMode::Celt => Self::frame_bytes(self.bitrate, self.frame, self.channels),
+            OpusMode::Silk | OpusMode::Hybrid => (2 * self.bitrate as usize * self.frame / RATE as usize / 8 + 1).clamp(80, 1275),
         }
     }
 
@@ -186,7 +204,7 @@ impl OpusEncoder {
             return Err(Error::invalid_arg("the frame length is set before any audio"));
         }
         if self.silk.is_some() && size < 2 {
-            return Err(Error::invalid_arg(format!("SILK frames are 10 or 20 ms, not {ms}")).alternatives(["10", "20"]));
+            return Err(Error::invalid_arg(format!("SILK and hybrid frames are 10 or 20 ms, not {ms}")).alternatives(["10", "20"]));
         }
         self.size = size;
         self.frame = FRAME >> (3 - size);
@@ -248,8 +266,14 @@ impl OpusEncoder {
             }
             s.rs.push(&s.mono)?;
             Self::pull(s);
+            if self.mode == OpusMode::Hybrid {
+                for &m in &s.mono {
+                    self.sig[0].push(m - EMPH_COEFF * self.prev[0]);
+                    self.prev[0] = m;
+                }
+            }
             self.input += self.frame as u64;
-            return self.code_silk(out);
+            return if self.mode == OpusMode::Hybrid { self.code_hybrid(out) } else { self.code_silk(out) };
         }
         if self.sig[0].len() != LOOKAHEAD {
             return Err(Error::invalid_arg("audio from encode() is waiting for the rest of its frame"));
@@ -304,6 +328,45 @@ impl OpusEncoder {
         Ok(1 + len)
     }
 
+    /// Codes a hybrid frame (SILK, then CELT from 8 kHz up, in one range coder) into `out`, and
+    /// returns the packet's length.
+    fn code_hybrid(&mut self, out: &mut [u8]) -> Result<usize> {
+        let s = self.silk.as_mut().expect("hybrid mode");
+        let fl = self.frame / 3;
+        let need = silk_enc::PAST + fl + silk_enc::LOOKAHEAD;
+        let n = self.frame + LOOKAHEAD;
+        if s.buf.len() < need || self.sig[0].len() < n {
+            return Err(Error::new(ErrorCode::Internal, "Opus: the hybrid frame is not all here"));
+        }
+        // the high band takes a steady share, its energies and some folded detail; SILK takes the
+        // rest, as much as it needs, and the frame ends after both
+        let cap = self.bytes;
+        self.rc.reset(cap - 1);
+        let celt_bps = 3000.0 + 0.25 * (self.bitrate as f64 - 16_000.0).max(0.0);
+        let per_frame = |bps: f64| bps * self.frame as f64 / RATE as f64;
+        let celt_bits = per_frame(celt_bps) as i32;
+        let target = per_frame(self.bitrate as f64 - celt_bps) - 8.0;
+        let used = s.enc.encode(&mut self.rc, &s.buf[..need], fl / 80, target, ((cap - 1) * 8) as i32 - celt_bits - 12);
+        let size = (1 + (used + 12 + celt_bits) as usize).div_ceil(8).clamp(3, cap);
+        self.rc.shrink(size - 1);
+        let total = ((size - 1) * 8) as i32;
+        // no redundant CELT frame
+        if used + 37 <= total {
+            self.rc.log(12, 0);
+        }
+        let intra = self.frames.is_multiple_of(INTRA_PERIOD);
+        self.celt.encode_frame(&mut self.rc, &[&self.sig[0][..n]], self.size, false, intra, None, HYBRID_START);
+        self.rc.finish_in_place().map_err(|_| Error::new(ErrorCode::Internal, "Opus: a frame did not fit its packet"))?;
+        // configurations 14 and 15: hybrid, full band, 10 or 20 ms; one mono frame per packet
+        out[0] = (14 + self.size as u8 - 2) << 3;
+        out[1..size].copy_from_slice(self.rc.bytes());
+        s.buf.drain(..fl);
+        self.sig[0].drain(..self.frame);
+        self.frames += 1;
+        self.transients += self.celt.was_transient() as u64;
+        Ok(size)
+    }
+
     /// Whether a whole frame is waiting to be coded.
     fn frame_ready(&self) -> bool {
         match &self.silk {
@@ -323,6 +386,12 @@ impl OpusEncoder {
                     }
                     s.rs.push(&s.mono)?;
                     Self::pull(s);
+                    if self.mode == OpusMode::Hybrid {
+                        for &m in &s.mono {
+                            self.sig[0].push(m - EMPH_COEFF * self.prev[0]);
+                            self.prev[0] = m;
+                        }
+                    }
                 }
             }
             None => {
@@ -358,7 +427,7 @@ impl OpusEncoder {
         let (a, b) = (&self.sig[0][..n], self.sig.get(1).map_or(&[][..], |s| &s[..n]));
         let both = [a, b];
         let refs = &both[..self.channels];
-        self.celt.encode_frame(&mut self.rc, refs, self.size, silent, self.frames % INTRA_PERIOD == 0, pitch);
+        self.celt.encode_frame(&mut self.rc, refs, self.size, silent, self.frames % INTRA_PERIOD == 0, pitch, 0);
         self.rc.finish_in_place().map_err(|_| Error::new(ErrorCode::Internal, "Opus: a frame did not fit its packet"))?;
         // configurations 28 to 31: CELT, full band, 2.5 to 20 ms; one frame per packet
         out[0] = ((28 + self.size as u8) << 3) | (((self.channels == 2) as u8) << 2);
@@ -374,7 +443,11 @@ impl OpusEncoder {
     fn emit(&mut self, packets: &mut Vec<Packet>, duration: i64) -> Result<()> {
         let pts = self.frames as i64 * self.frame as i64;
         let mut data = vec![0u8; self.bytes];
-        let len = if self.silk.is_some() { self.code_silk(&mut data)? } else { self.code(&mut data)? };
+        let len = match self.mode {
+            OpusMode::Celt => self.code(&mut data)?,
+            OpusMode::Silk => self.code_silk(&mut data)?,
+            OpusMode::Hybrid => self.code_hybrid(&mut data)?,
+        };
         data.truncate(len);
         packets.push(Packet { stream: 0, pts, duration, data });
         Ok(())
@@ -632,16 +705,38 @@ mod attacks {
     /// Speech through SILK mode and our decoder: the SNR at the best alignment, that alignment
     /// (0 when the pre-skip is right), and the bit rate.
     fn silk_round_trip(channels: usize, ms: f64, bitrate: u32) -> (f64, i64, f64) {
-        let mono = super::super::silk_enc::tests::speechlike(96_000, 48_000.0);
+        let (snr, lag, bps, _) = mode_round_trip(OpusMode::Silk, channels, ms, bitrate, false);
+        (snr, lag, bps)
+    }
+
+    /// Speech (with hiss above 8 kHz if `hiss`) through `mode` and our decoder: the SNR at the best alignment,
+    /// that alignment, the bit rate, and the share of the input's energy above 8 kHz that the
+    /// output has.
+    fn mode_round_trip(mode: OpusMode, channels: usize, ms: f64, bitrate: u32, hiss: bool) -> (f64, i64, f64, f64) {
+        let mut mono = super::super::silk_enc::tests::speechlike(96_000, 48_000.0);
+        if hiss {
+            // sibilance: noise from 10 to 14 kHz, in bursts
+            let mut s = 99u32;
+            let mut prev = 0f32;
+            for (i, v) in mono.iter_mut().enumerate() {
+                s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                let w = (s >> 9) as f32 / (1 << 23) as f32 - 0.5;
+                let hp = w - prev;
+                prev = w;
+                let burst = if (i / 4800) % 3 == 1 { 0.08 } else { 0.0 };
+                *v += burst * hp * (2.0 * std::f32::consts::PI * 12_000.0 * i as f32 / 48_000.0).cos();
+            }
+        }
         let input: Vec<f64> = mono.iter().flat_map(|&v| std::iter::repeat_n(v as f64, channels)).collect();
-        let mut enc = OpusEncoder::new(48_000, channels, bitrate).unwrap().with_mode(OpusMode::Silk).unwrap().with_frame_ms(ms).unwrap();
+        let mut enc = OpusEncoder::new(48_000, channels, bitrate).unwrap().with_mode(mode).unwrap().with_frame_ms(ms).unwrap();
         let mut packets = Vec::new();
         for chunk in input.chunks(1000 * channels) {
             let f = Frame::Audio(AudioFrame { sample_rate: 48_000, channels: channels as u16, pts: 0, samples: chunk.to_vec() });
             packets.extend(enc.encode(&f).unwrap());
         }
         packets.extend(enc.flush().unwrap());
-        assert!(packets.iter().all(|p| p.data.len() <= enc.packet_bytes() && p.data[0] >> 3 == 8 + (ms == 20.0) as u8));
+        let config = if mode == OpusMode::Silk { 8 } else { 14 } + (ms == 20.0) as u8;
+        assert!(packets.iter().all(|p| p.data.len() <= enc.packet_bytes() && p.data[0] >> 3 == config));
         let params = StreamParams::Audio { sample_rate: 48_000, channels: channels as u16 };
         let mut dec = super::super::OpusDecoder::new(&enc.head(), &params).unwrap();
         let mut out = Vec::new();
@@ -663,7 +758,34 @@ mod attacks {
         };
         let lag = (-30..=30).max_by(|&a, &b| snr_at(a).partial_cmp(&snr_at(b)).unwrap()).unwrap();
         let bytes: usize = packets.iter().map(|p| p.data.len()).sum();
-        (snr_at(lag), lag, bytes as f64 * 8.0 / 2.0)
+        // energy above 9 kHz, in and out: a windowed-sinc high-pass
+        let taps: Vec<f64> = (-64i32..=64)
+            .map(|k| {
+                let t = k as f64;
+                let lp = if k == 0 { 2.0 * 9_000.0 / 48_000.0 } else { (2.0 * std::f64::consts::PI * 9_000.0 / 48_000.0 * t).sin() / (std::f64::consts::PI * t) };
+                let w = 0.5 + 0.5 * (std::f64::consts::PI * t / 65.0).cos();
+                (if k == 0 { 1.0 } else { 0.0 }) - lp * w
+            })
+            .collect();
+        let high = |x: &dyn Fn(usize) -> f64| (200..mono.len() - 200).map(|n| taps.iter().enumerate().map(|(k, c)| c * x(n + k - 64)).sum::<f64>().powi(2)).sum::<f64>();
+        let hf = high(&|n| out[(n as i64 + lag) as usize]) / high(&|n| mono[n] as f64);
+        (snr_at(lag), lag, bytes as f64 * 8.0 / 2.0, hf)
+    }
+
+    #[test]
+    fn hybrid_mode_round_trips_with_the_high_band() {
+        for (ms, rate) in [(20.0, 24_000), (10.0, 32_000)] {
+            let (snr, lag, bps, hf) = mode_round_trip(OpusMode::Hybrid, 1, ms, rate, true);
+            let (silk_snr, _, _, silk_hf) = mode_round_trip(OpusMode::Silk, 1, ms, rate, true);
+            eprintln!("hybrid {ms} ms at {rate}: {snr:.1} dB at lag {lag}, {:.1} kb/s, high band {hf:.2} (SILK alone {silk_snr:.1} dB, {silk_hf:.2})", bps / 1000.0);
+            assert_eq!(lag, 0, "the two layers are out of step, or the pre-skip is off");
+            assert!(snr > 8.0, "{snr}");
+            assert!((bps / rate as f64 - 1.0).abs() < 0.2, "{bps} for {rate}");
+            assert!(hf > 0.3 && hf > 3.0 * silk_hf, "{hf} vs {silk_hf}");
+        }
+        // a stereo input is coded as its mix, the TOC mono
+        let (snr, lag, _, _) = mode_round_trip(OpusMode::Hybrid, 2, 20.0, 24_000, true);
+        assert!(snr > 8.0 && lag == 0, "{snr} {lag}");
     }
 
     #[test]

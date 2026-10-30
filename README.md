@@ -565,9 +565,18 @@ and, for 70 % of the long-term prediction, the pitch harmonics; without that fee
 cancelling the predictors' own noise and the rate stops falling as the steps grow. The delay is 4.3 ms of look-ahead
 and resampling plus the frame (`delay_ms()`), and `head()` carries the matching pre-skip. On one second of the
 speech-like test signal at 16 kb/s, libopus decodes the stream at 24.3 dB SNR (20 ms frames) and 21.9 dB (10 ms), and
-FFmpeg's decoder at 25.4 and 22.0; the CELT stream at 32 kb/s gets 21.7. Not yet: hybrid mode (SILK below 8 kHz with
-CELT above), in-band redundancy (LBRR), 40 and 60 ms packets, NLSF interpolation, stereo SILK, discontinuous
-transmission, and libopus's rate-distortion pulse search, so silence still costs about 15 bytes a frame.
+FFmpeg's decoder at 25.4 and 22.0; the CELT stream at 32 kb/s gets 21.7.
+
+Hybrid mode (`OpusMode::Hybrid`) adds the band above 8 kHz: each frame is SILK as above, then CELT from band 17 (8 kHz)
+to full band in the same range coder, without the pitch post-filter, as the decoder expects there. CELT takes a steady
+share (3 kb/s and a quarter of the rate above 16), SILK the rest, and the frame ends after both, so the rate is variable
+(a fixed size starved SILK in voiced frames and cost 3 to 12 dB below 7 kHz); the CELT input is delayed to the SILK
+side's delay, so the two meet in step and the stream has SILK's pre-skip. Mono, like SILK mode (configurations 14 and
+15: full band, 10 or 20 ms). On the speech-like test with hiss added from 10 to 14 kHz, hybrid gives back 73 % of the
+energy above 9 kHz, which SILK alone drops entirely. libopus decodes the hybrid streams at 28.5 dB (20 ms, 24 kb/s) and
+26.3 dB (10 ms), FFmpeg's decoder at 31.9 and 26.4. Not yet: in-band redundancy (LBRR), 40 and 60 ms packets, NLSF
+interpolation, stereo SILK, discontinuous transmission, switching modes mid-stream, and libopus's rate-distortion pulse
+search, so silence still costs about 15 bytes a frame.
 
 ### Voice link
 

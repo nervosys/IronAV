@@ -1,7 +1,7 @@
 //! Writes the Opus encoder's short-frame streams as Ogg files, for decoding by another decoder
 //! (libopus through FFmpeg, say): `IRONAV_OPUS_OUT=dir cargo test -p ironav-engine --test
 //! opus_interop -- --ignored`. Each file is one second of a speech-like signal, which is also
-//! written as `input.wav` to compare against: CELT at four frame lengths, and SILK at two.
+//! written as `input.wav` to compare against: CELT at four frame lengths, SILK and hybrid at two.
 
 use ironav_codec::opus::{opus_head, OpusEncoder, OpusMode};
 use ironav_core::{CodecId, Packet, Rational, StreamInfo, StreamParams};
@@ -45,11 +45,11 @@ fn short_frame_streams_for_another_decoder() {
         }
         m.finish().unwrap();
     }
-    for ms in [10.0, 20.0] {
-        let mut enc = OpusEncoder::new(48_000, 1, 16_000).unwrap().with_mode(OpusMode::Silk).unwrap().with_frame_ms(ms).unwrap();
+    for (mode, name, rate, ms) in [(OpusMode::Silk, "silk", 16_000, 10.0), (OpusMode::Silk, "silk", 16_000, 20.0), (OpusMode::Hybrid, "hybrid", 24_000, 10.0), (OpusMode::Hybrid, "hybrid", 24_000, 20.0)] {
+        let mut enc = OpusEncoder::new(48_000, 1, rate).unwrap().with_mode(mode).unwrap().with_frame_ms(ms).unwrap();
         let n = enc.frame_samples();
         let info = StreamInfo { codec: CodecId::Opus, extradata: enc.head(), bits: None, ..pcm.clone() };
-        let mut m = ironav_formats::create_muxer(&dir.join(format!("voice_silk_{ms}ms.opus")), "ogg").unwrap();
+        let mut m = ironav_formats::create_muxer(&dir.join(format!("voice_{name}_{ms}ms.opus")), "ogg").unwrap();
         m.write_header(&[info]).unwrap();
         let mut buf = vec![0u8; enc.packet_bytes()];
         for (k, f) in input.chunks_exact(n).enumerate() {

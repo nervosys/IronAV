@@ -247,15 +247,16 @@ impl Celt {
     /// Code the frame in `sig` (one slice per channel of `OVERLAP << size` pre-emphasised samples
     /// and the look-ahead) into `rc`. `size` is 0 to 3, for 2.5 to 20 ms. `silent` marks a frame
     /// of digital silence; `intra` codes the band energies without prediction from the previous
-    /// frame.
-    pub fn encode_frame(&mut self, rc: &mut RangeEncoder, sig: &[&[f32]], size: i32, silent: bool, intra: bool, pitch: Option<super::prefilter::PitchParams>) {
+    /// frame. Bands from `start` up are coded: 0 alone, 17 (8 kHz) after SILK in a hybrid frame,
+    /// where there is no post-filter.
+    pub fn encode_frame(&mut self, rc: &mut RangeEncoder, sig: &[&[f32]], size: i32, silent: bool, intra: bool, pitch: Option<super::prefilter::PitchParams>, start: usize) {
         let channels = sig.len();
         let n = OVERLAP << size;
         self.flushed = false;
         {
             let p = &mut self.p;
             p.coded_channels = channels as i32;
-            p.start_band = 0;
+            p.start_band = start;
             p.end_band = END;
             p.framebits = rc.frame_bits();
             p.size = size;
@@ -278,7 +279,7 @@ impl Celt {
             return;
         }
         // the pitch the pre-filter took out, for the decoder's post-filter to put back
-        if consumed + 16 <= self.p.framebits {
+        if start == 0 && consumed + 16 <= self.p.framebits {
             match pitch {
                 Some(pf) => {
                     rc.log(1, 1);
