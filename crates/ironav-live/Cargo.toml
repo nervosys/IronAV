@@ -18,6 +18,10 @@ ironsocketlayer = "0.7.2"
 # cameras and microphones through Media Foundation
 windows = { version = "0.62", features = ["Win32_Media_MediaFoundation", "Win32_System_Com"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# cameras through Video4Linux2's ioctls
+libc = "0.2"
+
 [dev-dependencies]
 # the TLS test issues its own certificates
 ic-drbg = { version = "0.3.2", features = ["std"] }

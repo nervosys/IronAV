@@ -1,5 +1,6 @@
 //! Capture devices: cameras and microphones, as `device://video[/NAME]` and
-//! `device://audio[/NAME]` sources.
+//! `device://audio[/NAME]` sources: Media Foundation on Windows, Video4Linux2 and ALSA (through
+//! `arecord`) on 64-bit Linux.
 //!
 //! A device only gives pictures or samples, so the source writes them as the byte streams the
 //! stream demuxers already read: a camera as Y4M (8-bit 4:2:0, converted from the NV12 or YUY2 the
@@ -11,10 +12,12 @@
 //! drops frames (in low light, say) runs behind the clock by as many.
 
 // the converters wait for the other platforms' backends
-#![cfg_attr(not(windows), allow(dead_code))]
+#![cfg_attr(not(any(windows, all(target_os = "linux", target_pointer_width = "64"))), allow(dead_code))]
 
 #[cfg(windows)]
 mod mf;
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+mod v4l2;
 
 use crate::source::{SourceInfo, ThreadSource};
 use crate::url::SourceUrl;
@@ -45,7 +48,11 @@ pub fn devices() -> Result<Vec<Device>> {
     {
         mf::devices()
     }
-    #[cfg(not(windows))]
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    {
+        v4l2::devices()
+    }
+    #[cfg(not(any(windows, all(target_os = "linux", target_pointer_width = "64"))))]
     {
         Ok(Vec::new())
     }
@@ -72,21 +79,25 @@ pub(crate) fn open(u: &SourceUrl, shown: String) -> Result<ThreadSource> {
 
 /// Starts the device's thread, and waits for it to say whether the device opened.
 fn start(kind: &str, name: Option<String>, wants: VideoWants, tx: SyncSender<std::io::Result<Vec<u8>>>, rx: &Receiver<std::io::Result<Vec<u8>>>) -> Result<()> {
-    #[cfg(windows)]
+    #[cfg(any(windows, all(target_os = "linux", target_pointer_width = "64")))]
     {
+        #[cfg(windows)]
+        use mf::run;
+        #[cfg(not(windows))]
+        use v4l2::run;
         let (ok_tx, ok_rx) = sync_channel(1);
         let kind = kind.to_string();
         std::thread::Builder::new()
             .name("ironav-capture".into())
-            .spawn(move || mf::run(&kind, name.as_deref(), wants, ok_tx, tx))
+            .spawn(move || run(&kind, name.as_deref(), wants, ok_tx, tx))
             .map_err(|e| Error::new(ErrorCode::Internal, format!("could not start capturing: {e}")))?;
         let _ = rx;
         ok_rx.recv().unwrap_or_else(|_| Err(Error::new(ErrorCode::Internal, "the capture thread stopped before the device opened")))
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, all(target_os = "linux", target_pointer_width = "64"))))]
     {
         let _ = (kind, name, wants, tx, rx);
-        Err(Error::new(ErrorCode::HardwareUnavailable, "capture devices are not supported on this platform yet").hint("Windows is supported; Linux (V4L2) and macOS are planned"))
+        Err(Error::new(ErrorCode::HardwareUnavailable, "capture devices are not supported on this platform yet").hint("Windows and 64-bit Linux are supported; macOS is planned"))
     }
 }
 
