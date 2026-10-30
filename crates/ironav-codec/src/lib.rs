@@ -20,6 +20,7 @@ mod pixconv;
 mod rawvideo;
 mod resample;
 mod scale;
+pub mod voice;
 
 pub use filters::{build_filter, FilterSpec, ParamSpec, FILTERS};
 pub use pixconv::{convert as convert_pixel_format, Matrix};

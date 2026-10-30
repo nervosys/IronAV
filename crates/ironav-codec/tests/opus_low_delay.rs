@@ -1,6 +1,8 @@
-//! Opus for a voice link: short frames coded one at a time into the caller's buffer.
+//! A voice link's pieces: Opus in short frames coded one at a time into the caller's buffer, and
+//! the streaming resampler.
 
 use ironav_codec::opus::{opus_head, OpusDecoder, OpusEncoder};
+use ironav_codec::voice::StreamResampler;
 use ironav_core::{Decoder, Frame, Packet, StreamParams};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -131,4 +133,36 @@ fn coding_a_frame_allocates_nothing() {
             assert_eq!(ALLOCS.with(Cell::get), 0, "{ms} ms, {channels} channels");
         }
     }
+}
+
+#[test]
+fn a_16_khz_link_allocates_nothing_per_frame() {
+    // 16 kHz 16-bit in, to 48 kHz, to 10 ms Opus frames, as a phone would send them
+    let input: Vec<i16> = voice(48_000).iter().step_by(3).map(|v| (v * 32767.0) as i16).collect();
+    let mut up = StreamResampler::new(16_000, 48_000, 1, 160).unwrap();
+    let mut enc = OpusEncoder::new(48_000, 1, 24_000).unwrap().with_frame_ms(10.0).unwrap();
+    let mut wide = vec![0i16; 4 * 480];
+    let mut pending = Vec::with_capacity(2 * 480);
+    let mut packet = vec![0u8; enc.packet_bytes()];
+    let mut packets = 0;
+    for (k, f) in input.chunks_exact(160).enumerate() {
+        if k == 2 {
+            ALLOCS.with(|a| a.set(0));
+            COUNTING.with(|c| c.set(true));
+        }
+        up.push_i16(f).unwrap();
+        let n = up.pull_i16(&mut wide);
+        pending.extend_from_slice(&wide[..n]);
+        while pending.len() >= 480 {
+            enc.encode_frame_into_i16(&pending[..480], &mut packet).unwrap();
+            pending.drain(..480);
+            packets += 1;
+        }
+    }
+    COUNTING.with(|c| c.set(false));
+    assert_eq!(ALLOCS.with(Cell::get), 0);
+    assert!(packets >= 95, "{packets}");
+    // the delay these two add
+    eprintln!("resampler {} ms + encoder {} ms", up.delay_ms(), enc.delay_ms());
+    assert!(up.delay_ms() + enc.delay_ms() <= 13.5);
 }

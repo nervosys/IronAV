@@ -136,8 +136,17 @@ impl OpusEncoder {
     /// Allocates nothing. It cannot follow audio passed to [`Encoder::encode`] that has not made a
     /// whole frame.
     pub fn encode_frame_into(&mut self, pcm: &[f32], out: &mut [u8]) -> Result<usize> {
-        if pcm.len() != self.frame * self.channels {
-            return Err(Error::invalid_arg(format!("a frame is {} samples ({} per channel), not {}", self.frame * self.channels, self.frame, pcm.len())));
+        self.encode_with(pcm.len(), |i| pcm[i], out)
+    }
+
+    /// [`encode_frame_into`](Self::encode_frame_into) for 16-bit samples.
+    pub fn encode_frame_into_i16(&mut self, pcm: &[i16], out: &mut [u8]) -> Result<usize> {
+        self.encode_with(pcm.len(), |i| pcm[i] as f32 / 32768.0, out)
+    }
+
+    fn encode_with(&mut self, len: usize, get: impl Fn(usize) -> f32, out: &mut [u8]) -> Result<usize> {
+        if len != self.frame * self.channels {
+            return Err(Error::invalid_arg(format!("a frame is {} samples ({} per channel), not {len}", self.frame * self.channels, self.frame)));
         }
         if out.len() < self.bytes {
             return Err(Error::invalid_arg(format!("the packet needs {} bytes, the buffer has {}", self.bytes, out.len())));
@@ -147,7 +156,7 @@ impl OpusEncoder {
         }
         for i in 0..self.frame {
             for c in 0..self.channels {
-                self.push(c, pcm[i * self.channels + c]);
+                self.push(c, get(i * self.channels + c));
             }
         }
         self.input += self.frame as u64;

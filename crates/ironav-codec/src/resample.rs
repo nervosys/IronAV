@@ -48,8 +48,11 @@ struct State {
     started: bool,
 }
 
-impl State {
-    fn new(in_rate: u32, out_rate: u32, channels: usize) -> Self {
+/// The filter for a conversion: `(l, m, half, table)`, where `l / m` is the output samples per
+/// input sample in lowest terms, `half` the input samples on each side of an output's instant,
+/// and `table` the `l` rows of `2 * half` coefficients, one row per fractional position.
+pub(crate) fn design(in_rate: u32, out_rate: u32) -> (usize, usize, usize, Vec<f64>) {
+    {
         let g = gcd(in_rate as u64, out_rate as u64);
         let (l, m) = ((out_rate as u64 / g) as usize, (in_rate as u64 / g) as usize);
         // the cut-off, as a fraction of the input's Nyquist frequency
@@ -74,7 +77,14 @@ impl State {
                 *c /= sum;
             }
         }
-        Self { channels, l, m, taps, table, hist: vec![Vec::new(); channels], base: -(half as i64 - 1), next: 0, received: 0, in_rate, started: false }
+        (l, m, half, table)
+    }
+}
+
+impl State {
+    fn new(in_rate: u32, out_rate: u32, channels: usize) -> Self {
+        let (l, m, half, table) = design(in_rate, out_rate);
+        Self { channels, l, m, taps: 2 * half, table, hist: vec![Vec::new(); channels], base: -(half as i64 - 1), next: 0, received: 0, in_rate, started: false }
     }
 
     fn half(&self) -> i64 {

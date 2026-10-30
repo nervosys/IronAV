@@ -486,6 +486,15 @@ the 2.5 ms look-ahead, so 12.5 ms at 10 ms frames and 7.5 ms at 5 ms. On one sec
 the pitch pre-filter it lacks matters most. `cargo test -p ironav-engine --test opus_interop -- --ignored` with
 `IRONAV_OPUS_OUT=dir` writes the streams for such a check.
 
+### Voice link
+
+`ironav_codec::voice` holds the pieces of a live voice link (a push-to-talk intercom, say), each working on one frame
+per call with buffers sized when it is made: no threads, no I/O, no allocation per frame, and each says what delay it
+adds. `StreamResampler::new(in_rate, out_rate, channels, max_push)` converts as the samples come (`push`/`pull`, in
+`f32` or `i16`, then `flush` at the end), with the `resample` filter's windowed sinc: 1 ms of look-ahead at 16 to 48 kHz
+and back, or 16 to 24, and no offset to correct. A 16 kHz 16-bit input taken up to 48 kHz and coded as 10 ms Opus
+frames (`encode_frame_into_i16`) adds 13.5 ms in all, and a counting allocator checks that nothing is allocated per frame.
+
 ## Vorbis
 
 Vorbis I is decoded (floor type 1; residue types 0, 1 and 2; any channel count up to 8 in the standard layouts, reordered to
