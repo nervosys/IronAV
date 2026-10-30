@@ -13,6 +13,8 @@
 use ironav_core::{CodecId, Demuxer, Error, ErrorCode, Packet, PixelFormat, Rational, Result, StreamInfo, StreamParams};
 use std::io::{Read, Seek, SeekFrom};
 
+pub(crate) mod live;
+
 /// Sanity cap on the size of the index we are willing to hold in memory.
 const MAX_MOOV: u64 = 1 << 30;
 
@@ -240,7 +242,7 @@ impl<R: Read + Seek + Send> Mp4Demuxer<R> {
                 r.seek(SeekFrom::Start(body_at))?;
                 let mut body = vec![0u8; body_len as usize];
                 r.read_exact(&mut body)?;
-                parse_moof(&body, start, &ids, &defaults, &mut next_dts, &mut samples)?;
+                parse_moof(&body, start, &ids, &defaults, &mut next_dts, &mut samples, usize::MAX)?;
             }
             // The index of a fragmented file is empty, so frame rate and length come from the fragments.
             for (i, t) in tracks.iter_mut().enumerate() {
@@ -279,7 +281,12 @@ fn be64(d: &[u8], at: usize) -> Result<u64> {
 
 /// Add the samples of one `moof` to `samples`. `defaults` holds each track's `trex` duration, size
 /// and flags; `next_dts` is where each track's next sample starts when a fragment has no `tfdt`.
-fn parse_moof(moof: &[u8], moof_start: u64, ids: &[u32], defaults: &[[u32; 3]], next_dts: &mut [i64], samples: &mut Vec<Sample>) -> Result<()> {
+/// At most `limit` samples are added.
+fn parse_moof(moof: &[u8], moof_start: u64, ids: &[u32], defaults: &[[u32; 3]], next_dts: &mut [i64], samples: &mut Vec<Sample>, limit: usize) -> Result<()> {
+    let first = samples.len();
+    // a traf with neither a base offset nor default-base-is-moof continues where the previous
+    // traf's data ended (ISO/IEC 14496-12 8.8.7.1); the first starts at the moof
+    let mut prev_end = moof_start;
     for b in boxes(moof) {
         let (kind, traf) = b?;
         if &kind != b"traf" {
@@ -289,7 +296,7 @@ fn parse_moof(moof: &[u8], moof_start: u64, ids: &[u32], defaults: &[[u32; 3]], 
         let flags = be32(tfhd, 0)? & 0xFF_FFFF;
         let Some(ti) = ids.iter().position(|&id| id == be32(tfhd, 4).unwrap_or(0)) else { continue };
         let mut at = 8;
-        let mut base = moof_start;
+        let mut base = if flags & 0x2_0000 != 0 { moof_start } else { prev_end };
         if flags & 1 != 0 {
             base = be64(tfhd, at)?;
             at += 8;
@@ -318,9 +325,12 @@ fn parse_moof(moof: &[u8], moof_start: u64, ids: &[u32], defaults: &[[u32; 3]], 
             if count > trun.len() {
                 return Err(corrupt("a fragment run claims more samples than it holds"));
             }
+            if count > limit.saturating_sub(samples.len() - first) {
+                return Err(corrupt("fragments describe more samples than IronAV holds at once"));
+            }
             let mut at = 8;
             if flags & 1 != 0 {
-                cursor = base.wrapping_add_signed(be32(trun, at)? as i32 as i64);
+                cursor = base.checked_add_signed(be32(trun, at)? as i32 as i64).ok_or_else(|| corrupt("a fragment's data offset is out of range"))?;
                 at += 4;
             }
             let first_flags = if flags & 4 != 0 {
@@ -347,13 +357,18 @@ fn parse_moof(moof: &[u8], moof_start: u64, ids: &[u32], defaults: &[[u32; 3]], 
                 };
                 let cts = field(flags & 0x800 != 0, 0)? as i32; // version 0 offsets are unsigned but never reach 2^31
                 samples.push(Sample { stream: ti as u16, sync: sample_flags & 0x1_0000 == 0, offset: cursor, size, dts: next_dts[ti], cts_offset: cts, duration });
-                cursor += size as u64;
-                next_dts[ti] += duration as i64;
+                cursor = cursor.checked_add(size as u64).ok_or_else(|| corrupt("a fragment's data runs past the largest offset"))?;
+                next_dts[ti] = next_dts[ti].saturating_add(duration as i64);
             }
         }
+        prev_end = cursor;
     }
     Ok(())
 }
+
+/// The most samples one track's index may list (a fixed-size `stsz` can claim billions in a few
+/// bytes); 2^27 is a month of 48 kHz AAC packets or 50 days of 30 fps video.
+const MAX_TRACK_SAMPLES: usize = 1 << 27;
 
 fn parse_trak(trak: &[u8], index: usize, samples: &mut Vec<Sample>) -> Result<Option<TrackInfo>> {
     let mdia = need(trak, b"mdia", "trak")?;
@@ -385,6 +400,9 @@ fn parse_trak(trak: &[u8], index: usize, samples: &mut Vec<Sample>) -> Result<Op
     let size_rows = stsz.get(12..).unwrap_or(&[]);
     if fixed == 0 && count.checked_mul(4).is_none_or(|n| n > size_rows.len()) {
         return Err(corrupt("stsz claims more samples than it holds"));
+    }
+    if count > MAX_TRACK_SAMPLES {
+        return Err(corrupt(format!("a track lists {count} samples, more than IronAV indexes")));
     }
     let size_of = |i: usize| -> u32 { if fixed != 0 { fixed } else { u32::from_be_bytes(size_rows[i * 4..i * 4 + 4].try_into().unwrap()) } };
 
@@ -785,7 +803,7 @@ impl<R: Read + Seek + Send> Demuxer for Mp4Demuxer<R> {
                 raw
             };
             self.seen[st] += 1;
-            return Ok(Some(Packet { stream: st, pts: s.dts + s.cts_offset as i64, duration: s.duration as i64, data }));
+            return Ok(Some(Packet { stream: st, pts: s.dts.saturating_add(s.cts_offset as i64), duration: s.duration as i64, data }));
         }
         Ok(None)
     }

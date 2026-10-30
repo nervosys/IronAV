@@ -72,10 +72,14 @@ Checked against EBU Tech 3341/3342 test signals (a -23 dBFS stereo sine reads -2
 The same analyzers run on media as it arrives. A source is a path, `path?follow` (a file that is still growing),
 `path?pace=realtime` (a file played as if live), `-` or `pipe:NAME`, `tcp://host:port` (connect),
 `tcp://:port` (listen, on loopback unless an address is given), or `udp://:port` / `udp://group:port` (multicast).
-Readable as it arrives: MPEG-TS, Matroska/WebM, Y4M, WAV, ADTS AAC and raw H.264/HEVC (Annex B, which carries no
-frame rate: give `fps`, 25 by default). Matroska is read the way a browser's MediaRecorder, OBS or `ffmpeg -f matroska -`
+Readable as it arrives: MPEG-TS, Matroska/WebM, fragmented MP4 (CMAF), Y4M, WAV, ADTS AAC and raw H.264/HEVC (Annex B,
+which carries no frame rate: give `fps`, 25 by default). Matroska is read the way a browser's MediaRecorder, OBS or `ffmpeg -f matroska -`
 sends it: Segment and Clusters of unknown size, no Cues. The packets are the ones the file reader gives, whatever pieces the
 bytes arrive in. So `ironav watch tcp://:9000` can follow a webcam that a web page streams as WebM.
+Fragmented MP4 is read the same way: an initialization segment (`moov` with `mvex`), then `moof`+`mdat` pairs, as written by
+LL-HLS and DASH packagers, Safari's MediaRecorder and `ffmpeg -movflags frag_keyframe+empty_moov`. Its packets also match
+the file reader's. An MP4 without fragments cannot be read as it arrives (its index is at the end, or describes data not yet
+sent) and is refused.
 
 ```sh
 ironav watch udp://:5000 --analyzers scene,black --level events | head -n 20
