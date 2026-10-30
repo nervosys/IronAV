@@ -494,6 +494,12 @@ adds. `StreamResampler::new(in_rate, out_rate, channels, max_push)` converts as 
 `f32` or `i16`, then `flush` at the end), with the `resample` filter's windowed sinc: 1 ms of look-ahead at 16 to 48 kHz
 and back, or 16 to 24, and no offset to correct. A 16 kHz 16-bit input taken up to 48 kHz and coded as 10 ms Opus
 frames (`encode_frame_into_i16`) adds 13.5 ms in all, and a counting allocator checks that nothing is allocated per frame.
+`Playout::new(frame_ms, target_ms, max_ms, max_bytes)` is the receiving side's jitter buffer: `insert(seq, packet)` as
+packets arrive (wrapping `u32` sequence numbers; late ones and duplicates are counted and dropped), and `pop()` once per
+frame period, which gives the next packet in order, `Missing` for a gap that later packets have passed (conceal it),
+`Underrun` when it runs dry (it then fills to the target again before playing), or `Buffering`. After a stall and a late
+burst that leaves more than `max_ms` waiting, the oldest packets are dropped down to the target, so the delay comes back
+down. `depth_ms()` is the delay it adds at that moment, and `stats()` counts what was played, missing, late and dropped.
 
 ## Vorbis
 

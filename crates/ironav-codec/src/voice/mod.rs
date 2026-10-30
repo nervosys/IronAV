@@ -3,9 +3,12 @@
 //! much delay it adds, so a caller can add up its budget.
 //!
 //! - [`StreamResampler`]: rate conversion (16 kHz to and from 24 and 48 kHz, or any other pair).
+//! - [`Playout`]: a jitter buffer that gives one packet per frame period, in order.
 //!
 //! The Opus encoder's frame-at-a-time path is `crate::opus::OpusEncoder::encode_frame_into`.
 
+mod playout;
 mod resample;
 
+pub use playout::{Playout, PlayoutStats, Pop};
 pub use resample::StreamResampler;
