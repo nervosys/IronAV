@@ -378,8 +378,12 @@ The demuxer takes H.264 (single, STAP-A, FU-A), HEVC (single, AP, FU), AAC (RFC 
 up on drops the damaged picture, and the next one when the lost packet may have begun it. Tracks are aligned by
 RTP-Info's `rtptime`; RTCP is passed through but not yet used, so a server without RTP-Info leaves each track counting
 from its first packet. Checked against FFmpeg's RTP muxer: captured, played through a stand-in camera, recorded, and
-decoded by FFmpeg without an error. Still to do in M4: RTP over UDP (the same framing, with the reorder buffer earning
-its keep), RTCP sender reports for wall-clock alignment, and HLS over plain HTTP.
+decoded by FFmpeg without an error. RTP over UDP (`?transport=udp`) uses an even/odd local port pair per track, takes
+datagrams only from the server's address (or a `source=` it names that the allow-list permits), frames them the same
+way, and sends an RTCP receiver report every 5 s; the order between tracks is not kept, and the demuxer does not need
+it. RTCP sender reports are not used for alignment: nearly every server sends RTP-Info, and rebasing a track once its
+packets have gone out would put a jump in recordings, so a server without RTP-Info leaves each track counting from its
+first packet. Still to do in M4: HLS over plain HTTP.
 
 M1 comes first because it needs no new input path. It turns the existing decoders into an understanding tool for
 files at once, and it fixes the event model, analyzer trait and MCP plumbing before anything goes live.

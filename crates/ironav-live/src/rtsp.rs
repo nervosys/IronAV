@@ -1,8 +1,10 @@
 //! An RTSP 1.0 client (RFC 2326) that plays a camera's or server's stream and hands on its RTP.
 //!
 //! `open` makes the connection through the address allow-list, sends OPTIONS, DESCRIBE, a SETUP
-//! for each track IronAV can read (RTP interleaved on the RTSP connection, so no UDP ports are
-//! needed and nothing arrives out of order), and PLAY. It answers Basic and Digest challenges with
+//! for each track IronAV can read, and PLAY. RTP comes interleaved on the RTSP connection by
+//! default, so no UDP ports are needed and nothing arrives out of order; with `?transport=udp` it
+//! comes over UDP to a pair of local ports per track instead, taken only from the server's address
+//! (so another host cannot inject packets), with an RTCP receiver report every few seconds. It answers Basic and Digest challenges with
 //! the URL's credentials and follows redirects, each one checked against the allow-list again.
 //! The bytes it gives are the RTP stream framing `ironav_formats::rtp` reads: first a description
 //! (the SDP, each track's channel, and the RTP-Info times), then each interleaved RTP and RTCP
@@ -17,7 +19,7 @@ use ironav_core::{Error, ErrorCode, Result};
 use ironav_formats::rtp::{description_frame, Description, Sdp, TrackSetup};
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
-use std::net::TcpStream;
+use std::net::{IpAddr, SocketAddr, TcpStream, UdpSocket};
 use std::time::{Duration, Instant};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -30,6 +32,10 @@ const MAX_OUT: usize = 64 << 20;
 const MAX_REDIRECTS: usize = 5;
 /// Tracks set up at most, which keeps every interleaved channel below the description's.
 const MAX_TRACKS: usize = 32;
+/// How often an RTCP receiver report goes to a server sending over UDP.
+const REPORT_EVERY: Duration = Duration::from_secs(5);
+/// How long a read over UDP sleeps between looks at its sockets.
+const UDP_POLL: Duration = Duration::from_millis(2);
 const USER_AGENT: &str = concat!("IronAV/", env!("CARGO_PKG_VERSION"));
 
 /// Where to connect, the URL to send (without credentials), and the credentials.
@@ -215,11 +221,47 @@ pub(crate) struct RtspSource {
     last_sent: Instant,
     get_parameter: bool,
     ended: bool,
+    /// Ask for RTP over UDP, and the sockets it arrives on.
+    want_udp: bool,
+    udp: Vec<UdpTrack>,
+    last_report: Instant,
+}
+
+/// One track's RTP and RTCP sockets when RTP comes over UDP.
+struct UdpTrack {
+    rtp: UdpSocket,
+    rtcp: UdpSocket,
+    channel: u8,
+    /// The addresses datagrams are taken from, and where receiver reports go.
+    from: Vec<IpAddr>,
+    report_to: Option<SocketAddr>,
+}
+
+/// An even local port for RTP and the odd one above it for RTCP, as RFC 3550 §11 asks.
+fn bind_pair(ip: IpAddr) -> Result<(UdpSocket, UdpSocket)> {
+    for _ in 0..32 {
+        let rtp = UdpSocket::bind((ip, 0))?;
+        let port = rtp.local_addr()?.port();
+        if port % 2 != 0 || port == u16::MAX {
+            continue;
+        }
+        if let Ok(rtcp) = UdpSocket::bind((ip, port + 1)) {
+            rtp.set_nonblocking(true)?;
+            rtcp.set_nonblocking(true)?;
+            return Ok((rtp, rtcp));
+        }
+    }
+    Err(Error::new(ErrorCode::Io, "could not find a free pair of UDP ports for RTP"))
 }
 
 impl RtspSource {
     pub(crate) fn open(u: &SourceUrl, shown: String) -> Result<RtspSource> {
         let allow = Allow::from_env()?;
+        let want_udp = match u.option("transport").map(str::to_ascii_lowercase).as_deref() {
+            None | Some("tcp") => false,
+            Some("udp") => true,
+            Some(other) => return Err(Error::invalid_arg(format!("transport must be tcp or udp, got '{other}'"))),
+        };
         let mut target = parse_target(&u.target, None)?;
         for _ in 0..=MAX_REDIRECTS {
             let conn = net::connect(&target.host, target.port, CONNECT_TIMEOUT, &allow, &shown)?;
@@ -240,6 +282,9 @@ impl RtspSource {
                 last_sent: Instant::now(),
                 get_parameter: false,
                 ended: false,
+                want_udp,
+                udp: Vec::new(),
+                last_report: Instant::now(),
             };
             match s.start(&target.url, &shown)? {
                 None => return Ok(s),
@@ -284,10 +329,18 @@ impl RtspSource {
             }
             let track_url = resolve(&base, m.control.as_deref());
             let ch = 2 * tracks.len() as u8;
-            let transport = format!("RTP/AVP/TCP;unicast;interleaved={}-{}", ch, ch + 1);
+            let pair = if self.want_udp { Some(bind_pair(self.conn.local_addr()?.ip())?) } else { None };
+            let transport = match &pair {
+                Some((rtp, rtcp)) => format!("RTP/AVP;unicast;client_port={}-{}", rtp.local_addr()?.port(), rtcp.local_addr()?.port()),
+                None => format!("RTP/AVP/TCP;unicast;interleaved={}-{}", ch, ch + 1),
+            };
             let r = self.request("SETUP", &track_url, &[("Transport", &transport)], shown)?;
             if r.status == 461 {
-                return Err(Error::new(ErrorCode::UnsupportedFormat, format!("{shown} does not send RTP over the RTSP connection (interleaved TCP)")).hint("RTP over UDP is not supported yet"));
+                return Err(if self.want_udp {
+                    Error::new(ErrorCode::UnsupportedFormat, format!("{shown} does not send RTP over UDP")).hint("leave out ?transport=udp to have RTP sent on the RTSP connection")
+                } else {
+                    Error::new(ErrorCode::UnsupportedFormat, format!("{shown} does not send RTP over the RTSP connection (interleaved TCP)")).hint("add ?transport=udp to have it sent over UDP")
+                });
             }
             if r.status != 200 {
                 return Err(status_error(&r, "SETUP", shown));
@@ -299,8 +352,23 @@ impl RtspSource {
                     self.keepalive = Duration::from_secs((t / 2).clamp(1, 300));
                 }
             }
+            if let Some((rtp, rtcp)) = pair {
+                // datagrams are taken only from the server, or a source it names that the allow-list permits
+                let reply = r.header("transport").unwrap_or("");
+                let peer = self.conn.peer_addr()?;
+                let mut from = vec![peer.ip()];
+                if let Some(ip) = param(reply, "source").and_then(|s| s.parse::<IpAddr>().ok()).filter(|ip| Allow::from_env().is_ok_and(|a| a.permits(*ip))) {
+                    from.push(ip);
+                }
+                let report_to = param(reply, "server_port").and_then(|p| {
+                    let mut ports = p.split('-').map(|x| x.trim().parse::<u16>().ok());
+                    let first = ports.next()??;
+                    Some(SocketAddr::new(peer.ip(), ports.next().flatten().unwrap_or(first.wrapping_add(1))))
+                });
+                self.udp.push(UdpTrack { rtp, rtcp, channel: ch, from, report_to });
+            }
             // the server may choose other channels
-            let channel = r.header("transport").and_then(|t| param(t, "interleaved")).and_then(|c| c.split('-').next()?.trim().parse::<u8>().ok()).unwrap_or(ch);
+            let channel = if self.want_udp { ch } else { r.header("transport").and_then(|t| param(t, "interleaved")).and_then(|c| c.split('-').next()?.trim().parse::<u8>().ok()).unwrap_or(ch) };
             if channel >= 254 || tracks.iter().any(|t: &TrackSetup| t.channel.abs_diff(channel) < 2) {
                 return Err(Error::new(ErrorCode::Io, format!("{shown} chose interleaved channel {channel}, which another track or the description uses")));
             }
@@ -506,7 +574,10 @@ impl Source for RtspSource {
     }
 
     fn read(&mut self, buf: &mut [u8], wait: Duration) -> Result<Chunk> {
-        if self.out.is_empty() && !self.ended {
+        if !self.udp.is_empty() && self.out.is_empty() && !self.ended {
+            self.read_udp(wait)?;
+        }
+        if self.out.is_empty() && !self.ended && self.udp.is_empty() {
             if self.last_sent.elapsed() >= self.keepalive {
                 // the reply is taken out of the stream like any other
                 let method = if self.get_parameter { "GET_PARAMETER" } else { "OPTIONS" };
@@ -531,6 +602,63 @@ impl Source for RtspSource {
             *d = s;
         }
         Ok(Chunk::Data(n))
+    }
+}
+
+impl RtspSource {
+    /// Gathers datagrams from the tracks' sockets (and replies from the RTSP connection) for at
+    /// most `wait`, framed as interleaved RTP would be.
+    fn read_udp(&mut self, wait: Duration) -> Result<()> {
+        let deadline = Instant::now() + wait;
+        let mut tmp = vec![0u8; 65536];
+        loop {
+            if self.last_sent.elapsed() >= self.keepalive {
+                let method = if self.get_parameter { "GET_PARAMETER" } else { "OPTIONS" };
+                let control = self.control.clone();
+                self.send(method, &control, &[])?;
+            }
+            if self.last_report.elapsed() >= REPORT_EVERY {
+                self.last_report = Instant::now();
+                // an empty receiver report from a fixed SSRC: enough to show the server we are here
+                let rr = [0x80, 201, 0, 1, 0x49, 0x72, 0x41, 0x56];
+                for t in &self.udp {
+                    if let Some(to) = t.report_to {
+                        let _ = t.rtcp.send_to(&rr, to);
+                    }
+                }
+            }
+            for t in &self.udp {
+                for (sock, channel) in [(&t.rtp, t.channel), (&t.rtcp, t.channel + 1)] {
+                    loop {
+                        match sock.recv_from(&mut tmp) {
+                            Ok((n, from)) if t.from.contains(&from.ip()) && n <= u16::MAX as usize => {
+                                self.out.extend([b'$', channel]);
+                                self.out.extend((n as u16).to_be_bytes());
+                                self.out.extend(&tmp[..n]);
+                            }
+                            Ok(_) => {} // from elsewhere: not ours to read
+                            Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                            Err(e) if matches!(e.kind(), ErrorKind::ConnectionReset | ErrorKind::Interrupted) => {}
+                            Err(e) => return Err(e.into()),
+                        }
+                    }
+                }
+            }
+            // replies to keepalives, and the end of the connection
+            self.ended = !self.fill(Duration::from_millis(1))?;
+            while let Some(m) = self.message()? {
+                if let Message::Frame(f) = m {
+                    self.out.extend(f);
+                }
+            }
+            if self.out.len() > MAX_OUT {
+                return Err(Error::new(ErrorCode::Io, format!("{} sent more than {} MiB that was not read", self.info.url, MAX_OUT >> 20)));
+            }
+            if !self.out.is_empty() || self.ended || Instant::now() >= deadline {
+                return Ok(());
+            }
+            std::thread::sleep(UDP_POLL);
+        }
     }
 }
 
@@ -610,6 +738,8 @@ mod tests {
         c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         let mut buf = Vec::new();
         let mut authorized = false;
+        let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut client_ports: Vec<u16> = Vec::new();
         loop {
             let mut tmp = [0u8; 4096];
             let n = match c.read(&mut tmp) {
@@ -641,12 +771,28 @@ mod tests {
                     "DESCRIBE" => write!(c, "RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\nContent-Base: rtsp://127.0.0.1:{port}/live/\r\nContent-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{sdp}", sdp.len()).unwrap(),
                     "SETUP" => {
                         let t = req.lines().find_map(|l| l.strip_prefix("Transport: ")).unwrap().to_string();
-                        write!(c, "RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\nSession: 12345678;timeout=2\r\nTransport: {t}\r\n\r\n").unwrap();
+                        let reply = match param(&t, "client_port") {
+                            Some(p) => {
+                                client_ports.push(p.split('-').next().unwrap().parse::<u16>().unwrap());
+                                format!("{t};server_port={}-{}", udp.local_addr().unwrap().port(), udp.local_addr().unwrap().port() + 1)
+                            }
+                            None => t,
+                        };
+                        write!(c, "RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\nSession: 12345678;timeout=2\r\nTransport: {reply}\r\n\r\n").unwrap();
                     }
                     "PLAY" => {
                         write!(c, "RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\nSession: 12345678\r\nRTP-Info: url=rtsp://127.0.0.1:{port}/live/streamid=0;seq=1;rtptime={},url=rtsp://127.0.0.1:{port}/live/streamid=1;seq=1;rtptime={}\r\n\r\n", rtptimes[0], rtptimes[1]).unwrap();
                         for (k, f) in frames.iter().enumerate() {
-                            c.write_all(f).unwrap();
+                            if client_ports.is_empty() {
+                                c.write_all(f).unwrap();
+                            } else {
+                                // RTP to the track's port, RTCP to the one above
+                                let port = client_ports[f[1] as usize / 2] + (f[1] % 2) as u16;
+                                udp.send_to(&f[4..], ("127.0.0.1", port)).unwrap();
+                                if k % 8 == 0 {
+                                    std::thread::sleep(Duration::from_millis(1));
+                                }
+                            }
                             if k == frames.len() / 2 {
                                 // a reply in the middle of the media, as to a keepalive
                                 c.write_all(b"RTSP/1.0 200 OK\r\nCSeq: 99\r\nContent-Length: 2\r\n\r\nok").unwrap();
@@ -664,15 +810,24 @@ mod tests {
 
     #[test]
     fn plays_a_camera_with_digest_credentials() {
+        plays_a_camera("");
+    }
+
+    #[test]
+    fn plays_a_camera_over_udp() {
+        plays_a_camera("?transport=udp");
+    }
+
+    fn plays_a_camera(options: &str) {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = l.local_addr().unwrap().port();
         let (tx, rx) = mpsc::channel();
         let cam = std::thread::spawn(move || camera(l, tx));
-        let url = format!("rtsp://admin:s3cret@127.0.0.1:{port}/live");
+        let url = format!("rtsp://admin:s3cret@127.0.0.1:{port}/live{options}");
         let u = SourceUrl::parse(&url).unwrap();
         let shown = crate::url::redact(&url);
         let mut s = RtspSource::open(&u, shown.clone()).unwrap();
-        assert_eq!(s.info().url, format!("rtsp://admin:***@127.0.0.1:{port}/live"));
+        assert_eq!(s.info().url, format!("rtsp://admin:***@127.0.0.1:{port}/live{options}"));
         let (_, _, frames) = fixture();
         let mut got = Vec::new();
         let mut buf = vec![0u8; 3000];
@@ -690,7 +845,27 @@ mod tests {
         let n = 4 + u16::from_be_bytes([got[2], got[3]]) as usize;
         let desc: Description = serde_json::from_slice(&got[4..n]).unwrap();
         assert_eq!(desc.tracks.iter().map(|t| (t.media, t.channel, t.seq)).collect::<Vec<_>>(), [(0, 0, Some(1)), (1, 2, Some(1))]);
-        assert!(got[n..] == frames.concat()[..], "the frames pass through untouched and the reply is taken out");
+        // each track's frames in order (over UDP the tracks' sockets are read in turn, so the order
+        // between tracks is not kept)
+        let by_channel = |frames: &mut dyn Iterator<Item = Vec<u8>>| {
+            let mut m: std::collections::BTreeMap<u8, Vec<Vec<u8>>> = Default::default();
+            for f in frames {
+                m.entry(f[1]).or_default().push(f);
+            }
+            m
+        };
+        let mut rest = &got[n..];
+        let mut seen = Vec::new();
+        while rest.len() >= 4 {
+            let len = 4 + u16::from_be_bytes([rest[2], rest[3]]) as usize;
+            seen.push(rest[..len].to_vec());
+            rest = &rest[len..];
+        }
+        assert!(rest.is_empty());
+        if options.is_empty() {
+            assert!(seen.concat() == frames.concat(), "the frames pass through untouched and the reply is taken out");
+        }
+        assert!(by_channel(&mut seen.into_iter()) == by_channel(&mut frames.clone().into_iter()), "every track's frames, in order");
         drop(s);
         cam.join().unwrap();
         let reqs: Vec<String> = rx.try_iter().collect();
@@ -699,6 +874,7 @@ mod tests {
         assert!(methods.contains(&"PLAY") && methods.last() == Some(&"TEARDOWN"), "{methods:?}");
         assert!(methods.contains(&"GET_PARAMETER"), "a keepalive within the 2 s session timeout: {methods:?}");
         assert!(reqs.iter().any(|r| r.starts_with("SETUP rtsp://127.0.0.1:") && r.contains("/live/streamid=1 ")));
+        assert_eq!(reqs.iter().any(|r| r.contains("client_port=")), !options.is_empty());
         // the password never goes over the wire, and Basic is not used when Digest is offered
         assert!(reqs.iter().all(|r| !r.contains("s3cret") && !r.contains("Basic")));
     }

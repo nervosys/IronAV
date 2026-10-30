@@ -11,8 +11,9 @@ use std::collections::BTreeMap;
 /// - `pace=realtime`: read a file no faster than it plays, as if it were live;
 /// - `follow`: keep reading a file as it grows;
 /// - `idle`: with `follow`, end after this many seconds without new bytes;
-/// - `listen`: wait for a TCP connection on the given address instead of making one.
-pub const OPTIONS: [&str; 6] = ["format", "fps", "pace", "follow", "idle", "listen"];
+/// - `listen`: wait for a TCP connection on the given address instead of making one;
+/// - `transport=udp`: have an RTSP server send RTP over UDP rather than on its connection.
+pub const OPTIONS: [&str; 7] = ["format", "fps", "pace", "follow", "idle", "listen", "transport"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SourceUrl {

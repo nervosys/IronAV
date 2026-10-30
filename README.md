@@ -72,7 +72,8 @@ Checked against EBU Tech 3341/3342 test signals (a -23 dBFS stereo sine reads -2
 The same analyzers run on media as it arrives. A source is a path, `path?follow` (a file that is still growing),
 `path?pace=realtime` (a file played as if live), `-` or `pipe:NAME`, `tcp://host:port` (connect),
 `tcp://:port` (listen, on loopback unless an address is given), or `udp://:port` / `udp://group:port` (multicast).
-`rtsp://[user:password@]host[:port]/path` plays a camera or RTSP server: RTP interleaved on the RTSP connection,
+`rtsp://[user:password@]host[:port]/path` plays a camera or RTSP server: RTP interleaved on the RTSP connection
+(or over UDP with `?transport=udp`, taken only from the server's address),
 Basic or Digest credentials, keepalives and TEARDOWN, with H.264, HEVC, AAC, Opus, G.711 and L16 tracks (others are
 skipped). The password never appears in output, and with Digest it is never sent.
 Outbound connections go only to loopback, private and link-local addresses (not the cloud metadata endpoints
