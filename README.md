@@ -159,6 +159,13 @@ one running (`stop_recording: true`), or both at once to go on in a new file; a 
 the next video keyframe, with its timestamps from zero. FFmpeg plays the playlists: a 12 s H.264/AAC stream recorded as three segments gives back all 300 pictures and 564
 audio frames, with no decode errors.
 
+A session can also encode its video again (`transcode`, or `--transcode OUT` for `watch`): the first video stream is
+decoded, scaled to `width` if given, and encoded as low-latency H.264 (no B pictures, a keyframe a second; `qp` or
+`bitrate_kbps`), written like a recording to a file or HLS, with the audio copied when the output holds it. It runs on
+its own thread; when it falls behind, video is dropped up to the next keyframe and counted
+(`transcode.dropped_packets`), so the session is never held up. The encoder is the software one, which suits reduced
+sizes.
+
 ```sh
 ironav watch udp://:5000 --record live/stream.m3u8 --segment-seconds 4 --keep-segments 10
 ```

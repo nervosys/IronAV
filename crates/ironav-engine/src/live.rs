@@ -71,6 +71,9 @@ pub struct OpenArgs {
     /// Close the session after this many seconds without a call about it (0: never).
     #[serde(default = "default_idle")]
     pub idle_timeout_seconds: f64,
+    /// Also encode the video again, as low-latency H.264, to a file or HLS.
+    #[serde(default)]
+    pub transcode: Option<crate::transcode::TranscodeOptions>,
 }
 
 fn default_idle() -> f64 {
@@ -129,6 +132,8 @@ struct Shared {
     thumbnails: VecDeque<(f64, VideoFrame)>,
     /// The recorder's status, as last published by the session thread.
     record: Option<Value>,
+    /// The transcode sink's status, as last published by the session thread.
+    transcode: Option<Value>,
     /// The recording asked for (at open or by `configure`) and not yet asked to stop, so a second
     /// start is refused even before the session thread has taken the first.
     recording: Option<String>,
@@ -286,6 +291,13 @@ pub fn open(args: &OpenArgs) -> Result<Arc<Session>> {
         }
         None => {}
     }
+    if let Some(t) = &args.transcode {
+        t.check()?;
+        // the same file, as Windows compares names
+        if args.record.as_ref().is_some_and(|r| r == &t.output || (cfg!(windows) && r.eq_ignore_ascii_case(&t.output))) {
+            return Err(Error::invalid_arg("record and transcode cannot write the same path"));
+        }
+    }
     if !(args.retain_seconds >= 0.0) {
         return Err(Error::invalid_arg("retain_seconds must be 0 or more"));
     }
@@ -330,6 +342,7 @@ pub fn open(args: &OpenArgs) -> Result<Arc<Session>> {
             summary: None,
             thumbnails: VecDeque::new(),
             record: None,
+            transcode: None,
             recording: args.record.clone(),
             reconfigure: VecDeque::new(),
             requested: 0,
@@ -343,11 +356,18 @@ pub fn open(args: &OpenArgs) -> Result<Arc<Session>> {
         polling: std::sync::atomic::AtomicUsize::new(0),
     });
     let worker = session.clone();
+    let transcode = args.transcode.clone();
     let handle = std::thread::Builder::new()
         .name(format!("ironav-live-{id}"))
         .spawn(move || {
             let mut rec = record.map(Recorder::new);
-            let r = worker.run(source, &opts, &stream_opts, realtime, &mut rec);
+            let mut tc = transcode.map(crate::transcode::Transcoder::new);
+            let r = worker.run(source, &opts, &stream_opts, realtime, &mut rec, &mut tc);
+            // the transcoder drains its encoder and finishes its output
+            if let Some(tc) = tc.as_mut() {
+                tc.finish();
+                lock(&worker.shared).transcode = Some(tc.status());
+            }
             // a recording is closed however the session ended
             if let Some(rec) = rec.as_mut() {
                 let end = lock(&worker.shared).media_seconds;
@@ -557,7 +577,7 @@ impl Session {
         })
     }
 
-    fn run(&self, mut source: Box<dyn Source>, opts: &AnalyzeOptions, sopts: &StreamOptions, realtime: bool, rec: &mut Option<Recorder>) -> Result<()> {
+    fn run(&self, mut source: Box<dyn Source>, opts: &AnalyzeOptions, sopts: &StreamOptions, realtime: bool, rec: &mut Option<Recorder>, tc: &mut Option<crate::transcode::Transcoder>) -> Result<()> {
         let mut deferred = Vec::new();
         let mut published = Instant::now();
         let mut buf = vec![0u8; 64 << 10];
@@ -632,6 +652,10 @@ impl Session {
                         rec.start(&streams);
                         sh.record = Some(rec.status());
                     }
+                    if let Some(tc) = tc.as_mut() {
+                        tc.start(&streams);
+                        sh.transcode = Some(tc.status());
+                    }
                     sh.streams = streams;
                     drop(sh);
                     analysis = Some(a);
@@ -650,12 +674,18 @@ impl Session {
                 let arrived = if realtime { Instant::now() } else { arrival };
                 self.keep(&sp, t);
                 // written before the shared state is locked: a slow disk holds up only this thread
+                if let Some(tc) = tc.as_mut() {
+                    // queued for the transcoder's thread, never waited for
+                    tc.packet(&sp.packet, sp.key);
+                }
+                if published.elapsed() >= Duration::from_millis(250) && (rec.is_some() || tc.is_some()) {
+                    published = Instant::now();
+                    let (r, c) = (rec.as_ref().map(Recorder::status), tc.as_ref().map(|t| t.status()));
+                    let mut sh = lock(&self.shared);
+                    (sh.record, sh.transcode) = (r.or(sh.record.take()), c);
+                }
                 if let Some(rec) = rec.as_mut() {
                     rec.packet(&sp.packet, t, sp.key);
-                    if published.elapsed() >= Duration::from_millis(250) {
-                        published = Instant::now();
-                        lock(&self.shared).record = Some(rec.status());
-                    }
                 }
                 a.packet_keyed(&sp.packet, sp.key, &mut |o| self.log(o, Some(arrived)))?;
                 let changed = a.take_changed();
@@ -761,6 +791,7 @@ impl Session {
             "log": { "first_seq": sh.log.front().map(|o| o.seq), "last_seq": sh.log.back().map(|o| o.seq) },
             "retained": { "from": sh.ring.front().map(|k| k.t), "to": sh.ring.back().map(|k| k.t), "bytes": sh.ring_bytes },
             "record": sh.record,
+            "transcode": sh.transcode,
         })
     }
 

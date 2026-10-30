@@ -319,6 +319,17 @@ fn stream_open_schema() -> Value {
             "sidecars": { "type": "array", "items": { "type": "string" }, "description": "Model sidecars to run as well (speech-to-text, detection, ...), by the names the operator configured in IRONAV_SIDECARS; `capabilities` lists them. Each takes the first analyzed stream of the kind it wants." },
             "record": { "type": "string", "description": "Also write the media as it arrives, without re-encoding: a file (.ts stays playable even if cut off; .mp4 is complete when the session closes), or an .m3u8 path for HLS: MPEG-TS segments cut at keyframes next to it, and the playlist rewritten after each one." },
             "segment_seconds": { "type": "number", "minimum": 1, "maximum": 600, "default": 6, "description": "HLS segment length (cut at the first keyframe after it)." },
+            "transcode": { "type": "object", "required": ["output"], "additionalProperties": false,
+                           "description": "Also encode the first video stream again as low-latency H.264 (software: no B pictures, a keyframe a second), to a file or an .m3u8 path for HLS, with the audio copied when the output holds it. Runs on its own thread; when it falls behind, video is dropped up to the next keyframe (status: transcode.dropped_packets). The software encoder suits reduced sizes: give width.",
+                           "properties": {
+                               "output": { "type": "string" },
+                               "width": { "type": "integer", "minimum": 16, "maximum": 16384, "description": "Even; the height keeps the aspect ratio. The source's size when absent." },
+                               "bitrate_kbps": { "type": "integer", "minimum": 1, "maximum": 1000000 },
+                               "qp": { "type": "integer", "minimum": 0, "maximum": 51, "description": "Constant quantiser when no bitrate is given (23 by default)." },
+                               "audio": { "type": "string", "enum": ["copy", "none"], "default": "copy" },
+                               "segment_seconds": { "type": "number", "minimum": 1, "maximum": 600 },
+                               "keep_segments": { "type": "integer", "minimum": 1 },
+                               "overwrite": { "type": "boolean" } } },
             "keep_segments": { "type": "integer", "minimum": 1, "description": "HLS: keep only the newest N segments (a sliding live playlist); all of them when absent." },
             "overwrite": { "type": "boolean", "default": false },
             "idle_timeout_seconds": { "type": "number", "minimum": 0, "default": 300, "description": "Close the session after this long without a call about it (0: never), so a forgotten one does not hold one of the 8 places." }

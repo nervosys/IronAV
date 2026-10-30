@@ -163,3 +163,43 @@ fn a_recording_is_started_and_moved_to_a_new_file_while_a_session_runs() {
         assert!(n > 5 && first.abs() < 0.05 && last < 1.6, "{}: {n} packets from {first} to {last}", f.display());
     }
 }
+
+#[test]
+fn a_session_transcodes_its_video_to_low_latency_h264() {
+    use ironav_core::MediaType;
+    let dir = scratch("transcode");
+    let src = concat!(env!("CARGO_MANIFEST_DIR"), "/../ironav-formats/tests/data/h264_aac.ts");
+    let out = dir.join("small.ts");
+    // a width that is not the source's: scaled, the height following
+    let s = call_tool("stream_open", &json!({ "source": src, "analyzers": ["structure"], "transcode": { "output": out.to_str().unwrap(), "width": 64, "qp": 30 } })).unwrap();
+    let id = s["session"].as_str().unwrap().to_string();
+    wait_end(&id);
+    let st = call_tool("stream_close", &json!({ "session": id })).unwrap();
+    let tc = &st["transcode"];
+    assert_eq!(tc["state"], "finished", "{st}");
+    assert_eq!(tc["error"], Value::Null, "{st}");
+    assert_eq!(tc["video"]["width"], 64, "{st}");
+    let pictures = tc["pictures_out"].as_u64().unwrap();
+    assert!(pictures >= 45 && pictures == tc["pictures_in"].as_u64().unwrap(), "{st}");
+    // H.264 that decodes to as many pictures, each as it arrives (no reordering), with the audio copied
+    let mut d = ironav_formats::open_demuxer(&out).unwrap();
+    let streams = d.streams().to_vec();
+    assert_eq!(streams.len(), 2, "{streams:?}");
+    let v = streams.iter().position(|s| s.params.media_type() == MediaType::Video).unwrap();
+    assert_eq!(streams[v].codec, ironav_core::CodecId::H264);
+    let mut dec = ironav_codec::new_decoder_for(&streams[v]).unwrap();
+    let (mut n, mut last) = (0, i64::MIN);
+    while let Some(p) = d.read_packet().unwrap() {
+        if p.stream == v {
+            assert!(p.pts > last, "pictures in order");
+            last = p.pts;
+            for f in dec.decode(&p).unwrap() {
+                let ironav_core::Frame::Video(f) = f else { unreachable!() };
+                assert_eq!(f.width, 64);
+                n += 1;
+            }
+        }
+    }
+    n += dec.flush().unwrap().len();
+    assert_eq!(n as u64, pictures);
+}

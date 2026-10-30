@@ -245,7 +245,10 @@ Each observation is one JSON object with a stable envelope; the ontology lists e
   one-frame VBV buffer under NVENC's low-latency tuning (which a constant quantiser also gets). Naming a codec with it re-encodes even a stream of the
   same codec, since the source may hold B-frames. Today the software H.264 encoder is suitable only for
   recording at a reduced resolution, or offline. A faster software preset is separate encoder work, and this
-  document does not promise it. `stream_open` takes `latency` once a session has a transcode sink.
+  document does not promise it. The transcode sink came later as `transcode` on `stream_open`
+(`engine/src/transcode.rs`): its own decoder, the `format` and `scale` filters as needed, the software encoder with
+this profile always (so no `latency` argument), and the recorder for its output, on a thread behind a bounded queue
+that drops video to the next keyframe when full. Starting it from `stream_configure` is not done.
 - Limits: `MAX_LIVE_SESSIONS` like the player's 8; per-session memory caps for the ring buffer, the log and the
   queues; an idle timeout that closes sessions nobody has polled.
 

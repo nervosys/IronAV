@@ -12,6 +12,7 @@ pub mod run;
 mod sessions;
 pub mod sidecar;
 pub mod tools;
+pub mod transcode;
 
 pub use job::{FilterCall, Job, Latency, StreamOpts};
 pub use plan::{plan, Plan};

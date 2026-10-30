@@ -57,7 +57,7 @@ fn help() -> Value {
             "probe <path>": "inspect a media file",
             "convert -i IN [-i MORE]... -o OUT [-f FMT] [--acodec C] [--vcodec C] [--abitrate KBPS] [--vbitrate KBPS | --qp N] [--latency low] [--filter name[:k=v,..]]... [--hwaccel P] [-y] [--dry-run] [--progress]": "convert, handbrake/ffmpeg style",
             "analyze FILE [--analyzers a,b] [--sidecars a,b] [--level digest|events|raw] [--digest-seconds N] [--from S] [--to S] [--streams 0,1] [--max N] [--thumbnails DIR] [--hwaccel P] [--keyframes-only] [--jsonl]": "what is in a file: loudness, silence, scene cuts, black and frozen pictures, thumbnails, gaps; --jsonl prints each observation as a line as it is found",
-            "watch SOURCE [--analyzers a,b] [--sidecars a,b] [--level digest|events|raw] [--digest-seconds N] [--format F] [--fps N] [--pace realtime] [--retain S] [--duration S] [--hwaccel P] [--keyframes-only] [--record OUT.ts|OUT.m3u8 [--segment-seconds S] [--keep-segments N] [-y]] [--commands]": "follow a live source (path, path?follow, -, tcp://host:port, tcp://:port, udp://:port): every observation as a JSON line as it happens, then a summary; with --commands, stdin takes one command per line (status, query kinds=speech_end newest_first=true, configure add=silence, configure stop_recording=true record=next.ts, snapshot, clip from=1 to=5 output=c.ts, close, or the same as JSON) and each reply is a line {\"reply\":...}",
+            "watch SOURCE [--analyzers a,b] [--sidecars a,b] [--level digest|events|raw] [--digest-seconds N] [--format F] [--fps N] [--pace realtime] [--retain S] [--duration S] [--hwaccel P] [--keyframes-only] [--record OUT.ts|OUT.m3u8 [--segment-seconds S] [--keep-segments N] [-y]] [--transcode OUT.ts|OUT.m3u8 [--width N] [--qp N | --vbitrate KBPS]] [--commands]": "follow a live source (path, path?follow, -, tcp://host:port, tcp://:port, udp://:port): every observation as a JSON line as it happens, then a summary; with --commands, stdin takes one command per line (status, query kinds=speech_end newest_first=true, configure add=silence, configure stop_recording=true record=next.ts, snapshot, clip from=1 to=5 output=c.ts, close, or the same as JSON) and each reply is a line {\"reply\":...}",
             "plan <job.json|->": "validate a JSON job without writing",
             "run <job.json|->": "execute a JSON job",
             "hw probe | hw select --codec C --direction decode|encode [--policy P]": "hardware acceleration",
@@ -259,9 +259,29 @@ fn watch(mut a: Args) -> Result<Value> {
     if a.switch(&["--keyframes-only"]) {
         args["keyframes_only"] = json!(true);
     }
+    if let Some(out) = a.flag(&["--transcode"])? {
+        let mut t = json!({ "output": out });
+        for (flag, key) in [("--width", "width"), ("--qp", "qp"), ("--vbitrate", "bitrate_kbps")] {
+            if let Some(v) = a.flag(&[flag])? {
+                t[key] = json!(v.parse::<u32>().map_err(|_| Error::invalid_arg(format!("{flag} must be a whole number, got '{v}'")))?);
+            }
+        }
+        if args.get("overwrite").is_some() {
+            t["overwrite"] = json!(true);
+        }
+        args["transcode"] = t;
+    }
     for (flag, key) in [("--digest-seconds", "digest_seconds"), ("--fps", "fps"), ("--retain", "retain_seconds"), ("--segment-seconds", "segment_seconds")] {
         if let Some(v) = num(flag, a.flag(&[flag])?)? {
             args[key] = json!(v);
+        }
+    }
+    // without --record, the segment options are the transcode's
+    if args.get("record").is_none() && args.get("transcode").is_some() {
+        for key in ["segment_seconds", "keep_segments"] {
+            if let Some(v) = args.as_object_mut().and_then(|o| o.remove(key)) {
+                args["transcode"][key] = v;
+            }
         }
     }
     let duration = num("--duration", a.flag(&["--duration"])?)?;
