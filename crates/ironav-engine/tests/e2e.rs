@@ -1591,6 +1591,25 @@ fn hevc_streams_decode_to_what_ffmpeg_decodes() {
     }
 }
 
+/// SAO on 16x16 coding tree blocks with 4:2:0 chroma, after deblocking, is bit-exact with a hardware
+/// decoder (NVDEC). FFmpeg 9.0.1's software decoder differs here by one chroma sample: with 8x8 chroma
+/// blocks it applies SAO before the neighbouring block's chroma edges are deblocked (fixed in its
+/// development tree for some edge classes), so its output is not the reference for this stream.
+#[test]
+fn hevc_sao_on_16x16_blocks_decodes_to_what_hardware_decodes() {
+    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    let dir = scratch("hevc-ctu16-sao");
+    let out = dir.join("out.y4m");
+    let mut j = job(&data.join("hevc_ctu16_sao.mp4"), &out);
+    j.hwaccel = "off".into();
+    j.video.codec = Some("rawvideo".into());
+    run(&j, &mut |_| {}).unwrap();
+    let got: Vec<u8> = y4m_frames_any(&out).concat();
+    let want = std::fs::read(data.join("hevc_ctu16_sao.nvdec.yuv")).unwrap();
+    assert_eq!(got.len(), want.len(), "size");
+    assert!(got == want, "pixels differ from NVDEC's");
+}
+
 /// VP9 streams from libvpx (key and inter frames with compound prediction, segmentation, tiles,
 /// 4:4:4, lossless, odd sizes) are bit-exact with FFmpeg's decoder.
 #[test]

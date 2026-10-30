@@ -298,6 +298,12 @@ transform skip, lossless and per-CU lossless coding, QP 0 and 51, chroma QP offs
 16x16 CTUs and odd sizes. All match on every frame, and four small clips are kept in that test. The range extension *coding tools*
 (implicit and explicit RDPCM, cross-component prediction, extended precision, persistent Rice adaptation, chroma QP offset lists and the rest)
 are not implemented, and x265 does not use them. An SPS or PPS that turns one on is refused with the tool's name. To find those flags the SPS is now read through its VUI.
+With 16x16 CTUs and 4:2:0 or 4:2:2 chroma, sample adaptive offset after deblocking is where FFmpeg 9.0.1 and this decoder part:
+FFmpeg filters one chroma block before the next block's chroma edges are deblocked, so now and then a corner or edge sample takes
+a different offset (its development tree has since fixed part of this, after 9.0.1). This decoder deblocks the whole picture
+first, as the specification orders, and matches NVDEC on every sample of every such 4:2:0 stream tried (the
+`hevc_sao_on_16x16_blocks_decodes_to_what_hardware_decodes` test keeps one); 4:2:2, which this GPU cannot decode, was checked by
+hand at the first differing sample.
 10-bit HEVC GPU decoding was compared with FFmpeg's software decoder on a 60-frame 720p Main 10 clip: every sample of every
 frame is identical. 10-bit H.264 (High 10) and 10-bit encoding of H.264 are not offered (consumer NVENC cannot encode it).
 
