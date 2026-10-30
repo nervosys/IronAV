@@ -59,6 +59,10 @@ pub fn devices() -> Result<Vec<Device>> {
     }
 }
 
+/// How long an open device may send nothing before reads fail: a driver can block forever when
+/// another program holds the device.
+const DEVICE_STALL: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Opens `device://video[/NAME]` or `device://audio[/NAME]`.
 pub(crate) fn open(u: &SourceUrl, shown: String) -> Result<ThreadSource> {
     let (kind, name) = match u.target.split_once('/') {
@@ -75,7 +79,7 @@ pub(crate) fn open(u: &SourceUrl, shown: String) -> Result<ThreadSource> {
     let info = SourceInfo { url: shown, kind: "device", live: true, synthetic: false };
     let (tx, rx) = sync_channel(4);
     start(&kind, name.map(str::to_string), wants, tx, &rx)?;
-    Ok(ThreadSource::from_channel(info, rx))
+    Ok(ThreadSource::from_channel(info, rx).stall_after(DEVICE_STALL))
 }
 
 /// Starts the device's thread, and waits for it to say whether the device opened.

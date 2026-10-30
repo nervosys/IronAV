@@ -178,6 +178,8 @@ pub(crate) struct ThreadSource {
     held: Vec<u8>,
     at: usize,
     ended: bool,
+    /// How long the source may send nothing before it counts as failed, and when it last sent.
+    stall: Option<(Duration, Instant)>,
 }
 
 impl ThreadSource {
@@ -208,7 +210,14 @@ impl ThreadSource {
 
     /// Bytes another thread sends, in order; the source ends when it stops sending.
     pub(crate) fn from_channel(info: SourceInfo, rx: Receiver<std::io::Result<Vec<u8>>>) -> Self {
-        ThreadSource { info, rx, held: Vec::new(), at: 0, ended: false }
+        ThreadSource { info, rx, held: Vec::new(), at: 0, ended: false, stall: None }
+    }
+
+    /// Fails reads once the source has sent nothing for `limit`: for a device, whose thread can
+    /// wait forever on a driver that gives nothing (when another program holds the device, say).
+    pub(crate) fn stall_after(mut self, limit: Duration) -> Self {
+        self.stall = Some((limit, Instant::now()));
+        self
     }
 }
 
@@ -222,9 +231,22 @@ impl Source for ThreadSource {
                 return Ok(Chunk::End);
             }
             match self.rx.recv_timeout(wait) {
-                Ok(Ok(b)) => (self.held, self.at) = (b, 0),
+                Ok(Ok(b)) => {
+                    (self.held, self.at) = (b, 0);
+                    if let Some((_, last)) = &mut self.stall {
+                        *last = Instant::now();
+                    }
+                }
                 Ok(Err(e)) => return Err(e.into()),
-                Err(RecvTimeoutError::Timeout) => return Ok(Chunk::Idle),
+                Err(RecvTimeoutError::Timeout) => {
+                    if let Some((limit, last)) = self.stall {
+                        if last.elapsed() >= limit {
+                            return Err(Error::new(ErrorCode::HardwareUnavailable, format!("{} sent nothing for {:.0} s", self.info.url, limit.as_secs_f64()))
+                                .hint("another program (a video call, say) may be holding the device; close it, or choose another device from `ironav devices`"));
+                        }
+                    }
+                    return Ok(Chunk::Idle);
+                }
                 Err(RecvTimeoutError::Disconnected) => {
                     self.ended = true;
                     return Ok(Chunk::End);
@@ -310,6 +332,28 @@ impl Source for UdpSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_device_that_goes_quiet_fails_rather_than_waiting_forever() {
+        let (tx, rx) = sync_channel(4);
+        let info = SourceInfo { url: "device://audio".into(), kind: "device", live: true, synthetic: false };
+        let mut s = ThreadSource::from_channel(info, rx).stall_after(Duration::from_millis(150));
+        tx.send(Ok(b"header".to_vec())).unwrap();
+        let mut buf = [0u8; 64];
+        assert!(matches!(s.read(&mut buf, Duration::from_millis(10)).unwrap(), Chunk::Data(6)));
+        assert!(matches!(s.read(&mut buf, Duration::from_millis(10)).unwrap(), Chunk::Idle));
+        let t0 = Instant::now();
+        let e = loop {
+            match s.read(&mut buf, Duration::from_millis(20)) {
+                Ok(Chunk::Idle) => assert!(t0.elapsed() < Duration::from_secs(5)),
+                Ok(c) => panic!("{c:?}"),
+                Err(e) => break e,
+            }
+        };
+        assert_eq!(e.code, ErrorCode::HardwareUnavailable);
+        assert!(e.message.contains("device://audio"), "{}", e.message);
+        drop(tx);
+    }
     use std::io::Write;
 
     /// Everything a source gives until it ends or `limit` bytes have come.

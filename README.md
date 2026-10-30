@@ -136,7 +136,8 @@ yet run on a Linux machine): `ironav devices` lists them, and `device://video` (
 one. `size=1280x720` and `fps=30` ask a camera for its nearest mode. A camera's pictures arrive as Y4M (converted from
 the NV12 or YUY2 it gives to 4:2:0) and are timed at the mode's frame rate, or, from a Motion JPEG camera on Linux, as
 live Matroska timed by the driver's clock and decoded by the JPEG decoder (which supplies the standard Huffman tables
-such cameras leave out); a microphone arrives as 16-bit PCM.
+such cameras leave out); a microphone arrives as 16-bit PCM. A device that sends nothing for 5 s once open (as when a video call
+holds it) fails with `hardware-unavailable` rather than waiting forever.
 For testing without either, `test://video` and `test://audio` are made up at the pace they play: a grey ramp with a
 white square crossing it each second and a new colour every 5 s, its frame number in its top row as 32 black or white
 blocks of 8 pixels (`ironav_live::synthetic::frame_number` reads it back, so a test can tell which frame it has and how
