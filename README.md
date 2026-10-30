@@ -72,8 +72,8 @@ Checked against EBU Tech 3341/3342 test signals (a -23 dBFS stereo sine reads -2
 The same analyzers run on media as it arrives. A source is a path, `path?follow` (a file that is still growing),
 `path?pace=realtime` (a file played as if live), `-` or `pipe:NAME`, `tcp://host:port` (connect),
 `tcp://:port` (listen, on loopback unless an address is given), or `udp://:port` / `udp://group:port` (multicast).
-Readable as it arrives: Y4M, WAV, ADTS AAC and raw H.264/HEVC (Annex B, which carries no frame rate: give `fps`,
-25 by default).
+Readable as it arrives: MPEG-TS, Y4M, WAV, ADTS AAC and raw H.264/HEVC (Annex B, which carries no frame rate:
+give `fps`, 25 by default).
 
 ```sh
 ironav watch udp://:5000 --analyzers scene,black --level events | head -n 20
@@ -627,6 +627,27 @@ and decodes the VP9 copies in MP4.
 Not done: no SeekHead, tags, chapters or attachments; PCM and more than one stream per kind are refused; an MP3's gapless trim (from its LAME tag) is not
 carried over and the Opus pre-skip is carried only as the OpusHead plus CodecDelay. I did not test B-frame video, because the
 encoder here does not produce it.
+
+## MPEG transport streams
+
+`.ts`, `.m2ts` and `.mts` are read and written (format `mpegts`): H.264 or HEVC video with AAC or MP3 audio. Reading takes
+188-byte packets and 192-byte M2TS ones and follows the first program. The parameters of each stream come from its first
+units (the SPS, the ADTS or MP3 header), and the frame rate comes from the spacing of the timestamps. 33-bit timestamps are
+unwrapped. A gap in the continuity counter drops only the unit it breaks. Video starts at a keyframe. The same parser reads
+files and live sources, so `ironav watch udp://:5000` takes a transport stream directly. Files report their duration
+(from the timestamps near the end) and can be seeked to a keyframe at or before the requested time.
+
+Writing puts the video on PID 0x100 with the PCR, and repeats the PAT and PMT before every keyframe and at least twice a second.
+Access units get an access unit delimiter, AAC gets ADTS headers, and video decode times are derived from the
+presentation times, so B-frames from the encoder or a copy come out right.
+
+Checked with FFmpeg (through PyAV): files that FFmpeg wrote (libx264 or libx265 with B-frames, AAC or MP3) read with the same
+packet counts and times, and FFmpeg reads what IronAV writes without a decode error. That covers copies of those files,
+IronAV's own H.264 encoder with B-frames, a Matroska file remuxed to TS, and HEVC+MP3 transcoded to H.264+AAC. In all of
+them every frame decodes, the decode times always increase, and no presentation time is before its decode time.
+
+Not handled: Opus, AC-3, MPEG-2 video and subtitles (skipped when reading, refused when writing), more than one program,
+and PMT changes during a stream.
 
 ## Performance
 

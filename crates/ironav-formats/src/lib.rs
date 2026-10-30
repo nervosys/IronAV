@@ -12,6 +12,7 @@ pub mod stream;
 mod ogg;
 mod vpxav1;
 mod oggwrite;
+pub mod ts;
 mod wav;
 mod jpeg;
 mod y4m;
@@ -149,6 +150,15 @@ pub static FORMATS: &[FormatSpec] = &[
         mux: true,
         codecs: &[CodecId::Hevc],
     },
+    FormatSpec {
+        name: "mpegts",
+        extensions: &["ts", "m2ts", "mts"],
+        description: "MPEG transport stream (broadcast, IPTV, HLS segments); 192-byte M2TS packets are read too",
+        media: MediaType::Video,
+        demux: true,
+        mux: true,
+        codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Aac, CodecId::Mp3],
+    },
 ];
 
 pub fn find_format(name: &str) -> Result<&'static FormatSpec> {
@@ -171,7 +181,8 @@ pub fn format_for_path(path: &Path) -> Result<&'static FormatSpec> {
 /// Open `path` and pick a demuxer from the file's magic bytes (extension is ignored).
 pub fn open_demuxer(path: &Path) -> Result<Box<dyn Demuxer>> {
     let mut f = BufReader::with_capacity(1 << 20, File::open(path)?);
-    let mut magic = [0u8; 12];
+    // a transport stream shows itself by sync bytes 188 (or 192) bytes apart
+    let mut magic = [0u8; 400];
     let n = f.read(&mut magic)?;
     f.seek(SeekFrom::Start(0))?;
     let magic = &magic[..n];
@@ -186,7 +197,9 @@ pub fn open_demuxer(path: &Path) -> Result<Box<dyn Demuxer>> {
     } else {
         None
     };
-    if magic.len() >= 12 && &magic[..4] == b"RIFF" && &magic[8..12] == b"WAVE" {
+    if ts::packet_size(magic).is_some() {
+        Ok(Box::new(ts::TsDemuxer::open(f)?))
+    } else if magic.len() >= 12 && &magic[..4] == b"RIFF" && &magic[8..12] == b"WAVE" {
         Ok(Box::new(wav::WavDemuxer::open(f)?))
     } else if flac::looks_like_flac(magic) && behind_id3.as_ref().map_or(true, |b| b.starts_with(b"fLaC")) {
         Ok(Box::new(flac::FlacDemuxer::open(f)?))
@@ -232,6 +245,7 @@ pub fn create_muxer(path: &Path, format: &str) -> Result<Box<dyn Muxer>> {
         "webm" => Ok(Box::new(mkvwrite::MatroskaWriter::webm(out))),
         "h264" => Ok(Box::new(annexb::AnnexBMuxer::new(out, CodecId::H264))),
         "hevc" => Ok(Box::new(annexb::AnnexBMuxer::new(out, CodecId::Hevc))),
+        "mpegts" => Ok(Box::new(ts::TsMuxer::new(out))),
         _ => Err(Error::new(ErrorCode::UnsupportedFormat, format!("format '{format}' cannot be written"))),
     }
 }

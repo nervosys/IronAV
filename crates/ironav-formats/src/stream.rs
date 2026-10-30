@@ -3,7 +3,8 @@
 //! transport (and a fuzzer): [`StreamDemuxer::feed`] bytes in, [`StreamDemuxer::next_packet`]
 //! packets out, `None` meaning "not enough yet".
 //!
-//! The formats here are the self-delimiting ones: Y4M, WAV, ADTS (AAC) and Annex B H.264/HEVC.
+//! The formats here are the self-delimiting ones: Y4M, WAV, ADTS (AAC), Annex B H.264/HEVC and
+//! MPEG-TS ([`crate::ts`]).
 
 use crate::{adts, wav, y4m};
 use ironav_core::{CodecId, Error, ErrorCode, Packet, PixelFormat, Rational, Result, StreamInfo, StreamParams};
@@ -76,10 +77,11 @@ pub struct StreamOptions {
 }
 
 /// Formats [`stream_demuxer`] can read.
-pub const STREAM_FORMATS: [&str; 5] = ["y4m", "wav", "aac", "h264", "hevc"];
+pub const STREAM_FORMATS: [&str; 6] = ["y4m", "wav", "aac", "h264", "hevc", "mpegts"];
 
 /// Bytes [`stream_demuxer`] wants to see before it can tell the format.
-pub const SNIFF_BYTES: usize = 12;
+/// (A transport stream needs two packets' sync bytes.)
+pub const SNIFF_BYTES: usize = 200;
 
 /// A stream demuxer for input starting with `magic` (at least [`SNIFF_BYTES`] of it, unless the
 /// input is shorter), or of the format `opts.format` names.
@@ -101,6 +103,7 @@ pub fn stream_demuxer(magic: &[u8], opts: &StreamOptions) -> Result<Box<dyn Stre
         "aac" | "adts" => Box::new(AdtsStream::default()),
         "h264" | "avc" => Box::new(AnnexBStream::new(CodecId::H264, fps)),
         "hevc" | "h265" => Box::new(AnnexBStream::new(CodecId::Hevc, fps)),
+        "mpegts" | "ts" | "m2ts" => Box::new(crate::ts::TsStream::default()),
         other => {
             return Err(Error::new(ErrorCode::UnsupportedFormat, format!("'{other}' cannot be read as a stream")).alternatives(STREAM_FORMATS));
         }
@@ -108,6 +111,9 @@ pub fn stream_demuxer(magic: &[u8], opts: &StreamOptions) -> Result<Box<dyn Stre
 }
 
 fn sniff(m: &[u8]) -> Option<&'static str> {
+    if crate::ts::packet_size(m).is_some() {
+        return Some("mpegts");
+    }
     if m.starts_with(b"YUV4MPEG2") {
         return Some("y4m");
     }

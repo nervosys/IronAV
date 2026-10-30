@@ -390,7 +390,7 @@ pub fn tools() -> &'static [Tool] {
             },
             Tool {
                 name: "stream_open",
-                description: "Start watching a live source (a socket, a pipe, a growing file, or a file played as if live). It is read, demuxed and analyzed on its own thread as it arrives; follow it with stream_events. Readable as it arrives: Y4M, WAV, ADTS AAC and raw H.264/HEVC.",
+                description: "Start watching a live source (a socket, a pipe, a growing file, or a file played as if live). It is read, demuxed and analyzed on its own thread as it arrives; follow it with stream_events. Readable as it arrives: MPEG-TS, Y4M, WAV, ADTS AAC and raw H.264/HEVC.",
                 cli: "ironav watch <source> [--analyzers a,b] [--level L] [--format F] [--fps N] [--pace realtime]",
                 input_schema: stream_open_schema(),
                 read_only: true,

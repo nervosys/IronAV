@@ -714,6 +714,26 @@ mod tests {
     }
 
     #[test]
+    fn a_transport_stream_over_tcp_gives_its_video_and_audio() {
+        let data = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../ironav-formats/tests/data/h264_aac.ts")).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let a: OpenArgs = serde_json::from_value(json!({ "source": format!("tcp://127.0.0.1:{port}"), "analyzers": ["structure", "levels"], "hwaccel": "off" })).unwrap();
+        let s = open(&a).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        for c in data.chunks(1316) {
+            std::io::Write::write_all(&mut peer, c).unwrap();
+        }
+        drop(peer);
+        wait_end(&s);
+        let st = close(&s.id).unwrap();
+        assert_eq!(st["format"], "mpegts", "{st}");
+        assert_eq!(st["streams"].as_array().map(Vec::len), Some(2));
+        assert_eq!(st["packets"].as_u64(), Some(145));
+        assert!(st["summary"]["audio1"]["levels"].is_object(), "{st}");
+    }
+
+    #[test]
     fn sessions_are_limited_and_arguments_checked() {
         let mut opened = Vec::new();
         let mut busy = None;
