@@ -359,8 +359,9 @@ live sessions with the ring buffer and log; `stream_open`, `stream_events`, `str
 `stream_clip` and `stream_close`; and `ironav watch`. The session limit uses a new error code, `busy` (exit 75),
 and an unreachable source is `io`, so no further codes were added. Ogg (Opus, Vorbis, FLAC) and MP3 stream demuxers
 followed later (`ironav-formats/src/audio_stream.rs`); their packets match the file readers'. Left for later:
-low-delay H.264 and HEVC output; `stream_query` and `stream_configure`; the idle timeout; and stdin commands for
-`watch`. Packet metadata (keyframe flag and arrival time) is held in the live layer (`StreamPacket`) instead of
+low-delay H.264 and HEVC output and stdin commands for `watch`. `stream_query`, `stream_configure` (level, digest
+interval, adding and removing built-in analyzers; not sinks or sidecars yet) and the idle timeout (`idle_timeout_seconds`,
+300 by default, counted from the last call that names the session) came later. Packet metadata (keyframe flag and arrival time) is held in the live layer (`StreamPacket`) instead of
 as new `Packet` fields, so §9's migration was not needed.
 
 M3 so far: the MPEG-TS reader and writer (`ironav-formats/src/ts.rs`). One push parser serves files and live sources,

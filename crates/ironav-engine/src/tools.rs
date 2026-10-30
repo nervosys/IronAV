@@ -260,6 +260,25 @@ fn h_stream_clip(args: &Value) -> Result<Value> {
     session_arg(args)?.clip(from, to, need_str(args, "output")?, str_arg(args, "format")?, overwrite)
 }
 
+fn h_stream_query(args: &Value) -> Result<Value> {
+    let q: crate::live::Query = serde_json::from_value(args.clone())
+        .map_err(|e| Error::invalid_arg(format!("invalid stream_query arguments: {e}")).hint("the schema is in `ironav tools` (tool 'stream_query')"))?;
+    Ok(crate::live::get(&q.session)?.query(&q))
+}
+
+fn h_stream_configure(args: &Value) -> Result<Value> {
+    let s = session_arg(args)?;
+    let list = |key: &str| -> Result<Vec<String>> {
+        match args.get(key) {
+            None | Some(Value::Null) => Ok(Vec::new()),
+            Some(Value::Array(a)) => a.iter().map(|k| k.as_str().map(str::to_string).ok_or_else(|| Error::invalid_arg(format!("'{key}' must be analyzer names")))).collect(),
+            Some(_) => Err(Error::invalid_arg(format!("'{key}' must be an array of analyzer names"))),
+        }
+    };
+    let c = crate::analyze::Reconfigure { level: str_arg(args, "level")?.map(str::to_string), digest_seconds: f64_arg(args, "digest_seconds")?, add: list("add")?, remove: list("remove")? };
+    s.configure(c)
+}
+
 fn h_stream_close(args: &Value) -> Result<Value> {
     crate::live::close(need_str(args, "session")?)
 }
@@ -281,7 +300,8 @@ fn stream_open_schema() -> Value {
             "record": { "type": "string", "description": "Also write the media as it arrives, without re-encoding: a file (.ts stays playable even if cut off; .mp4 is complete when the session closes), or an .m3u8 path for HLS: MPEG-TS segments cut at keyframes next to it, and the playlist rewritten after each one." },
             "segment_seconds": { "type": "number", "minimum": 1, "maximum": 600, "default": 6, "description": "HLS segment length (cut at the first keyframe after it)." },
             "keep_segments": { "type": "integer", "minimum": 1, "description": "HLS: keep only the newest N segments (a sliding live playlist); all of them when absent." },
-            "overwrite": { "type": "boolean", "default": false }
+            "overwrite": { "type": "boolean", "default": false },
+            "idle_timeout_seconds": { "type": "number", "minimum": 0, "default": 300, "description": "Close the session after this long without a call about it (0: never), so a forgotten one does not hold one of the 8 places." }
         }),
         &["source"],
     )
@@ -416,7 +436,7 @@ pub fn tools() -> &'static [Tool] {
                     json!({
                         "session": { "type": "string" },
                         "after": { "type": "integer", "minimum": 0, "default": 0 },
-                        "kinds": { "type": "array", "items": { "type": "string", "enum": ironav_analyze::KINDS.iter().map(|k| k.name).collect::<Vec<_>>() }, "description": "Only these kinds (all when absent)." },
+                        "kinds": { "type": "array", "items": { "type": "string" }, "description": "Only these kinds (all when absent): the ones `capabilities` lists, or a sidecar's." },
                         "level": { "type": "string", "enum": ironav_analyze::Level::ALL.iter().map(|l| l.name()).collect::<Vec<_>>(), "default": "events" },
                         "max": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 },
                         "wait_ms": { "type": "integer", "minimum": 0, "maximum": 30000, "default": 0 }
@@ -455,6 +475,44 @@ pub fn tools() -> &'static [Tool] {
                 ),
                 read_only: false,
                 handler: Handler::Plain(h_stream_clip),
+            },
+            Tool {
+                name: "stream_query",
+                description: "Search a live session's log (the newest 20000 observations): by kind, analyzer, stream, media time overlapping from..to, and text in the data (a transcript's words, say). newest_first answers 'when did X last happen'. Unlike stream_events it does not wait, and it sees every level.",
+                cli: "",
+                input_schema: object(
+                    json!({
+                        "session": { "type": "string" },
+                        "kinds": { "type": "array", "items": { "type": "string" } },
+                        "analyzer": { "type": "string" },
+                        "stream": { "type": "integer", "minimum": 0 },
+                        "from": { "type": "number", "description": "Media seconds." },
+                        "to": { "type": "number", "description": "Media seconds." },
+                        "text": { "type": "string", "description": "Case-insensitive, anywhere in the data." },
+                        "max": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 },
+                        "newest_first": { "type": "boolean", "default": false }
+                    }),
+                    &["session"],
+                ),
+                read_only: true,
+                handler: Handler::Plain(h_stream_query),
+            },
+            Tool {
+                name: "stream_configure",
+                description: "Change a running session: the most detail it keeps (level), the digest interval (from the next window), and which built-in analyzers run (add, remove). An added video analyzer starts at the next keyframe. Returns the status with `applied` once the session has taken the change (within a second).",
+                cli: "",
+                input_schema: object(
+                    json!({
+                        "session": { "type": "string" },
+                        "level": { "type": "string", "enum": ironav_analyze::Level::ALL.iter().map(|l| l.name()).collect::<Vec<_>>() },
+                        "digest_seconds": { "type": "number", "exclusiveMinimum": 0 },
+                        "add": { "type": "array", "items": { "type": "string", "enum": ironav_analyze::ANALYZERS.iter().map(|a| a.name).collect::<Vec<_>>() } },
+                        "remove": { "type": "array", "items": { "type": "string", "enum": ironav_analyze::ANALYZERS.iter().map(|a| a.name).collect::<Vec<_>>() } }
+                    }),
+                    &["session"],
+                ),
+                read_only: false,
+                handler: Handler::Plain(h_stream_configure),
             },
             Tool {
                 name: "stream_close",

@@ -117,7 +117,10 @@ waiting costs nothing while the stream is quiet. Pass the returned `next_after` 
 returns the newest picture, or the one at `at` seconds, as an image. `stream_clip` writes `from`..`to` of the
 retained media (`retain_seconds`, 60 by default) to a file without re-encoding, starting at a keyframe.
 `stream_status` reports the state, bytes, packets and latency percentiles; `stream_close` returns the summary.
-At most 8 sessions are open at once (error code `busy` past that).
+`stream_query` searches the log (the newest 20000 observations) by kind, analyzer, stream, media time and text, newest
+first if asked ("when was speech last heard"). `stream_configure` changes a running session's level, digest interval and
+built-in analyzers. At most 8 sessions are open at once (error code `busy` past that), and one that no call has asked
+about for `idle_timeout_seconds` (300 by default; 0 for never) is closed and forgotten.
 
 A session can also record what arrives, without re-encoding (`record`, or `--record` for `watch`). The recording can be a
 single file: a `.ts` stays playable even if the recording is cut off, while an `.mp4` is complete only once the session

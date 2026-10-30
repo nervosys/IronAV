@@ -102,6 +102,8 @@ struct Stream {
     last_video: Option<f64>,
     end: f64,
     decode_errors: u64,
+    /// A decoder started mid-stream waits for a keyframe.
+    wait_key: bool,
 }
 
 impl Stream {
@@ -146,6 +148,37 @@ pub struct Analysis {
     /// The newest decoded picture and its time, kept for snapshots.
     pub last_picture: Option<(f64, VideoFrame)>,
     out: Vec<Observation>,
+    /// What `configure` needs to add analyzers later.
+    settings: Settings,
+    hwaccel: String,
+}
+
+/// A change to a running analysis.
+#[derive(Debug, Clone, Default)]
+pub struct Reconfigure {
+    pub level: Option<String>,
+    pub digest_seconds: Option<f64>,
+    pub add: Vec<String>,
+    pub remove: Vec<String>,
+}
+
+impl Reconfigure {
+    /// Checks names and values, so a request learns of a mistake at once.
+    pub fn check(&self) -> Result<()> {
+        if let Some(l) = &self.level {
+            Level::parse(l).ok_or_else(|| Error::invalid_arg(format!("unknown level '{l}'")).alternatives(Level::ALL.iter().map(|l| l.name())))?;
+        }
+        if self.digest_seconds.is_some_and(|d| !(d > 0.0)) {
+            return Err(Error::invalid_arg("digest_seconds must be above 0"));
+        }
+        for n in self.add.iter().chain(&self.remove) {
+            analyzer(n).ok_or_else(|| Error::invalid_arg(format!("unknown analyzer '{n}'")).alternatives(ANALYZERS.iter().map(|a| a.name)))?;
+        }
+        if let Some(n) = self.add.iter().find(|n| self.remove.contains(n)) {
+            return Err(Error::invalid_arg(format!("'{n}' is both added and removed")));
+        }
+        Ok(())
+    }
 }
 
 impl Analysis {
@@ -240,6 +273,7 @@ impl Analysis {
                 last_video: None,
                 end: 0.0,
                 decode_errors: 0,
+                wait_key: false,
             }));
         }
         for car in pending {
@@ -249,11 +283,76 @@ impl Analysis {
         if to <= from {
             return Err(Error::invalid_arg("'to' must be after 'from'"));
         }
-        Ok(Analysis { level, digest_seconds: opts.digest_seconds, from, to, streams, window: None, latest: from, warnings, last_picture: None, out: Vec::new() })
+        Ok(Analysis {
+            level,
+            digest_seconds: opts.digest_seconds,
+            from,
+            to,
+            streams,
+            window: None,
+            latest: from,
+            warnings,
+            last_picture: None,
+            out: Vec::new(),
+            settings,
+            hwaccel: opts.hwaccel.clone(),
+        })
     }
 
     pub fn level(&self) -> Level {
         self.level
+    }
+
+    /// Changes a running analysis: its level, its digest interval (from the next window), and
+    /// which built-in analyzers run. An added analyzer starts with what arrives next (a video
+    /// decoder started now waits for a keyframe); a removed one is dropped without a summary, and
+    /// a stream left with no frame analyzer stops being decoded. Returns warnings.
+    pub fn configure(&mut self, c: &Reconfigure) -> Result<Vec<String>> {
+        c.check()?;
+        if let Some(l) = &c.level {
+            self.level = Level::parse(l).unwrap();
+        }
+        if let Some(d) = c.digest_seconds {
+            self.digest_seconds = d;
+        }
+        let mut warnings = Vec::new();
+        for s in self.streams.iter_mut().flatten() {
+            let keep = |(n, _): &(&'static str, Box<dyn Analyzer>)| !c.remove.iter().any(|r| r == n);
+            s.packet_analyzers.retain(keep);
+            s.frame_analyzers.retain(keep);
+            let media = s.info.params.media_type();
+            for name in &c.add {
+                let info = analyzer(name).unwrap();
+                if !info.consumes.applies_to(media) || s.names().contains(&info.name) {
+                    continue;
+                }
+                if info.consumes == Consumes::Packets {
+                    s.packet_analyzers.push((info.name, info.make(&s.info, &self.settings)));
+                    continue;
+                }
+                if s.decoder.is_none() {
+                    let made = if media == MediaType::Video {
+                        ironav_player::open_video_decoder(&s.info, &self.hwaccel)
+                    } else {
+                        ironav_codec::new_decoder_for(&s.info).map(|d| (d, "software"))
+                    };
+                    match made {
+                        Ok((dec, n)) => (s.decoder, s.decoder_name, s.wait_key) = (Some(dec), Some(n), true),
+                        Err(e) => {
+                            warnings.push(format!("stream {}: '{name}' not added: {} is not decoded: {}", s.info.index, s.info.codec.name(), e.message));
+                            continue;
+                        }
+                    }
+                }
+                s.frame_analyzers.push((info.name, info.make(&s.info, &self.settings)));
+            }
+            if s.frame_analyzers.is_empty() && s.decoder.is_some() {
+                (s.decoder, s.decoder_name) = (None, None);
+                (s.audio_next, s.last_video) = (None, None);
+            }
+        }
+        self.warnings.extend(warnings.iter().cloned());
+        Ok(warnings)
     }
 
     /// Whether stream `i` is analyzed.
@@ -287,7 +386,15 @@ impl Analysis {
     /// Shows one packet (and the frames it decodes to) to the analyzers; what they observe goes
     /// to `sink`, in order, already filtered by the level.
     pub fn packet(&mut self, p: &Packet, sink: &mut dyn FnMut(Observation) -> Result<()>) -> Result<()> {
+        self.packet_keyed(p, true, sink)
+    }
+
+    /// [`packet`](Self::packet), saying whether a decoder can start at it (as a live source knows).
+    pub fn packet_keyed(&mut self, p: &Packet, key: bool, sink: &mut dyn FnMut(Observation) -> Result<()>) -> Result<()> {
         let Some(Some(s)) = self.streams.get_mut(p.stream) else { return Ok(()) };
+        if s.wait_key && key {
+            s.wait_key = false;
+        }
         let (from, to) = (self.from, self.to);
         let tb = s.info.time_base.as_f64();
         let t = p.pts as f64 * tb;
@@ -298,7 +405,7 @@ impl Analysis {
             }
             s.end = s.end.max(t + p.duration as f64 * tb);
         }
-        let frames = match s.decoder.as_mut().map(|dec| dec.decode(p)) {
+        let frames = match s.decoder.as_mut().filter(|_| !s.wait_key).map(|dec| dec.decode(p)) {
             None => Vec::new(),
             Some(Ok(f)) => f,
             Some(Err(e)) => {

@@ -5,7 +5,7 @@
 //! A live source is never held up by its readers. The observation log and the packet ring are
 //! bounded; a reader that falls behind finds the oldest entries gone and is told how many.
 
-use crate::analyze::{png_of, AnalyzeOptions, Analysis};
+use crate::analyze::{png_of, AnalyzeOptions, Analysis, Reconfigure};
 use crate::record::{RecordOptions, Recorder};
 use ironav_analyze::{Level, Observation};
 use ironav_core::{Error, ErrorCode, Rational, Result, StreamInfo, VideoFrame};
@@ -66,6 +66,13 @@ pub struct OpenArgs {
     pub keep_segments: Option<usize>,
     #[serde(default)]
     pub overwrite: bool,
+    /// Close the session after this many seconds without a call about it (0: never).
+    #[serde(default = "default_idle")]
+    pub idle_timeout_seconds: f64,
+}
+
+fn default_idle() -> f64 {
+    300.0
 }
 
 fn default_level() -> String {
@@ -120,6 +127,40 @@ struct Shared {
     thumbnails: VecDeque<(f64, VideoFrame)>,
     /// The recorder's status, as last published by the session thread.
     record: Option<Value>,
+    /// Changes waiting for the session thread, and how many it has applied.
+    reconfigure: VecDeque<Reconfigure>,
+    requested: u64,
+    applied: u64,
+}
+
+/// A search of a session's log.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Query {
+    pub session: String,
+    #[serde(default)]
+    pub kinds: Vec<String>,
+    #[serde(default)]
+    pub analyzer: Option<String>,
+    #[serde(default)]
+    pub stream: Option<usize>,
+    /// Media time: observations that overlap `from..to`.
+    #[serde(default)]
+    pub from: Option<f64>,
+    #[serde(default)]
+    pub to: Option<f64>,
+    /// Case-insensitive text anywhere in an observation's data (a transcript's words, say).
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default = "default_query_max")]
+    pub max: usize,
+    /// The newest first ("when was speech last heard").
+    #[serde(default)]
+    pub newest_first: bool,
+}
+
+fn default_query_max() -> usize {
+    100
 }
 
 pub struct Session {
@@ -131,6 +172,10 @@ pub struct Session {
     changed: Condvar,
     stop: AtomicBool,
     thread: Mutex<Option<JoinHandle<()>>>,
+    idle: Option<Duration>,
+    /// When a call last asked about the session, and how many long polls are waiting on it.
+    touched: Mutex<Instant>,
+    polling: std::sync::atomic::AtomicUsize,
 }
 
 fn sessions() -> &'static Mutex<(u64, HashMap<String, Arc<Session>>)> {
@@ -143,15 +188,32 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 pub fn get(id: &str) -> Result<Arc<Session>> {
+    sweep();
     let s = lock(sessions());
-    s.1.get(id).cloned().ok_or_else(|| {
+    let found = s.1.get(id).cloned().ok_or_else(|| {
         Error::new(ErrorCode::NotFound, format!("no live session '{id}'")).alternatives(s.1.keys().cloned().collect::<Vec<_>>())
-    })
+    })?;
+    found.touch();
+    Ok(found)
+}
+
+/// Forgets sessions nobody has asked about for their idle timeout; their threads stop themselves.
+fn sweep() {
+    let mut s = lock(sessions());
+    s.1.retain(|_, x| {
+        let keep = !x.idle_expired();
+        if !keep {
+            x.stop.store(true, Ordering::Relaxed);
+        }
+        keep
+    });
 }
 
 pub fn list() -> Vec<Value> {
-    let s = lock(sessions());
-    let mut v: Vec<_> = s.1.values().map(|x| x.status()).collect();
+    sweep();
+    // each status takes its session's lock: not while holding every session's
+    let all: Vec<Arc<Session>> = lock(sessions()).1.values().cloned().collect();
+    let mut v: Vec<_> = all.iter().map(|x| x.status()).collect();
     v.sort_by(|a, b| a["session"].as_str().cmp(&b["session"].as_str()));
     v
 }
@@ -213,6 +275,10 @@ pub fn open(args: &OpenArgs) -> Result<Arc<Session>> {
     if !(args.retain_seconds >= 0.0) {
         return Err(Error::invalid_arg("retain_seconds must be 0 or more"));
     }
+    if !(args.idle_timeout_seconds >= 0.0) {
+        return Err(Error::invalid_arg("idle_timeout_seconds must be 0 (never) or more"));
+    }
+    sweep();
     {
         let s = lock(sessions());
         if s.1.len() >= MAX_SESSIONS {
@@ -250,10 +316,16 @@ pub fn open(args: &OpenArgs) -> Result<Arc<Session>> {
             summary: None,
             thumbnails: VecDeque::new(),
             record: None,
+            reconfigure: VecDeque::new(),
+            requested: 0,
+            applied: 0,
         }),
         changed: Condvar::new(),
         stop: AtomicBool::new(false),
         thread: Mutex::new(None),
+        idle: (args.idle_timeout_seconds > 0.0).then(|| Duration::from_secs_f64(args.idle_timeout_seconds.min(1e9))),
+        touched: Mutex::new(Instant::now()),
+        polling: std::sync::atomic::AtomicUsize::new(0),
     });
     let worker = session.clone();
     let handle = std::thread::Builder::new()
@@ -278,10 +350,21 @@ pub fn open(args: &OpenArgs) -> Result<Arc<Session>> {
             }
             drop(sh);
             worker.changed.notify_all();
+            if worker.idle_expired() {
+                lock(sessions()).1.retain(|_, x| !Arc::ptr_eq(x, &worker));
+            }
         })
         .map_err(|e| Error::new(ErrorCode::Internal, format!("could not start the session thread: {e}")))?;
     *lock(&session.thread) = Some(handle);
-    lock(sessions()).1.insert(id, session.clone());
+    {
+        // another open may have taken the last place meanwhile
+        let mut s = lock(sessions());
+        if s.1.len() >= MAX_SESSIONS {
+            session.stop.store(true, Ordering::Relaxed);
+            return Err(Error::new(ErrorCode::Busy, format!("{MAX_SESSIONS} live sessions are open already")).hint("close one with stream_close"));
+        }
+        s.1.insert(id, session.clone());
+    }
     Ok(session)
 }
 
@@ -322,7 +405,101 @@ fn now_iso() -> String {
 }
 
 impl Session {
+    fn touch(&self) {
+        *lock(&self.touched) = Instant::now();
+    }
+
+    fn idle_expired(&self) -> bool {
+        self.polling.load(Ordering::Relaxed) == 0 && self.idle.is_some_and(|d| lock(&self.touched).elapsed() > d)
+    }
+
+    /// Changes the running analysis; waits up to a second for the session thread to apply it.
+    pub fn configure(&self, c: Reconfigure) -> Result<Value> {
+        c.check()?;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut sh = lock(&self.shared);
+        if matches!(sh.state, State::Ended | State::Failed | State::Closed) {
+            return Err(Error::invalid_arg(format!("session {} has stopped; nothing is left to configure", self.id)));
+        }
+        sh.reconfigure.push_back(c);
+        sh.requested += 1;
+        let mine = sh.requested;
+        while sh.applied < mine && !matches!(sh.state, State::Ended | State::Failed | State::Closed) {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            sh = self.changed.wait_timeout(sh, deadline - now).unwrap_or_else(|e| e.into_inner()).0;
+        }
+        let applied = sh.applied >= mine;
+        drop(sh);
+        let mut v = self.status();
+        v["applied"] = json!(applied);
+        Ok(v)
+    }
+
+    /// Applies waiting changes to the analysis, or keeps them in `deferred` for it until there is one.
+    /// Opening a decoder can be slow, so it is done without the session's lock.
+    fn reconfigure(&self, analysis: Option<&mut Analysis>, deferred: &mut Vec<Reconfigure>) {
+        let changes: Vec<Reconfigure> = {
+            let mut sh = lock(&self.shared);
+            if sh.reconfigure.is_empty() {
+                return;
+            }
+            sh.reconfigure.drain(..).collect()
+        };
+        let n = changes.len() as u64;
+        let mut warnings = Vec::new();
+        let mut analyzed = None;
+        match analysis {
+            Some(a) => {
+                for c in &changes {
+                    if let Err(e) = a.configure(c) {
+                        warnings.push(format!("configure: {}", e.message));
+                    }
+                }
+                analyzed = Some(a.describe());
+                warnings.splice(0..0, a.warnings().iter().cloned());
+            }
+            None => deferred.extend(changes),
+        }
+        let mut sh = lock(&self.shared);
+        if let Some(v) = analyzed {
+            sh.analyzed = v;
+            sh.warnings = warnings;
+        }
+        sh.applied += n;
+        drop(sh);
+        self.changed.notify_all();
+    }
+
+    /// Observations in the log that match `q`, oldest first unless asked otherwise.
+    pub fn query(&self, q: &Query) -> Value {
+        let text = q.text.as_ref().map(|t| t.to_lowercase());
+        let sh = lock(&self.shared);
+        let matches = |o: &&Observation| {
+            (q.kinds.is_empty() || q.kinds.iter().any(|k| k == o.kind))
+                && q.analyzer.as_ref().is_none_or(|a| a == o.analyzer)
+                && q.stream.is_none_or(|s| o.stream == Some(s))
+                && q.from.is_none_or(|f| o.t_end.unwrap_or(o.t) >= f)
+                && q.to.is_none_or(|t| o.t <= t)
+                && text.as_ref().is_none_or(|t| o.data.to_string().to_lowercase().contains(t))
+        };
+        let max = q.max.clamp(1, 1000);
+        let total = sh.log.iter().filter(matches).count();
+        let found: Vec<&Observation> = if q.newest_first { sh.log.iter().rev().filter(matches).take(max).collect() } else { sh.log.iter().filter(matches).take(max).collect() };
+        json!({
+            "session": self.id,
+            "state": sh.state,
+            "events": found,
+            "matched": total,
+            "more": total > found.len(),
+            "log": { "first_seq": sh.log.front().map(|o| o.seq), "last_seq": sh.log.back().map(|o| o.seq) },
+        })
+    }
+
     fn run(&self, mut source: Box<dyn Source>, opts: &AnalyzeOptions, sopts: &StreamOptions, realtime: bool, mut rec: Option<&mut Recorder>) -> Result<()> {
+        let mut deferred = Vec::new();
         let mut published = Instant::now();
         let mut buf = vec![0u8; 64 << 10];
         let mut head = Vec::new();
@@ -331,9 +508,13 @@ impl Session {
         let mut pace: Option<(Instant, f64)> = None;
         let mut ended = false;
         while !ended {
+            if self.idle_expired() {
+                self.stop.store(true, Ordering::Relaxed);
+            }
             if self.stop.load(Ordering::Relaxed) {
                 break;
             }
+            self.reconfigure(analysis.as_mut(), &mut deferred);
             let chunk = source.read(&mut buf, READ_WAIT)?;
             let arrival = Instant::now();
             let bytes: &[u8] = match chunk {
@@ -371,9 +552,15 @@ impl Session {
                 if self.stop.load(Ordering::Relaxed) {
                     break;
                 }
+                // a paced source spends long in here: changes are taken between packets too
+                self.reconfigure(analysis.as_mut(), &mut deferred);
                 if analysis.is_none() {
                     let streams = d.streams().to_vec();
-                    let a = Analysis::new(&streams, opts, 0.0, f64::INFINITY, true)?;
+                    let mut a = Analysis::new(&streams, opts, 0.0, f64::INFINITY, true)?;
+                    // changes asked for before the first packet
+                    for c in deferred.drain(..) {
+                        a.configure(&c)?;
+                    }
                     let mut sh = lock(&self.shared);
                     // a reader that decides late (after an ID3 tag) knows by now
                     sh.format = Some(d.format_name());
@@ -409,7 +596,7 @@ impl Session {
                         lock(&self.shared).record = Some(rec.status());
                     }
                 }
-                a.packet(&sp.packet, &mut |o| self.log(o, Some(arrived)))?;
+                a.packet_keyed(&sp.packet, sp.key, &mut |o| self.log(o, Some(arrived)))?;
                 let mut sh = lock(&self.shared);
                 sh.packets += 1;
                 sh.media_seconds = sh.media_seconds.max(a.position());
@@ -512,6 +699,16 @@ impl Session {
 
     /// Observations after `after`, filtered, waiting up to `wait` for the first one.
     pub fn events(&self, after: u64, kinds: &[String], level: Level, max: usize, wait: Duration) -> Value {
+        struct Polling<'a>(&'a Session);
+        impl Drop for Polling<'_> {
+            fn drop(&mut self) {
+                self.0.touch();
+                self.0.polling.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        self.polling.fetch_add(1, Ordering::Relaxed);
+        let _polling = Polling(self);
+        self.touch();
         let deadline = Instant::now() + wait;
         let mut sh = lock(&self.shared);
         loop {
@@ -523,7 +720,7 @@ impl Session {
                 // the seq to ask after next time: past what was returned, or past everything
                 // looked at when nothing matched
                 let next = found.last().map(|o| o.seq).unwrap_or_else(|| sh.log.back().map_or(after, |o| o.seq.max(after)));
-                let missed = sh.log.front().map_or(0, |o| o.seq.saturating_sub(after + 1));
+                let missed = sh.log.front().map_or(0, |o| o.seq.saturating_sub(after.saturating_add(1)));
                 return json!({
                     "session": self.id,
                     "state": sh.state,

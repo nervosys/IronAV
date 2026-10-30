@@ -137,11 +137,13 @@ fn speech_gating_sends_only_the_utterance_with_its_pre_roll() {
     for w in chunks.windows(2) {
         assert!((w[0]["t_end"].as_f64().unwrap() - w[1]["t"].as_f64().unwrap()).abs() < 0.002, "{r}");
     }
-    // the voice-activity analyzer agrees, and the digest carries the sidecar's text
+    // the voice-activity analyzer agrees, and the summary carries the sidecar's text (a digest may
+    // close before the sidecar's answers arrive; the summary waits for them)
     assert_eq!(of_kind(&r, "speech_start").len(), 1, "{r}");
     let digest = &of_kind(&r, "digest")[0]["data"]["audio0"];
-    assert!(digest["echo"]["text"].as_str().unwrap().starts_with("chunk1 chunk2"), "{r}");
     assert!(digest["voice_activity"]["speech_fraction"].as_f64().unwrap() > 0.2, "{r}");
+    let summary = &of_kind(&r, "summary")[0]["data"]["audio0"];
+    assert!(summary["echo"]["text"].as_str().unwrap().starts_with("chunk1 chunk2"), "{r}");
 }
 
 #[test]
