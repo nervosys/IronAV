@@ -420,9 +420,25 @@ impl RangeEncoder {
         out
     }
 
+    /// Starts another frame of exactly `size` bytes in the same buffer, which allocates only when
+    /// it is larger than any before.
+    pub fn reset(&mut self, size: usize) {
+        self.buf.clear();
+        self.buf.resize(size, 0);
+        (self.offs, self.end_offs, self.end_window, self.nend_bits, self.total_bits) = (0, 0, 0, 0, 33);
+        (self.range, self.value, self.rem, self.ext, self.error) = (TOP, 0, -1, 0, false);
+    }
+
     /// Finish the frame: flush the range coder and merge in the raw bits. Fails if the frame
     /// overflowed.
+    #[cfg(test)]
     pub fn finish(mut self) -> Result<Vec<u8>, ()> {
+        self.finish_in_place()?;
+        Ok(self.buf)
+    }
+
+    /// [`finish`](Self::finish), leaving the frame in [`bytes`](Self::bytes).
+    pub fn finish_in_place(&mut self) -> Result<(), ()> {
         let mut l = 32 - ilog(self.range) as i32;
         let mut msk = (TOP - 1) >> l;
         let mut end = self.value.wrapping_add(msk) & !msk;
@@ -462,8 +478,13 @@ impl RangeEncoder {
         if self.error {
             Err(())
         } else {
-            Ok(self.buf)
+            Ok(())
         }
+    }
+
+    /// The frame, once finished.
+    pub fn bytes(&self) -> &[u8] {
+        &self.buf
     }
 }
 

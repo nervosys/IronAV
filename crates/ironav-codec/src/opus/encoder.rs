@@ -1,8 +1,11 @@
-//! An Opus encoder: CELT mode, 48 kHz, 20 ms frames, constant bit rate, mono or stereo.
+//! An Opus encoder: CELT mode, 48 kHz, frames of 2.5, 5, 10 or 20 ms, constant bit rate, mono or
+//! stereo.
 //!
 //! The frame coding is in `celt/enc.rs`; this file turns a stream of samples into packets: the
 //! pre-emphasis filter, buffering for the window's look-ahead, the TOC byte, and the end of the
-//! stream.
+//! stream. Besides the [`Encoder`] trait, which takes frames of any length, a caller that has its
+//! own framing (a voice link, say) codes one frame at a time into its own buffer with
+//! [`OpusEncoder::encode_frame_into`], which allocates nothing.
 
 use super::celt::enc::{FRAME, LOOKAHEAD};
 use super::celt::Celt;
@@ -32,7 +35,12 @@ pub fn opus_head(channels: usize) -> Vec<u8> {
 
 pub struct OpusEncoder {
     celt: Celt,
+    rc: RangeEncoder,
     channels: usize,
+    bitrate: u32,
+    /// The frame's size code (0 to 3: 2.5 to 20 ms) and samples.
+    size: i32,
+    frame: usize,
     /// Bytes of a full packet, TOC included.
     bytes: usize,
     /// The previous input sample of each channel, for the pre-emphasis.
@@ -56,9 +64,94 @@ impl OpusEncoder {
         if !(1..=2).contains(&channels) {
             return Err(Error::new(ErrorCode::UnsupportedCodec, format!("the Opus encoder takes mono or stereo audio, not {channels} channels")));
         }
-        // 20 ms of the bit rate, but never less than a few bytes or more than a frame can hold
-        let bytes = (bitrate as usize * FRAME / RATE as usize / 8).clamp(8 * channels, 1275);
-        Ok(Self { celt: Celt::new(channels, true), channels, bytes, prev: [0.0; 2], sig: vec![vec![0.0; LOOKAHEAD]; channels], frames: 0, transients: 0, input: 0 })
+        let mut sig = vec![Vec::with_capacity(2 * FRAME + LOOKAHEAD); channels];
+        for s in sig.iter_mut() {
+            s.resize(LOOKAHEAD, 0.0);
+        }
+        Ok(Self {
+            celt: Celt::new(channels, true),
+            rc: RangeEncoder::new(1275),
+            channels,
+            bitrate,
+            size: 3,
+            frame: FRAME,
+            bytes: Self::frame_bytes(bitrate, FRAME, channels),
+            prev: [0.0; 2],
+            sig,
+            frames: 0,
+            transients: 0,
+            input: 0,
+        })
+    }
+
+    /// A frame's worth of the bit rate, but never less than a few bytes or more than a frame can hold.
+    fn frame_bytes(bitrate: u32, frame: usize, channels: usize) -> usize {
+        (bitrate as usize * frame / RATE as usize / 8).clamp(8 * channels, 1275)
+    }
+
+    /// Frames of `ms` milliseconds: 2.5, 5, 10 or 20 (the default). Shorter frames lower the delay
+    /// and cost quality at the same bit rate. Only before any audio.
+    pub fn with_frame_ms(mut self, ms: f64) -> Result<Self> {
+        let size = match ms {
+            2.5 => 0,
+            5.0 => 1,
+            10.0 => 2,
+            20.0 => 3,
+            _ => return Err(Error::invalid_arg(format!("Opus frames are 2.5, 5, 10 or 20 ms, not {ms}")).alternatives(["2.5", "5", "10", "20"])),
+        };
+        if self.input > 0 {
+            return Err(Error::invalid_arg("the frame length is set before any audio"));
+        }
+        self.size = size;
+        self.frame = FRAME >> (3 - size);
+        self.bytes = Self::frame_bytes(self.bitrate, self.frame, self.channels);
+        Ok(self)
+    }
+
+    /// Samples per channel in a frame (at 48 kHz).
+    pub fn frame_samples(&self) -> usize {
+        self.frame
+    }
+
+    /// Bytes in every packet but those of digital silence (3), TOC included.
+    pub fn packet_bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// The delay the encoder adds, in samples at 48 kHz: a frame of buffering and the window's
+    /// look-ahead (the decoder drops the look-ahead as the stream's pre-skip). A frame passed
+    /// to [`encode_frame_into`](Self::encode_frame_into) comes out of a decoder this much later.
+    pub fn delay_samples(&self) -> usize {
+        self.frame + LOOKAHEAD
+    }
+
+    /// [`delay_samples`](Self::delay_samples) in milliseconds.
+    pub fn delay_ms(&self) -> f64 {
+        self.delay_samples() as f64 * 1000.0 / RATE as f64
+    }
+
+    /// Codes one frame: `pcm` holds exactly [`frame_samples`](Self::frame_samples) interleaved
+    /// samples per channel (-1 to 1), and the packet, TOC byte first, is written to the start of
+    /// `out` (at least [`packet_bytes`](Self::packet_bytes) long). Returns the packet's length.
+    /// Allocates nothing. It cannot follow audio passed to [`Encoder::encode`] that has not made a
+    /// whole frame.
+    pub fn encode_frame_into(&mut self, pcm: &[f32], out: &mut [u8]) -> Result<usize> {
+        if pcm.len() != self.frame * self.channels {
+            return Err(Error::invalid_arg(format!("a frame is {} samples ({} per channel), not {}", self.frame * self.channels, self.frame, pcm.len())));
+        }
+        if out.len() < self.bytes {
+            return Err(Error::invalid_arg(format!("the packet needs {} bytes, the buffer has {}", self.bytes, out.len())));
+        }
+        if self.sig[0].len() != LOOKAHEAD {
+            return Err(Error::invalid_arg("audio from encode() is waiting for the rest of its frame"));
+        }
+        for i in 0..self.frame {
+            for c in 0..self.channels {
+                self.push(c, pcm[i * self.channels + c]);
+            }
+        }
+        self.input += self.frame as u64;
+        self.code(out)
     }
 
     /// The bit rate used when none is asked for: 64 kb/s per channel.
@@ -71,25 +164,35 @@ impl OpusEncoder {
         self.prev[c] = x;
     }
 
-    fn emit(&mut self, packets: &mut Vec<Packet>, duration: i64) -> Result<()> {
-        let n = FRAME + LOOKAHEAD;
+    /// Codes the frame at the front of the buffered signal into `out`, and returns the packet's length.
+    fn code(&mut self, out: &mut [u8]) -> Result<usize> {
+        let n = self.frame + LOOKAHEAD;
         let silent = self.sig.iter().all(|s| s[..n].iter().all(|&v| v == 0.0));
         // digital silence needs only the flag
         let size = if silent { 3 } else { self.bytes };
-        let mut rc = RangeEncoder::new(size - 1);
-        let refs: Vec<&[f32]> = self.sig.iter().map(|s| &s[..n]).collect();
-        self.celt.encode_frame(&mut rc, &refs, silent, self.frames % INTRA_PERIOD == 0);
-        let body = rc.finish().map_err(|_| Error::new(ErrorCode::Internal, "Opus: a frame did not fit its packet"))?;
-        let mut data = Vec::with_capacity(size);
-        // configuration 31 (CELT, full band, 20 ms), one frame per packet
-        data.push(0xF8 | (((self.channels == 2) as u8) << 2));
-        data.extend(body);
-        packets.push(Packet { stream: 0, pts: self.frames as i64 * FRAME as i64, duration, data });
+        self.rc.reset(size - 1);
+        let (a, b) = (&self.sig[0][..n], self.sig.get(1).map_or(&[][..], |s| &s[..n]));
+        let both = [a, b];
+        let refs = &both[..self.channels];
+        self.celt.encode_frame(&mut self.rc, refs, self.size, silent, self.frames % INTRA_PERIOD == 0);
+        self.rc.finish_in_place().map_err(|_| Error::new(ErrorCode::Internal, "Opus: a frame did not fit its packet"))?;
+        // configurations 28 to 31: CELT, full band, 2.5 to 20 ms; one frame per packet
+        out[0] = ((28 + self.size as u8) << 3) | (((self.channels == 2) as u8) << 2);
+        out[1..size].copy_from_slice(self.rc.bytes());
         self.frames += 1;
         self.transients += self.celt.was_transient() as u64;
         for s in self.sig.iter_mut() {
-            s.drain(..FRAME);
+            s.drain(..self.frame);
         }
+        Ok(size)
+    }
+
+    fn emit(&mut self, packets: &mut Vec<Packet>, duration: i64) -> Result<()> {
+        let pts = self.frames as i64 * self.frame as i64;
+        let mut data = vec![0u8; self.bytes];
+        let len = self.code(&mut data)?;
+        data.truncate(len);
+        packets.push(Packet { stream: 0, pts, duration, data });
         Ok(())
     }
 }
@@ -110,8 +213,8 @@ impl Encoder for OpusEncoder {
         }
         self.input += n as u64;
         let mut packets = Vec::new();
-        while self.sig[0].len() >= FRAME + LOOKAHEAD {
-            self.emit(&mut packets, FRAME as i64)?;
+        while self.sig[0].len() >= self.frame + LOOKAHEAD {
+            self.emit(&mut packets, self.frame as i64)?;
         }
         Ok(packets)
     }
@@ -122,16 +225,17 @@ impl Encoder for OpusEncoder {
             return Ok(packets);
         }
         // frames until every input sample has come out of the decoder, which is the pre-skip late
-        let wanted = (self.input as usize + PRE_SKIP).div_ceil(FRAME) as u64;
+        let frame = self.frame;
+        let wanted = (self.input as usize + PRE_SKIP).div_ceil(frame) as u64;
         while self.frames < wanted {
-            while self.sig[0].len() < FRAME + LOOKAHEAD {
+            while self.sig[0].len() < frame + LOOKAHEAD {
                 for c in 0..self.channels {
                     self.push(c, 0.0);
                 }
             }
             let last = self.frames + 1 == wanted;
             // the final packet decodes to more than the stream holds; say how much to keep
-            let duration = if last { (self.input as usize + PRE_SKIP - (wanted as usize - 1) * FRAME) as i64 } else { FRAME as i64 };
+            let duration = if last { (self.input as usize + PRE_SKIP - (wanted as usize - 1) * frame) as i64 } else { frame as i64 };
             self.emit(&mut packets, duration)?;
         }
         Ok(packets)

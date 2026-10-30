@@ -474,7 +474,17 @@ rate as it should (a tone-and-noise test signal, mono: 10 dB at 16 kb/s, 22 dB a
 is only a simple transient detector (a frame with a sudden attack is coded as eight short blocks; on a test of decaying hits that is +1.3 dB SNR), no pitch pre-filter,
 no band boosts or tuned allocation trim, and no variable bit rate or SILK/hybrid modes, so at the same size it will sound
 worse than libopus. The end of a stream is exact in Ogg (the last page's granule position) and in Matroska/WebM (the last block carries a
-`DiscardPadding`, which our reader honours); FFmpeg decodes both to exactly the source's length. Not compared with libopus for quality: I have no libopus encoder to run.
+`DiscardPadding`, which our reader honours); FFmpeg decodes both to exactly the source's length.
+
+For a voice link, frames can be 2.5, 5 or 10 ms instead of 20 (`OpusEncoder::with_frame_ms`), and a caller with its own
+framing codes one frame at a time into its own buffer (`encode_frame_into(pcm, out) -> len`), which allocates nothing
+after the first frame (a counting allocator checks it). `delay_ms()` gives the delay the encoder adds: a frame plus
+the 2.5 ms look-ahead, so 12.5 ms at 10 ms frames and 7.5 ms at 5 ms. On one second of a speech-like test signal at
+32 kb/s, libopus (through PyAV) and FFmpeg's own decoder both decode every frame length to within 2e-5 of ours, at
+18.9, 20.5, 20.4 and 3.7 dB SNR for 20, 10, 5 and 2.5 ms. libopus's own encoder (CELT, constant 32 kb/s) gets
+28.3, 26.5, 25.3 and 16.2 dB on the same signal: this encoder is 6 to 12 dB behind it, most of all at 2.5 ms, where
+the pitch pre-filter it lacks matters most. `cargo test -p ironav-engine --test opus_interop -- --ignored` with
+`IRONAV_OPUS_OUT=dir` writes the streams for such a check.
 
 ## Vorbis
 
