@@ -84,8 +84,8 @@ fn round_trip(ms: f64, bitrate: u32, input: &[f32]) -> (Vec<f64>, OpusEncoder) {
 #[test]
 fn short_frames_round_trip_and_say_their_delay() {
     let input = voice(48_000);
-    // measured: 18.6, 20.1, 20.2 and 11.9 dB
-    for (ms, delay, min_snr) in [(20.0, 22.5, 17.0), (10.0, 12.5, 18.0), (5.0, 7.5, 18.0), (2.5, 5.0, 10.0)] {
+    // measured: 21.2, 21.6, 20.2 and 11.9 dB
+    for (ms, delay, min_snr) in [(20.0, 22.5, 20.0), (10.0, 12.5, 20.0), (5.0, 7.5, 18.0), (2.5, 5.0, 10.0)] {
         let (out, enc) = round_trip(ms, 32_000, &input);
         assert_eq!(enc.delay_ms(), delay);
         assert_eq!(enc.frame_samples() as f64, 48.0 * ms);

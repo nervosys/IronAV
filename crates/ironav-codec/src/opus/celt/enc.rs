@@ -5,8 +5,8 @@
 //! forward MDCT, band energies) and the parts that only an encoder has to decide (energy
 //! quantisation, the pulse search, the stereo angle).
 //!
-//! Not done: the pitch pre-filter, finer time-frequency resolution changes, band boosts, a tuned
-//! allocation trim and variable bit rate.
+//! The pitch pre-filter is in `prefilter.rs`; this codes its parameters. Not done: finer
+//! time-frequency resolution changes, band boosts, a tuned allocation trim and variable bit rate.
 
 use super::*;
 use crate::opus::rc::RangeEncoder;
@@ -248,7 +248,7 @@ impl Celt {
     /// and the look-ahead) into `rc`. `size` is 0 to 3, for 2.5 to 20 ms. `silent` marks a frame
     /// of digital silence; `intra` codes the band energies without prediction from the previous
     /// frame.
-    pub fn encode_frame(&mut self, rc: &mut RangeEncoder, sig: &[&[f32]], size: i32, silent: bool, intra: bool) {
+    pub fn encode_frame(&mut self, rc: &mut RangeEncoder, sig: &[&[f32]], size: i32, silent: bool, intra: bool, pitch: Option<super::prefilter::PitchParams>) {
         let channels = sig.len();
         let n = OVERLAP << size;
         self.flushed = false;
@@ -277,10 +277,25 @@ impl Celt {
             }
             return;
         }
-        // no pitch post-filter
+        // the pitch the pre-filter took out, for the decoder's post-filter to put back
         if consumed + 16 <= self.p.framebits {
-            rc.log(1, 0);
+            match pitch {
+                Some(pf) => {
+                    rc.log(1, 1);
+                    let v = pf.period as u32 + 1;
+                    let octave = 27 - v.leading_zeros();
+                    Coder::uint(rc, 6, octave);
+                    Coder::raw(rc, 4 + octave, v - (16 << octave));
+                    Coder::raw(rc, 3, pf.qg);
+                    Coder::cdf(rc, &CELT_MODEL_TAPSET, pf.tapset);
+                }
+                None => {
+                    rc.log(1, 0);
+                }
+            }
             consumed = rc.tell();
+        } else {
+            debug_assert!(pitch.is_none(), "a pre-filtered frame without room for its parameters");
         }
         if size > 0 && consumed + 3 <= self.p.framebits {
             rc.log(3, transient as u32);
@@ -310,6 +325,8 @@ impl Celt {
             self.block[c].coeffs = coeffs;
         }
 
+        // an even split between low and high bands: libopus's tilt-following trim measured worse here
+        self.p.alloc_trim = 5;
         let mut error = [[0f32; MAX_BANDS]; 2];
         self.encode_coarse_energy(rc, &log_e, intra, &mut error);
         self.decode_tf_changes(rc);

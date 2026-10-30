@@ -8,6 +8,7 @@
 //! [`OpusEncoder::encode_frame_into`], which allocates nothing.
 
 use super::celt::enc::{FRAME, LOOKAHEAD};
+use super::celt::prefilter::Prefilter;
 use super::celt::Celt;
 use super::rc::RangeEncoder;
 use ironav_core::{Encoder, Error, ErrorCode, Frame, Packet, Result};
@@ -36,6 +37,7 @@ pub fn opus_head(channels: usize) -> Vec<u8> {
 pub struct OpusEncoder {
     celt: Celt,
     rc: RangeEncoder,
+    pre: Prefilter,
     channels: usize,
     bitrate: u32,
     /// The frame's size code (0 to 3: 2.5 to 20 ms) and samples.
@@ -71,6 +73,7 @@ impl OpusEncoder {
         Ok(Self {
             celt: Celt::new(channels, true),
             rc: RangeEncoder::new(1275),
+            pre: Prefilter::default(),
             channels,
             bitrate,
             size: 3,
@@ -180,10 +183,17 @@ impl OpusEncoder {
         // digital silence needs only the flag
         let size = if silent { 3 } else { self.bytes };
         self.rc.reset(size - 1);
+        // the pitch pre-filter needs room for its parameters; off, it fades out
+        let enabled = !silent && size - 1 > 12 * self.channels;
+        let pitch = match &mut self.sig[..] {
+            [a] => self.pre.run(&mut [&mut a[..n]], self.frame, enabled, size - 1),
+            [a, b] => self.pre.run(&mut [&mut a[..n], &mut b[..n]], self.frame, enabled, size - 1),
+            _ => unreachable!("one or two channels"),
+        };
         let (a, b) = (&self.sig[0][..n], self.sig.get(1).map_or(&[][..], |s| &s[..n]));
         let both = [a, b];
         let refs = &both[..self.channels];
-        self.celt.encode_frame(&mut self.rc, refs, self.size, silent, self.frames % INTRA_PERIOD == 0);
+        self.celt.encode_frame(&mut self.rc, refs, self.size, silent, self.frames % INTRA_PERIOD == 0, pitch);
         self.rc.finish_in_place().map_err(|_| Error::new(ErrorCode::Internal, "Opus: a frame did not fit its packet"))?;
         // configurations 28 to 31: CELT, full band, 2.5 to 20 ms; one frame per packet
         out[0] = ((28 + self.size as u8) << 3) | (((self.channels == 2) as u8) << 2);

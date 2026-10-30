@@ -7,6 +7,7 @@ use super::mdct::Dct4;
 use super::rc::{ilog, Coder, RangeDecoder};
 
 pub(super) mod enc;
+pub(super) mod prefilter;
 use super::tables::*;
 use ironav_core::{Error, Result};
 
@@ -1017,10 +1018,11 @@ impl Celt {
             }
         }
 
-        // Allocation trim
+        // Allocation trim (an encoder sets the one it wants beforehand)
+        let want = f.alloc_trim.clamp(0, 10) as usize;
         f.alloc_trim = 5;
         if rc.tell_frac() + (6 << 3) <= tbits_8ths {
-            f.alloc_trim = rc.cdf(&CELT_MODEL_ALLOC_TRIM, 5) as i32;
+            f.alloc_trim = rc.cdf(&CELT_MODEL_ALLOC_TRIM, want) as i32;
         }
 
         // Anti-collapse bit reservation

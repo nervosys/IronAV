@@ -471,7 +471,7 @@ The range encoder is checked symbol by symbol against the decoder's, including i
 Checked: FFmpeg (through PyAV) opens the Matroska files and decodes them; our decoder's output and FFmpeg's agree to
 83 dB, and both are 20.4 dB SNR against the source on a 6 s, 128 kb/s stereo test signal. Quality grows with the bit
 rate as it should (a tone-and-noise test signal, mono: 10 dB at 16 kb/s, 22 dB at 64, 29 at 128, 39 at 256). This is a first encoder, not libopus: there
-is only a simple transient detector (a frame with a sudden attack is coded as eight short blocks; on a test of decaying hits that is +1.3 dB SNR), no pitch pre-filter,
+is only a simple transient detector (a frame with a sudden attack is coded as eight short blocks; on a test of decaying hits that is +1.3 dB SNR),
 no band boosts or tuned allocation trim, and no variable bit rate or SILK/hybrid modes, so at the same size it will sound
 worse than libopus. The end of a stream is exact in Ogg (the last page's granule position) and in Matroska/WebM (the last block carries a
 `DiscardPadding`, which our reader honours); FFmpeg decodes both to exactly the source's length.
@@ -481,9 +481,16 @@ framing codes one frame at a time into its own buffer (`encode_frame_into(pcm, o
 after the first frame (a counting allocator checks it). `delay_ms()` gives the delay the encoder adds: a frame plus
 the 2.5 ms look-ahead, so 12.5 ms at 10 ms frames and 7.5 ms at 5 ms. On one second of a speech-like test signal at
 32 kb/s, libopus (through PyAV) and FFmpeg's own decoder both decode every frame length to within 2e-5 of ours, at
-18.9, 20.5, 20.4 and 3.7 dB SNR for 20, 10, 5 and 2.5 ms. libopus's own encoder (CELT, constant 32 kb/s) gets
-28.3, 26.5, 25.3 and 16.2 dB on the same signal: this encoder is 6 to 12 dB behind it, most of all at 2.5 ms, where
-the pitch pre-filter it lacks matters most. `cargo test -p ironav-engine --test opus_interop -- --ignored` with
+21.7, 22.7, 20.4 and 3.7 dB SNR for 20, 10, 5 and 2.5 ms. libopus's own encoder (CELT, constant 32 kb/s) gets
+28.3, 26.5, 25.3 and 16.2 dB on the same signal: this encoder is 4 to 12 dB behind it, most of all at 2.5 ms.
+
+The pitch pre-filter takes a voice's (or an instrument's) pitch out of the signal before the transform, with a comb
+filter the decoder's post-filter undoes, so the bands are not spent on its harmonics. The period is found by
+correlation on a half-rate copy, refined at the full rate and checked against its fractions so a multiple of the true
+period is not taken; the gain and the thresholds for turning it on are libopus's. It is on in frames of more than 12
+bytes per channel, and lifted the speech-like test from 18.9 to 21.7 dB at 20 ms and from 20.5 to 22.7 dB at 10 ms (at 5
+and 2.5 ms the frames are too small for it to pay its side information). libopus's allocation trim, which follows the
+spectrum's tilt, was tried and measured 1 to 4 dB worse here, so the trim stays even. `cargo test -p ironav-engine --test opus_interop -- --ignored` with
 `IRONAV_OPUS_OUT=dir` writes the streams for such a check.
 
 ### Voice link
