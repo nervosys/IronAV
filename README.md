@@ -90,7 +90,21 @@ waiting costs nothing while the stream is quiet. Pass the returned `next_after` 
 returns the newest picture, or the one at `at` seconds, as an image. `stream_clip` writes `from`..`to` of the
 retained media (`retain_seconds`, 60 by default) to a file without re-encoding, starting at a keyframe.
 `stream_status` reports the state, bytes, packets and latency percentiles; `stream_close` returns the summary.
-At most 8 sessions are open at once (error code `busy` past that). MPEG-TS, RTSP and HLS are designed but not built
+At most 8 sessions are open at once (error code `busy` past that).
+
+A session can also record what arrives, without re-encoding (`record`, or `--record` for `watch`). The recording can be a
+single file: a `.ts` stays playable even if the recording is cut off, while an `.mp4` is complete only once the session
+closes. It can also be HLS: give an `.m3u8` path, and MPEG-TS segments are cut at the first keyframe after each
+`segment_seconds` (6 by default) and written next to the playlist. The playlist is replaced whole after every segment, so a
+player can follow the recording live. With `keep_segments: N` the playlist is a sliding window and older segments are
+deleted; otherwise it keeps them all and is closed with `#EXT-X-ENDLIST` when the session ends. A source that the recording
+format cannot hold, such as Y4M into `.ts`, leaves the analysis running and reports the reason under `record.error` in the
+status. FFmpeg plays the playlists: a 12 s H.264/AAC stream recorded as three segments gives back all 300 pictures and 564
+audio frames, with no decode errors.
+
+```sh
+ironav watch udp://:5000 --record live/stream.m3u8 --segment-seconds 4 --keep-segments 10
+``` MPEG-TS, RTSP and HLS are designed but not built
 yet: see [docs/design/agentic-realtime.md](docs/design/agentic-realtime.md).
 
 ## Ontology

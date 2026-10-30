@@ -270,7 +270,11 @@ fn stream_open_schema() -> Value {
             "fps": { "type": "number", "exclusiveMinimum": 0, "description": "Frame rate of a raw H.264/HEVC stream, which carries none (25 when absent)." },
             "pace": { "type": "string", "enum": ["realtime", "none"], "description": "realtime: read no faster than the media plays." },
             "thumbnail_seconds": { "type": "number", "minimum": 2, "default": 10 },
-            "hwaccel": { "type": "string", "default": "auto" }
+            "hwaccel": { "type": "string", "default": "auto" },
+            "record": { "type": "string", "description": "Also write the media as it arrives, without re-encoding: a file (.ts stays playable even if cut off; .mp4 is complete when the session closes), or an .m3u8 path for HLS: MPEG-TS segments cut at keyframes next to it, and the playlist rewritten after each one." },
+            "segment_seconds": { "type": "number", "minimum": 1, "maximum": 600, "default": 6, "description": "HLS segment length (cut at the first keyframe after it)." },
+            "keep_segments": { "type": "integer", "minimum": 1, "description": "HLS: keep only the newest N segments (a sliding live playlist); all of them when absent." },
+            "overwrite": { "type": "boolean", "default": false }
         }),
         &["source"],
     )

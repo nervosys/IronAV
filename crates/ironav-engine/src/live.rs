@@ -6,6 +6,7 @@
 //! bounded; a reader that falls behind finds the oldest entries gone and is told how many.
 
 use crate::analyze::{png_of, AnalyzeOptions, Analysis};
+use crate::record::{RecordOptions, Recorder};
 use ironav_analyze::{Level, Observation};
 use ironav_core::{Error, ErrorCode, Rational, Result, StreamInfo, VideoFrame};
 use ironav_formats::stream::{stream_demuxer, StreamOptions, StreamPacket, SNIFF_BYTES};
@@ -54,6 +55,15 @@ pub struct OpenArgs {
     pub thumbnail_seconds: Option<f64>,
     #[serde(default = "default_hwaccel")]
     pub hwaccel: String,
+    /// Record the media as it arrives: a file, or an `.m3u8` path for HLS segments and a playlist.
+    #[serde(default)]
+    pub record: Option<String>,
+    #[serde(default)]
+    pub segment_seconds: Option<f64>,
+    #[serde(default)]
+    pub keep_segments: Option<usize>,
+    #[serde(default)]
+    pub overwrite: bool,
 }
 
 fn default_level() -> String {
@@ -106,6 +116,8 @@ struct Shared {
     summary: Option<Value>,
     /// Thumbnails since the last snapshot of them was read, newest last (at most a few).
     thumbnails: VecDeque<(f64, VideoFrame)>,
+    /// The recorder's status, as last published by the session thread.
+    record: Option<Value>,
 }
 
 pub struct Session {
@@ -187,6 +199,14 @@ pub fn open(args: &OpenArgs) -> Result<Arc<Session>> {
         Some("realtime" | "1" | "on") => true,
         Some(p) => return Err(Error::invalid_arg(format!("unknown pace '{p}'")).alternatives(["realtime", "none"])),
     };
+    let record = args.record.as_ref().map(|path| RecordOptions { path: path.clone(), segment_seconds: args.segment_seconds, keep_segments: args.keep_segments, overwrite: args.overwrite });
+    match &record {
+        Some(r) => r.check()?,
+        None if args.segment_seconds.is_some() || args.keep_segments.is_some() => {
+            return Err(Error::invalid_arg("segment_seconds and keep_segments go with record"));
+        }
+        None => {}
+    }
     if !(args.retain_seconds >= 0.0) {
         return Err(Error::invalid_arg("retain_seconds must be 0 or more"));
     }
@@ -226,6 +246,7 @@ pub fn open(args: &OpenArgs) -> Result<Arc<Session>> {
             latencies: VecDeque::new(),
             summary: None,
             thumbnails: VecDeque::new(),
+            record: None,
         }),
         changed: Condvar::new(),
         stop: AtomicBool::new(false),
@@ -235,7 +256,14 @@ pub fn open(args: &OpenArgs) -> Result<Arc<Session>> {
     let handle = std::thread::Builder::new()
         .name(format!("ironav-live-{id}"))
         .spawn(move || {
-            let r = worker.run(source, &opts, &stream_opts, realtime);
+            let mut rec = record.map(Recorder::new);
+            let r = worker.run(source, &opts, &stream_opts, realtime, rec.as_mut());
+            // a recording is closed however the session ended
+            if let Some(rec) = rec.as_mut() {
+                let end = lock(&worker.shared).media_seconds;
+                rec.finish(end);
+                lock(&worker.shared).record = Some(rec.status());
+            }
             let mut sh = lock(&worker.shared);
             if let Err(e) = r {
                 sh.state = State::Failed;
@@ -291,7 +319,8 @@ fn now_iso() -> String {
 }
 
 impl Session {
-    fn run(&self, mut source: Box<dyn Source>, opts: &AnalyzeOptions, sopts: &StreamOptions, realtime: bool) -> Result<()> {
+    fn run(&self, mut source: Box<dyn Source>, opts: &AnalyzeOptions, sopts: &StreamOptions, realtime: bool, mut rec: Option<&mut Recorder>) -> Result<()> {
+        let mut published = Instant::now();
         let mut buf = vec![0u8; 64 << 10];
         let mut head = Vec::new();
         let mut demux = None;
@@ -346,6 +375,10 @@ impl Session {
                     sh.state = State::Running;
                     sh.analyzed = a.describe();
                     sh.warnings = a.warnings().to_vec();
+                    if let Some(rec) = rec.as_deref_mut() {
+                        rec.start(&streams);
+                        sh.record = Some(rec.status());
+                    }
                     sh.streams = streams;
                     drop(sh);
                     analysis = Some(a);
@@ -363,6 +396,14 @@ impl Session {
                 }
                 let arrived = if realtime { Instant::now() } else { arrival };
                 self.keep(&sp, t);
+                // written before the shared state is locked: a slow disk holds up only this thread
+                if let Some(rec) = rec.as_deref_mut() {
+                    rec.packet(&sp.packet, t, sp.key);
+                    if published.elapsed() >= Duration::from_millis(250) {
+                        published = Instant::now();
+                        lock(&self.shared).record = Some(rec.status());
+                    }
+                }
                 a.packet(&sp.packet, &mut |o| self.log(o, Some(arrived)))?;
                 let mut sh = lock(&self.shared);
                 sh.packets += 1;
@@ -460,6 +501,7 @@ impl Session {
             "latency_ms": { "p50": pct(0.5), "p95": pct(0.95), "samples": lat.len() },
             "log": { "first_seq": sh.log.front().map(|o| o.seq), "last_seq": sh.log.back().map(|o| o.seq) },
             "retained": { "from": sh.ring.front().map(|k| k.t), "to": sh.ring.back().map(|k| k.t), "bytes": sh.ring_bytes },
+            "record": sh.record,
         })
     }
 
@@ -640,6 +682,12 @@ mod tests {
         f
     }
 
+    /// Live tests take turns: one of them fills every session slot.
+    fn turn() -> std::sync::MutexGuard<'static, ()> {
+        static T: Mutex<()> = Mutex::new(());
+        lock(&T)
+    }
+
     fn args(source: &str) -> OpenArgs {
         serde_json::from_value(json!({ "source": source, "analyzers": ["scene", "structure"] })).unwrap()
     }
@@ -654,6 +702,7 @@ mod tests {
 
     #[test]
     fn a_file_session_observes_snapshots_clips_and_closes() {
+        let _turn = turn();
         let dir = std::env::temp_dir().join(format!("ironav-live-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join("in.y4m");
@@ -697,6 +746,7 @@ mod tests {
 
     #[test]
     fn a_tcp_session_reads_what_a_peer_sends() {
+        let _turn = turn();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let s = open(&args(&format!("tcp://127.0.0.1:{port}"))).unwrap();
@@ -715,6 +765,7 @@ mod tests {
 
     #[test]
     fn a_transport_stream_over_tcp_gives_its_video_and_audio() {
+        let _turn = turn();
         let data = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../ironav-formats/tests/data/h264_aac.ts")).unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -733,8 +784,94 @@ mod tests {
         assert!(st["summary"]["audio1"]["levels"].is_object(), "{st}");
     }
 
+    fn record_ts_fixture(dir: &Path, record: &str, extra: Value) -> Value {
+        let src = concat!(env!("CARGO_MANIFEST_DIR"), "/../ironav-formats/tests/data/h264_aac.ts");
+        let mut a = json!({ "source": src, "analyzers": ["structure"], "record": dir.join(record).to_str().unwrap() });
+        for (k, v) in extra.as_object().unwrap() {
+            a[k] = v.clone();
+        }
+        let s = open(&serde_json::from_value(a).unwrap()).unwrap();
+        wait_end(&s);
+        close(&s.id).unwrap()
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("ironav-rec-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn a_session_records_to_one_file() {
+        let _turn = turn();
+        let dir = scratch("file");
+        for name in ["out.ts", "out.mp4"] {
+            let st = record_ts_fixture(&dir, name, json!({}));
+            assert_eq!(st["record"]["error"], Value::Null, "{st}");
+            assert_eq!(st["record"]["packets"], 145, "{st}");
+            let mut d = ironav_formats::open_demuxer(&dir.join(name)).unwrap();
+            assert_eq!(d.streams().len(), 2);
+            let n = std::iter::from_fn(|| d.read_packet().unwrap()).count();
+            assert_eq!(n, 145, "{name}");
+        }
+        // an existing file is not replaced unless asked
+        let src = concat!(env!("CARGO_MANIFEST_DIR"), "/../ironav-formats/tests/data/h264_aac.ts");
+        let a: OpenArgs = serde_json::from_value(json!({ "source": src, "record": dir.join("out.ts").to_str().unwrap() })).unwrap();
+        assert_eq!(open(&a).err().map(|e| e.code), Some(ErrorCode::OutputExists));
+        // a Y4M source cannot go into a transport stream; the session goes on and says why
+        let y4m = dir.join("in.y4m");
+        std::fs::write(&y4m, y4m_with_cut()).unwrap();
+        let a: OpenArgs = serde_json::from_value(json!({ "source": y4m.to_str().unwrap(), "analyzers": ["scene"], "record": dir.join("y.ts").to_str().unwrap() })).unwrap();
+        let s = open(&a).unwrap();
+        wait_end(&s);
+        let st = close(&s.id).unwrap();
+        assert_eq!(st["state"], "ended");
+        assert_eq!(st["record"]["error"]["code"], "unsupported-format", "{st}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_session_records_hls_segments_and_a_playlist() {
+        let _turn = turn();
+        let dir = scratch("hls");
+        let st = record_ts_fixture(&dir, "live.m3u8", json!({ "segment_seconds": 1 }));
+        assert_eq!(st["record"]["error"], Value::Null, "{st}");
+        let m3u8 = std::fs::read_to_string(dir.join("live.m3u8")).unwrap();
+        assert!(m3u8.starts_with("#EXTM3U
+") && m3u8.ends_with("#EXT-X-ENDLIST
+"), "{m3u8}");
+        assert!(m3u8.contains("#EXT-X-PLAYLIST-TYPE:EVENT"));
+        let durations: Vec<f64> = m3u8.lines().filter_map(|l| l.strip_prefix("#EXTINF:")).map(|d| d.trim_end_matches(',').parse().unwrap()).collect();
+        assert_eq!(durations.len(), 2, "{m3u8}");
+        // keyframes every 0.48 s: the first segment is cut at the first one a second or more in
+        assert!(durations[0] >= 1.0 && durations[0] < 1.5, "{durations:?}");
+        assert!((durations.iter().sum::<f64>() - 2.03).abs() < 0.05, "{durations:?}");
+        let mut packets = 0;
+        for name in m3u8.lines().filter(|l| l.ends_with(".ts")) {
+            let mut d = ironav_formats::open_demuxer(&dir.join(name)).unwrap();
+            let first = d.read_packet().unwrap().unwrap();
+            packets += 1 + std::iter::from_fn(|| d.read_packet().unwrap()).count();
+            // each segment starts with a picture a decoder can start from
+            assert!(d.streams().len() == 2 && first.data.windows(4).any(|w| w == [0, 0, 1, 0x65]) || first.stream != 0, "{name}");
+        }
+        // everything: the first video keyframe is the first packet in the file
+        assert_eq!(packets, 145);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // a sliding window keeps only the newest segment
+        let dir = scratch("window");
+        let st = record_ts_fixture(&dir, "w.m3u8", json!({ "segment_seconds": 1, "keep_segments": 1 }));
+        assert_eq!(st["record"]["segments"]["first_seq"], 1, "{st}");
+        let m3u8 = std::fs::read_to_string(dir.join("w.m3u8")).unwrap();
+        assert!(m3u8.contains("#EXT-X-MEDIA-SEQUENCE:1") && !m3u8.contains("EVENT"), "{m3u8}");
+        assert!(!dir.join("w_00000.ts").exists() && dir.join("w_00001.ts").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn sessions_are_limited_and_arguments_checked() {
+        let _turn = turn();
         let mut opened = Vec::new();
         let mut busy = None;
         // listening sessions stay open until closed; other tests may hold some of the slots

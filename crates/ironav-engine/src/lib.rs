@@ -7,6 +7,7 @@ pub mod analyze;
 pub mod job;
 pub mod live;
 pub mod plan;
+pub mod record;
 pub mod run;
 mod sessions;
 pub mod tools;
