@@ -315,7 +315,7 @@ against, not claims:
 - URLs are redacted (`rtsp://user:***@host/…`) in every observation, status, log and error.
 - Outbound connections pass an address allow-list (`ironav-live/src/net.rs`, built before M4). Agents choose source
   URLs, and a server that connects anywhere it is told is an SSRF hazard. The default allows loopback, private and
-  link-local ranges, except the cloud metadata endpoints (169.254.169.254, fd00:ec2::254). Anything wider comes from
+  link-local ranges, except the cloud metadata endpoints (169.254.169.254, fd00:ec2::254, 169.254.170.2 and .23). Anything wider comes from
   `IRONAV_NET_ALLOW` (addresses, CIDR ranges or `any`), which the operator sets and a request cannot. Every address a
   name resolves to is checked, and only one that passed is dialled, so a name that resolves differently a moment later
   cannot slip past. Redirects go through the same check. A refusal is `invalid_argument`, with a hint naming the variable.
@@ -368,6 +368,18 @@ each segment (an EVENT playlist, or a sliding window with `keep_segments`). Matr
 (`ironav-formats/src/mp4demux/live.rs`), reusing the file reader's `parse_trak` and `parse_moof`. The `latency: low` encode profile is a
 video option of jobs (`StreamOpts::latency`), carried by the plan's step as `low_latency` to the software H.264
 encoder (`H264Encoder::low_latency`) and NVENC; live sessions will take it when they gain a transcode sink.
+
+M4 so far: the address allow-list (`ironav-live/src/net.rs`), and RTSP (`ironav-live/src/rtsp.rs`, with MD5 for Digest
+in `md5.rs`) feeding the RTP demuxer (`ironav-formats/src/rtp.rs`). A session still has one byte stream: the RTSP source
+asks for RTP interleaved on its connection and passes it on in that framing, after a description frame (channel 255:
+the SDP, each track's channel, and RTP-Info's `rtptime` and `seq`). `stream_demuxer` recognises the framing as `rtp`.
+The demuxer takes H.264 (single, STAP-A, FU-A), HEVC (single, AP, FU), AAC (RFC 3640 hbr/lbr), Opus, and G.711 and L16
+(decoded to 16-bit PCM). Its reorder buffer holds up to 64 packets per track and costs nothing in order. A gap it gives
+up on drops the damaged picture, and the next one when the lost packet may have begun it. Tracks are aligned by
+RTP-Info's `rtptime`; RTCP is passed through but not yet used, so a server without RTP-Info leaves each track counting
+from its first packet. Checked against FFmpeg's RTP muxer: captured, played through a stand-in camera, recorded, and
+decoded by FFmpeg without an error. Still to do in M4: RTP over UDP (the same framing, with the reorder buffer earning
+its keep), RTCP sender reports for wall-clock alignment, and HLS over plain HTTP.
 
 M1 comes first because it needs no new input path. It turns the existing decoders into an understanding tool for
 files at once, and it fixes the event model, analyzer trait and MCP plumbing before anything goes live.

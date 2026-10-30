@@ -1,4 +1,5 @@
-//! Source URLs: `tcp://host:port`, `udp://:port`, `pipe:`, `-`, `file:path` or a bare path, each
+//! Source URLs: `tcp://host:port`, `udp://:port`, `rtsp://[user:password@]host[:port]/path`, `pipe:`,
+//! `-`, `file:path` or a bare path, each
 //! optionally followed by `?key=value&...` options.
 
 use ironav_core::{Error, Result};
@@ -47,9 +48,9 @@ impl SourceUrl {
             ("file".to_string(), base.to_string())
         };
         match scheme.as_str() {
-            "file" | "pipe" | "tcp" | "udp" => {}
+            "file" | "pipe" | "tcp" | "udp" | "rtsp" => {}
             other => {
-                return Err(Error::invalid_arg(format!("'{other}' sources are not supported")).alternatives(["file", "pipe", "tcp", "udp"]));
+                return Err(Error::invalid_arg(format!("'{other}' sources are not supported")).alternatives(["file", "pipe", "tcp", "udp", "rtsp"]));
             }
         }
         if matches!(scheme.as_str(), "tcp" | "udp") && !target.contains(':') {
@@ -67,20 +68,49 @@ impl SourceUrl {
     }
 }
 
+/// `%XX` escapes decoded, as user names and passwords in URLs are written.
+pub(crate) fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match (b[i], b.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok())) {
+            (b'%', Some(v)) => {
+                out.push(v);
+                i += 3;
+            }
+            (c, _) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// What follows `scheme://`, split into user information, host and port, and the rest (path and
+/// query). The user information ends at the last `@` before any `?`, so a password holding an
+/// unescaped `/` is still taken whole (and redacted whole) rather than read as a path.
+pub(crate) fn split_authority(rest: &str) -> (Option<&str>, &str, &str) {
+    let query = rest.find('?').unwrap_or(rest.len());
+    let (cred, after) = match rest[..query].rfind('@') {
+        Some(at) => (Some(&rest[..at]), &rest[at + 1..]),
+        None => (None, rest),
+    };
+    let end = after.find(['/', '?']).unwrap_or(after.len());
+    (cred, &after[..end], &after[end..])
+}
+
 /// `url` with any password replaced by `***`, so it can be echoed in observations, statuses and
 /// errors. User information with no `:` may itself be a token, so all of it is replaced.
 pub fn redact(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else { return url.to_string() };
-    let (auth, tail) = match rest.find(['/', '?']) {
-        Some(i) => rest.split_at(i),
-        None => (rest, ""),
-    };
-    match auth.rsplit_once('@') {
-        Some((cred, host)) => match cred.split_once(':') {
+    match split_authority(rest) {
+        (Some(cred), host, tail) => match cred.split_once(':') {
             Some((user, _)) => format!("{scheme}://{user}:***@{host}{tail}"),
             None => format!("{scheme}://***@{host}{tail}"),
         },
-        None => url.to_string(),
+        (None, ..) => url.to_string(),
     }
 }
 
@@ -98,7 +128,9 @@ mod tests {
         assert!(u.flag("follow") && u.option("pace") == Some("realtime"));
         assert_eq!(SourceUrl::parse("-").unwrap().scheme, "pipe");
         assert_eq!(SourceUrl::parse("C:/media/a?b.wav").unwrap().target, "C:/media/a?b.wav");
-        assert!(SourceUrl::parse("rtsp://cam/stream").is_err());
+        assert_eq!(SourceUrl::parse("rtsp://cam/stream").unwrap().scheme, "rtsp");
+        assert!(SourceUrl::parse("srt://cam:9000").is_err());
+        assert_eq!(percent_decode("p%40ss%3a%zz"), "p@ss:%zz");
         assert!(SourceUrl::parse("tcp://localhost").is_err());
     }
 
@@ -108,5 +140,7 @@ mod tests {
         assert_eq!(redact("udp://:5000"), "udp://:5000");
         assert_eq!(redact("clip.y4m"), "clip.y4m");
         assert_eq!(redact("rtsp://3f9aTOKEN@cam/live"), "rtsp://***@cam/live");
+        // an unescaped '/' in the password must not end the user information early
+        assert_eq!(redact("rtsp://bob:pa/ss@cam:554/live?x=a@b"), "rtsp://bob:***@cam:554/live?x=a@b");
     }
 }

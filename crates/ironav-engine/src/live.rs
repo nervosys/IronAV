@@ -886,7 +886,7 @@ mod tests {
             assert_eq!(close(id).unwrap()["state"], "closed");
         }
         assert_eq!(busy.expect("the limit was not reached").code, ErrorCode::Busy);
-        assert_eq!(open(&serde_json::from_value(json!({ "source": "rtsp://cam/x" })).unwrap()).err().map(|e| e.code), Some(ErrorCode::InvalidArgument));
+        assert_eq!(open(&serde_json::from_value(json!({ "source": "srt://cam:9000" })).unwrap()).err().map(|e| e.code), Some(ErrorCode::InvalidArgument));
         let bad: OpenArgs = serde_json::from_value(json!({ "source": "-", "analyzers": ["nope"] })).unwrap();
         assert_eq!(open(&bad).err().map(|e| e.code), Some(ErrorCode::InvalidArgument));
         assert!(serde_json::from_value::<OpenArgs>(json!({ "source": "-", "colour": 1 })).is_err());

@@ -72,8 +72,11 @@ Checked against EBU Tech 3341/3342 test signals (a -23 dBFS stereo sine reads -2
 The same analyzers run on media as it arrives. A source is a path, `path?follow` (a file that is still growing),
 `path?pace=realtime` (a file played as if live), `-` or `pipe:NAME`, `tcp://host:port` (connect),
 `tcp://:port` (listen, on loopback unless an address is given), or `udp://:port` / `udp://group:port` (multicast).
-Outbound connections go only to loopback, private and link-local addresses (not the cloud metadata endpoint
-169.254.169.254), checked after the name resolves. Whoever runs IronAV can allow more with `IRONAV_NET_ALLOW`:
+`rtsp://[user:password@]host[:port]/path` plays a camera or RTSP server: RTP interleaved on the RTSP connection,
+Basic or Digest credentials, keepalives and TEARDOWN, with H.264, HEVC, AAC, Opus, G.711 and L16 tracks (others are
+skipped). The password never appears in output, and with Digest it is never sent.
+Outbound connections go only to loopback, private and link-local addresses (not the cloud metadata endpoints
+169.254.169.254 and 169.254.170.2/.23), checked after the name resolves. Whoever runs IronAV can allow more with `IRONAV_NET_ALLOW`:
 addresses and CIDR ranges separated by commas, or `any`. A request cannot widen it.
 Readable as it arrives: MPEG-TS, Matroska/WebM, fragmented MP4 (CMAF), Y4M, WAV, ADTS AAC and raw H.264/HEVC (Annex B,
 which carries no frame rate: give `fps`, 25 by default). Matroska is read the way a browser's MediaRecorder, OBS or `ffmpeg -f matroska -`

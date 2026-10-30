@@ -4,7 +4,8 @@
 //! packets out, `None` meaning "not enough yet".
 //!
 //! The formats here are the self-delimiting ones: Y4M, WAV, ADTS (AAC), Annex B H.264/HEVC and
-//! MPEG-TS ([`crate::ts`]), Matroska/WebM (`mkv::live`) and fragmented MP4 (`mp4demux::live`).
+//! MPEG-TS ([`crate::ts`]), Matroska/WebM (`mkv::live`), fragmented MP4 (`mp4demux::live`) and RTP
+//! in RTSP's interleaved framing ([`crate::rtp`]).
 
 use crate::{adts, wav, y4m};
 use ironav_core::{CodecId, Error, ErrorCode, Packet, PixelFormat, Rational, Result, StreamInfo, StreamParams};
@@ -77,7 +78,7 @@ pub struct StreamOptions {
 }
 
 /// Formats [`stream_demuxer`] can read.
-pub const STREAM_FORMATS: [&str; 9] = ["y4m", "wav", "aac", "h264", "hevc", "mpegts", "matroska", "webm", "mp4"];
+pub const STREAM_FORMATS: [&str; 10] = ["y4m", "wav", "aac", "h264", "hevc", "mpegts", "matroska", "webm", "mp4", "rtp"];
 
 /// Bytes [`stream_demuxer`] wants to see before it can tell the format.
 /// (A transport stream needs two packets' sync bytes.)
@@ -106,6 +107,7 @@ pub fn stream_demuxer(magic: &[u8], opts: &StreamOptions) -> Result<Box<dyn Stre
         "mpegts" | "ts" | "m2ts" => Box::new(crate::ts::TsStream::default()),
         "matroska" | "mkv" | "webm" => Box::new(crate::mkv::live::MkvStream::default()),
         "mp4" | "fmp4" | "cmaf" => Box::new(crate::mp4demux::live::Mp4Stream::default()),
+        "rtp" => Box::new(crate::rtp::RtpStream::default()),
         other => {
             return Err(Error::new(ErrorCode::UnsupportedFormat, format!("'{other}' cannot be read as a stream")).alternatives(STREAM_FORMATS));
         }
@@ -113,6 +115,9 @@ pub fn stream_demuxer(magic: &[u8], opts: &StreamOptions) -> Result<Box<dyn Stre
 }
 
 fn sniff(m: &[u8]) -> Option<&'static str> {
+    if m.starts_with(&[b'$', crate::rtp::DESCRIPTION_CHANNEL]) {
+        return Some("rtp");
+    }
     if crate::ts::packet_size(m).is_some() {
         return Some("mpegts");
     }

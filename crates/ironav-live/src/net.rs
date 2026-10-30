@@ -7,7 +7,8 @@
 //!
 //! Allowed by default: loopback, private ranges (10/8, 172.16/12, 192.168/16, fc00::/7) and
 //! link-local ranges (169.254/16, fe80::/10), where cameras and encoders usually live, except the
-//! cloud metadata endpoints (169.254.169.254, fd00:ec2::254), the classic target of such requests.
+//! cloud metadata endpoints (169.254.169.254, fd00:ec2::254, 169.254.170.2 and .23), the classic target of
+//! such requests.
 //! Anything wider comes from `IRONAV_NET_ALLOW`, set by whoever runs IronAV and never by the request:
 //! a comma-separated list of addresses and CIDR ranges (`203.0.113.7, 198.51.100.0/24, 2001:db8::/32`),
 //! or `any`. An address listed there is allowed even if it is a metadata endpoint.
@@ -19,7 +20,14 @@ use std::time::Duration;
 /// The environment variable that widens the allow-list.
 pub const ALLOW_VAR: &str = "IRONAV_NET_ALLOW";
 
-const METADATA: [IpAddr; 2] = [IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)), IpAddr::V6(Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254))];
+/// Cloud metadata endpoints: the instance service (AWS, Azure, GCP and others), AWS's IPv6 one, and
+/// the ECS task and EKS pod identity services.
+const METADATA: [IpAddr; 4] = [
+    IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)),
+    IpAddr::V6(Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254)),
+    IpAddr::V4(Ipv4Addr::new(169, 254, 170, 2)),
+    IpAddr::V4(Ipv4Addr::new(169, 254, 170, 23)),
+];
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Allow {
@@ -152,7 +160,7 @@ mod tests {
         for ok in ["127.0.0.1", "10.1.2.3", "172.16.0.1", "172.31.255.255", "192.168.1.64", "169.254.10.20", "::1", "fd12::1", "fe80::1", "::ffff:192.168.0.9"] {
             assert!(a.permits(ip(ok)), "{ok}");
         }
-        for no in ["8.8.8.8", "172.32.0.1", "100.64.0.1", "0.0.0.0", "169.254.169.254", "fd00:ec2::254", "2001:db8::1", "::ffff:8.8.8.8", "::", "224.0.0.1"] {
+        for no in ["8.8.8.8", "172.32.0.1", "100.64.0.1", "0.0.0.0", "169.254.169.254", "fd00:ec2::254", "169.254.170.2", "169.254.170.23", "2001:db8::1", "::ffff:8.8.8.8", "::", "224.0.0.1"] {
             assert!(!a.permits(ip(no)), "{no}");
         }
     }

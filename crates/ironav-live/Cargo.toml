@@ -4,9 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Live input for IronAV: byte sources (growing files, pipes, TCP, UDP) read as they arrive."
+description = "Live input for IronAV: byte sources (growing files, pipes, TCP, UDP, RTSP) read as they arrive."
 
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
 ironav-core.workspace = true
+ironav-formats.workspace = true

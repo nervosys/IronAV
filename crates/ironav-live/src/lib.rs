@@ -1,11 +1,13 @@
 //! Live input: byte sources read as the bytes arrive, from a file (whole, or followed while it
-//! grows), standard input or a named pipe, a TCP connection or a UDP port.
+//! grows), standard input or a named pipe, a TCP connection, a UDP port, or an RTSP camera or server.
 //!
 //! A source only moves bytes. Parsing them is the stream demuxers' job (`ironav_formats::stream`),
 //! and pacing, decoding and analysis belong to the session that owns the source. Every read takes
 //! a deadline, so whoever reads can notice in time that it has been asked to stop.
 
+mod md5;
 pub mod net;
+mod rtsp;
 mod source;
 mod url;
 

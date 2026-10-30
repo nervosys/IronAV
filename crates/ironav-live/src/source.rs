@@ -24,7 +24,7 @@ pub enum Chunk {
 pub struct SourceInfo {
     /// The URL with any password replaced.
     pub url: String,
-    /// `file`, `pipe`, `tcp` or `udp`.
+    /// `file`, `pipe`, `tcp`, `udp` or `rtsp`.
     pub kind: &'static str,
     /// Whether the bytes arrive at the pace of the media (a socket, a pipe, a followed file)
     /// rather than as fast as they can be read.
@@ -93,6 +93,7 @@ pub fn open_source(url: &str) -> Result<Box<dyn Source>> {
             };
             Box::new(UdpSource { info: SourceInfo { url: shown, kind: "udp", live: true }, sock })
         }
+        "rtsp" => Box::new(crate::rtsp::RtspSource::open(&u, shown)?),
         _ => unreachable!("SourceUrl::parse accepts only these schemes"),
     })
 }
