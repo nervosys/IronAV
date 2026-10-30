@@ -57,6 +57,8 @@ pub struct OpenArgs {
     pub hwaccel: String,
     #[serde(default)]
     pub sidecars: Vec<String>,
+    #[serde(default)]
+    pub keyframes_only: bool,
     /// Record the media as it arrives: a file, or an `.m3u8` path for HLS segments and a playlist.
     #[serde(default)]
     pub record: Option<String>,
@@ -247,6 +249,7 @@ pub fn open(args: &OpenArgs) -> Result<Arc<Session>> {
         thumbnail_seconds: args.thumbnail_seconds,
         hwaccel: args.hwaccel.clone(),
         sidecars: args.sidecars.clone(),
+        keyframes_only: args.keyframes_only,
         ..AnalyzeOptions::default()
     };
     // check the analysis options now rather than when the first packet arrives

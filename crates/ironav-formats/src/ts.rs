@@ -81,7 +81,7 @@ fn codec_of(stream_type: u8) -> Option<CodecId> {
 }
 
 /// NAL units of an Annex B access unit, without their start codes.
-fn nals(d: &[u8]) -> impl Iterator<Item = &[u8]> {
+pub(crate) fn nals(d: &[u8]) -> impl Iterator<Item = &[u8]> {
     let mut starts = Vec::new();
     let mut i = 0;
     while i + 3 <= d.len() {

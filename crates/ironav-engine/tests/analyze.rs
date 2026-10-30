@@ -169,3 +169,28 @@ fn analyze_and_run_stop_when_cancelled() {
     assert_eq!(e.code, ErrorCode::Cancelled);
     assert!(!out.exists() && !d.join("out.wav.partial").exists());
 }
+
+#[test]
+fn keyframes_only_decodes_a_picture_a_keyframe() {
+    let d = scratch("keyframes");
+    let y4m = d.join("cut.y4m");
+    cut_and_black(&y4m);
+    // H.264 with a keyframe every second, which is where this clip changes
+    let mp4 = d.join("cut.mp4");
+    let mut job = Job { input: y4m.display().to_string(), output: mp4.display().to_string(), hwaccel: "off".into(), ..Job::default() };
+    job.video.codec = Some("h264".into());
+    job.video.latency = Some(ironav_engine::Latency::Low);
+    call_tool("run", &serde_json::to_value(&job).unwrap()).unwrap();
+    let input = mp4.display().to_string();
+    let r = call_tool("analyze", &json!({ "input": input, "keyframes_only": true, "level": "raw", "digest_seconds": 1, "hwaccel": "off" })).unwrap();
+    // three pictures decoded, so two change scores
+    assert_eq!(r["counts"]["change"], 2, "{r}");
+    let got = kinds(&r);
+    let at = |k: &str| got.iter().filter(|g| g.0 == k).map(|g| (g.1, g.2)).collect::<Vec<_>>();
+    assert_eq!(at("scene_cut"), [(1.0, None), (2.0, None)], "{got:?}");
+    assert_eq!(at("black_end"), [(1.0, Some(2.0))], "{got:?}");
+    // freeze needs every picture: not run, and refused when asked for
+    assert!(!got.iter().any(|g| g.0.starts_with("freeze")), "{got:?}");
+    let e = call_tool("analyze", &json!({ "input": input, "keyframes_only": true, "analyzers": ["freeze"] })).unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidArgument, "{e:?}");
+}

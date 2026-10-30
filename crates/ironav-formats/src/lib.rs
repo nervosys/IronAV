@@ -17,6 +17,8 @@ pub mod rtp;
 pub mod ts;
 mod wav;
 mod jpeg;
+mod keyframe;
+pub use keyframe::is_keyframe;
 mod y4m;
 
 use ironav_core::{CodecId, Demuxer, Error, ErrorCode, MediaType, Muxer, Result};

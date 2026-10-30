@@ -59,6 +59,11 @@ pub struct AnalyzeOptions {
     /// Model sidecars, by the names the operator gave them in `IRONAV_SIDECARS`.
     #[serde(default)]
     pub sidecars: Vec<String>,
+    /// Decode only the video pictures that need no other (IDR, I and key frames): a fraction of
+    /// the work, for thumbnails, cuts and black spans at keyframe resolution. `freeze`, which
+    /// compares neighbouring pictures, does not run.
+    #[serde(default)]
+    pub keyframes_only: bool,
 }
 
 impl Default for AnalyzeOptions {
@@ -72,6 +77,7 @@ impl Default for AnalyzeOptions {
             thumbnail_width: None,
             hwaccel: default_hwaccel(),
             sidecars: Vec::new(),
+            keyframes_only: false,
         }
     }
 }
@@ -105,6 +111,8 @@ struct Stream {
     decode_errors: u64,
     /// A decoder started mid-stream waits for a keyframe.
     wait_key: bool,
+    /// Only keyframes are decoded (video, with [`AnalyzeOptions::keyframes_only`]).
+    keyframes_only: bool,
 }
 
 impl Stream {
@@ -156,6 +164,7 @@ pub struct Analysis {
     settings: Settings,
     hwaccel: String,
     live: bool,
+    keyframes_only: bool,
     /// Sidecars `configure` added, starting on their own threads.
     starting: Vec<(&'static str, Receiver<Result<Pending>>)>,
     /// Analyzers `configure` removed, finishing on their own threads: their last observations.
@@ -170,7 +179,7 @@ fn start_decoder(s: &mut Stream, hwaccel: &str, live: bool) -> std::result::Resu
         return Ok(());
     }
     let made = if s.info.params.media_type() == MediaType::Video {
-        ironav_player::open_video_decoder_with(&s.info, hwaccel, &ironav_codec::DecoderOptions { low_delay: live })
+        ironav_player::open_video_decoder_with(&s.info, hwaccel, &ironav_codec::DecoderOptions { low_delay: live || s.keyframes_only })
     } else {
         ironav_codec::new_decoder_for(&s.info).map(|d| (d, "software"))
     };
@@ -231,6 +240,15 @@ impl Analysis {
                 .map(|n| analyzer(n).ok_or_else(|| Error::invalid_arg(format!("unknown analyzer '{n}'")).alternatives(ANALYZERS.iter().map(|a| a.name))))
                 .collect::<Result<_>>()?
         };
+        // freeze compares neighbouring pictures, which keyframes are not
+        let chosen: Vec<&AnalyzerInfo> = if opts.keyframes_only {
+            if !opts.analyzers.is_empty() && chosen.iter().any(|a| a.name == "freeze") {
+                return Err(Error::invalid_arg("'freeze' needs every picture, so it cannot run with keyframes_only"));
+            }
+            chosen.into_iter().filter(|a| a.name != "freeze").collect()
+        } else {
+            chosen
+        };
         let settings = Settings {
             thumbnail_seconds: opts.thumbnail_seconds.unwrap_or(Settings::default().thumbnail_seconds),
             thumbnail_width: opts.thumbnail_width.unwrap_or(Settings::default().thumbnail_width),
@@ -275,8 +293,9 @@ impl Analysis {
             let (mut decoder, mut decoder_name) = (None, None);
             if !fa.is_empty() || wants_car {
                 let made = if media == MediaType::Video {
-                    // a live source wants each picture as soon as it can be shown
-                    ironav_player::open_video_decoder_with(info, &opts.hwaccel, &ironav_codec::DecoderOptions { low_delay: live })
+                    // a live source wants each picture as soon as it can be shown, and keyframes
+                    // in order of decoding are in order of showing
+                    ironav_player::open_video_decoder_with(info, &opts.hwaccel, &ironav_codec::DecoderOptions { low_delay: live || opts.keyframes_only })
                 } else {
                     ironav_codec::new_decoder_for(info).map(|d| (d, "software"))
                 };
@@ -312,6 +331,7 @@ impl Analysis {
                 decode_errors: 0,
                 // live demuxers start video at a keyframe already; this guards any that do not
                 wait_key: live,
+                keyframes_only: opts.keyframes_only && media == MediaType::Video,
             }));
         }
         for car in pending {
@@ -333,6 +353,7 @@ impl Analysis {
             settings,
             hwaccel: opts.hwaccel.clone(),
             live,
+            keyframes_only: opts.keyframes_only,
             starting: Vec::new(),
             retiring: Vec::new(),
             changed: false,
@@ -373,6 +394,10 @@ impl Analysis {
             for name in &c.add {
                 let Some(info) = analyzer(name) else { continue };
                 if !info.consumes.applies_to(media) || s.names().contains(&info.name) {
+                    continue;
+                }
+                if self.keyframes_only && info.name == "freeze" {
+                    warnings.push("'freeze' not added: it needs every picture, and this session decodes keyframes only".into());
                     continue;
                 }
                 if info.consumes == Consumes::Packets {
@@ -543,7 +568,18 @@ impl Analysis {
             }
             s.end = s.end.max(t + p.duration as f64 * tb);
         }
-        let frames = match s.decoder.as_mut().filter(|_| !s.wait_key).map(|dec| dec.decode(p)) {
+        // keyframes only: the rest are not decoded, and each keyframe is shown at once (a software
+        // decoder is drained; no later picture can come before it)
+        let skip = s.keyframes_only && !ironav_formats::is_keyframe(s.info.codec, &p.data).unwrap_or(key);
+        let drain = s.keyframes_only && s.decoder_name == Some("software");
+        let decoded = s.decoder.as_mut().filter(|_| !s.wait_key && !skip).map(|dec| {
+            let mut f = dec.decode(p)?;
+            if drain {
+                f.extend(dec.flush()?);
+            }
+            Ok::<_, Error>(f)
+        });
+        let frames = match decoded {
             None => Vec::new(),
             Some(Ok(f)) => f,
             Some(Err(e)) => {
@@ -688,7 +724,14 @@ fn feed_frame(s: &mut Stream, f: Frame, from: f64, to: f64, out: &mut Vec<Observ
                 StreamParams::Video { frame_rate, .. } if frame_rate.num > 0 && frame_rate.den > 0 => frame_rate.as_f64(),
                 _ => 0.0,
             };
-            let dt = if rate > 0.0 { 1.0 / rate } else { s.last_video.map_or(0.04, |l| (t - l).clamp(0.001, 1.0)) };
+            let dt = if s.keyframes_only {
+                // a keyframe stands for the pictures up to the next one: take the last interval
+                s.last_video.map_or(if rate > 0.0 { 1.0 / rate } else { 0.04 }, |l| (t - l).clamp(0.001, 60.0))
+            } else if rate > 0.0 {
+                1.0 / rate
+            } else {
+                s.last_video.map_or(0.04, |l| (t - l).clamp(0.001, 1.0))
+            };
             s.last_video = Some(t);
             if t < from || t > to {
                 return None;

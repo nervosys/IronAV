@@ -62,6 +62,11 @@ chooses how much comes back: `digest` (digests and the summary: the fewest token
 silences, spans, thumbnails, gaps) or `raw` (plus per-picture change scores and loudness once a second).
 `--jsonl` prints each observation as a line the moment it is found. Thumbnails are written as PNG files with
 `--thumbnails DIR` (`thumbnail_dir`), or returned to MCP clients as image blocks with `inline_thumbnails`.
+`keyframes_only` (`--keyframes-only`, for live sessions too) decodes only the pictures that need no other (IDR and I
+pictures, key frames), told from the bitstream: a fraction of the work for thumbnails, cuts and black spans at keyframe
+resolution (a cut is reported at the first keyframe after it). `freeze` does not run then. A GPU decoder is not
+drained after each keyframe, so with one (`hwaccel` auto on an NVIDIA machine) a picture can come out a few
+keyframes late; its time is still right.
 The kinds and analyzers are listed by `ironav capabilities` and are entities in the ontology (`analyzer/…`,
 `observation/…`, related by `emits`).
 

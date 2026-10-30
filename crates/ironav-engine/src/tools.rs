@@ -296,6 +296,7 @@ fn stream_open_schema() -> Value {
             "pace": { "type": "string", "enum": ["realtime", "none"], "description": "realtime: read no faster than the media plays." },
             "thumbnail_seconds": { "type": "number", "minimum": 2, "default": 10 },
             "hwaccel": { "type": "string", "default": "auto" },
+            "keyframes_only": { "type": "boolean", "default": false, "description": "Decode only keyframes (IDR, I and key frames): a fraction of the work, for thumbnails, cuts and black spans at keyframe resolution (a cut is reported at the first keyframe after it). The freeze analyzer does not run." },
             "sidecars": { "type": "array", "items": { "type": "string" }, "description": "Model sidecars to run as well (speech-to-text, detection, ...), by the names the operator configured in IRONAV_SIDECARS; `capabilities` lists them. Each takes the first analyzed stream of the kind it wants." },
             "record": { "type": "string", "description": "Also write the media as it arrives, without re-encoding: a file (.ts stays playable even if cut off; .mp4 is complete when the session closes), or an .m3u8 path for HLS: MPEG-TS segments cut at keyframes next to it, and the playlist rewritten after each one." },
             "segment_seconds": { "type": "number", "minimum": 1, "maximum": 600, "default": 6, "description": "HLS segment length (cut at the first keyframe after it)." },
@@ -326,6 +327,7 @@ pub fn analyze_schema() -> Value {
             "thumbnail_seconds": { "type": "number", "minimum": 2, "default": 10, "description": "Longest time between thumbnails; new content brings one sooner (at most every 2 s)." },
             "thumbnail_width": { "type": "integer", "minimum": 16, "default": 320 },
             "hwaccel": { "type": "string", "default": "auto", "description": "Video decoding: auto, off, require or a backend name, as for jobs." },
+            "keyframes_only": { "type": "boolean", "default": false, "description": "Decode only keyframes (IDR, I and key frames): a fraction of the work, for thumbnails, cuts and black spans at keyframe resolution (a cut is reported at the first keyframe after it). The freeze analyzer does not run." },
             "sidecars": { "type": "array", "items": { "type": "string" }, "description": "Model sidecars to run as well (speech-to-text, detection, ...), by the names the operator configured in IRONAV_SIDECARS; `capabilities` lists them. Each takes the first analyzed stream of the kind it wants." }
         }),
         &["input"],
@@ -415,7 +417,7 @@ pub fn tools() -> &'static [Tool] {
             Tool {
                 name: "analyze",
                 description: "Understand a media file without looking at it: runs analyzers (stream structure, audio levels, EBU R128 loudness, silence, speech, scene cuts, black and frozen pictures, thumbnails, and any model sidecars the operator configured) and returns typed observations with a digest per window and a summary. Use level 'digest' for the fewest tokens. Writes files only when thumbnail_dir is given.",
-                cli: "ironav analyze <file> [--analyzers a,b] [--sidecars a,b] [--level digest|events|raw] [--digest-seconds N] [--from S] [--to S] [--thumbnails DIR] [--jsonl]",
+                cli: "ironav analyze <file> [--analyzers a,b] [--sidecars a,b] [--level digest|events|raw] [--digest-seconds N] [--from S] [--to S] [--thumbnails DIR] [--keyframes-only] [--jsonl]",
                 input_schema: analyze_schema(),
                 read_only: false,
                 handler: Handler::WithCtx(h_analyze),
