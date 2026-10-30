@@ -248,7 +248,8 @@ Each observation is one JSON object with a stable envelope; the ontology lists e
   document does not promise it. The transcode sink came later as `transcode` on `stream_open`
 (`engine/src/transcode.rs`): its own decoder, the `format` and `scale` filters as needed, the software encoder with
 this profile always (so no `latency` argument), and the recorder for its output, on a thread behind a bounded queue
-that drops video to the next keyframe when full. Starting it from `stream_configure` is not done.
+that drops video to the next keyframe when full. `stream_configure` starts one on a running session (from the next video keyframe, its
+timestamps from zero, as a late recording) or finishes it, waiting for its queued pictures.
 - Limits: `MAX_LIVE_SESSIONS` like the player's 8; per-session memory caps for the ring buffer, the log and the
   queues; an idle timeout that closes sessions nobody has polled.
 

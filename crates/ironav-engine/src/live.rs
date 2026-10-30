@@ -137,18 +137,22 @@ struct Shared {
     /// The recording asked for (at open or by `configure`) and not yet asked to stop, so a second
     /// start is refused even before the session thread has taken the first.
     recording: Option<String>,
+    /// The same for the transcode sink.
+    transcoding: Option<String>,
     /// Changes waiting for the session thread, and how many it has applied.
     reconfigure: VecDeque<(Reconfigure, RecordChange)>,
     requested: u64,
     applied: u64,
 }
 
-/// A change to a session's recording, from `stream_configure`: stop the one running, start
-/// another, or both (to go on in a new file).
+/// A change to a session's recording and transcoding, from `stream_configure`: stop the one
+/// running, start another, or both (to go on in a new file).
 #[derive(Debug, Clone, Default)]
 pub struct RecordChange {
     pub stop: bool,
     pub start: Option<RecordOptions>,
+    pub stop_transcode: bool,
+    pub transcode: Option<crate::transcode::TranscodeOptions>,
 }
 
 /// A search of a session's log.
@@ -344,6 +348,7 @@ pub fn open(args: &OpenArgs) -> Result<Arc<Session>> {
             record: None,
             transcode: None,
             recording: args.record.clone(),
+            transcoding: args.transcode.as_ref().map(|t| t.output.clone()),
             reconfigure: VecDeque::new(),
             requested: 0,
             applied: 0,
@@ -455,6 +460,9 @@ impl Session {
         if let Some(o) = &r.start {
             o.check()?;
         }
+        if let Some(t) = &r.transcode {
+            t.check()?;
+        }
         let deadline = Instant::now() + Duration::from_secs(1);
         let mut sh = lock(&self.shared);
         if matches!(sh.state, State::Ended | State::Failed | State::Closed) {
@@ -463,11 +471,20 @@ impl Session {
         if let (Some(_), false, Some(cur)) = (&r.start, r.stop, &sh.recording) {
             return Err(Error::invalid_arg(format!("already recording to {cur}")).hint("pass stop_recording: true as well to go on in the new file"));
         }
+        if let (Some(_), false, Some(cur)) = (&r.transcode, r.stop_transcode, &sh.transcoding) {
+            return Err(Error::invalid_arg(format!("already transcoding to {cur}")).hint("pass stop_transcode: true as well to go on in the new file"));
+        }
         if r.stop {
             sh.recording = None;
         }
         if let Some(o) = &r.start {
             sh.recording = Some(o.path.clone());
+        }
+        if r.stop_transcode {
+            sh.transcoding = None;
+        }
+        if let Some(t) = &r.transcode {
+            sh.transcoding = Some(t.output.clone());
         }
         sh.reconfigure.push_back((c, r));
         sh.requested += 1;
@@ -488,7 +505,7 @@ impl Session {
 
     /// Applies waiting changes to the analysis, or keeps them in `deferred` for it until there is one,
     /// and to the recording. Opening a decoder can be slow, so it is done without the session's lock.
-    fn reconfigure(&self, analysis: Option<&mut Analysis>, deferred: &mut Vec<Reconfigure>, rec: &mut Option<Recorder>) {
+    fn reconfigure(&self, analysis: Option<&mut Analysis>, deferred: &mut Vec<Reconfigure>, rec: &mut Option<Recorder>, tc: &mut Option<crate::transcode::Transcoder>) {
         let changes: Vec<(Reconfigure, RecordChange)> = {
             let mut sh = lock(&self.shared);
             if sh.reconfigure.is_empty() {
@@ -499,7 +516,8 @@ impl Session {
         let n = changes.len() as u64;
         let (changes, records): (Vec<Reconfigure>, Vec<RecordChange>) = changes.into_iter().unzip();
         let mut rec_warnings = Vec::new();
-        for r in records {
+        for mut r in records {
+            self.change_transcode(r.stop_transcode, r.transcode.take(), tc);
             self.change_recording(r, rec, &mut rec_warnings);
         }
         let mut warnings = Vec::new();
@@ -552,6 +570,25 @@ impl Session {
         *rec = Some(new);
     }
 
+    /// Stops and starts the transcode sink. One started once media is flowing begins at the next
+    /// keyframe; a stopped one finishes its output on its own thread's time (this waits for it).
+    fn change_transcode(&self, stop: bool, start: Option<crate::transcode::TranscodeOptions>, tc: &mut Option<crate::transcode::Transcoder>) {
+        if stop {
+            if let Some(mut old) = tc.take() {
+                old.finish();
+                lock(&self.shared).transcode = Some(old.status());
+            }
+        }
+        let Some(o) = start else { return };
+        let mut new = crate::transcode::Transcoder::new(o);
+        let streams = lock(&self.shared).streams.clone();
+        if !streams.is_empty() {
+            new.start_late(&streams);
+        }
+        lock(&self.shared).transcode = Some(new.status());
+        *tc = Some(new);
+    }
+
     /// Observations in the log that match `q`, oldest first unless asked otherwise.
     pub fn query(&self, q: &Query) -> Value {
         let text = q.text.as_ref().map(|t| t.to_lowercase());
@@ -593,7 +630,7 @@ impl Session {
             if self.stop.load(Ordering::Relaxed) {
                 break;
             }
-            self.reconfigure(analysis.as_mut(), &mut deferred, rec);
+            self.reconfigure(analysis.as_mut(), &mut deferred, rec, tc);
             let chunk = source.read(&mut buf, READ_WAIT)?;
             let arrival = Instant::now();
             let bytes: &[u8] = match chunk {
@@ -632,7 +669,7 @@ impl Session {
                     break;
                 }
                 // a paced source spends long in here: changes are taken between packets too
-                self.reconfigure(analysis.as_mut(), &mut deferred, rec);
+                self.reconfigure(analysis.as_mut(), &mut deferred, rec, tc);
                 if analysis.is_none() {
                     let streams = d.streams().to_vec();
                     let mut a = Analysis::new(&streams, opts, 0.0, f64::INFINITY, true)?;
@@ -682,7 +719,7 @@ impl Session {
                     published = Instant::now();
                     let (r, c) = (rec.as_ref().map(Recorder::status), tc.as_ref().map(|t| t.status()));
                     let mut sh = lock(&self.shared);
-                    (sh.record, sh.transcode) = (r.or(sh.record.take()), c);
+                    (sh.record, sh.transcode) = (r.or(sh.record.take()), c.or(sh.transcode.take()));
                 }
                 if let Some(rec) = rec.as_mut() {
                     rec.packet(&sp.packet, t, sp.key);

@@ -295,7 +295,11 @@ fn h_stream_configure(args: &Value) -> Result<Value> {
     if start.is_none() && (given("segment_seconds") || given("keep_segments") || given("overwrite")) {
         return Err(Error::invalid_arg("segment_seconds, keep_segments and overwrite go with record"));
     }
-    s.configure(c, crate::live::RecordChange { stop: flag("stop_recording")?, start })
+    let transcode = match args.get("transcode") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(serde_json::from_value::<crate::transcode::TranscodeOptions>(v.clone()).map_err(|e| Error::invalid_arg(format!("transcode: {e}")))?),
+    };
+    s.configure(c, crate::live::RecordChange { stop: flag("stop_recording")?, start, stop_transcode: flag("stop_transcode")?, transcode })
 }
 
 fn h_stream_close(args: &Value) -> Result<Value> {
@@ -531,7 +535,7 @@ pub fn tools() -> &'static [Tool] {
             },
             Tool {
                 name: "stream_configure",
-                description: "Change a running session: the most detail it keeps (level), the digest interval (from the next window), and which analyzers and sidecars run (add, remove: built-in analyzer names, or the operator's sidecar names from `capabilities`). An added video analyzer starts at the next keyframe. An added sidecar starts in the background and joins the first stream of its kind once ready (its name then shows in the status; a failure is an analyzer_failed observation). A removed one finishes in the background, and its closing observations follow. It can also start a recording (record), finish the running one (stop_recording), or both to go on in a new file. Returns the status with `applied` once the session has taken the change (within a second).",
+                description: "Change a running session: the most detail it keeps (level), the digest interval (from the next window), and which analyzers and sidecars run (add, remove: built-in analyzer names, or the operator's sidecar names from `capabilities`). An added video analyzer starts at the next keyframe. An added sidecar starts in the background and joins the first stream of its kind once ready (its name then shows in the status; a failure is an analyzer_failed observation). A removed one finishes in the background, and its closing observations follow. It can also start a recording (record), finish the running one (stop_recording), or both to go on in a new file; the same for a transcode (transcode, stop_transcode). Returns the status with `applied` once the session has taken the change (within a second).",
                 cli: "",
                 input_schema: object(
                     json!({
@@ -544,7 +548,9 @@ pub fn tools() -> &'static [Tool] {
                         "record": { "type": "string", "description": "Start recording, as stream_open's record: a file begins at the next video keyframe with its timestamps from zero; an .m3u8 path writes HLS segments. With stop_recording, the old recording is finished first, so this goes on in a new file." },
                         "segment_seconds": { "type": "number", "minimum": 1, "maximum": 600 },
                         "keep_segments": { "type": "integer", "minimum": 1 },
-                        "overwrite": { "type": "boolean", "description": "Replace an existing recording at that path." }
+                        "overwrite": { "type": "boolean", "description": "Replace an existing recording at that path." },
+                        "stop_transcode": { "type": "boolean", "description": "Finish the transcode running now." },
+                        "transcode": { "type": "object", "description": "Start a transcode, as stream_open's: it begins at the next video keyframe with its timestamps from zero. With stop_transcode, the old one is finished first." }
                     }),
                     &["session"],
                 ),

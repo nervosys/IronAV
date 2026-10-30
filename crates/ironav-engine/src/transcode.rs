@@ -78,15 +78,24 @@ pub struct Transcoder {
     thread: Option<JoinHandle<()>>,
     status: Arc<Mutex<Value>>,
     video: Option<usize>,
-    /// Video packets are dropped until the next keyframe (the queue was full).
+    /// Video packets are dropped until the next keyframe (the queue was full, or it started on a
+    /// running session).
     dropping: bool,
+    late: bool,
     dropped: u64,
 }
 
 impl Transcoder {
     pub fn new(opts: TranscodeOptions) -> Self {
         let status = Arc::new(Mutex::new(json!({ "output": opts.output, "state": "waiting" })));
-        Transcoder { opts, tx: None, thread: None, status, video: None, dropping: false, dropped: 0 }
+        Transcoder { opts, tx: None, thread: None, status, video: None, dropping: false, late: false, dropped: 0 }
+    }
+
+    /// [`start`](Self::start) on a session already running: decoding begins at the next video
+    /// keyframe, and the output's timestamps start at zero with its first picture.
+    pub fn start_late(&mut self, streams: &[StreamInfo]) {
+        (self.late, self.dropping) = (true, true);
+        self.start(streams);
     }
 
     /// The streams are known: starts the transcoder's thread.
@@ -100,7 +109,8 @@ impl Transcoder {
             return;
         };
         let (tx, rx) = sync_channel(QUEUE);
-        let work = Work::new(self.opts.clone(), streams, v, self.status.clone());
+        let mut work = Work::new(self.opts.clone(), streams, v, self.status.clone());
+        work.late = self.late;
         self.tx = Some(tx);
         let status = self.status.clone();
         let output = self.opts.output.clone();
@@ -125,10 +135,13 @@ impl Transcoder {
         let video = Some(p.stream) == self.video;
         if video && self.dropping {
             if !key {
-                self.dropped += 1;
+                // waiting for the first keyframe of a late start is not falling behind
+                if !self.late {
+                    self.dropped += 1;
+                }
                 return;
             }
-            self.dropping = false;
+            (self.dropping, self.late) = (false, false);
         }
         match tx.try_send((p.clone(), key)) {
             Ok(()) => {}
@@ -187,6 +200,7 @@ struct Work {
     pictures_in: u64,
     pictures_out: u64,
     size: Option<(u32, u32)>,
+    late: bool,
     error: Option<Error>,
 }
 
@@ -205,7 +219,7 @@ impl Work {
             }
         }
         let rec = Recorder::new(opts.record());
-        Work { opts, streams: streams.to_vec(), video, map, decoder: None, convert: None, scale: None, encoder: None, rec, started: false, status, pictures_in: 0, pictures_out: 0, size: None, error: None }
+        Work { opts, streams: streams.to_vec(), video, map, decoder: None, convert: None, scale: None, encoder: None, rec, started: false, status, pictures_in: 0, pictures_out: 0, size: None, late: false, error: None }
     }
 
     fn run(mut self, rx: Receiver<(Packet, bool)>) {
@@ -331,7 +345,11 @@ impl Work {
             }
             out.push(s);
         }
-        self.rec.start(&out);
+        if self.late {
+            self.rec.start_late(&out);
+        } else {
+            self.rec.start(&out);
+        }
         Ok(())
     }
 

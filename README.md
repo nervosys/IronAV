@@ -164,7 +164,8 @@ decoded, scaled to `width` if given, and encoded as low-latency H.264 (no B pict
 `bitrate_kbps`), written like a recording to a file or HLS, with the audio copied when the output holds it. It runs on
 its own thread; when it falls behind, video is dropped up to the next keyframe and counted
 (`transcode.dropped_packets`), so the session is never held up. The encoder is the software one, which suits reduced
-sizes.
+sizes. `stream_configure` starts one on a running session (`transcode`, with the same options) beginning at the next
+video keyframe with its timestamps from zero, finishes the one running (`stop_transcode: true`), or both.
 
 ```sh
 ironav watch udp://:5000 --record live/stream.m3u8 --segment-seconds 4 --keep-segments 10

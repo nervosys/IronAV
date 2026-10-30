@@ -203,3 +203,40 @@ fn a_session_transcodes_its_video_to_low_latency_h264() {
     n += dec.flush().unwrap().len();
     assert_eq!(n as u64, pictures);
 }
+
+#[test]
+fn a_transcode_is_started_and_moved_to_a_new_file_while_a_session_runs() {
+    let dir = scratch("transcode_late");
+    let src = concat!(env!("CARGO_MANIFEST_DIR"), "/../ironav-formats/tests/data/h264_aac.ts");
+    let s = call_tool("stream_open", &json!({ "source": format!("{src}?pace=realtime"), "analyzers": ["structure"] })).unwrap();
+    let id = s["session"].as_str().unwrap().to_string();
+    let (a, b) = (dir.join("a.ts"), dir.join("b.ts"));
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let tc = |p: &std::path::Path| json!({ "output": p.to_str().unwrap(), "width": 64, "qp": 30 });
+    let c = call_tool("stream_configure", &json!({ "session": id, "transcode": tc(&a) })).unwrap();
+    assert_eq!(c["applied"], true, "{c}");
+    // a second transcode needs the first stopped
+    let e = call_tool("stream_configure", &json!({ "session": id, "transcode": tc(&b) })).unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidArgument, "{e:?}");
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    let c = call_tool("stream_configure", &json!({ "session": id, "stop_transcode": true, "transcode": tc(&b) })).unwrap();
+    assert_eq!(c["applied"], true, "{c}");
+    wait_end(&id);
+    let st = call_tool("stream_close", &json!({ "session": id })).unwrap();
+    assert_eq!(st["transcode"]["output"], b.to_str().unwrap(), "{st}");
+    assert_eq!(st["transcode"]["state"], "finished", "{st}");
+    assert_eq!(st["transcode"]["error"], Value::Null, "{st}");
+    // each file starts at a keyframe with its timestamps from zero, and holds part of the source
+    for f in [&a, &b] {
+        let mut d = ironav_formats::open_demuxer(f).unwrap();
+        let streams = d.streams().to_vec();
+        let (mut first, mut last, mut n) = (f64::INFINITY, 0f64, 0);
+        while let Some(p) = d.read_packet().unwrap() {
+            let t = p.pts as f64 * streams[p.stream].time_base.as_f64();
+            first = first.min(t);
+            last = last.max(t);
+            n += 1;
+        }
+        assert!(n > 5 && first.abs() < 0.05 && last < 1.6, "{}: {n} packets from {first} to {last}", f.display());
+    }
+}
