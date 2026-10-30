@@ -79,6 +79,9 @@ pub struct H264Encoder {
     /// B pictures between the P pictures (with CABAC), and the pictures waiting to be coded as them.
     bframes: usize,
     pending: Vec<(Source, i64, u64)>,
+    /// Pictures between IDR pictures, and the seconds of bits the spending may run ahead or behind.
+    keyint: u64,
+    rc_window: f64,
     /// Display index of the last IDR picture.
     idr_at: u64,
     /// The last picture's luma at a quarter of the size, to find scene cuts.
@@ -135,6 +138,8 @@ impl H264Encoder {
             refs: Vec::new(),
             bframes: BFRAMES,
             pending: Vec::new(),
+            keyint: KEYINT,
+            rc_window: 1.0,
             idr_at: 0,
             last_low: None,
             #[cfg(test)]
@@ -147,6 +152,18 @@ impl H264Encoder {
             frame_num: 0,
             idr_id: 0,
         })
+    }
+
+    /// Sets the encoder up for live delivery: no B pictures, so each picture is sent as soon as it
+    /// is coded and none waits for a later one (the SPS then declares no reordering, so decoders
+    /// show each at once too); an IDR picture every second, so a viewer joining late waits at most
+    /// that long; and spending held to a quarter of a second's bits, so no burst outruns a small
+    /// receive buffer.
+    pub fn low_latency(mut self) -> Self {
+        self.bframes = 0;
+        self.keyint = self.fps().round().max(1.0) as u64;
+        self.rc_window = 0.25;
+        self
     }
 
     fn fps(&self) -> f64 {
@@ -265,7 +282,7 @@ impl H264Encoder {
     /// Steers the quantiser so the bits spent follow the bits the rate allows. A picture's size
     /// roughly halves for every 6 added to the quantiser, which says what quantiser the last
     /// picture would have needed; the running surplus or deficit, against a second's worth of
-    /// bits, pulls the next one further.
+    /// bits (a quarter of one at low latency), pulls the next one further.
     fn rate_update(&mut self, bits: usize, qp: i32, kind: u8) {
         let Some(rate) = self.bitrate else {
             return;
@@ -278,7 +295,7 @@ impl H264Encoder {
         if kind == 2 {
             return;
         }
-        let window = rate as f64;
+        let window = rate as f64 * self.rc_window;
         let budget = 6.0 * ((self.spent + window) / (self.allowed + window).max(1.0)).log2();
         // an IDR picture is expected to cost several P pictures, and a P picture more than one
         // picture's worth when B pictures, which cost much less, lie between them
@@ -471,7 +488,7 @@ impl Encoder for H264Encoder {
             inter as f64 > SCENE_CUT * intra as f64
         });
         self.last_low = Some(low);
-        let idr = d == 0 || d - self.idr_at >= KEYINT || cut;
+        let idr = d == 0 || d - self.idr_at >= self.keyint || cut;
         let mut out = Vec::new();
         if idr || self.pending.len() == self.b_frames() {
             if idr {
@@ -590,6 +607,27 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn low_latency_sends_each_picture_as_it_is_coded() {
+        let (w, h) = (64, 48);
+        let params = StreamParams::Video { width: w as u32, height: h as u32, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational::new(25, 1) };
+        let mut enc = H264Encoder::new(&params, None, Some(150_000)).unwrap().low_latency();
+        let mut dec = H264Decoder::new();
+        let mut idrs = Vec::new();
+        for t in 0..60 {
+            let pkts = enc.encode(&Frame::Video(scene(w, h, t))).unwrap();
+            assert_eq!(pkts.len(), 1, "picture {t} leaves as soon as it is coded");
+            assert_eq!(pkts[0].pts, t as i64);
+            if pkts[0].data.windows(4).any(|b| b[..3] == [0, 0, 1] && b[3] & 0x1F == 5) {
+                idrs.push(t);
+            }
+            // no reordering is declared, so the decoder shows each picture at once too
+            assert_eq!(dec.decode(&pkts[0]).unwrap().len(), 1, "picture {t} decoded at once");
+        }
+        assert!(enc.flush().unwrap().is_empty());
+        assert!([0, 25, 50].iter().all(|i| idrs.contains(i)), "an IDR picture each second: {idrs:?}");
     }
 
     #[test]

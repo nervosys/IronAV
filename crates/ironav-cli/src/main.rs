@@ -6,7 +6,7 @@ mod mcp;
 mod play;
 
 use ironav_core::{Error, Result};
-use ironav_engine::{call_tool, ontology, tools, FilterCall, Job};
+use ironav_engine::{call_tool, ontology, tools, FilterCall, Job, Latency};
 use serde_json::{json, Value};
 use std::io::{IsTerminal, Read, Write};
 
@@ -55,7 +55,7 @@ fn help() -> Value {
         "commands": {
             "capabilities": "what this build can do (start here)",
             "probe <path>": "inspect a media file",
-            "convert -i IN [-i MORE]... -o OUT [-f FMT] [--acodec C] [--vcodec C] [--abitrate KBPS] [--vbitrate KBPS | --qp N] [--filter name[:k=v,..]]... [--hwaccel P] [-y] [--dry-run] [--progress]": "convert, handbrake/ffmpeg style",
+            "convert -i IN [-i MORE]... -o OUT [-f FMT] [--acodec C] [--vcodec C] [--abitrate KBPS] [--vbitrate KBPS | --qp N] [--latency low] [--filter name[:k=v,..]]... [--hwaccel P] [-y] [--dry-run] [--progress]": "convert, handbrake/ffmpeg style",
             "analyze FILE [--analyzers a,b] [--level digest|events|raw] [--digest-seconds N] [--from S] [--to S] [--streams 0,1] [--max N] [--thumbnails DIR] [--hwaccel P] [--jsonl]": "what is in a file: loudness, silence, scene cuts, black and frozen pictures, thumbnails, gaps; --jsonl prints each observation as a line as it is found",
             "watch SOURCE [--analyzers a,b] [--level digest|events|raw] [--digest-seconds N] [--format F] [--fps N] [--pace realtime] [--retain S] [--duration S] [--hwaccel P] [--record OUT.ts|OUT.m3u8 [--segment-seconds S] [--keep-segments N] [-y]]": "follow a live source (path, path?follow, -, tcp://host:port, tcp://:port, udp://:port): every observation as a JSON line as it happens, then a summary",
             "plan <job.json|->": "validate a JSON job without writing",
@@ -115,6 +115,14 @@ fn dispatch(mut a: Args, progress: bool) -> Result<Value> {
             job.audio.bitrate_kbps = a.flag(&["--abitrate", "-b:a"])?.map(|v| v.parse().map_err(|_| Error::invalid_arg(format!("--abitrate must be a whole number of kbit/s, got '{v}'")))).transpose()?;
             job.video.bitrate_kbps = a.flag(&["--vbitrate", "-b:v"])?.map(|v| v.parse().map_err(|_| Error::invalid_arg(format!("--vbitrate must be a whole number of kbit/s, got '{v}'")))).transpose()?;
             job.video.qp = a.flag(&["--qp"])?.map(|v| v.parse().map_err(|_| Error::invalid_arg(format!("--qp must be a whole number 0-51, got '{v}'")))).transpose()?;
+            job.video.latency = a
+                .flag(&["--latency"])?
+                .map(|v| match v.as_str() {
+                    "low" => Ok(Latency::Low),
+                    "normal" => Ok(Latency::Normal),
+                    _ => Err(Error::invalid_arg(format!("--latency must be low or normal, got '{v}'"))),
+                })
+                .transpose()?;
             for f in a.flags(&["--filter"])? {
                 job.filters.push(FilterCall::parse_shorthand(&f)?);
             }

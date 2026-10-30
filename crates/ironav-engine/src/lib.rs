@@ -12,7 +12,7 @@ pub mod run;
 mod sessions;
 pub mod tools;
 
-pub use job::{FilterCall, Job, StreamOpts};
+pub use job::{FilterCall, Job, Latency, StreamOpts};
 pub use plan::{plan, Plan};
 pub use run::{run, Progress, Report};
 pub use analyze::{analyze, AnalyzeJob};

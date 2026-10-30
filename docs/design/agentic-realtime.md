@@ -236,10 +236,13 @@ Each observation is one JSON object with a stable envelope; the ontology lists e
 - **Sinks**: record (fragmented MP4 or TS, written progressively so a crash leaves a playable file),
   segment (HLS-style TS/fMP4 segments and a playlist), transcode (through the existing encoder registry), and
   restream (TS over UDP/TCP).
-- **Real-time encoding profile**: `latency: "low"` sets `bframes = 0`, no look-ahead and VBV-constrained rate
-  control, and prefers NVENC's low-latency preset. Today the software H.264 encoder is suitable only for
+- **Real-time encoding profile** (built, as `video.latency: "low"` on a job and `--latency low` on `convert`):
+  no B-frames, so each picture leaves as soon as it is coded and the SPS declares no reordering; an IDR picture
+  every second; no look-ahead; and a bit rate held to a quarter of a second's bits in software, or CBR with a
+  one-frame VBV buffer under NVENC's low-latency tuning (which a constant quantiser also gets). Naming a codec with it re-encodes even a stream of the
+  same codec, since the source may hold B-frames. Today the software H.264 encoder is suitable only for
   recording at a reduced resolution, or offline. A faster software preset is separate encoder work, and this
-  document does not promise it.
+  document does not promise it. `stream_open` takes `latency` once a session has a transcode sink.
 - Limits: `MAX_LIVE_SESSIONS` like the player's 8; per-session memory caps for the ring buffer, the log and the
   queues; an idle timeout that closes sessions nobody has polled.
 
@@ -341,7 +344,7 @@ Each milestone is usable on its own and passes the test gate.
 |---|---|---|
 | **M1: understand files** (done) | `ironav-analyze` with `structure`, `levels`, `loudness`, `silence`, `scene` (shared with the encoder), `black`, `freeze`, `thumbnails`; the `analyze` tool and CLI; digests; MCP concurrency, progress and cancellation | none |
 | **M2: live bytes** (done in part) | the `Source` trait; `pipe:`, `?follow`, `?pace=realtime`, `tcp://`, `udp://`; `StreamDemuxer` for Annex B, ADTS, Y4M, WAV, Ogg and MP3; packet metadata; `LiveSession`, the ring buffer, the `stream_*` tools and `ironav watch`; low-delay H.264 and HEVC output | none |
-| **M3: broadcast** (done except the `latency: low` encode profile) | the MPEG-TS demuxer and muxer; live fMP4 and MKV reading; a progressive fMP4/TS recorder; `stream_clip`; segmenting; the `latency: low` encode profile | none |
+| **M3: broadcast** (done) | the MPEG-TS demuxer and muxer; live fMP4 and MKV reading; a progressive fMP4/TS recorder; `stream_clip`; segmenting; the `latency: low` encode profile | none |
 | **M4: cameras and the web** | RTSP and RTP depacketizers with a jitter buffer and RTCP; HLS over plain HTTP | none |
 | **M5: models** | the sidecar protocol, voice-activity gating and two reference sidecars kept out of tree (speech-to-text, detection) | none in the core; each sidecar chooses its own |
 | **M6: optional transports** | HTTPS/HLS, RTSPS, SRT, capture devices, WebRTC ingest | each one by decision (§10) |
@@ -359,8 +362,9 @@ and the writer's output has been checked against FFmpeg. Recording (`record` on 
 in `engine/src/record.rs`) writes one file, or HLS segments cut at keyframes plus a playlist that is replaced whole after
 each segment (an EVENT playlist, or a sliding window with `keep_segments`). Matroska and WebM are read as they arrive
 (`ironav-formats/src/mkv/live.rs`), and the packets match the file reader's. Fragmented MP4 is read as it arrives
-(`ironav-formats/src/mp4demux/live.rs`), reusing the file reader's `parse_trak` and `parse_moof`. Still to do in M3:
-the `latency: low` encode profile.
+(`ironav-formats/src/mp4demux/live.rs`), reusing the file reader's `parse_trak` and `parse_moof`. The `latency: low` encode profile is a
+video option of jobs (`StreamOpts::latency`), carried by the plan's step as `low_latency` to the software H.264
+encoder (`H264Encoder::low_latency`) and NVENC; live sessions will take it when they gain a transcode sink.
 
 M1 comes first because it needs no new input path. It turns the existing decoders into an understanding tool for
 files at once, and it fixes the event model, analyzer trait and MCP plumbing before anything goes live.

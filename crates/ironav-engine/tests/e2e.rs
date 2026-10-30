@@ -1794,3 +1794,37 @@ fn jpeg_reencode_stays_close() {
     let psnr = 10.0 * (255.0f64 * 255.0 / mse.max(1e-9)).log10();
     assert!(psnr > 35.0, "PSNR {psnr}");
 }
+
+#[test]
+fn low_latency_re_encodes_without_reordering() {
+    let dir = scratch("low-latency");
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ironav-formats/tests/data/h264_aac.ts");
+    let out = dir.join("live.mp4");
+    let mut j = job(&src, &out);
+    j.hwaccel = "off".into();
+    // the source is H.264 with B pictures; naming h264 with low latency re-encodes it anyway
+    j.video.codec = Some("h264".into());
+    j.video.latency = Some(ironav_engine::Latency::Low);
+    let p = plan(&j).unwrap();
+    let v = serde_json::to_value(&p).unwrap();
+    assert!(v["steps"].as_array().unwrap().iter().any(|s| s["low_latency"] == true && s["action"] == "transcode"), "{v}");
+    run(&j, &mut |_| {}).unwrap();
+    let mut d = ironav_formats::open_demuxer(&out).unwrap();
+    let video = d.streams().iter().position(|s| s.params.media_type() == ironav_core::MediaType::Video).unwrap();
+    let mut pts = Vec::new();
+    while let Some(pk) = d.read_packet().unwrap() {
+        if pk.stream == video {
+            pts.push(pk.pts);
+        }
+    }
+    assert!(pts.len() > 10);
+    assert!(pts.windows(2).all(|w| w[0] < w[1]), "decode order is display order: {pts:?}");
+
+    // audio has nothing to hold back, and a copied stream has no encoder to set up
+    let mut a = job(&src, &dir.join("a.mp4"));
+    a.audio.latency = Some(ironav_engine::Latency::Low);
+    assert_eq!(plan(&a).unwrap_err().code, ErrorCode::InvalidArgument);
+    let mut c = job(&src, &dir.join("c.mp4"));
+    c.video.latency = Some(ironav_engine::Latency::Low);
+    assert_eq!(plan(&c).unwrap_err().code, ErrorCode::InvalidArgument);
+}

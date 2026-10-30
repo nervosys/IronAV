@@ -147,6 +147,7 @@ B-frames and no look-ahead, so output order equals input order and each frame yi
 ```
 ironav convert -i in.y4m -o out.h264 --vcodec h264 --qp 24        # quality-targeted (0-51, default 23)
 ironav convert -i in.y4m -o out.mp4  --vcodec hevc --vbitrate 4000   # ~4 Mbit/s, in an MP4
+ironav convert -i in.ts  -o out.ts   --vcodec h264 --vbitrate 2000 --latency low   # for live delivery: no B-frames, IDR each second
 ironav convert -i in.mp3 -o out.mka --acodec opus --abitrate 96   # Opus at 96 kbit/s (resampled to 48 kHz automatically)
 ```
 
@@ -480,7 +481,7 @@ filtered as a whole. Reconstruction reuses the decoder's prediction, inverse tra
 reference the encoder keeps is the one every decoder builds (a unit test decodes each picture and compares). `--qp N`
 holds a quantiser (23 by default; IDR pictures get 3 less, as in x264, and B pictures 5 more); `--vbitrate KBPS` steers the quantiser picture by picture to an average rate.
 An IDR picture with SPS and PPS starts every 250 pictures, and at a scene cut: a picture that a quarter-size motion search predicts from the last one little better than from its own block means (this saves 1.9 % on a clip of three 20-picture scenes). NVENC is still chosen when a usable GPU is present;
-`--hwaccel off` selects the software encoder.
+`--hwaccel off` selects the software encoder. `--latency low` (`"latency": "low"` in a job's `video`) sets either encoder up for live delivery: no B pictures, so every picture leaves as soon as it is coded and decoders show it at once; an IDR picture every second; and a bit rate held to a quarter of a second's bits (NVENC uses its low-latency tuning, and with a bit rate CBR and a one-frame buffer). MJPEG and raw video send each picture at once either way.
 
 Checked by decoding with FFmpeg (through PyAV): 24 cases from 16x16 to 1280x720, QP 0 to 51 and four bit rates all decode
 bit-for-bit like IronAV's own decoder, with CABAC and with CAVLC. CABAC codes the same pictures in 37 % fewer bits than

@@ -47,6 +47,23 @@ pub struct StreamOpts {
     /// defaults to 23.
     #[serde(default)]
     pub qp: Option<u8>,
+    /// Video only: `low` encodes for live delivery, where each picture should leave as soon as it
+    /// is coded; `normal` (the default) favours size. See [`Latency`].
+    #[serde(default)]
+    pub latency: Option<Latency>,
+}
+
+/// How long an encoder may hold pictures back to make the stream smaller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Latency {
+    /// B pictures, long keyframe intervals and a second of rate-control slack: smallest output.
+    Normal,
+    /// No B pictures, so no picture waits for a later one; a keyframe every second, so a viewer
+    /// joining late waits at most that long; and a bit rate held to a quarter of a second's bits
+    /// (on NVENC, whose low-latency tuning is used, constant bit rate with a one-picture buffer).
+    /// MJPEG and raw video code each picture alone, so they are low latency either way.
+    Low,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

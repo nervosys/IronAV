@@ -173,7 +173,7 @@ fn execute(
             let encoder = match hw {
                 Some(backend) if dst.params.media_type() == MediaType::Video => {
                     hw_name = Some(backend.name());
-                    new_video_encoder(backend, dst.codec, &dst.params, rate)?
+                    new_video_encoder(backend, dst.codec, &dst.params, rate, st.low_latency)?
                 }
                 _ if dst.codec == CodecId::Mjpeg && dst.params.media_type() == MediaType::Video => {
                     let quality = st.qp.map_or(JpegEncoder::default_quality(), JpegEncoder::quality_for_qp);
@@ -184,7 +184,8 @@ fn execute(
                         RateControl::ConstQp(q) => (Some(q), None),
                         RateControl::Bitrate(b) => (None, Some(b)),
                     };
-                    Box::new(H264Encoder::new(&dst.params, qp, bitrate)?)
+                    let e = H264Encoder::new(&dst.params, qp, bitrate)?;
+                    Box::new(if st.low_latency { e.low_latency() } else { e })
                 }
                 _ => new_encoder_with(dst.codec, &dst.params, dst.bits, st.bitrate_kbps)?,
             };
