@@ -93,8 +93,8 @@ pub fn open_source(url: &str) -> Result<Box<dyn Source>> {
             };
             Box::new(UdpSource { info: SourceInfo { url: shown, kind: "udp", live: true }, sock })
         }
-        "rtsp" => Box::new(crate::rtsp::RtspSource::open(&u, shown)?),
-        "http" => crate::hls::open(&u, shown)?,
+        "rtsp" | "rtsps" => Box::new(crate::rtsp::RtspSource::open(&u, shown)?),
+        "http" | "https" => crate::hls::open(&u, shown)?,
         _ => unreachable!("SourceUrl::parse accepts only these schemes"),
     })
 }

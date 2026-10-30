@@ -1,4 +1,4 @@
-//! `http://` sources: HLS (RFC 8216) when the URL names a playlist, a progressive download
+//! `http://` and `https://` sources: HLS (RFC 8216) when the URL names a playlist, a progressive download
 //! otherwise.
 //!
 //! A master playlist's highest-bandwidth variant is played. Its segments are fetched in order and
@@ -9,8 +9,9 @@
 //! segments from its end and is reloaded every target duration (half of one when nothing was
 //! added); media sequence numbers keep a segment from being given twice, and segments that slid
 //! out of the window before they were fetched are skipped. Byte ranges are fetched with Range
-//! requests. Encrypted playlists, HTTPS segments and separate audio renditions are not supported;
-//! the first two are refused when the source is opened.
+//! requests. Encrypted playlists and separate audio renditions are not supported; the first are
+//! refused when the source is opened, and so is a playlist reached over HTTPS that lists segments
+//! over plain HTTP, which anyone on the way could change.
 
 use crate::http::{self, join, HttpUrl};
 use crate::net::Allow;
@@ -176,16 +177,19 @@ fn check(media: &Media, shown: &str) -> Result<()> {
     if let Some(m) = &media.encrypted {
         return Err(Error::new(ErrorCode::UnsupportedFormat, format!("{shown} is encrypted ({m}), which IronAV does not decrypt")));
     }
-    if let Some(s) = media.segments.iter().find(|s| !s.uri.starts_with("http://") || s.map.as_ref().is_some_and(|(u, _)| !u.starts_with("http://"))) {
-        return Err(Error::new(ErrorCode::UnsupportedFormat, format!("{shown} has a segment at {}, which is not plain HTTP", redact(&s.uri))).hint("HTTPS needs TLS, which IronAV does not speak yet"));
+    // a source opened over TLS keeps every segment under TLS
+    let tls = shown.starts_with("https://");
+    let web = |u: &str| u.starts_with("https://") || (!tls && u.starts_with("http://"));
+    if let Some(s) = media.segments.iter().find(|s| !web(&s.uri) || s.map.as_ref().is_some_and(|(u, _)| !web(u))) {
+        return Err(Error::new(ErrorCode::UnsupportedFormat, format!("{shown} has a segment at {}, which is not {}", redact(&s.uri), if tls { "HTTPS" } else { "HTTP" })));
     }
     Ok(())
 }
 
-/// Opens an `http://` source: HLS when the response is a playlist, the body itself otherwise.
+/// Opens an `http://` or `https://` source: HLS when the response is a playlist, the body itself otherwise.
 pub(crate) fn open(u: &SourceUrl, shown: String) -> Result<Box<dyn Source>> {
     let allow = Allow::from_env()?;
-    let url = format!("http://{}", u.target);
+    let url = format!("{}://{}", u.scheme, u.target);
     HttpUrl::parse(&url)?;
     let mut r = http::get(&url, None, &allow)?;
     let mut head = vec![0u8; 0];
@@ -548,16 +552,16 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_and_https_playlists_are_refused_and_plain_files_download() {
+    fn encrypted_and_ftp_playlists_are_refused_and_plain_files_download() {
         let routes: Routes = Default::default();
         {
             let mut r = routes.lock().unwrap();
             r.insert("/enc.m3u8".into(), b"#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-KEY:METHOD=AES-128,URI=\"k\"\n#EXTINF:2,\na.ts\n#EXT-X-ENDLIST\n".to_vec());
-            r.insert("/tls.m3u8".into(), b"#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2,\nhttps://cdn.example/a.ts\n#EXT-X-ENDLIST\n".to_vec());
+            r.insert("/ftp.m3u8".into(), b"#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2,\nftp://cdn.example/a.ts\n#EXT-X-ENDLIST\n".to_vec());
             r.insert("/clip.ts".into(), fixture("h264_aac.ts"));
         }
         let port = server(routes, |_, _| {});
-        for p in ["enc", "tls"] {
+        for p in ["enc", "ftp"] {
             let e = crate::open_source(&format!("http://127.0.0.1:{port}/{p}.m3u8")).err().unwrap();
             assert_eq!(e.code, ErrorCode::UnsupportedFormat, "{p}: {e:?}");
         }

@@ -1,12 +1,13 @@
 //! A small HTTP/1.1 client for sources: GET over plain TCP, every connection (and every redirect)
 //! through the address allow-list, one request per connection, bodies by length, chunked or until
-//! the connection closes, byte ranges, and timeouts on every read and write. HTTPS waits for TLS.
+//! the connection closes, byte ranges, and timeouts on every read and write. HTTPS goes through
+//! [`tls`](crate::tls), and a redirect from it to plain HTTP is refused.
 
 use crate::net::{self, Allow};
+use crate::tls::{self, Conn};
 use crate::url::{percent_decode, redact, split_authority};
 use ironav_core::{Error, ErrorCode, Result};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
 use std::time::Duration;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -24,16 +25,16 @@ pub(crate) struct HttpUrl {
     /// The path and query, starting with `/`.
     pub path: String,
     pub user: Option<(String, String)>,
+    /// `https`.
+    pub tls: bool,
 }
 
 impl HttpUrl {
     pub fn parse(url: &str) -> Result<HttpUrl> {
         let (scheme, rest) = url.split_once("://").ok_or_else(|| Error::invalid_arg(format!("'{}' is not an http:// URL", redact(url))))?;
-        if scheme.eq_ignore_ascii_case("https") {
-            return Err(Error::new(ErrorCode::UnsupportedFormat, format!("{} needs TLS, which IronAV does not speak yet", redact(url))).hint("use an http:// URL"));
-        }
-        if !scheme.eq_ignore_ascii_case("http") {
-            return Err(Error::invalid_arg(format!("'{scheme}' is not http")));
+        let tls = scheme.eq_ignore_ascii_case("https");
+        if !tls && !scheme.eq_ignore_ascii_case("http") {
+            return Err(Error::invalid_arg(format!("'{scheme}' is not http or https")));
         }
         let (cred, authority, path) = split_authority(rest);
         let (host, port) = if let Some(v6) = authority.strip_prefix('[') {
@@ -48,7 +49,7 @@ impl HttpUrl {
         if host.is_empty() {
             return Err(Error::invalid_arg("an http URL needs a host"));
         }
-        let port = port.map(|p| p.parse::<u16>().map_err(|_| Error::invalid_arg("the http URL's port is not a number"))).transpose()?.unwrap_or(80);
+        let port = port.map(|p| p.parse::<u16>().map_err(|_| Error::invalid_arg("the http URL's port is not a number"))).transpose()?.unwrap_or(if tls { 443 } else { 80 });
         let user = cred.map(|c| {
             let (u, p) = c.split_once(':').unwrap_or((c, ""));
             (percent_decode(u), percent_decode(p))
@@ -62,19 +63,23 @@ impl HttpUrl {
         }
         let path = path.replace(' ', "%20");
         let path = if path.is_empty() { "/".to_string() } else if path.starts_with('?') { format!("/{path}") } else { path };
-        Ok(HttpUrl { authority: authority.to_string(), host: host.to_string(), port, path, user })
+        Ok(HttpUrl { authority: authority.to_string(), host: host.to_string(), port, path, user, tls })
+    }
+
+    fn scheme(&self) -> &'static str {
+        if self.tls { "https" } else { "http" }
     }
 
     /// The URL without credentials.
     pub fn plain(&self) -> String {
-        format!("http://{}{}", self.authority, self.path)
+        format!("{}://{}{}", self.scheme(), self.authority, self.path)
     }
 
     /// The URL with its credentials, escaped: for resolving references against, never for display.
     pub fn full(&self) -> String {
         let esc = |s: &str| s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect::<String>();
         match &self.user {
-            Some((u, p)) => format!("http://{}:{}@{}{}", esc(u), esc(p), self.authority, self.path),
+            Some((u, p)) => format!("{}://{}:{}@{}{}", self.scheme(), esc(u), esc(p), self.authority, self.path),
             None => self.plain(),
         }
     }
@@ -149,7 +154,7 @@ pub(crate) struct Response {
     /// The URL that answered, after redirects, with the credentials that went to it: references are
     /// resolved against it, and it is shown only through `redact`.
     pub url: String,
-    conn: BufReader<TcpStream>,
+    conn: BufReader<Conn>,
     body: Body,
 }
 
@@ -226,9 +231,10 @@ pub(crate) fn get(url: &str, range: Option<(u64, u64)>, allow: &Allow) -> Result
     let mut u = HttpUrl::parse(url)?;
     for _ in 0..=MAX_REDIRECTS {
         let shown = redact(&u.plain());
-        let conn = net::connect(&u.host, u.port, CONNECT_TIMEOUT, allow, &shown)?;
-        conn.set_read_timeout(Some(IO_TIMEOUT))?;
-        conn.set_write_timeout(Some(IO_TIMEOUT))?;
+        let tcp = net::connect(&u.host, u.port, CONNECT_TIMEOUT, allow, &shown)?;
+        let mut conn = if u.tls { tls::connect(tcp, &u.host, Some(b"http/1.1"), &shown)? } else { Conn::Plain(tcp) };
+        conn.tcp().set_read_timeout(Some(IO_TIMEOUT))?;
+        conn.tcp().set_write_timeout(Some(IO_TIMEOUT))?;
         let mut req = format!("GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {USER_AGENT}\r\nAccept: */*\r\nConnection: close\r\n", u.path, u.authority);
         if let Some((user, pass)) = &u.user {
             req += &format!("Authorization: Basic {}\r\n", base64(format!("{user}:{pass}").as_bytes()));
@@ -237,7 +243,7 @@ pub(crate) fn get(url: &str, range: Option<(u64, u64)>, allow: &Allow) -> Result
             req += &format!("Range: bytes={first}-{last}\r\n");
         }
         req += "\r\n";
-        (&conn).write_all(req.as_bytes())?;
+        conn.write_all(req.as_bytes())?;
         let mut conn = BufReader::new(conn);
         let mut size = 0;
         // interim answers (100 Continue, 103 Early Hints) come before the real one
@@ -269,6 +275,9 @@ pub(crate) fn get(url: &str, range: Option<(u64, u64)>, allow: &Allow) -> Result
         if matches!(status, 301 | 302 | 303 | 307 | 308) {
             let loc = header("location").ok_or_else(|| Error::new(ErrorCode::Io, format!("{shown} redirects without saying where")))?;
             let next = HttpUrl::parse(&join(&u.plain(), &loc))?;
+            if u.tls && !next.tls {
+                return Err(Error::new(ErrorCode::Io, format!("{shown} redirects to plain HTTP ({}), which is refused", redact(&next.plain()))));
+            }
             let same = next.host.eq_ignore_ascii_case(&u.host) && next.port == u.port;
             u = HttpUrl { user: if next.user.is_some() { next.user.clone() } else if same { u.user.clone() } else { None }, ..next };
             continue;
@@ -298,7 +307,7 @@ pub(crate) fn get(url: &str, range: Option<(u64, u64)>, allow: &Allow) -> Result
     Err(Error::new(ErrorCode::Io, format!("{} redirects more than {MAX_REDIRECTS} times", redact(url))))
 }
 
-fn base64(d: &[u8]) -> String {
+pub(crate) fn base64(d: &[u8]) -> String {
     const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut s = String::new();
     for c in d.chunks(3) {
@@ -320,7 +329,10 @@ mod tests {
         assert_eq!((u.host.as_str(), u.port, u.path.as_str(), u.plain().as_str()), ("cam.local", 8080, "/a/b.m3u8?x=1", "http://cam.local:8080/a/b.m3u8?x=1"));
         assert_eq!(u.user, Some(("bob".into(), "p@ss".into())));
         assert_eq!(HttpUrl::parse("http://[::1]").unwrap().path, "/");
-        assert_eq!(HttpUrl::parse("https://x/y").unwrap_err().code, ErrorCode::UnsupportedFormat);
+        let s = HttpUrl::parse("https://u:p@x/y").unwrap();
+        assert_eq!((s.port, s.tls, s.plain().as_str(), s.full().as_str()), (443, true, "https://x/y", "https://u:p@x/y"));
+        assert_eq!(join("https://x/a/i.m3u8", "s.ts"), "https://x/a/s.ts");
+        assert!(HttpUrl::parse("ftp://x/y").is_err());
         let base = "http://h:1/live/v/index.m3u8?token=a";
         assert_eq!(join(base, "seg1.ts"), "http://h:1/live/v/seg1.ts");
         assert_eq!(join(base, "../a/seg.ts?x"), "http://h:1/live/a/seg.ts?x");

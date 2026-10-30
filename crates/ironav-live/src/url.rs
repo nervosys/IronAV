@@ -50,9 +50,9 @@ impl SourceUrl {
             ("file".to_string(), base.to_string())
         };
         match scheme.as_str() {
-            "file" | "pipe" | "tcp" | "udp" | "rtsp" | "http" => {}
+            "file" | "pipe" | "tcp" | "udp" | "rtsp" | "rtsps" | "http" | "https" => {}
             other => {
-                return Err(Error::invalid_arg(format!("'{other}' sources are not supported")).alternatives(["file", "pipe", "tcp", "udp", "rtsp", "http"]));
+                return Err(Error::invalid_arg(format!("'{other}' sources are not supported")).alternatives(["file", "pipe", "tcp", "udp", "rtsp", "rtsps", "http", "https"]));
             }
         }
         if matches!(scheme.as_str(), "tcp" | "udp") && !target.contains(':') {

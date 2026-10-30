@@ -1,8 +1,8 @@
 # Design: agentic-first real-time streaming, parsing and understanding
 
 Status: M1 (understanding files) and most of M2 (live bytes) are implemented; the rest is a proposal
-(2026-10-29). Nothing beyond that is implemented yet unless it says so. §8 lists what M2 left for later. TLS, when the HTTPS transport comes, uses rustls with IronCrypto's `ic-rustls`
-provider.
+(2026-10-29). Nothing beyond that is implemented yet unless it says so. §8 lists what M2 left for later. TLS (`https://`, `rtsps://`) uses IronSocketLayer, with
+IronPKI validating certificates.
 
 IronAV already treats agents as first-class for **files**: one tool registry feeds the CLI, the MCP server and the
 GUIs; jobs are declarative JSON; `plan` validates without writing; errors name alternatives; the ontology says what
@@ -90,9 +90,10 @@ Source URLs, in rough order of delivery:
 | `file:path`, plain path | as today, plus `?pace=realtime` (paced replay that simulates live) and `?follow=1` (growing file, like `tail -f`) |
 | `-` / `pipe:` | stdin or a named pipe |
 | `tcp://host:port`, `udp://host:port[?multicast]` | `std::net`; carries MPEG-TS, Annex B, ADTS and other raw byte streams |
-| `rtsp://` | RTSP over TCP using `std::net`; RTP over UDP or interleaved; no TLS |
+| `rtsp://` | RTSP over TCP using `std::net`; RTP over UDP or interleaved (over TLS as `rtsps://`, below) |
 | `http://` | HLS and progressive download over plain HTTP using `std::net` |
-| `https://`, `rtsps://`, `srt://` | feature-gated; each needs a dependency decision (§10) |
+| `https://`, `rtsps://` | the same over TLS 1.3: IronSocketLayer, with IronPKI checking the chain and name against the platform's PEM bundle and `IRONAV_CA_FILE` (`ironav-live/src/tls.rs`) |
+| `srt://` | needs a dependency decision (§10) |
 | `device:audio/default`, `device:video/0` | capture (WASAPI/Media Foundation, V4L2, AVFoundation); feature-gated, last |
 
 ### 3.2 Incremental demux (L1)
@@ -428,7 +429,9 @@ files at once, and it fixes the event model, analyzer trait and MCP plumbing bef
 
 ## 10. Decisions needed before the later milestones
 
-1. **TLS**: decided. rustls with IronCrypto (`ic-rustls`) as the crypto provider, behind a cargo feature.
+1. **TLS**: decided and done. First rustls with IronCrypto's `ic-rustls`; then, at the user's direction,
+   IronSocketLayer (TLS 1.3 only, over IronCrypto) with IronPKI for path validation and the root store. IronCrypto itself
+   holds no roots. Not behind a feature: both are first-party crates.
 2. **Async**: this design deliberately uses no async runtime. Confirm that, or choose `tokio` for M4 and later
    (needed only if session counts grow into the hundreds).
 3. **Capture devices**: per-OS native APIs written here, or a crate such as `cpal`, which the player already uses for

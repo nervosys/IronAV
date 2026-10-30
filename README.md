@@ -87,7 +87,14 @@ Basic or Digest credentials, keepalives and TEARDOWN, with H.264, HEVC, AAC, Opu
 skipped). The password never appears in output, and with Digest it is never sent.
 `http://host[:port]/path` plays HLS when it names a playlist (the highest-bandwidth variant; TS or fMP4 segments with
 `EXT-X-MAP` and byte ranges; a live playlist is followed from three segments before its end), and downloads anything
-else as it arrives. Encrypted playlists, separate audio renditions and HTTPS are not supported yet.
+else as it arrives. Encrypted playlists and separate audio renditions are not supported yet.
+`https://` and `rtsps://` (port 322 by default) are the same over TLS 1.3, using IronSocketLayer, with IronPKI checking
+the server's certificate chain and that it names the host in the URL (a DNS name or an IP address). The trusted roots
+are the platform's PEM bundle (`SSL_CERT_FILE`, the usual Linux, BSD and macOS paths, or the one Git for Windows
+installs; the Windows certificate store is not read) and `IRONAV_CA_FILE`, a PEM file of further roots, such as a
+camera maker's or your own CA. Checking cannot be turned off. A redirect from TLS to plain HTTP or RTSP is refused, and so
+is `rtsps://` with `?transport=udp`, which would send the media outside TLS. Servers that only speak TLS 1.2, as some
+older cameras do, cannot be reached.
 Outbound connections go only to loopback, private and link-local addresses (not the cloud metadata endpoints
 169.254.169.254 and 169.254.170.2/.23), checked after the name resolves. Whoever runs IronAV can allow more with `IRONAV_NET_ALLOW`:
 addresses and CIDR ranges separated by commas, or `any`. A request cannot widen it.
