@@ -7,6 +7,8 @@
 //! - `crash N MARKER`: like `echo` without the gate, but exits after N chunks unless MARKER exists
 //!   (which it then creates), so a restart behaves.
 //! - `mute`: exits before its hello, complaining on stderr.
+//! - `slow SECONDS PIDFILE`: writes its process id to PIDFILE and waits SECONDS before its hello,
+//!   then behaves as `echo`.
 
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
@@ -16,6 +18,11 @@ fn main() {
     let mode = args.first().map(String::as_str).unwrap_or("");
     let hello = match mode {
         "dtmf" => json!({ "audio": { "rate": 8000, "format": "s16", "chunk_seconds": 0.5 } }),
+        "slow" => {
+            let _ = std::fs::write(&args[2], std::process::id().to_string());
+            std::thread::sleep(std::time::Duration::from_secs_f64(args[1].parse().unwrap_or(1.0)));
+            json!({ "audio": { "rate": 16000, "format": "s16", "chunk_seconds": 1.0, "gate": "speech" } })
+        }
         "echo" => json!({ "audio": { "rate": 16000, "format": "s16", "chunk_seconds": 1.0, "gate": "speech" } }),
         "crash" => json!({ "audio": { "rate": 16000, "format": "f32", "chunk_seconds": 0.5 } }),
         "pictures" => json!({ "video": { "every_seconds": 0.5, "width": 32, "format": "rgb24" } }),
@@ -24,7 +31,7 @@ fn main() {
             std::process::exit(2);
         }
         _ => {
-            eprintln!("usage: ironav-sidecar-example dtmf|echo|pictures|crash N MARKER|mute");
+            eprintln!("usage: ironav-sidecar-example dtmf|echo|pictures|crash N MARKER|mute|slow SECONDS PIDFILE");
             std::process::exit(2);
         }
     };

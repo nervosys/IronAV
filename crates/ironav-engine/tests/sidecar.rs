@@ -30,6 +30,7 @@ fn configure() -> &'static Path {
             "absent": { "command": ["ironav-no-such-sidecar-program"], "media": "video" },
             "liar": { "command": [exe, "dtmf"], "media": "video" },
             "missing": { "command": ["ironav-no-such-sidecar-program"] },
+            "slow": { "command": [exe, "slow", "1", dir.join("slow.pid").to_str().unwrap()] },
         });
         let path = dir.join("sidecars.json");
         std::fs::write(&path, list.to_string()).unwrap();
@@ -95,6 +96,57 @@ fn a_sidecar_is_added_to_a_running_session_and_removed() {
     let c = call_tool("stream_configure", &json!({ "session": id, "remove": ["dtmf"] })).unwrap();
     assert_eq!(c["applied"], true, "{c}");
     assert!(!c["analyzed"][0]["analyzers"].as_array().unwrap().contains(&json!("dtmf")), "{c}");
+    let _ = call_tool("stream_close", &json!({ "session": id }));
+}
+
+/// Whether process `pid` is still running.
+fn alive(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        let out = std::process::Command::new("tasklist").args(["/FI", &format!("PID eq {pid}"), "/NH"]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).contains(&pid.to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        // a zombie still has its /proc entry, so this also tells whether it was waited for
+        Path::new(&format!("/proc/{pid}")).exists()
+    }
+}
+
+#[test]
+fn a_sidecar_removed_while_starting_is_stopped_and_never_joins() {
+    let dir = configure();
+    let pidfile = dir.join("slow.pid");
+    let _ = std::fs::remove_file(&pidfile);
+    let wav = scratch("slow").join("tone.wav");
+    let x: Vec<f64> = (0..48000 * 6).map(|i| 0.3 * (2.0 * PI * 440.0 * i as f64 / 48000.0).sin()).collect();
+    write_wav(&wav, &x, 1, 48000);
+    let s = call_tool("stream_open", &json!({ "source": format!("{}?pace=realtime", wav.display()), "analyzers": ["levels"] })).unwrap();
+    let id = s["session"].as_str().unwrap().to_string();
+    call_tool("stream_configure", &json!({ "session": id, "add": ["slow"] })).unwrap();
+    // it has started, and is waiting before its hello
+    let t0 = std::time::Instant::now();
+    let pid = loop {
+        if let Some(p) = std::fs::read_to_string(&pidfile).ok().and_then(|t| t.trim().parse::<u32>().ok()) {
+            break p;
+        }
+        assert!(t0.elapsed().as_secs() < 10, "the sidecar never started");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert!(alive(pid), "the sidecar waits a second before its hello");
+    let c = call_tool("stream_configure", &json!({ "session": id, "remove": ["slow"] })).unwrap();
+    assert_eq!(c["applied"], true, "{c}");
+    // once its start ends (after its hello) it is stopped rather than attached
+    let t0 = std::time::Instant::now();
+    while alive(pid) {
+        assert!(t0.elapsed().as_secs() < 10, "the removed sidecar is still running");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let st = call_tool("stream_status", &json!({ "session": id })).unwrap();
+    assert!(!st["analyzed"][0]["analyzers"].as_array().unwrap().contains(&json!("slow")), "{st}");
+    let failed = call_tool("stream_query", &json!({ "session": id, "kinds": ["analyzer_failed"] })).unwrap();
+    assert_eq!(failed["matched"], 0, "a removal is not a failure: {failed}");
     let _ = call_tool("stream_close", &json!({ "session": id }));
 }
 

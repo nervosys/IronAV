@@ -591,8 +591,13 @@ impl Pending {
 
 impl Drop for Pending {
     fn drop(&mut self) {
+        // a sidecar never attached (removed while starting, or with no stream to take): stopped,
+        // and waited for so it leaves no zombie behind
         if self.running.is_some() {
-            self.shared.kill();
+            if let Some(mut c) = self.shared.take() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
         }
     }
 }
