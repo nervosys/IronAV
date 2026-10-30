@@ -130,11 +130,13 @@ headers passed to the decoder, which starts over with them), and damaged pages s
 sends it: Segment and Clusters of unknown size, no Cues. The packets are the ones the file reader gives, whatever pieces the
 bytes arrive in. So `ironav watch tcp://:9000` can follow a webcam that a web page streams as WebM.
 A camera or microphone on this machine is a source too, on Windows (Media Foundation) and 64-bit Linux (Video4Linux2
-cameras in YUYV, NV12 or I420 modes, streamed through memory-mapped buffers; ALSA microphones through `arecord` from
-alsa-utils, at 48 kHz mono; a camera that offers only MJPEG is refused there for now; built and checked for Linux but not
+cameras in YUYV, NV12 or I420 modes, or Motion JPEG when a camera offers nothing uncompressed, streamed through
+memory-mapped buffers; ALSA microphones through `arecord` from alsa-utils, at 48 kHz mono; built and checked for Linux but not
 yet run on a Linux machine): `ironav devices` lists them, and `device://video` (the first camera), `device://video/1` or `device://audio/usb` (by a part of the name) open
 one. `size=1280x720` and `fps=30` ask a camera for its nearest mode. A camera's pictures arrive as Y4M (converted from
-the NV12 or YUY2 it gives to 4:2:0) and are timed at the mode's frame rate; a microphone arrives as 16-bit PCM.
+the NV12 or YUY2 it gives to 4:2:0) and are timed at the mode's frame rate, or, from a Motion JPEG camera on Linux, as
+live Matroska timed by the driver's clock and decoded by the JPEG decoder (which supplies the standard Huffman tables
+such cameras leave out); a microphone arrives as 16-bit PCM.
 For testing without either, `test://video` and `test://audio` are made up at the pace they play: a grey ramp with a
 white square crossing it each second and a new colour every 5 s, its frame number in its top row as 32 black or white
 blocks of 8 pixels (`ironav_live::synthetic::frame_number` reads it back, so a test can tell which frame it has and how

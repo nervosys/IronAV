@@ -4,7 +4,8 @@
 //!
 //! A device only gives pictures or samples, so the source writes them as the byte streams the
 //! stream demuxers already read: a camera as Y4M (8-bit 4:2:0, converted from the NV12 or YUY2 the
-//! device gives), a microphone as WAV with an open-ended `data` chunk. NAME is a device's index
+//! device gives), a camera that sends only Motion JPEG as live Matroska (each picture a keyframe,
+//! timed by the driver's clock), a microphone as WAV with an open-ended `data` chunk. NAME is a device's index
 //! from [`devices`] or a part of its name (any case); without it, the first device is used.
 //! `size=WxH` and `fps` ask the camera for a mode, the nearest it has being taken.
 //!
@@ -140,6 +141,44 @@ pub(crate) fn parse_fps(s: &str) -> Result<f64> {
 /// The Y4M stream header for 8-bit 4:2:0 pictures.
 pub(crate) fn y4m_header(w: u32, h: u32, fps: Rational) -> Vec<u8> {
     format!("YUV4MPEG2 W{w} H{h} F{}:{} Ip A1:1 C420jpeg\n", fps.num, fps.den).into_bytes()
+}
+
+/// An EBML element with an eight-byte size.
+#[cfg_attr(windows, allow(dead_code))] // Media Foundation decodes Motion JPEG itself
+fn ebml(id: &[u8], body: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(id.len() + 8 + body.len());
+    v.extend_from_slice(id);
+    v.push(0x01);
+    v.extend_from_slice(&(body.len() as u64).to_be_bytes()[1..]);
+    v.extend_from_slice(body);
+    v
+}
+
+/// The start of a live Matroska stream (a Segment of unknown size) holding one Motion JPEG track
+/// of `w` by `h`, with times in milliseconds.
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn mjpeg_header(w: u32, h: u32, fps: Rational) -> Vec<u8> {
+    let uint = |id: &[u8], v: u64| ebml(id, &v.to_be_bytes());
+    let mut video = uint(&[0xB0], w as u64);
+    video.extend(uint(&[0xBA], h as u64));
+    let mut track = [uint(&[0xD7], 1), uint(&[0x73, 0xC5], 1), uint(&[0x83], 1), ebml(&[0x86], b"V_MJPEG")].concat();
+    if fps.num > 0 && fps.den > 0 {
+        track.extend(uint(&[0x23, 0xE3, 0x83], (1_000_000_000 * fps.den as u64) / fps.num as u64));
+    }
+    track.extend(ebml(&[0xE0], &video));
+    let mut d = ebml(&[0x1A, 0x45, 0xDF, 0xA3], &[ebml(&[0x42, 0x86], &[1]), ebml(&[0x42, 0x82], b"matroska"), ebml(&[0x42, 0x87], &[4]), ebml(&[0x42, 0x85], &[2])].concat());
+    d.extend_from_slice(&[0x18, 0x53, 0x80, 0x67, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+    d.extend(ebml(&[0x15, 0x49, 0xA9, 0x66], &[uint(&[0x2A, 0xD7, 0xB1], 1_000_000), ebml(&[0x4D, 0x80], b"ironav")].concat()));
+    d.extend(ebml(&[0x16, 0x54, 0xAE, 0x6B], &ebml(&[0xAE], &track)));
+    d
+}
+
+/// One Motion JPEG picture at `ms` milliseconds, as a Cluster holding a keyframe.
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn mjpeg_frame(jpeg: &[u8], ms: u64) -> Vec<u8> {
+    let mut block = vec![0x81, 0, 0, 0x80];
+    block.extend_from_slice(jpeg);
+    ebml(&[0x1F, 0x43, 0xB6, 0x75], &[ebml(&[0xE7], &ms.to_be_bytes()), ebml(&[0xA3], &block)].concat())
 }
 
 /// A WAV header for 16-bit PCM whose length is not known.
@@ -301,6 +340,30 @@ mod tests {
         d.feed(&a).unwrap();
         assert!(d.next_packet().unwrap().is_some());
         assert_eq!(d.streams()[0].codec, ironav_core::CodecId::PcmS16Le);
+    }
+
+    #[test]
+    fn motion_jpeg_is_read_as_matroska() {
+        let mut d = mjpeg_header(64, 48, Rational::new(30, 1));
+        let pics: Vec<Vec<u8>> = (0..5u8).map(|i| [&[0xFF, 0xD8][..], &[i; 40], &[0xFF, 0xD9]].concat()).collect();
+        for (i, p) in pics.iter().enumerate() {
+            d.extend(mjpeg_frame(p, 1000 + 33 * i as u64));
+        }
+        let mut s = ironav_formats::stream::stream_demuxer(&d, &Default::default()).unwrap();
+        s.feed(&d).unwrap();
+        let mut got = Vec::new();
+        while let Some(p) = s.next_packet().unwrap() {
+            got.push(p);
+        }
+        let st = &s.streams()[0];
+        assert_eq!(st.codec, ironav_core::CodecId::Mjpeg);
+        assert!(matches!(st.params, ironav_core::StreamParams::Video { width: 64, height: 48, .. }), "{:?}", st.params);
+        assert_eq!(got.len(), 5);
+        for (i, p) in got.iter().enumerate() {
+            assert_eq!(p.packet.data, pics[i]);
+            assert!(p.key);
+            assert_eq!(p.packet.pts * st.time_base.num * 1000 / st.time_base.den, 1000 + 33 * i as i64);
+        }
     }
 
     #[test]

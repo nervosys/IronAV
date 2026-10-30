@@ -348,6 +348,18 @@ fn read_dqt(seg: &[u8], qt: &mut [[u16; 64]; 4]) -> Result<()> {
     Ok(())
 }
 
+/// The Huffman tables a JPEG starts with: Annex K's, luminance in slot 0 and chrominance in slot 1.
+/// Motion JPEG from cameras leaves out its DHT and relies on these; a DHT replaces them.
+fn standard_huffs() -> ([Option<Huff>; 4], [Option<Huff>; 4]) {
+    let mut dc: [Option<Huff>; 4] = Default::default();
+    let mut ac: [Option<Huff>; 4] = Default::default();
+    dc[0] = Huff::new(&DC_LUMA_BITS, &DC_VALS).ok();
+    dc[1] = Huff::new(&DC_CHROMA_BITS, &DC_VALS).ok();
+    ac[0] = Huff::new(&AC_LUMA_BITS, &AC_LUMA_VALS).ok();
+    ac[1] = Huff::new(&AC_CHROMA_BITS, &AC_CHROMA_VALS).ok();
+    (dc, ac)
+}
+
 fn read_dht(seg: &[u8], dc: &mut [Option<Huff>; 4], ac: &mut [Option<Huff>; 4]) -> Result<()> {
     let mut p = 0;
     while p + 17 <= seg.len() {
@@ -385,8 +397,7 @@ fn parse_headers(d: &[u8]) -> Result<Headers> {
         return Err(Error::invalid_input("not a JPEG: no SOI marker"));
     }
     let mut qt = [[0u16; 64]; 4];
-    let mut dc: [Option<Huff>; 4] = Default::default();
-    let mut ac: [Option<Huff>; 4] = Default::default();
+    let (mut dc, mut ac) = standard_huffs();
     let mut restart = 0usize;
     let mut frame: Option<Frame0> = None;
     let mut pos = 2;
@@ -606,30 +617,8 @@ impl JpegDecoder {
                         let seg = d.get(at + 2..at + len).ok_or_else(|| Error::invalid_input("JPEG marker segment is truncated"))?;
                         match m {
                             0xDD => restart = be16(seg, 0)?,
-                            0xDB | 0xC4 => {
-                                // reuse the header parser on a synthetic stream holding just this segment
-                                let mut tmp = vec![0xFF, 0xD8, 0xFF, m];
-                                tmp.extend_from_slice(&d[at..at + len]);
-                                tmp.extend_from_slice(&[0xFF, 0xC0, 0, 11, 8, 0, 1, 0, 1, 1, 1, 0x11, 0, 0xFF, 0xDA, 0, 2]);
-                                let (_, q2, d2, a2, _, _) = parse_headers(&tmp)?;
-                                if m == 0xDB {
-                                    let mut p2 = 0;
-                                    while p2 < seg.len() {
-                                        let id = (seg[p2] & 15) as usize;
-                                        qts[id] = q2[id];
-                                        p2 += 1 + if seg[p2] >> 4 == 0 { 64 } else { 128 };
-                                    }
-                                } else {
-                                    for i in 0..4 {
-                                        if d2[i].is_some() {
-                                            dcs[i] = d2[i].clone();
-                                        }
-                                        if a2[i].is_some() {
-                                            acs[i] = a2[i].clone();
-                                        }
-                                    }
-                                }
-                            }
+                            0xDB => read_dqt(seg, &mut qts)?,
+                            0xC4 => read_dht(seg, &mut dcs, &mut acs)?,
                             _ => {}
                         }
                         let mut q = at + len;
@@ -667,8 +656,7 @@ impl JpegDecoder {
         let store: Vec<(usize, usize)> = f.comps.iter().map(|c| (mcux * c.h, mcuy * c.v)).collect();
         let mut coefs: Vec<Vec<[i32; 64]>> = store.iter().map(|&(w, h)| vec![[0i32; 64]; w * h]).collect();
         let mut qts = [[0u16; 64]; 4];
-        let mut dcs: [Option<Huff>; 4] = Default::default();
-        let mut acs: [Option<Huff>; 4] = Default::default();
+        let (mut dcs, mut acs) = standard_huffs();
         let mut restart = 0usize;
         let mut scans = 0;
         let mut pos = 2;
@@ -1089,5 +1077,39 @@ impl Encoder for JpegEncoder {
             return Err(Error::invalid_input("the JPEG encoder received an audio frame"));
         };
         Ok(vec![Packet { stream: 0, pts: v.pts, duration: 1, data: self.encode_image(v)? }])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Drops every DHT segment, as Motion JPEG from a camera does.
+    fn strip_dht(d: &[u8]) -> Vec<u8> {
+        let mut o = d[..2].to_vec();
+        let mut p = 2;
+        while d[p] == 0xFF && d[p + 1] != 0xDA {
+            let len = 2 + u16::from_be_bytes([d[p + 2], d[p + 3]]) as usize;
+            if d[p + 1] != 0xC4 {
+                o.extend_from_slice(&d[p..p + len]);
+            }
+            p += len;
+        }
+        o.extend_from_slice(&d[p..]);
+        o
+    }
+
+    #[test]
+    fn a_jpeg_without_huffman_tables_uses_the_standard_ones() {
+        let (w, h) = (48usize, 32usize);
+        let y: Vec<u8> = (0..w * h).map(|i| ((i % w) * 5 + (i / w) * 3) as u8).collect();
+        let c: Vec<u8> = (0..w * h / 4).map(|i| (100 + i % 40) as u8).collect();
+        let v = VideoFrame { width: w as u32, height: h as u32, pix_fmt: PixelFormat::Yuv420p, pts: 0, planes: vec![y, c.clone(), c] };
+        let full = encode_jpeg(&v, 80).unwrap();
+        let bare = strip_dht(&full);
+        assert!(bare.len() < full.len() && !bare.windows(2).any(|m| m == [0xFF, 0xC4]));
+        let dec = JpegDecoder::new();
+        let (a, b) = (dec.decode_image(&full, 0).unwrap(), dec.decode_image(&bare, 0).unwrap());
+        assert_eq!(a.planes, b.planes);
     }
 }

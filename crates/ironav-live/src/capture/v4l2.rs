@@ -1,10 +1,11 @@
-//! Cameras on Linux through Video4Linux2 (memory-mapped streaming, YUYV, NV12 or I420 modes),
-//! and microphones through ALSA by way of `arecord` (from alsa-utils), which keeps a C library
-//! out of the build. A camera that offers only MJPEG or another compressed mode is refused.
+//! Cameras on Linux through Video4Linux2 (memory-mapped streaming, YUYV, NV12 or I420 modes, or
+//! Motion JPEG when the camera offers nothing uncompressed), and microphones through ALSA by way of
+//! `arecord` (from alsa-utils), which keeps a C library out of the build. A camera that offers only
+//! H.264 or another compressed mode is refused.
 //!
 //! The structures below are the kernel's, as laid out on 64-bit targets.
 
-use super::{choose, send, wav_header, y4m_frame, y4m_header, Device, Layout, VideoWants};
+use super::{choose, mjpeg_frame, mjpeg_header, send, wav_header, y4m_frame, y4m_header, Device, Layout, VideoWants};
 use ironav_core::{Error, ErrorCode, Rational, Result};
 use std::ffi::CString;
 use std::io::Read;
@@ -28,6 +29,8 @@ const fn fourcc(c: &[u8; 4]) -> u32 {
 const YUYV: u32 = fourcc(b"YUYV");
 const NV12: u32 = fourcc(b"NV12");
 const YU12: u32 = fourcc(b"YU12");
+const MJPG: u32 = fourcc(b"MJPG");
+const JPEG: u32 = fourcc(b"JPEG");
 
 #[repr(C)]
 struct Capability {
@@ -254,7 +257,7 @@ fn camera(name: Option<&str>, wants: VideoWants, ok: &SyncSender<Result<()>>, tx
     let d = choose(&devs, name, "video")?;
     let path = &list[d.index].1;
     let fd = Fd::open(path).map_err(io(&format!("could not open {}", d.name)))?;
-    // the first layout the camera offers that becomes 4:2:0 without decoding
+    // the first layout the camera offers that becomes 4:2:0 without decoding, else Motion JPEG
     let mut chosen = None;
     for index in 0..64 {
         let mut f: FmtDesc = zeroed();
@@ -262,7 +265,7 @@ fn camera(name: Option<&str>, wants: VideoWants, ok: &SyncSender<Result<()>>, tx
         if fd.ioctl(ENUM_FMT, &mut f).is_err() {
             break;
         }
-        let rank = [YUYV, NV12, YU12].iter().position(|&p| p == f.pixelformat);
+        let rank = [YUYV, NV12, YU12, MJPG, JPEG].iter().position(|&p| p == f.pixelformat);
         if let Some(r) = rank {
             if chosen.is_none_or(|(c, _)| r < c) {
                 chosen = Some((r, f.pixelformat));
@@ -270,7 +273,7 @@ fn camera(name: Option<&str>, wants: VideoWants, ok: &SyncSender<Result<()>>, tx
         }
     }
     let Some((_, pixelformat)) = chosen else {
-        return Err(Error::new(ErrorCode::UnsupportedFormat, format!("{} offers no YUYV, NV12 or I420 mode", d.name)).hint("cameras that send only MJPEG are not supported on Linux yet"));
+        return Err(Error::new(ErrorCode::UnsupportedFormat, format!("{} offers no YUYV, NV12, I420 or Motion JPEG mode", d.name)).hint("cameras that send only H.264 are not supported on Linux yet"));
     };
     let (w, h) = wants.size.unwrap_or((640, 480));
     let mut fmt: Format = zeroed();
@@ -278,11 +281,13 @@ fn camera(name: Option<&str>, wants: VideoWants, ok: &SyncSender<Result<()>>, tx
     fmt.pix = PixFormat { width: w, height: h, pixelformat, field: FIELD_NONE, ..zeroed() };
     fd.ioctl(S_FMT, &mut fmt).map_err(io("could not set the camera's mode"))?;
     let pix = fmt.pix;
+    // None for Motion JPEG
     let layout = match pix.pixelformat {
-        YUYV => Layout::Yuy2,
-        NV12 => Layout::Nv12,
-        YU12 => Layout::I420,
-        _ => return Err(Error::new(ErrorCode::UnsupportedFormat, format!("{} chose a mode that is not YUYV, NV12 or I420", d.name))),
+        YUYV => Some(Layout::Yuy2),
+        NV12 => Some(Layout::Nv12),
+        YU12 => Some(Layout::I420),
+        MJPG | JPEG => None,
+        _ => return Err(Error::new(ErrorCode::UnsupportedFormat, format!("{} chose a mode that is not YUYV, NV12, I420 or Motion JPEG", d.name))),
     };
     let mut parm: StreamParm = zeroed();
     parm.kind = BUF_TYPE_VIDEO_CAPTURE;
@@ -313,9 +318,16 @@ fn camera(name: Option<&str>, wants: VideoWants, ok: &SyncSender<Result<()>>, tx
     let _ = ok.send(Ok(()));
     let (ew, eh) = (pix.width as usize & !1, pix.height as usize & !1);
     let r = (|| {
-        if !send(tx, y4m_header(ew as u32, eh as u32, rate)) {
+        let header = match layout {
+            Some(_) => y4m_header(ew as u32, eh as u32, rate),
+            None => mjpeg_header(pix.width, pix.height, rate),
+        };
+        if !send(tx, header) {
             return Ok(());
         }
+        // Motion JPEG is timed by the driver's clock from the first picture, or by the frame rate
+        // when the driver gives no time
+        let (mut first, mut count) = (None, 0u64);
         loop {
             let mut pfd = libc::pollfd { fd: fd.0, events: libc::POLLIN, revents: 0 };
             // SAFETY: one valid pollfd
@@ -339,7 +351,21 @@ fn camera(name: Option<&str>, wants: VideoWants, ok: &SyncSender<Result<()>>, tx
             let m = &maps[b.index as usize];
             // SAFETY: the driver filled `bytesused` bytes of this mapped buffer and hands it to us until it is queued again
             let data = unsafe { std::slice::from_raw_parts(m.0 as *const u8, (b.bytesused as usize).min(m.1)) };
-            let frame = y4m_frame(data, layout, ew, eh, pix.bytesperline as usize, pix.height as usize);
+            let frame = match layout {
+                Some(l) => y4m_frame(data, l, ew, eh, pix.bytesperline as usize, pix.height as usize),
+                // a picture cut short or left empty (some cameras send these after a glitch) is dropped
+                None if data.len() < 4 || data[..2] != [0xFF, 0xD8] => None,
+                None => {
+                    let us = b.timestamp[0].saturating_mul(1_000_000).saturating_add(b.timestamp[1]);
+                    let ms = if us > 0 {
+                        (us - *first.get_or_insert(us)).max(0) as u64 / 1000
+                    } else {
+                        count * 1000 * rate.den as u64 / rate.num.max(1) as u64
+                    };
+                    count += 1;
+                    Some(mjpeg_frame(data, ms))
+                }
+            };
             fd.ioctl(QBUF, &mut b).map_err(io("reading the camera"))?;
             if let Some(f) = frame {
                 if !send(tx, f) {
