@@ -1591,6 +1591,24 @@ fn hevc_streams_decode_to_what_ffmpeg_decodes() {
     }
 }
 
+/// An open-GOP stream joined at a CRA picture, as a live viewer joins it: the RASL pictures that lean on
+/// pictures before the join are dropped, and the rest are bit-exact with FFmpeg's decoder (which, like
+/// NVDEC, gives the same pictures the whole stream decodes to from there on).
+#[test]
+fn hevc_joined_at_a_cra_picture_drops_its_rasl_pictures() {
+    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    let dir = scratch("hevc-cra-start");
+    let out = dir.join("out.y4m");
+    let mut j = job(&data.join("hevc_cra_start.mkv"), &out);
+    j.hwaccel = "off".into();
+    j.video.codec = Some("rawvideo".into());
+    run(&j, &mut |_| {}).unwrap();
+    let got: Vec<u8> = y4m_frames_any(&out).concat();
+    let want = std::fs::read(data.join("hevc_cra_start.ffmpeg.yuv")).unwrap();
+    assert_eq!(got.len(), want.len(), "16 pictures of the 19 after the join");
+    assert!(got == want, "pixels differ from FFmpeg's");
+}
+
 /// SAO on 16x16 coding tree blocks with 4:2:0 chroma, after deblocking, is bit-exact with a hardware
 /// decoder (NVDEC). FFmpeg 9.0.1's software decoder differs here by one chroma sample: with 8x8 chroma
 /// blocks it applies SAO before the neighbouring block's chroma edges are deblocked (fixed in its

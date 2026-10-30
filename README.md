@@ -290,8 +290,13 @@ the output is cropped to the display size and returned as planar `yuv420p` in di
 HEVC also has a software decoder (`--hwaccel off`, or automatically where the GPU cannot take a stream): Main and Main 10 (and monochrome, 4:2:2 and 4:4:4 at 8 and 10 bits) with I, P and B pictures,
 merge and AMVP motion prediction, temporal motion vectors, weighted prediction, wavefronts, multiple slices, default scaling lists, transform skip, lossless (transquant bypass),
 QP deltas, constrained intra, the deblocking filter and sample adaptive offset. These are checked sample-for-sample against FFmpeg on x265 streams (the
-`hevc_streams_decode_to_what_ffmpeg_decodes` test and a wider sweep of encoder settings). Written from the specification but **not yet checked against a reference stream** because x265
-cannot produce them: tiles, PCM, long-term reference pictures, scaling lists sent in the SPS/PPS, 12-bit, and random-access (CRA/RASL) handling.
+`hevc_streams_decode_to_what_ffmpeg_decodes` test and a wider sweep of encoder settings), and on NVENC streams too (Main and Main 10,
+B pictures used as references, intra refresh, weighted prediction, 4:4:4, ultra-low-latency and lossless tuning). Scaling lists sent in
+the SPS (an x265 matrix file, at 8 and 10 bits and 4:4:4) match as well, and so does joining an open-GOP stream at a CRA picture: its
+RASL pictures are dropped and the rest are the pictures the whole stream gives from there (the `hevc_joined_at_a_cra_picture_drops_its_rasl_pictures`
+test, checked against NVDEC too). Written from the specification but **not yet checked against a reference stream** because neither
+encoder here produces them: tiles, PCM and long-term reference pictures. 12-bit streams are decoded but refused at the output, which
+has no 12-bit pixel format.
 4:2:2 and 4:4:4 (the range extension profiles' chroma formats) were checked the same way: 60 x265 streams, 4:2:2 and 4:4:4 at 8 and 10 bits,
 covering intra-only and B-frame coding, noise, presets from ultrafast to slow, deep transform trees, AMP, weighted prediction,
 transform skip, lossless and per-CU lossless coding, QP 0 and 51, chroma QP offsets, scaling lists, constrained intra, wavefronts with slices,
