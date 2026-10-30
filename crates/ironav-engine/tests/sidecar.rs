@@ -27,6 +27,8 @@ fn configure() -> &'static Path {
             "pictures": { "command": [exe, "pictures"] },
             "crash": { "command": [exe, "crash", "2", marker.to_str().unwrap()] },
             "mute": { "command": [exe, "mute"], "start_seconds": 5 },
+            "absent": { "command": ["ironav-no-such-sidecar-program"], "media": "video" },
+            "liar": { "command": [exe, "dtmf"], "media": "video" },
         });
         let path = dir.join("sidecars.json");
         std::fs::write(&path, list.to_string()).unwrap();
@@ -202,6 +204,21 @@ fn sidecars_are_named_by_the_operator_and_failures_say_why() {
     // a video sidecar on audio alone is not run, and says so
     let r = call_tool("analyze", &json!({ "input": wav.to_str().unwrap(), "analyzers": ["levels"], "sidecars": ["pictures"] })).unwrap();
     assert!(r["warnings"].to_string().contains("sidecar 'pictures' not run"), "{r}");
+    // one that says it wants video is not even started for audio alone (this one could not start)
+    let r = call_tool("analyze", &json!({ "input": wav.to_str().unwrap(), "analyzers": ["levels"], "sidecars": ["absent", "dtmf"] })).unwrap();
+    assert!(r["warnings"].to_string().contains("sidecar 'absent' not run: it wants video"), "{r}");
+    // and one whose hello disagrees with what the list says fails
+    let mut f = b"YUV4MPEG2 W16 H16 F25:1 Ip A1:1 C420jpeg
+".to_vec();
+    for _ in 0..5 {
+        f.extend_from_slice(b"FRAME
+");
+        f.extend(std::iter::repeat(128u8).take(16 * 16 * 3 / 2));
+    }
+    let y4m = dir.join("tiny.y4m");
+    std::fs::write(&y4m, f).unwrap();
+    let e = call_tool("analyze", &json!({ "input": y4m.to_str().unwrap(), "sidecars": ["liar"], "hwaccel": "off" })).unwrap_err();
+    assert!(e.message.contains("asked for audio but IRONAV_SIDECARS says video"), "{e:?}");
     let caps = call_tool("capabilities", &json!({})).unwrap();
     assert!(caps["sidecars"].as_array().unwrap().contains(&json!("echo")), "{caps}");
 }

@@ -68,6 +68,25 @@ pub struct SidecarConfig {
     /// A child that takes nothing for this long while inputs wait is restarted.
     #[serde(default = "default_hang")]
     pub hang_seconds: f64,
+    /// The kind of stream it will ask for, if known: then it is not started for media without one.
+    #[serde(default)]
+    pub media: Option<SidecarMedia>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SidecarMedia {
+    Audio,
+    Video,
+}
+
+impl SidecarMedia {
+    pub fn media_type(self) -> MediaType {
+        match self {
+            SidecarMedia::Audio => MediaType::Audio,
+            SidecarMedia::Video => MediaType::Video,
+        }
+    }
 }
 
 fn default_start() -> f64 {
@@ -78,6 +97,10 @@ fn default_finish() -> f64 {
 }
 fn default_hang() -> f64 {
     60.0
+}
+
+pub fn media_name(m: MediaType) -> &'static str {
+    if m == MediaType::Video { "video" } else { "audio" }
 }
 
 /// Reads and checks a sidecar list: a JSON object from names to [`SidecarConfig`]s.
@@ -489,7 +512,22 @@ impl Pending {
         let (tx, rx) = sync_channel(QUEUE);
         let (etx, erx) = sync_channel(EVENTS);
         let (running, wants) = spawn(name, cfg, None, 0, &shared, &tx, &etx)?;
-        Ok(Pending { name, cfg: cfg.clone(), live, wants, shared, running: Some((running, Pipes { tx, rx, etx, erx })) })
+        let p = Pending { name, cfg: cfg.clone(), live, wants, shared, running: Some((running, Pipes { tx, rx, etx, erx })) };
+        if let Some(m) = cfg.media.filter(|m| m.media_type() != p.media()) {
+            // dropping it stops the child
+            return Err(Error::invalid_arg(format!("sidecar '{name}' asked for {} but {CONFIG_VAR} says {}", media_name(p.media()), media_name(m.media_type())))
+                .hint(format!("correct its \"media\" in the {CONFIG_VAR} file")));
+        }
+        Ok(p)
+    }
+
+    /// Starts several at once, so their models load side by side; the first failure is returned.
+    pub fn start_all(list: &[(&'static str, SidecarConfig)], live: bool) -> Result<Vec<Pending>> {
+        std::thread::scope(|s| {
+            let started: Vec<_> = list.iter().map(|(name, cfg)| s.spawn(move || Pending::start(name, cfg, live))).collect();
+            let results: Vec<Result<Pending>> = started.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(Error::new(ErrorCode::Internal, "a sidecar start panicked")))).collect();
+            results.into_iter().collect()
+        })
     }
 
     pub fn name(&self) -> &'static str {

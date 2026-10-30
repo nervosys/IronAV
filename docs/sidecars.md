@@ -22,6 +22,9 @@ Sidecars are defined by whoever runs IronAV, not by requests. `IRONAV_SIDECARS` 
 | `start_seconds` | 30 | how long it may take to say hello (loading a model can be slow) |
 | `finish_seconds` | 120 | how long it may take to finish once the input has ended |
 | `hang_seconds` | 60 | a child that takes no input for this long while inputs are waiting is killed and restarted |
+| `media` | (none) | `"audio"` or `"video"`: what its hello will ask for. When given, the sidecar is not started at all for media with no stream of that kind, and a hello asking for the other kind is a failure. Without it, IronAV must start the program to learn what it wants |
+
+A request's sidecars start side by side, so a slow model load does not hold up the others.
 
 A request names sidecars from that list (`"sidecars": ["asr"]` on `analyze` or `stream_open`, `--sidecars asr` on the
 CLI). `capabilities` lists the configured names. A request cannot start any other program. Names are up to 32 lowercase

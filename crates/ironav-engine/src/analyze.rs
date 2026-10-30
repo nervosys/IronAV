@@ -212,14 +212,22 @@ impl Analysis {
             }
             opts.streams.clone()
         };
-        let sidecars = crate::sidecar::resolve(&opts.sidecars)?;
-        let mut pending = Vec::new();
-        if !infos.is_empty() {
-            for (name, cfg) in &sidecars {
-                pending.push(Pending::start(name, cfg, live)?);
-            }
+        if to <= from {
+            return Err(Error::invalid_arg("'to' must be after 'from'"));
         }
         let mut warnings = Vec::new();
+        let mut sidecars = crate::sidecar::resolve(&opts.sidecars)?;
+        // one that says what it wants is not started when there is no such stream
+        sidecars.retain(|(name, cfg)| {
+            let Some(m) = cfg.media.map(|m| m.media_type()) else { return true };
+            let any = infos.iter().any(|s| wanted.contains(&s.index) && s.params.media_type() == m);
+            if !any {
+                let media = crate::sidecar::media_name(m);
+                warnings.push(format!("sidecar '{name}' not run: it wants {media} and no {media} stream is analyzed"));
+            }
+            any
+        });
+        let mut pending = if infos.is_empty() { Vec::new() } else { Pending::start_all(&sidecars, live)? };
         let mut streams = Vec::new();
         for info in infos {
             if !wanted.contains(&info.index) {
@@ -230,18 +238,9 @@ impl Analysis {
             let label = format!("{}{}", if media == MediaType::Video { "video" } else { "audio" }, info.index);
             let mine: Vec<&AnalyzerInfo> = chosen.iter().copied().filter(|a| a.consumes.applies_to(media)).collect();
             let (pa, fa): (Vec<_>, Vec<_>) = mine.into_iter().partition(|a| a.consumes == Consumes::Packets);
-            // each sidecar takes the first analyzed stream of the kind it wants
-            let mut cars = Vec::new();
-            let mut k = 0;
-            while k < pending.len() {
-                if pending[k].media() == media {
-                    cars.push(pending.remove(k));
-                } else {
-                    k += 1;
-                }
-            }
+            let wants_car = pending.iter().any(|p| p.media() == media);
             let (mut decoder, mut decoder_name) = (None, None);
-            if !fa.is_empty() || !cars.is_empty() {
+            if !fa.is_empty() || wants_car {
                 let made = if media == MediaType::Video {
                     ironav_player::open_video_decoder(info, &opts.hwaccel)
                 } else {
@@ -254,13 +253,17 @@ impl Analysis {
             }
             let fa = if decoder.is_some() { fa } else { Vec::new() };
             let mut frame_analyzers: Vec<(&'static str, Box<dyn Analyzer>)> = fa.iter().map(|a| (a.name, a.make(info, &settings))).collect();
-            for car in cars {
-                if decoder.is_none() {
-                    warnings.push(format!("sidecar '{}' not run: stream {} is not decoded", car.name(), info.index));
-                    continue;
+            // each sidecar takes the first decoded stream of the kind it wants
+            if decoder.is_some() {
+                let mut k = 0;
+                while k < pending.len() {
+                    if pending[k].media() == media {
+                        let car = pending.remove(k);
+                        frame_analyzers.push((car.name(), Box::new(car.attach(info)?)));
+                    } else {
+                        k += 1;
+                    }
                 }
-                let name = car.name();
-                frame_analyzers.push((name, Box::new(car.attach(info)?)));
             }
             streams.push(Some(Stream {
                 info: info.clone(),
@@ -277,11 +280,8 @@ impl Analysis {
             }));
         }
         for car in pending {
-            let media = if car.media() == MediaType::Video { "video" } else { "audio" };
-            warnings.push(format!("sidecar '{}' not run: it wants {media} and no {media} stream is analyzed", car.name()));
-        }
-        if to <= from {
-            return Err(Error::invalid_arg("'to' must be after 'from'"));
+            let media = crate::sidecar::media_name(car.media());
+            warnings.push(format!("sidecar '{}' not run: it wants {media} and no {media} stream is analyzed and decoded", car.name()));
         }
         Ok(Analysis {
             level,
