@@ -1843,6 +1843,7 @@ dependencies = [
  "ironav-engine",
  "ironav-gui",
  "ironav-hwaccel",
+ "ironav-live",
  "ironav-ontology",
  "ironav-player",
  "ironav-webui",

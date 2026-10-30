@@ -11,6 +11,7 @@ serde_json.workspace = true
 ironav-core.workspace = true
 ironav-hwaccel.workspace = true
 ironav-engine.workspace = true
+ironav-live.workspace = true
 ironav-webui.workspace = true
 ironav-gui = { workspace = true, optional = true }
 ironav-ontology.workspace = true

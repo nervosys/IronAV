@@ -109,7 +109,15 @@ some-encoder | ironav watch - --fps 30
 
 `watch` prints each observation as a JSON line as it happens (with `wall`, the UTC time it was logged, and
 `latency_ms`, from the packet's arrival), and then the final status and summary when the source ends or after
-`--duration` seconds.
+`--duration` seconds. With `--commands` it also reads one command per line on stdin and answers each with a line
+`{"reply":"query","ok":true,"result":...}` among the observations: `status`, `query`, `configure`, `snapshot`, `clip`
+and `close` run the matching `stream_*` tool on the session, written as JSON (`{"cmd":"query","kinds":["speech_end"],
+"id":7}`, `id` echoed) or as `query kinds=speech_end newest_first=true max=1`. (Not with `-` as the source, since that
+is stdin.)
+
+```sh
+ironav watch udp://:5000 --commands < commands.txt
+```
 
 Over MCP an agent opens a session and polls it. `stream_open` starts reading on its own thread and returns at
 once. `stream_events {session, after, wait_ms}` is a long poll: it returns as soon as something new is logged, so

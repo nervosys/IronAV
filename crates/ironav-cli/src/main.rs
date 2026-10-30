@@ -57,7 +57,7 @@ fn help() -> Value {
             "probe <path>": "inspect a media file",
             "convert -i IN [-i MORE]... -o OUT [-f FMT] [--acodec C] [--vcodec C] [--abitrate KBPS] [--vbitrate KBPS | --qp N] [--latency low] [--filter name[:k=v,..]]... [--hwaccel P] [-y] [--dry-run] [--progress]": "convert, handbrake/ffmpeg style",
             "analyze FILE [--analyzers a,b] [--sidecars a,b] [--level digest|events|raw] [--digest-seconds N] [--from S] [--to S] [--streams 0,1] [--max N] [--thumbnails DIR] [--hwaccel P] [--jsonl]": "what is in a file: loudness, silence, scene cuts, black and frozen pictures, thumbnails, gaps; --jsonl prints each observation as a line as it is found",
-            "watch SOURCE [--analyzers a,b] [--sidecars a,b] [--level digest|events|raw] [--digest-seconds N] [--format F] [--fps N] [--pace realtime] [--retain S] [--duration S] [--hwaccel P] [--record OUT.ts|OUT.m3u8 [--segment-seconds S] [--keep-segments N] [-y]]": "follow a live source (path, path?follow, -, tcp://host:port, tcp://:port, udp://:port): every observation as a JSON line as it happens, then a summary",
+            "watch SOURCE [--analyzers a,b] [--sidecars a,b] [--level digest|events|raw] [--digest-seconds N] [--format F] [--fps N] [--pace realtime] [--retain S] [--duration S] [--hwaccel P] [--record OUT.ts|OUT.m3u8 [--segment-seconds S] [--keep-segments N] [-y]] [--commands]": "follow a live source (path, path?follow, -, tcp://host:port, tcp://:port, udp://:port): every observation as a JSON line as it happens, then a summary; with --commands, stdin takes one command per line (status, query kinds=speech_end newest_first=true, configure add=silence, snapshot, clip from=1 to=5 output=c.ts, close, or the same as JSON) and each reply is a line {\"reply\":...}",
             "plan <job.json|->": "validate a JSON job without writing",
             "run <job.json|->": "execute a JSON job",
             "hw probe | hw select --codec C --direction decode|encode [--policy P]": "hardware acceleration",
@@ -259,26 +259,41 @@ fn watch(mut a: Args) -> Result<Value> {
         }
     }
     let duration = num("--duration", a.flag(&["--duration"])?)?;
+    let commands = a.switch(&["--commands"]);
     if let Some(extra) = a.rest.first() {
         return Err(Error::invalid_arg(format!("unexpected argument '{extra}'")));
     }
     let open: ironav_engine::live::OpenArgs = serde_json::from_value(args).map_err(|e| Error::invalid_arg(format!("invalid arguments: {e}")))?;
     let level = ironav_engine::analyze::Level::parse(&open.level).unwrap_or(ironav_engine::analyze::Level::Events);
+    if commands && ironav_live::SourceUrl::parse(&open.source).is_ok_and(|u| u.scheme == "pipe") {
+        return Err(Error::invalid_arg("--commands reads stdin, which is the source here").hint("send the media over tcp:// or udp:// instead"));
+    }
     let s = ironav_engine::live::open(&open)?;
+    let replies = commands.then(|| watch_commands(s.id.clone()));
     let t0 = std::time::Instant::now();
     let mut after = 0;
     let mut out = std::io::stdout().lock();
+    let wait = std::time::Duration::from_millis(if commands { 100 } else { 250 });
+    let mut closing = false;
     loop {
-        let r = s.events(after, &[], level, 1000, std::time::Duration::from_millis(250));
+        let r = s.events(after, &[], level, 1000, wait);
         after = r["next_after"].as_u64().unwrap_or(after);
         for e in r["events"].as_array().into_iter().flatten() {
             let _ = writeln!(out, "{e}");
         }
+        for (reply, close) in replies.iter().flat_map(|rx| rx.try_iter()) {
+            let _ = writeln!(out, "{reply}");
+            closing |= close;
+        }
         let _ = out.flush();
         let done = matches!(r["state"].as_str(), Some("ended" | "failed" | "closed")) && !r["more"].as_bool().unwrap_or(false) && r["events"].as_array().is_none_or(|e| e.is_empty());
-        if done || duration.is_some_and(|d| t0.elapsed().as_secs_f64() >= d) {
+        if done || closing || duration.is_some_and(|d| t0.elapsed().as_secs_f64() >= d) {
             break;
         }
+    }
+    // answers to commands that were running when the source ended
+    for (reply, _) in replies.iter().flat_map(|rx| rx.try_iter()) {
+        let _ = writeln!(out, "{reply}");
     }
     let closed = ironav_engine::live::close(&s.id)?;
     if closed["state"] == "failed" {
@@ -287,6 +302,85 @@ fn watch(mut a: Args) -> Result<Value> {
         return Err(Error::new(code, e["message"].as_str().unwrap_or("the source failed")));
     }
     Ok(closed)
+}
+
+/// `watch --commands`: reads stdin on its own thread and answers each line by calling the
+/// session's tool, so a slow one (configure waits for the session) does not hold up the
+/// observations. Replies come back with whether the command was `close`.
+fn watch_commands(session: String) -> std::sync::mpsc::Receiver<(Value, bool)> {
+    use std::io::BufRead;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::stdin().lock().lines() {
+            let Ok(line) = line else { break };
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let (reply, close) = watch_command(&session, line);
+            if tx.send((reply, close)).is_err() || close {
+                break;
+            }
+        }
+    });
+    rx
+}
+
+const WATCH_COMMANDS: [&str; 7] = ["status", "query", "configure", "snapshot", "clip", "close", "help"];
+const WATCH_LISTS: [&str; 3] = ["kinds", "add", "remove"];
+
+/// One command line: a JSON object with `cmd`, or the player's style, `query kinds=a,b max=5`.
+/// A value is text for the text fields, a list (split at commas) for the list fields, and
+/// otherwise JSON when it parses as JSON (numbers, true) or else text. Values have no spaces.
+fn watch_command(session: &str, line: &str) -> (Value, bool) {
+    let mut req = if line.starts_with('{') {
+        match serde_json::from_str::<Value>(line) {
+            Ok(v) if v.is_object() => v,
+            _ => return (json!({ "reply": null, "ok": false, "error": Error::invalid_arg("not a JSON object").hint("send {\"cmd\":\"status\"} or a bare word such as status") }), false),
+        }
+    } else {
+        let mut words = line.split_whitespace();
+        let mut v = json!({ "cmd": words.next().unwrap_or_default() });
+        for w in words {
+            let Some((k, val)) = w.split_once('=').filter(|(k, _)| !matches!(*k, "cmd" | "id")) else {
+                return (json!({ "reply": v["cmd"], "ok": false, "error": Error::invalid_arg(format!("'{w}' is not key=value")) }), false);
+            };
+            let text = matches!(k, "text" | "analyzer" | "output" | "format" | "level");
+            v[k] = match serde_json::from_str::<Value>(val) {
+                _ if text => json!(val),
+                Ok(j) if !WATCH_LISTS.contains(&k) || j.is_array() => j,
+                _ => json!(val),
+            };
+        }
+        v
+    };
+    // a single name for a list field, in either form
+    for k in WATCH_LISTS {
+        if let Some(s) = req[k].as_str() {
+            req[k] = json!(s.split(',').filter(|s| !s.is_empty()).collect::<Vec<_>>());
+        }
+    }
+    let id = req.as_object_mut().and_then(|o| o.remove("id"));
+    let cmd = req.as_object_mut().and_then(|o| o.remove("cmd")).and_then(|c| c.as_str().map(str::to_string)).unwrap_or_default();
+    let cmd = if matches!(cmd.as_str(), "quit" | "stop" | "exit") { "close".to_string() } else { cmd };
+    let result = match cmd.as_str() {
+        "help" => Ok(json!({ "commands": WATCH_COMMANDS, "example": "query kinds=speech_end newest_first=true max=1", "tools": "each runs the stream_<command> tool with this session; see `ironav tools`" })),
+        // the main loop closes the session once the observations before it are out
+        "close" => Ok(json!({ "closing": true })),
+        c if WATCH_COMMANDS.contains(&c) => {
+            req["session"] = json!(session);
+            call_tool(&format!("stream_{c}"), &req)
+        }
+        c => Err(Error::invalid_arg(format!("unknown command '{c}'")).alternatives(WATCH_COMMANDS)),
+    };
+    let mut reply = match result {
+        Ok(v) => json!({ "reply": cmd, "ok": true, "result": v }),
+        Err(e) => json!({ "reply": cmd, "ok": false, "error": e }),
+    };
+    if let Some(id) = id {
+        reply["id"] = id;
+    }
+    (reply, cmd == "close")
 }
 
 fn run_job(v: Value, progress: bool) -> Result<Value> {

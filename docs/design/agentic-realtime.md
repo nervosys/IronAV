@@ -286,7 +286,9 @@ Every tool returns the existing envelope and error codes. New codes: `source-unr
 - `ironav watch <source> [same options] [--record out.mp4] [--retain 60]` streams observations as JSON lines on
   stdout until the source ends or the user presses Ctrl-C, then prints a final digest. This is the shell-tool path
   for agents without MCP: `ironav watch udp://:5000 --level events | head -n 50`.
-- `ironav watch` also accepts the player's command style on stdin (`snapshot`, `clip from=… to=…`, `status`).
+- `ironav watch --commands` also accepts the player's command style on stdin (`snapshot`, `clip from=… to=…`,
+  `status`, `query`, `configure`, `close`, or a JSON object with `cmd`); replies are `{"reply":…}` lines among the
+  observations.
 
 ### 4.4 Ontology
 
@@ -359,7 +361,7 @@ live sessions with the ring buffer and log; `stream_open`, `stream_events`, `str
 `stream_clip` and `stream_close`; and `ironav watch`. The session limit uses a new error code, `busy` (exit 75),
 and an unreachable source is `io`, so no further codes were added. Ogg (Opus, Vorbis, FLAC) and MP3 stream demuxers
 followed later (`ironav-formats/src/audio_stream.rs`); their packets match the file readers'. Left for later:
-low-delay H.264 and HEVC output and stdin commands for `watch`. `stream_query`, `stream_configure` (level, digest
+low-delay H.264 and HEVC output. Stdin commands for `watch` (`--commands`), `stream_query`, `stream_configure` (level, digest
 interval, adding and removing built-in analyzers; not sinks or sidecars yet) and the idle timeout (`idle_timeout_seconds`,
 300 by default, counted from the last call that names the session) came later. Packet metadata (keyframe flag and arrival time) is held in the live layer (`StreamPacket`) instead of
 as new `Packet` fields, so §9's migration was not needed.
