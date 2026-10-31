@@ -5,8 +5,8 @@
 //! (a coarse search then refinement) and a chroma mode, and 8x8 units choose one transform or four.
 //! Inter units are merged (spatial candidates; a merged unit without residual is skipped) or use one
 //! motion vector per unit with quarter-sample refinement, coded with AMVP. Residuals are transformed,
-//! quantised with a dead zone by QP and coded with CABAC. The loop filter is the deblocking filter;
-//! SAO is off.
+//! quantised with a dead zone by QP and coded with CABAC. The loop filters are the deblocking filter
+//! and SAO, whose band or edge offsets are chosen per CTB on the deblocked picture.
 //! Slices (rows of CTBs) are coded on threads. Output is Annex B with VPS, SPS and PPS ahead of
 //! every IDR picture; the sample-entry configuration is in-band, as for H.264.
 //!
@@ -16,12 +16,13 @@
 
 mod cabac;
 mod cu;
+mod sao;
 mod syntax;
 
 use super::filter;
 use super::frame::{CurPic, Frame, Geometry, SliceInfo};
 use super::ps::{parse_pps, parse_sps, Pps, Sps};
-use cu::{Source, SliceCoder};
+use cu::{lambda_for, Node, Source, SliceCoder};
 use ironav_core::{Encoder, Error, ErrorCode, Packet, PixelFormat, Rational, Result, StreamParams};
 use std::ops::Range;
 use syntax::{put_nal, LOG2_CTB};
@@ -195,7 +196,7 @@ impl HevcEncoder {
         let bands: Vec<Range<usize>> = (0..n).map(|i| i * ctb_h / n..(i + 1) * ctb_h / n).collect();
         let (sps, pps, geo) = (&self.sps, &self.pps, &self.geo);
         let refp = self.refs.as_ref();
-        let coded: Vec<(CurPic, Vec<u8>)> = std::thread::scope(|s| {
+        let coded: Vec<(SliceCoder, Vec<Node>)> = std::thread::scope(|s| {
             let jobs: Vec<_> = bands
                 .iter()
                 .enumerate()
@@ -209,22 +210,30 @@ impl HevcEncoder {
                 .collect();
             jobs.into_iter().map(|j| j.join().expect("an HEVC slice thread panicked")).collect()
         });
+        // the slices' CTB rows make up the picture, which is deblocked, then gets its SAO decided on
+        // the deblocked samples and applied by the decoder's filter; the slice data follows, as the
+        // SAO syntax needs the parameters
+        let mut pic = CurPic::new(sps, pts, poc);
+        pic.slices = vec![SliceInfo { deblocking_disabled: false, beta_offset_div2: 0, tc_offset_div2: 0, loop_filter_across_slices: true, cb_qp_offset: 0, cr_qp_offset: 0 }; n];
+        for (i, (rows, (part, _))) in bands.iter().zip(&coded).enumerate() {
+            merge(&mut pic, &part.pic, rows, ctb_w, nctb, i as u16);
+        }
+        filter::deblock(&mut pic, sps, pps, geo);
+        pic.sao = sao::decide(&pic, src, sps, lambda_for(qp));
+        if pic.sao.iter().any(|s| s.kind != [0; 3]) {
+            filter::sao(&mut pic, sps, pps, geo);
+        }
         let mut data = Vec::new();
         if idr {
             put_nal(&mut data, 32, &self.vps_rbsp);
             put_nal(&mut data, 33, &self.sps_rbsp);
             put_nal(&mut data, 34, &self.pps_rbsp);
         }
-        // the slices' CTB rows make up the picture, which is then loop filtered across them
-        let mut pic = CurPic::new(sps, pts, poc);
-        pic.slices = vec![SliceInfo { deblocking_disabled: false, beta_offset_div2: 0, tc_offset_div2: 0, loop_filter_across_slices: true, cb_qp_offset: 0, cr_qp_offset: 0 }; n];
-        for (i, (rows, (part, bytes))) in bands.iter().zip(&coded).enumerate() {
-            merge(&mut pic, part, rows, ctb_w, nctb, i as u16);
+        for (i, (rows, (part, nodes))) in bands.iter().zip(&coded).enumerate() {
             let mut rbsp = syntax::slice_header(i == 0, rows.start * ctb_w, nctb, idr, poc as u32, qp);
-            rbsp.extend_from_slice(bytes);
+            rbsp.extend(part.write(rows.clone(), nodes, &pic.sao));
             put_nal(&mut data, if idr { 19 } else { 1 }, &rbsp);
         }
-        filter::run(&mut pic, &self.sps, &self.pps, &self.geo);
         self.rate_update(data.len() * 8, qp, kind);
         let frame = pic.frame;
         #[cfg(test)]

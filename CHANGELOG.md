@@ -87,6 +87,6 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 ### Known limitations
 
 - AV1 is decoded on NVIDIA GPUs only; there is no software AV1 decoder and no AV1 encoder yet.
-- The software HEVC encoder is Main profile, 8-bit 4:2:0 only, with no SAO, sign data hiding or B pictures; wider HEVC encoding needs an NVIDIA GPU.
+- The software HEVC encoder is Main profile, 8-bit 4:2:0 only, with no sign data hiding or B pictures (its SAO is per-CTB band or edge offsets); wider HEVC encoding needs an NVIDIA GPU.
 - Sound output through a real device has been built but not verified by listening or measurement.
 - IronAV is not yet a drop-in replacement for FFmpeg or HandBrake.

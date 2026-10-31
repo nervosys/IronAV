@@ -43,7 +43,7 @@ pub struct Frame {
 }
 
 /// Sample adaptive offset parameters of one CTB, per colour component.
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
 pub struct Sao {
     /// 0 off, 1 band offset, 2 edge offset.
     pub kind: [u8; 3],

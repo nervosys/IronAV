@@ -142,7 +142,7 @@ fn chroma_segment(p: &mut [u16], pos: usize, across: isize, along: isize, lines:
     }
 }
 
-fn deblock(pic: &mut CurPic, sps: &Sps, pps: &Pps, geo: &Geometry) {
+pub fn deblock(pic: &mut CurPic, sps: &Sps, pps: &Pps, geo: &Geometry) {
     let (w4, h4) = (pic.w4, pic.h4);
     let l = sps.log2_ctb;
     let (bd_y, bd_c) = (sps.bit_depth_luma, sps.bit_depth_chroma);
@@ -211,7 +211,7 @@ fn deblock(pic: &mut CurPic, sps: &Sps, pps: &Pps, geo: &Geometry) {
     }
 }
 
-fn sao(pic: &mut CurPic, sps: &Sps, pps: &Pps, geo: &Geometry) {
+pub fn sao(pic: &mut CurPic, sps: &Sps, pps: &Pps, geo: &Geometry) {
     let ncomp = if sps.chroma_format_idc == 0 { 1 } else { 3 };
     let l = sps.log2_ctb;
     for c in 0..ncomp {

@@ -3,7 +3,7 @@
 //! coding tree. Predictions, transforms and the reconstruction are the decoder's, so the encoder's
 //! pictures are the decoder's.
 
-use super::super::frame::{CurPic, Frame, Geometry, MvField, EDGE_TU_H, EDGE_TU_V, PRED_INTER, PRED_INTRA};
+use super::super::frame::{CurPic, Frame, Geometry, MvField, Sao, EDGE_TU_H, EDGE_TU_V, PRED_INTER, PRED_INTRA};
 use super::super::inter::{chroma_mc, luma_mc, scale_mv};
 use super::super::intra;
 use super::super::ps::{Pps, Sps};
@@ -77,6 +77,11 @@ const SIDE_INTER: f64 = 6.0;
 /// Scales HM's lambda (for squared error) up: the decisions measure absolute differences, and the
 /// bits are estimates, so a stronger rate weight measures smaller at equal PSNR.
 const LAMBDA_SCALE: f64 = 2.0;
+
+/// The rate weight of a quantiser: squared error per bit.
+pub fn lambda_for(qp: i32) -> f64 {
+    LAMBDA_SCALE * 0.57 * 2f64.powf((qp as f64 - 12.0) / 3.0)
+}
 
 /// Chroma quantisation parameter for a luma one (Table 8-10, 8-bit 4:2:0).
 pub fn chroma_qp(qp: i32) -> i32 {
@@ -166,7 +171,7 @@ impl<'a> SliceCoder<'a> {
             ref_poc,
             pic: CurPic::new(sps, 0, poc),
             qp,
-            lambda: LAMBDA_SCALE * 0.57 * 2f64.powf((qp as f64 - 12.0) / 3.0),
+            lambda: lambda_for(qp),
             slice_addr,
             slice_idx,
             p_slice: refp.is_some(),
@@ -1035,23 +1040,88 @@ impl<'a> SliceCoder<'a> {
         }
     }
 
-    /// Codes the CTBs of `rows` (CTB rows of the picture) as one slice segment's data; returns the
-    /// picture coded and the slice data bytes (the slice header is the caller's).
-    pub fn run(mut self, rows: Range<usize>) -> (CurPic, Vec<u8>) {
+    /// Decides the coding trees of the CTBs of `rows` (CTB rows of the picture); the slice's picture
+    /// and the trees are returned, and `write` codes them once the loop filters have run.
+    pub fn run(mut self, rows: Range<usize>) -> (Self, Vec<Node>) {
         let ctb_w = self.sps.ctb_w;
         let (first, end) = (rows.start * ctb_w, (rows.end * ctb_w).min(self.sps.ctb_w * self.sps.ctb_h));
         for rs in first..end {
             self.pic.ctb_slice_addr[rs] = self.slice_addr;
             self.pic.ctb_slice_idx[rs] = self.slice_idx;
         }
-        let init = &INIT_VALUES[if self.p_slice { 1 } else { 0 }];
-        let mut e = CabacEnc::new(BitWriter::new(), init, self.qp);
+        let mut nodes = Vec::with_capacity(end - first);
         for rs in first..end {
             let (x0, y0) = ((rs % ctb_w) << LOG2_CTB, (rs / ctb_w) << LOG2_CTB);
-            let (_, node) = self.quad(x0, y0, LOG2_CTB, 0);
-            self.write_node(&mut e, &node, x0, y0, LOG2_CTB, 0);
+            nodes.push(self.quad(x0, y0, LOG2_CTB, 0).1);
+        }
+        (self, nodes)
+    }
+
+    /// The slice data of the CTBs of `rows`, with their trees and the picture's SAO parameters (the
+    /// slice header is the caller's).
+    pub fn write(&self, rows: Range<usize>, nodes: &[Node], sao: &[Sao]) -> Vec<u8> {
+        let ctb_w = self.sps.ctb_w;
+        let (first, end) = (rows.start * ctb_w, (rows.end * ctb_w).min(self.sps.ctb_w * self.sps.ctb_h));
+        let init = &INIT_VALUES[if self.p_slice { 1 } else { 0 }];
+        let mut e = CabacEnc::new(BitWriter::new(), init, self.qp);
+        for (rs, node) in (first..end).zip(nodes) {
+            self.write_sao(&mut e, rs, sao, first);
+            let (x0, y0) = ((rs % ctb_w) << LOG2_CTB, (rs / ctb_w) << LOG2_CTB);
+            self.write_node(&mut e, node, x0, y0, LOG2_CTB, 0);
             e.terminate((rs + 1 == end) as u32);
         }
-        (self.pic, e.w.into_bytes())
+        e.w.into_bytes()
+    }
+
+    /// The SAO syntax of CTB `rs` of a slice that starts at CTB `first`: a merge with the left or up
+    /// CTB when it is in the slice and has the same parameters, else the parameters themselves.
+    fn write_sao(&self, e: &mut CabacEnc, rs: usize, sao: &[Sao], first: usize) {
+        let ctb_w = self.sps.ctb_w;
+        let s = sao[rs];
+        if !rs.is_multiple_of(ctb_w) && rs > first {
+            let m = s == sao[rs - 1];
+            e.decision(SAO_MERGE_FLAG_OFFSET, m as u32);
+            if m {
+                return;
+            }
+        }
+        if rs >= ctb_w && rs - ctb_w >= first {
+            let m = s == sao[rs - ctb_w];
+            e.decision(SAO_MERGE_FLAG_OFFSET, m as u32);
+            if m {
+                return;
+            }
+        }
+        for c in 0..3 {
+            if c < 2 {
+                e.decision(SAO_TYPE_IDX_OFFSET, (s.kind[c] != 0) as u32);
+                if s.kind[c] != 0 {
+                    e.bypass((s.kind[c] == 2) as u32);
+                }
+            }
+            if s.kind[c] == 0 {
+                continue;
+            }
+            // truncated unary, with the largest magnitude of 8-bit video (7) unterminated
+            for &o in &s.offset[c] {
+                let a = o.unsigned_abs() as u32;
+                for _ in 0..a {
+                    e.bypass(1);
+                }
+                if a < 7 {
+                    e.bypass(0);
+                }
+            }
+            if s.kind[c] == 1 {
+                for &o in &s.offset[c] {
+                    if o != 0 {
+                        e.bypass((o < 0) as u32);
+                    }
+                }
+                e.bypass_bits(s.band_pos[c] as u32, 5);
+            } else if c < 2 {
+                e.bypass_bits(s.eo_class[c] as u32, 2);
+            }
+        }
     }
 }

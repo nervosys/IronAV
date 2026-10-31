@@ -91,7 +91,7 @@ pub fn sps(pw: usize, ph: usize, crop: [usize; 4], level: u8) -> Vec<u8> {
     w.ue(1); // max_transform_hierarchy_depth_intra
     w.flag(false); // scaling_list_enabled_flag
     w.flag(false); // amp_enabled_flag
-    w.flag(false); // sample_adaptive_offset_enabled_flag
+    w.flag(true); // sample_adaptive_offset_enabled_flag
     w.flag(false); // pcm_enabled_flag
     w.ue(1); // num_short_term_ref_pic_sets: the previous picture
     w.ue(1); // num_negative_pics
@@ -160,6 +160,10 @@ pub fn slice_header(first: bool, addr: usize, nctb: usize, idr: bool, poc: u32, 
     if !idr {
         w.put(8, poc & 255); // slice_pic_order_cnt_lsb
         w.flag(true); // short_term_ref_pic_set_sps_flag; the one set takes no index bits
+    }
+    w.flag(true); // slice_sao_luma_flag
+    w.flag(true); // slice_sao_chroma_flag: the CTBs choose their offsets
+    if !idr {
         w.flag(false); // num_ref_idx_active_override_flag
         w.ue(0); // five_minus_max_num_merge_cand
     }
