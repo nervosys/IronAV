@@ -1,6 +1,6 @@
 //! A software HEVC (H.265) encoder: Main profile, 8-bit 4:2:0 with any even dimensions. Pictures are
 //! IDR pictures and P pictures that each refer to the one before, so the stream is low-delay and
-//! needs no reordering. Coding tree units are 32x32, split into coding units of 8x8 to 32x32 by a
+//! needs no reordering. Coding tree units are 64x64, split into coding units of 8x8 to 32x32 by a
 //! rate-distortion decision on the actual reconstruction. Intra units choose one of the 35 modes
 //! (a coarse search then refinement) and a chroma mode, and 8x8 units choose one transform or four.
 //! Inter units are merged (spatial candidates; a merged unit without residual is skipped) or use one
@@ -130,8 +130,8 @@ impl HevcEncoder {
             count: 0,
             idr_at: 0,
             keyint: KEYINT,
-            // a slice per four CTB rows or so: more slices lose too much prediction across their edges
-            slices: std::thread::available_parallelism().map_or(1, |n| n.get()).min(((ph / (1 << LOG2_CTB)) / 4).max(1)),
+            // a slice per 128 rows or so: more slices lose too much prediction across their edges
+            slices: std::thread::available_parallelism().map_or(1, |n| n.get()).min(((ph / 32) / 4).max(1)),
             #[cfg(test)]
             recon: Vec::new(),
         })

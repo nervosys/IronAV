@@ -7,7 +7,7 @@ use super::cabac::CabacEnc;
 use crate::h264::enc::bitw::BitWriter;
 
 /// Sizes of the coding tree in this encoder: 32x32 CTBs, 8x8 to 32x32 coding units, 4x4 to 32x32 transforms.
-pub const LOG2_CTB: u32 = 5;
+pub const LOG2_CTB: u32 = 6;
 pub const LOG2_MIN_CB: u32 = 3;
 pub const LOG2_MAX_TB: u32 = 5;
 

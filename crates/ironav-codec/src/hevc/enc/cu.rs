@@ -10,7 +10,7 @@ use super::super::ps::{Pps, Sps};
 use super::super::tables::*;
 use super::super::transform::{dequantise, inverse, DST4, LEVEL_SCALE};
 use super::cabac::CabacEnc;
-use super::syntax::{residual, LOG2_CTB, LOG2_MIN_CB};
+use super::syntax::{residual, LOG2_CTB, LOG2_MAX_TB, LOG2_MIN_CB};
 use crate::h264::enc::bitw::BitWriter;
 use std::ops::Range;
 
@@ -514,7 +514,8 @@ impl<'a> SliceCoder<'a> {
         let n = 1usize << log2;
         let inside = x + n <= self.w && y + n <= self.h;
         let can_split = log2 > LOG2_MIN_CB;
-        if !inside {
+        // a unit larger than the largest transform is split
+        if !inside || log2 > LOG2_MAX_TB {
             return self.split(x, y, log2, depth, 0.0);
         }
         let before = self.save(x, y, n);
