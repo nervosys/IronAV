@@ -1,8 +1,8 @@
 use crate::job::{FilterCall, Job};
-use ironav_codec::{audio_bitrate_range, build_filter, new_encoder_with, FILTERS};
+use ironav_codec::{audio_bitrate_range, build_filter, encoder_extradata_with_opts, new_encoder_with_opts, FILTERS};
 use ironav_core::{CodecId, Error, ErrorCode, MediaType, Result, StreamInfo, StreamParams};
 use ironav_formats::{find_format, format_for_path, open_demuxer};
-use crate::job::{Latency, StreamOpts};
+use crate::job::{Latency, OpusJob, StreamOpts};
 use ironav_hwaccel::{probe_all, provider_codecs, select, Direction, HwPolicy, RateControl, Selection, DEFAULT_QP};
 use serde::Serialize;
 use std::path::Path;
@@ -29,6 +29,9 @@ pub struct Step {
     /// The audio encoder's target bit rate, when one was asked for.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bitrate_kbps: Option<u32>,
+    /// The Opus encoder settings asked for, when the audio is written as Opus.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opus: Option<OpusJob>,
     /// The constant quantizer asked for the video encoder (0 to 51), when one was.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub qp: Option<u8>,
@@ -217,13 +220,27 @@ pub fn plan(job: &Job) -> Result<Plan> {
         let named = opts.codec.as_deref().is_some_and(|c| c != "copy");
         let rate_wanted = (media == MediaType::Audio && opts.bitrate_kbps.is_some() && audio_bitrate_range(to).is_some())
             || (to == CodecId::Mjpeg && opts.qp.is_some())
-            || (media == MediaType::Video && low && named);
+            || (media == MediaType::Video && low && named)
+            || (media == MediaType::Audio && opts.opus.is_some());
         let action = if to == s.codec && chain.is_empty() && !rate_wanted { Action::Copy } else { Action::Transcode };
         if rate_wanted && to == s.codec && chain.is_empty() {
-            warnings.push(format!("{at}: a rate, quality or latency was set, so the {} stream is re-encoded instead of copied", to.name()));
+            warnings.push(format!("{at}: a rate, quality, latency or encoder setting was set, so the {} stream is re-encoded instead of copied", to.name()));
         }
         if media == MediaType::Audio && opts.qp.is_some() {
             return Err(Error::invalid_arg("qp applies to video streams only"));
+        }
+        let codec_opus = opts.opus.as_ref().map(OpusJob::codec_options);
+        if opts.opus.is_some() {
+            if media == MediaType::Video {
+                return Err(Error::invalid_arg("opus settings apply to audio streams only").hint("set the audio codec to opus instead"));
+            }
+            if to != CodecId::Opus {
+                return Err(Error::invalid_arg(format!("opus settings apply to the opus encoder only, and this audio is written as {}", to.name()))
+                    .hint("set the audio codec to opus, or leave the opus settings out"));
+            }
+        }
+        if let Some(p) = opts.opus.as_ref().and_then(|o| o.fec_loss_percent).filter(|&p| p > 100) {
+            return Err(Error::invalid_arg(format!("fec_loss_percent must be 0 to 100, got {p}")));
         }
         if media == MediaType::Audio && opts.latency.is_some() {
             return Err(Error::invalid_arg("latency applies to video streams only").hint("audio encoders send each frame as soon as it is full"));
@@ -324,7 +341,7 @@ pub fn plan(job: &Job) -> Result<Plan> {
                     "run `ironav hw probe`; NVENC needs an NVIDIA GPU with a driver that supports NVENC API 13.1"
                 }));
             } else {
-                new_encoder_with(to, &params, bits, audio_kbps)?;
+                new_encoder_with_opts(to, &params, bits, audio_kbps, codec_opus.as_ref())?;
             }
         }
 
@@ -343,11 +360,11 @@ pub fn plan(job: &Job) -> Result<Plan> {
             time_base,
             duration,
             bits,
-            extradata: if action == Action::Copy { s.extradata.clone() } else { ironav_codec::encoder_extradata(to, &params) },
+            extradata: if action == Action::Copy { s.extradata.clone() } else { encoder_extradata_with_opts(to, &params, audio_kbps, codec_opus.as_ref())? },
             lead_in: if action == Action::Copy { s.lead_in } else { ironav_codec::encoder_lead_in(to) },
             params,
         });
-        steps.push(Step { input_file: file, input_stream: s.index, output_stream: steps.len(), action, from_codec: s.codec, to_codec: to, filters: chain, bitrate_kbps: audio_kbps, qp: if media == MediaType::Video && action == Action::Transcode { opts.qp } else { None }, low_latency: media == MediaType::Video && action == Action::Transcode && low, hardware });
+        steps.push(Step { input_file: file, input_stream: s.index, output_stream: steps.len(), action, from_codec: s.codec, to_codec: to, filters: chain, bitrate_kbps: audio_kbps, opus: opts.opus.clone(), qp: if media == MediaType::Video && action == Action::Transcode { opts.qp } else { None }, low_latency: media == MediaType::Video && action == Action::Transcode && low, hardware });
     }
 
     if let Some(i) = used.iter().position(|u| !u) {

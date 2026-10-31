@@ -1055,6 +1055,75 @@ fn resample_feeds_opus_and_bitrate_sets_the_size() {
     assert_eq!(plan(&j).unwrap_err().code, ErrorCode::InvalidArgument);
 }
 
+/// The Opus settings in a job reach the encoder and its head: SILK at 60 ms with FEC and DTX writes
+/// packets whose TOC says SILK at 60 ms, and they decode; automatic mode with a voice signal
+/// decodes; the settings are refused for another codec and for a bad frame length.
+#[test]
+fn opus_settings_reach_the_encoder() {
+    use ironav_engine::{OpusJob, OpusMode, OpusSignal};
+    let dir = scratch("opus-settings");
+    let n = 48_000;
+    let samples: Vec<i16> = (0..n)
+        .map(|i| {
+            let t = i as f64 / 48_000.0;
+            let env = (2.0 * std::f64::consts::PI * 3.0 * t).sin().abs();
+            (6000.0 * env * (2.0 * std::f64::consts::PI * 220.0 * t).sin()) as i16
+        })
+        .collect();
+    let wav = dir.join("in.wav");
+    write_wav(&wav, &samples, 1, 48_000);
+
+    let out = dir.join("silk60.opus");
+    let mut j = job(&wav, &out);
+    j.audio.codec = Some("opus".into());
+    j.audio.bitrate_kbps = Some(24);
+    j.audio.opus = Some(OpusJob { mode: Some(OpusMode::Silk), frame_ms: Some(60.0), fec_loss_percent: Some(10), dtx: true, ..OpusJob::default() });
+    run(&j, &mut |_| {}).unwrap();
+    let mut d = ironav_formats::open_demuxer(&out).unwrap();
+    let mut packets = 0;
+    while let Some(p) = d.read_packet().unwrap() {
+        let config = p.data[0] >> 3;
+        assert!(config < 12 && config % 4 == 3, "packet {packets}: TOC config {config}, want SILK at 60 ms");
+        packets += 1;
+    }
+    assert!(packets > 0, "no packets");
+    let back = dir.join("silk60.wav");
+    let mut j = job(&out, &back);
+    j.audio.codec = Some("pcm_s16le".into());
+    run(&j, &mut |_| {}).unwrap();
+    let frames = pcm(&back).len() / 2;
+    assert!(frames >= n && frames < n + 4_800, "silk60: {frames} samples for {n}");
+
+    let out = dir.join("auto.opus");
+    let mut j = job(&wav, &out);
+    j.audio.codec = Some("opus".into());
+    j.audio.opus = Some(OpusJob { mode: Some(OpusMode::Auto), signal: Some(OpusSignal::Voice), ..OpusJob::default() });
+    run(&j, &mut |_| {}).unwrap();
+    let back = dir.join("auto.wav");
+    let mut j = job(&out, &back);
+    j.audio.codec = Some("pcm_s16le".into());
+    run(&j, &mut |_| {}).unwrap();
+    let frames = pcm(&back).len() / 2;
+    assert!(frames >= n && frames < n + 4_800, "auto: {frames} samples for {n}");
+
+    let mut j = job(&wav, &dir.join("aac.mka"));
+    j.audio.codec = Some("aac".into());
+    j.audio.opus = Some(OpusJob { dtx: true, ..OpusJob::default() });
+    let err = plan(&j).unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidArgument);
+    assert!(err.message.contains("opus") && err.message.contains("aac"), "{}", err.message);
+
+    let mut j = job(&wav, &dir.join("bad.opus"));
+    j.audio.codec = Some("opus".into());
+    j.audio.opus = Some(OpusJob { frame_ms: Some(3.0), ..OpusJob::default() });
+    let err = plan(&j).unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidArgument);
+    assert!(err.message.contains("2.5, 5, 10, 20, 40 or 60"), "{}", err.message);
+
+    j.audio.opus = Some(OpusJob { fec_loss_percent: Some(101), ..OpusJob::default() });
+    assert_eq!(plan(&j).unwrap_err().code, ErrorCode::InvalidArgument);
+}
+
 /// Ogg Opus output: packets copied from a Matroska or Ogg file arrive unchanged and end where the
 /// source ended, an encode to `.opus` decodes close to its input, and other codecs are refused.
 #[test]

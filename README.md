@@ -559,9 +559,13 @@ window (48 samples in the test file) long, because Matroska does not record wher
 
 ### Opus encoder
 
-`--acodec opus` writes CELT-mode Opus: 48 kHz mono or stereo (other rates are resampled first, with a warning), 20 ms
-frames, constant bit rate (64 kb/s per channel); the library also has SILK, hybrid and automatic modes, DTX, in-band FEC
-and 2.5 to 60 ms frames (below), which the CLI and job JSON do not select yet. It goes into `.opus` (Ogg), `.mka`, `.mkv` and `.webm` with the `OpusHead` and the
+`--acodec opus` writes CELT-mode Opus by default: 48 kHz mono or stereo (other rates are resampled first, with a warning), 20 ms
+frames, constant bit rate (64 kb/s per channel). `--opus-mode celt|silk|hybrid|auto`, `--opus-signal auto|voice|music`
+(for auto), `--opus-frame-ms N` (2.5 to 60), `--opus-fec PCT` and `--opus-dtx` select the other modes, frame lengths,
+in-band FEC and DTX (the job JSON takes them as `audio.opus`, with the same names as `mode`, `signal`, `frame_ms`,
+`fec_loss_percent` and `dtx`; `audio.opus` is refused for any codec but opus). For example
+`ironav convert -i in.wav -o out.opus --acodec opus --abitrate 24 --opus-mode silk --opus-frame-ms 60 --opus-fec 10 --opus-dtx`.
+It goes into `.opus` (Ogg), `.mka`, `.mkv` and `.webm` with the `OpusHead` and the
 pre-skip. It is written against the decoder: the bit allocation and the band quantiser are the decoder's own code, made
 generic over a `Coder` trait so that one body of code reads or writes a frame and the two cannot disagree, and what the
 encoder adds is the forward MDCT (checked to invert the decoder's synthesis), the band energies and their coarse/fine

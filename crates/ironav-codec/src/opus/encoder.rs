@@ -399,7 +399,7 @@ impl OpusEncoder {
             return Err(Error::invalid_arg("the mode is set before any audio"));
         }
         if mode != OpusMode::Celt && self.size < 2 {
-            return Err(Error::invalid_arg("SILK and hybrid frames are 10 or 20 ms").alternatives(["10", "20"]));
+            return Err(Error::invalid_arg("SILK, hybrid and automatic modes take frames of 10 ms or more").alternatives(["10", "20", "40", "60"]));
         }
         self.silk = match mode {
             OpusMode::Celt => None,
@@ -655,7 +655,7 @@ impl OpusEncoder {
             return Err(Error::invalid_arg("the frame length is set before any audio"));
         }
         if self.silk.is_some() && size < 2 {
-            return Err(Error::invalid_arg(format!("SILK and hybrid frames are 10 or 20 ms, not {ms}")).alternatives(["10", "20"]));
+            return Err(Error::invalid_arg(format!("SILK, hybrid and automatic modes take frames of 10 ms or more, not {ms}")).alternatives(["10", "20", "40", "60"]));
         }
         self.size = size;
         self.frame = FRAME >> (3 - size);

@@ -51,6 +51,9 @@ pub struct StreamOpts {
     /// is coded; `normal` (the default) favours size. See [`Latency`].
     #[serde(default)]
     pub latency: Option<Latency>,
+    /// Opus encoder settings, for audio written as `opus`: mode, signal, packet length, FEC and DTX.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opus: Option<OpusJob>,
 }
 
 /// How long an encoder may hold pictures back to make the stream smaller.
@@ -64,6 +67,91 @@ pub enum Latency {
     /// (on NVENC, whose low-latency tuning is used, constant bit rate with a one-picture buffer).
     /// MJPEG and raw video code each picture alone, so they are low latency either way.
     Low,
+}
+
+/// Opus encoder settings beyond the bit rate. Anything left out keeps the default: CELT mode, 20 ms
+/// packets, no FEC, no DTX.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpusJob {
+    /// `celt` (the default) for music at any bit rate; `silk` for speech at low bit rates
+    /// (wideband); `hybrid` for speech with its high frequencies; `auto` to pick for each packet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<OpusMode>,
+    /// `voice`, `music` or `auto` (the default): what the input is, for `auto` mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<OpusSignal>,
+    /// Packet length in milliseconds: 2.5, 5, 10, 20 (the default), 40 or 60. SILK and hybrid
+    /// modes, and `auto`, need 10 or more.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_ms: Option<f64>,
+    /// Expected packet loss, 0 to 100 percent. Above 0 turns on in-band forward error correction:
+    /// each speech frame is coded again, coarser, into the next packet. Default 0 (off).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fec_loss_percent: Option<u8>,
+    /// Discontinuous transmission: in a pause most frames are not sent, only the packet's TOC byte.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dtx: bool,
+}
+
+/// The Opus coding mode (see `OpusJob::mode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OpusMode {
+    /// CELT: music and anything else, at any bit rate.
+    Celt,
+    /// SILK: speech, wideband, at low bit rates.
+    Silk,
+    /// Hybrid: speech, full band.
+    Hybrid,
+    /// Chosen for each packet by the bit rate and the signal.
+    Auto,
+}
+
+/// What the input is, for `auto` mode (see `OpusJob::signal`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OpusSignal {
+    /// Guessed from how the level moves.
+    Auto,
+    /// Speech: SILK and hybrid up to a higher bit rate.
+    Voice,
+    /// Music: CELT down to a lower bit rate.
+    Music,
+}
+
+impl From<OpusMode> for ironav_codec::opus::OpusMode {
+    fn from(m: OpusMode) -> Self {
+        match m {
+            OpusMode::Celt => Self::Celt,
+            OpusMode::Silk => Self::Silk,
+            OpusMode::Hybrid => Self::Hybrid,
+            OpusMode::Auto => Self::Auto,
+        }
+    }
+}
+
+impl From<OpusSignal> for ironav_codec::opus::OpusSignal {
+    fn from(s: OpusSignal) -> Self {
+        match s {
+            OpusSignal::Auto => Self::Auto,
+            OpusSignal::Voice => Self::Voice,
+            OpusSignal::Music => Self::Music,
+        }
+    }
+}
+
+impl OpusJob {
+    /// The codec's options for these settings.
+    pub fn codec_options(&self) -> ironav_codec::OpusOptions {
+        ironav_codec::OpusOptions {
+            mode: self.mode.map(Into::into).unwrap_or_default(),
+            signal: self.signal.map(Into::into).unwrap_or_default(),
+            frame_ms: self.frame_ms,
+            fec_loss: u32::from(self.fec_loss_percent.unwrap_or(0)),
+            dtx: self.dtx,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

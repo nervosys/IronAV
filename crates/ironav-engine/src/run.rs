@@ -1,8 +1,8 @@
-use crate::job::Job;
+use crate::job::{Job, OpusJob};
 use crate::plan::{plan, rate_control, Action, Plan};
 use ironav_codec::h264::H264Encoder;
 use ironav_codec::jpeg::JpegEncoder;
-use ironav_codec::{build_filter, new_encoder_with};
+use ironav_codec::{build_filter, new_encoder_with_opts};
 use ironav_core::{CodecId, Decoder, Encoder, Error, ErrorCode, Filter, Frame, MediaType, Packet, Rational, Result};
 use ironav_hwaccel::{new_video_decoder, new_video_encoder, Direction, RateControl};
 use ironav_formats::{create_muxer, open_demuxer};
@@ -187,7 +187,10 @@ fn execute(
                     let e = H264Encoder::new(&dst.params, qp, bitrate)?;
                     Box::new(if st.low_latency { e.low_latency() } else { e })
                 }
-                _ => new_encoder_with(dst.codec, &dst.params, dst.bits, st.bitrate_kbps)?,
+                _ => {
+                    let opus = st.opus.as_ref().map(OpusJob::codec_options);
+                    new_encoder_with_opts(dst.codec, &dst.params, dst.bits, st.bitrate_kbps, opus.as_ref())?
+                }
             };
             let hw_dec = st.hardware.iter().find(|h| h.direction == Direction::Decode).and_then(|h| h.chosen);
             let decoder = match hw_dec {

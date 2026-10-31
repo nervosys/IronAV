@@ -291,12 +291,48 @@ pub fn audio_bitrate_range(codec: CodecId) -> Option<(u32, u32)> {
 
 /// Like `new_encoder`, with a target bit rate for the codecs that take one (`audio_bitrate_range`).
 pub fn new_encoder_with(codec: CodecId, params: &StreamParams, bits: Option<u8>, bitrate_kbps: Option<u32>) -> Result<Box<dyn Encoder>> {
+    new_encoder_with_opts(codec, params, bits, bitrate_kbps, None)
+}
+
+/// Opus encoder settings beyond the bit rate. The defaults are the library's: CELT mode, 20 ms
+/// packets, no FEC, no DTX.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct OpusOptions {
+    /// CELT, SILK, hybrid or automatic.
+    pub mode: opus::OpusMode,
+    /// What the input is, for automatic mode.
+    pub signal: opus::OpusSignal,
+    /// Packet length in milliseconds: 2.5, 5, 10, 20, 40 or 60.
+    pub frame_ms: Option<f64>,
+    /// Expected packet loss in percent, for in-band FEC; 0 is off.
+    pub fec_loss: u32,
+    /// Discontinuous transmission: a pause sends only TOC bytes.
+    pub dtx: bool,
+}
+
+impl OpusOptions {
+    fn apply(&self, enc: opus::OpusEncoder) -> Result<opus::OpusEncoder> {
+        // the frame length first: the SILK and hybrid modes check it
+        let enc = match self.frame_ms {
+            Some(ms) => enc.with_frame_ms(ms)?,
+            None => enc,
+        };
+        Ok(enc.with_mode(self.mode)?.with_signal(self.signal).with_fec(self.fec_loss).with_dtx(self.dtx))
+    }
+}
+
+/// Like `new_encoder_with`, with Opus encoder settings for the Opus codec (other codecs ignore them).
+pub fn new_encoder_with_opts(codec: CodecId, params: &StreamParams, bits: Option<u8>, bitrate_kbps: Option<u32>, opus_opts: Option<&OpusOptions>) -> Result<Box<dyn Encoder>> {
     match (codec, params) {
         (c, StreamParams::Audio { .. }) if c.sample_format().is_some() => Ok(Box::new(pcm::PcmEncoder::new(c.sample_format().unwrap()))),
         (CodecId::Flac, StreamParams::Audio { sample_rate, channels }) => Ok(Box::new(flac::FlacEncoder::new(*sample_rate, *channels, bits)?)),
         (CodecId::Opus, StreamParams::Audio { sample_rate, channels }) => {
             let bitrate = bitrate_kbps.map_or(opus::OpusEncoder::default_bitrate(*channels as usize), |k| k * 1000);
-            Ok(Box::new(opus::OpusEncoder::new(*sample_rate, *channels as usize, bitrate)?))
+            let enc = opus::OpusEncoder::new(*sample_rate, *channels as usize, bitrate)?;
+            Ok(Box::new(match opus_opts {
+                Some(o) => o.apply(enc)?,
+                None => enc,
+            }))
         }
         (CodecId::Vorbis, StreamParams::Audio { sample_rate, channels }) => {
             let bitrate = bitrate_kbps.map_or(vorbis::VorbisEncoder::default_bitrate(*channels as usize), |k| k * 1000);
@@ -320,6 +356,18 @@ pub fn new_encoder_with(codec: CodecId, params: &StreamParams, bits: Option<u8>,
             p.media_type()
         ))),
         (c, _) => Err(unsupported(c, "encoder")),
+    }
+}
+
+/// The codec configuration for a stream from `new_encoder_with_opts` with the same arguments: as
+/// `encoder_extradata`, but an Opus head carries the pre-skip of the mode asked for.
+pub fn encoder_extradata_with_opts(codec: CodecId, params: &StreamParams, bitrate_kbps: Option<u32>, opus_opts: Option<&OpusOptions>) -> Result<Vec<u8>> {
+    match (codec, params, opus_opts) {
+        (CodecId::Opus, StreamParams::Audio { sample_rate, channels }, Some(o)) => {
+            let bitrate = bitrate_kbps.map_or(opus::OpusEncoder::default_bitrate(*channels as usize), |k| k * 1000);
+            Ok(o.apply(opus::OpusEncoder::new(*sample_rate, *channels as usize, bitrate)?)?.head())
+        }
+        _ => Ok(encoder_extradata(codec, params)),
     }
 }
 

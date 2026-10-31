@@ -17,7 +17,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - **Codecs (encoders):** software H.264 (Constrained Baseline, then Main with CABAC and High with the 8x8
   transform, B pictures, rate-distortion mode decisions), AAC-LC with an ADTS writer, MP3 Layer III with
   an MP3 writer, Vorbis, Opus (CELT, wideband SILK, hybrid, DTX, in-band FEC, automatic mode switching,
-  2.5 to 60 ms frames; the CLI and job JSON write CELT mode at 20 ms), JPEG and Motion-JPEG, and FLAC.
+  2.5 to 60 ms frames; the CLI and job JSON select the mode, signal, frame size, FEC and DTX), JPEG and Motion-JPEG, and FLAC.
 - **Codecs (voice link):** a playout buffer, a streaming resampler, speech detection with push-to-talk
   trimming, automatic gain control, noise suppression, and Opus packet-loss concealment.
 - **Containers:** WAV, FLAC, Y4M, MP4, Matroska and WebM (read and write), Ogg (Opus, Vorbis and FLAC),
