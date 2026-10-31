@@ -4,6 +4,7 @@
 //! "what can IronAV actually do"; the ontology and the planner both read them.
 
 pub mod aac;
+pub mod av1;
 pub mod alac;
 pub mod change;
 pub mod flac;
