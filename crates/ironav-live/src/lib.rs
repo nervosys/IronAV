@@ -20,6 +20,7 @@ mod source;
 pub mod synthetic;
 pub mod tls;
 mod url;
+mod youtube;
 
 pub use net::{Allow, ALLOW_VAR};
 pub use reconnect::{Health, HealthState, Policy};

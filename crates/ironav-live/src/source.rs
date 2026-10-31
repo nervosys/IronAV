@@ -27,7 +27,7 @@ pub enum Chunk {
 pub struct SourceInfo {
     /// The URL with any password replaced.
     pub url: String,
-    /// `file`, `pipe`, `tcp`, `udp`, `rtsp`, `hls`, `http`, `device` or `test`.
+    /// `file`, `pipe`, `tcp`, `udp`, `rtsp`, `hls`, `http`, `youtube`, `device` or `test`.
     pub kind: &'static str,
     /// Whether the bytes arrive at the pace of the media (a socket, a pipe, a followed file)
     /// rather than as fast as they can be read.
@@ -80,6 +80,9 @@ fn open_once(url: &str) -> Result<Box<dyn Source>> {
     let u = SourceUrl::parse(url)?;
     let shown = redact(url);
     let unreachable = |e: std::io::Error, what: &str| Error::new(ErrorCode::Io, format!("{what} {shown}: {e}")).hint("check the address, and that the sender is running");
+    if let Some(id) = crate::youtube::video_id(&u) {
+        return crate::youtube::open(&u, &id, shown);
+    }
     Ok(match u.scheme.as_str() {
         "file" => {
             let f = std::fs::File::open(&u.target).map_err(|e| {

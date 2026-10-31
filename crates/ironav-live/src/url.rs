@@ -1,5 +1,6 @@
 //! Source URLs: `tcp://host:port`, `udp://:port`, `rtsp://[user:password@]host[:port]/path`,
-//! `http://host[:port]/path` (HLS or a download), `device://video[/NAME]` or
+//! `http://host[:port]/path` (HLS or a download; a YouTube video or live stream by its watch URL,
+//! through yt-dlp), `device://video[/NAME]` or
 //! `device://audio[/NAME]` (a camera or microphone), `pipe:`,
 //! `-`, `file:path` or a bare path, each
 //! optionally followed by `?key=value&...` options.
@@ -16,8 +17,11 @@ use std::collections::BTreeMap;
 /// - `idle`: with `follow`, end after this many seconds without new bytes;
 /// - `listen`: wait for a TCP connection on the given address instead of making one;
 /// - `transport=udp`: have an RTSP server send RTP over UDP rather than on its connection;
-/// - `audio`: the HLS audio rendition to play, by language or name.
-pub const OPTIONS: [&str; 14] = ["format", "fps", "pace", "follow", "idle", "listen", "transport", "audio", "size", "reconnect", "stall", "retries", "rate", "duration"];
+/// - `audio`: the HLS audio rendition to play, by language or name;
+/// - `height`: the tallest HLS (or YouTube) variant to play, in lines;
+/// - `cookies`: for a YouTube URL, the browser whose signed-in session yt-dlp reads (`firefox`,
+///   `chrome`, ...), as its `--cookies-from-browser` does.
+pub const OPTIONS: [&str; 16] = ["format", "fps", "pace", "follow", "idle", "listen", "transport", "audio", "size", "reconnect", "stall", "retries", "rate", "duration", "height", "cookies"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SourceUrl {

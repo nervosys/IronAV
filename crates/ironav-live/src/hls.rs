@@ -1,7 +1,9 @@
 //! `http://` and `https://` sources: HLS (RFC 8216) when the URL names a playlist, a progressive download
 //! otherwise.
 //!
-//! A master playlist's highest-bandwidth variant is played. When it takes its audio from a separate
+//! A master playlist's highest-bandwidth variant is played, of those whose `CODECS` list nothing
+//! IronAV cannot decode (all of them when every one does) and, with the `height` option, of those no taller than that
+//! (the shortest when none is). When it takes its audio from a separate
 //! rendition (`EXT-X-MEDIA` of `TYPE=AUDIO` in its `AUDIO` group, with a URI), that one is played
 //! with it: the one the `audio` option names by language or name, else the default, else the first.
 //! The two playlists are then followed side by side, the one behind in media time fetched next, and
@@ -66,6 +68,9 @@ struct Media {
 struct Variant {
     bandwidth: u64,
     uri: String,
+    /// Its `CODECS` and the height of its `RESOLUTION`, when given.
+    codecs: Option<String>,
+    height: Option<u32>,
     /// The `GROUP-ID` of the audio renditions it plays with.
     audio: Option<String>,
 }
@@ -129,7 +134,7 @@ fn parse(text: &str, base: &str) -> Result<Playlist> {
     let mut media = Media { target: 6.0, ..Media::default() };
     let mut seq = 0u64;
     let mut duration = 0.0;
-    let mut pending_variant: Option<(u64, Option<String>)> = None;
+    let mut pending_variant: Option<(u64, Option<String>, Option<String>, Option<u32>)> = None;
     let mut range: Option<String> = None;
     let mut map: Option<(String, Option<(u64, u64)>)> = None;
     // where the last range of each resource ended, for ranges without an offset
@@ -144,7 +149,8 @@ fn parse(text: &str, base: &str) -> Result<Playlist> {
                 "EXT-X-STREAM-INF" => {
                     let a = attributes(value);
                     let get = |key: &str| a.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
-                    pending_variant = Some((get("BANDWIDTH").and_then(|v| v.parse().ok()).unwrap_or(0), get("AUDIO")));
+                    let height = get("RESOLUTION").and_then(|r| r.split_once(['x', 'X']).and_then(|(_, h)| h.parse().ok()));
+                    pending_variant = Some((get("BANDWIDTH").and_then(|v| v.parse().ok()).unwrap_or(0), get("AUDIO"), get("CODECS"), height));
                 }
                 "EXT-X-MEDIA" => {
                     let a = attributes(value);
@@ -188,8 +194,8 @@ fn parse(text: &str, base: &str) -> Result<Playlist> {
             continue;
         }
         let uri = join(base, line);
-        if let Some((bandwidth, audio)) = pending_variant.take() {
-            variants.push(Variant { bandwidth, uri, audio });
+        if let Some((bandwidth, audio, codecs, height)) = pending_variant.take() {
+            variants.push(Variant { bandwidth, uri, audio, codecs, height });
             continue;
         }
         let prev = last_end.as_ref().filter(|(u, _)| *u == uri).and_then(|(_, e)| e.checked_add(1));
@@ -263,7 +269,8 @@ pub(crate) fn open(u: &SourceUrl, shown: String) -> Result<Box<dyn Source>> {
     let mut playlist_url = at;
     let mut audio = None;
     if let Playlist::Master(variants, renditions) = &playlist {
-        let best = variants.iter().max_by_key(|v| v.bandwidth).cloned().unwrap();
+        let height = u.option("height").map(|h| h.parse::<u32>().map_err(|_| Error::invalid_arg(format!("height must be a number of lines, got '{h}'")))).transpose()?;
+        let best = pick_variant(variants, height);
         audio = pick_audio(&best, renditions, u.option("audio"), &shown)?;
         let (at, p) = fetch_playlist(&best.uri, &allow)?;
         if matches!(p, Playlist::Master(..)) {
@@ -286,6 +293,29 @@ pub(crate) fn open(u: &SourceUrl, shown: String) -> Result<Box<dyn Source>> {
     };
     let audio = HlsReader::new(allow, media.0, shown, media.1)?;
     Ok(Box::new(ThreadSource::new(info, Box::new(Renditions { parts: [video, audio], done: [false; 2], out: std::io::Cursor::new(ironav_formats::renditions::MAGIC.to_vec()) }))))
+}
+
+/// Codecs (by their `CODECS` names' first part) that IronAV decodes.
+const DECODED: [&str; 8] = ["avc1", "avc3", "hvc1", "hev1", "vp09", "vp8", "mp4a", "opus"];
+
+/// The variant to play: the highest bandwidth of those that list no codec IronAV does not decode
+/// (or of all, when every one does), and with `height`, of those no taller (the shortest when none is).
+fn pick_variant(variants: &[Variant], height: Option<u32>) -> Variant {
+    let decoded = |v: &&Variant| v.codecs.as_ref().is_none_or(|c| c.split(',').all(|c| DECODED.iter().any(|d| c.trim().starts_with(d))));
+    let mut pool: Vec<&Variant> = variants.iter().filter(decoded).collect();
+    if pool.is_empty() {
+        pool = variants.iter().collect();
+    }
+    if let Some(h) = height {
+        let fits: Vec<&Variant> = pool.iter().copied().filter(|v| v.height.is_none_or(|vh| vh <= h)).collect();
+        pool = if fits.is_empty() {
+            let least = pool.iter().filter_map(|v| v.height).min();
+            pool.into_iter().filter(|v| v.height == least).collect()
+        } else {
+            fits
+        };
+    }
+    pool.into_iter().max_by_key(|v| v.bandwidth).cloned().expect("a master playlist has variants")
 }
 
 /// The URI of the audio rendition to play with `variant`: the one `wanted` names (by language or
@@ -598,6 +628,21 @@ mod tests {
         let port = server(routes, |_, _| {});
         let got = drain(&format!("http://127.0.0.1:{port}/master.m3u8"), Duration::from_secs(10)).unwrap();
         assert!(got == ts, "the segments, in order, are the stream");
+    }
+
+    #[test]
+    fn the_variant_is_one_that_decodes_and_fits_the_height() {
+        let text = "#EXTM3U\n\
+#EXT-X-STREAM-INF:BANDWIDTH=300000,CODECS=\"avc1.4D400C,mp4a.40.2\",RESOLUTION=320x240\nlow.m3u8\n\
+#EXT-X-STREAM-INF:BANDWIDTH=2000000,CODECS=\"avc1.640028,mp4a.40.2\",RESOLUTION=1280x720\nhd.m3u8\n\
+#EXT-X-STREAM-INF:BANDWIDTH=900000,CODECS=\"vp09.00.20.08,mp4a.40.2\",RESOLUTION=640x360\nvp9.m3u8\n\
+#EXT-X-STREAM-INF:BANDWIDTH=5000000,CODECS=\"av01.0.08M.08,mp4a.40.2\",RESOLUTION=1920x1080\nav1.m3u8\n";
+        let Playlist::Master(v, _) = parse(text, "https://h/m.m3u8").unwrap() else { panic!("a master playlist") };
+        let uri = |h| pick_variant(&v, h).uri;
+        // AV1 is not decoded, so the 720p H.264 one
+        assert_eq!(uri(None), "https://h/hd.m3u8");
+        assert_eq!(uri(Some(480)), "https://h/vp9.m3u8");
+        assert_eq!(uri(Some(100)), "https://h/low.m3u8");
     }
 
     #[test]

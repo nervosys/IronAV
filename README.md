@@ -106,12 +106,24 @@ each media profile (Media service version 1, or version 2 when that is all the c
 frame rate and bitrate, the RTSP URI for `stream_open` (add the credentials to it) and a JPEG snapshot URI. Credentials
 go as a WS-Security password digest dated by the camera's own clock, which it is asked for first; a camera that wants
 HTTP digest authentication instead is not supported yet. Its connections go through the same allow-list as a source's.
-`http://host[:port]/path` plays HLS when it names a playlist (the highest-bandwidth variant; TS or fMP4 segments with
+`http://host[:port]/path` plays HLS when it names a playlist (the highest-bandwidth variant of those whose `CODECS` IronAV
+decodes, no taller than `?height=` when given; TS or fMP4 segments with
 `EXT-X-MAP` and byte ranges; a live playlist is followed from three segments before its end), and downloads anything
 else as it arrives. A variant whose audio is a separate rendition (`EXT-X-MEDIA` with `TYPE=AUDIO`) plays with it: the
 default one, or the one `?audio=` names by language or name (`?audio=fr`). The two playlists are fetched side by side
 and their packets merged in time order; packed AAC with Apple's ID3 timestamp lines up with the video. Encrypted
 playlists are not supported.
+A YouTube URL (`youtube.com/watch?v=`, `youtu.be/`, `/shorts/`, `/live/`, `/embed/`) plays the video or live stream
+through its HLS master playlist, found by [yt-dlp](https://github.com/yt-dlp/yt-dlp) (`yt-dlp -J`, from `IRONAV_YTDLP`
+or the `PATH`), which keeps up with YouTube's player API; IronAV reads only its answer and fetches the playlist and its
+segments itself, under its own name, a segment at a time as the session reads them. It does not imitate a browser or work
+around YouTube's checks, and it keeps its requests few: one question to yt-dlp per video, kept until the URLs are about
+to expire (a reconnect or a second session asks nothing), at least two seconds apart. When YouTube asks the address to
+sign in ("confirm you're not a bot"), the error says so, and `?cookies=firefox` (or `chrome`, `edge`, ...) lets yt-dlp
+use the caller's own signed-in browser session. `?height=480` caps the variant; AV1 variants are passed over. "Me at the
+zoo" (`watch?v=jNQXAC9IVRw`) streams as H.264 320x240 and AAC stereo through every analyzer. A video with no HLS
+playlist (only separate progressive files) is refused with a hint to download it first. Fetching from YouTube is
+subject to its terms of service.
 `https://` and `rtsps://` (port 322 by default) are the same over TLS 1.3, using IronSocketLayer, with IronPKI checking
 the server's certificate chain and that it names the host in the URL (a DNS name or an IP address). The trusted roots
 are the platform's PEM bundle (`SSL_CERT_FILE`, the usual Linux, BSD and macOS paths, or the one Git for Windows
@@ -218,11 +230,14 @@ while let Some(f) = tap.recv_timeout(Duration::from_secs(5))? {
 ```
 
 A video tap gives at most `fps` pictures a second (every one when not given), scaled to fit `width` x `height` (aspect
-kept) and, with `letterbox`, padded with black to exactly that size, as RGB, BGR or grey bytes. An audio tap
+kept) and, with `letterbox`, padded to exactly that size (centred, or `placement: TopLeft` as YOLOX-style detectors
+take it; padding `pad`, 0 by default, 114 for those), as RGB, BGR or grey bytes. An audio tap
 (`TapConfig::audio()`) gives mono windows of `window_ms` at `rate` (16 kHz unless asked), starting every `hop_ms` (so
 windows overlap when it is shorter), and at the end of the stream a last, shorter window with what is left; with `features: true` each window comes with its RMS and peak level in dBFS,
 spectral centroid and 85% roll-off in Hz, spectral flatness (near 1 for noise, near 0 for a tone) and the share of its
-20 ms frames a speech detector took for speech (`ironav_codec::voice::SpectrumMeter` and `Vad`). It takes the stream given as `stream` or the first of its kind, starting its
+20 ms frames that sound like speech: well above an adaptive noise floor, not hiss, and among loud frames that vary as
+syllables do over the last second, as the `voice_activity` analyzer takes them, each frame for itself with no hangover,
+so silence, a steady tone or hum, and hiss read 0 (the spectrum from `ironav_codec::voice::SpectrumMeter`). It takes the stream given as `stream` or the first of its kind, starting its
 decoder if nothing else needed one; if none suits, the first `recv_timeout` says why. The session never waits for a
 tap: each keeps `queue` items (1 unless asked: the latest wins) and drops the oldest when full, and `stats()` counts
 what was made, taken and dropped. Each item has a sequence number counting every item made, so a reader sees a gap; the
