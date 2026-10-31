@@ -220,8 +220,9 @@ fn a_transcode_is_started_and_moved_to_a_new_file_while_a_session_runs() {
     assert_eq!(e.code, ErrorCode::InvalidArgument, "{e:?}");
     // well before the 1.1 s clip ends, even on a loaded machine
     std::thread::sleep(std::time::Duration::from_millis(300));
-    let c = call_tool("stream_configure", &json!({ "session": id, "stop_transcode": true, "transcode": tc(&b) })).unwrap();
-    assert_eq!(c["applied"], true, "{c}");
+    // stopping the first transcode flushes its encoder, which can take longer than configure waits
+    // (1 s) on a loaded machine, so `applied` may still be false here; the status below shows the change
+    call_tool("stream_configure", &json!({ "session": id, "stop_transcode": true, "transcode": tc(&b) })).unwrap();
     wait_end(&id);
     let st = call_tool("stream_close", &json!({ "session": id })).unwrap();
     assert_eq!(st["transcode"]["output"], b.to_str().unwrap(), "{st}");
