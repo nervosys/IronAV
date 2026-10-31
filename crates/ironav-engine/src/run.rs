@@ -2,6 +2,7 @@ use crate::job::{Job, OpusJob};
 use crate::plan::{plan, rate_control, Action, Plan};
 use ironav_codec::h264::H264Encoder;
 use ironav_codec::jpeg::JpegEncoder;
+use ironav_codec::vp8::Vp8Encoder;
 use ironav_codec::{build_filter, new_encoder_with_opts};
 use ironav_core::{CodecId, Decoder, Encoder, Error, ErrorCode, Filter, Frame, MediaType, Packet, Rational, Result};
 use ironav_hwaccel::{new_video_decoder, new_video_encoder, Direction, RateControl};
@@ -186,6 +187,13 @@ fn execute(
                     };
                     let e = H264Encoder::new(&dst.params, qp, bitrate)?;
                     Box::new(if st.low_latency { e.low_latency() } else { e })
+                }
+                _ if dst.codec == CodecId::Vp8 && dst.params.media_type() == MediaType::Video => {
+                    let (qp, bitrate) = match rate {
+                        RateControl::ConstQp(q) => (Some(q), None),
+                        RateControl::Bitrate(b) => (None, Some(b)),
+                    };
+                    Box::new(Vp8Encoder::new(&dst.params, qp, bitrate)?)
                 }
                 _ => {
                     let opus = st.opus.as_ref().map(OpusJob::codec_options);

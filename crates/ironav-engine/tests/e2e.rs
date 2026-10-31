@@ -1529,6 +1529,125 @@ fn vp8_copied_into_webm_and_matroska_still_decodes_identically() {
     }
 }
 
+/// Whether FFmpeg is on PATH. The FFmpeg checks below skip (and say so) when it is not.
+fn ffmpeg_available() -> bool {
+    std::process::Command::new("ffmpeg").arg("-version").output().is_ok_and(|o| o.status.success())
+}
+
+/// Planar 4:2:0 frames of a moving pattern: a gradient, a bar sliding right and a dark block sliding
+/// left, with a little noise.
+fn moving_pattern(w: usize, h: usize, n: usize) -> Vec<Vec<u8>> {
+    (0..n)
+        .map(|t| {
+            let mut seed = 7u32 + t as u32 * 1000;
+            let mut noise = move || {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                ((seed >> 16) % 7) as i32 - 3
+            };
+            let mut f = Vec::new();
+            for r in 0..h {
+                for c in 0..w {
+                    let mut v = (c * 160 / w + r * 60 / h) as i32 + 20;
+                    if (c + 3 * t) % w < w / 5 && r > h / 5 && r < h / 2 {
+                        v = 220 - ((c + r) % 7) as i32 * 10;
+                    }
+                    let dark = (c + w - (2 * t) % w) % w;
+                    if dark > w / 2 && dark < w / 2 + w / 6 && r > h / 2 {
+                        v = 30 + ((r * 5) % 40) as i32;
+                    }
+                    f.push((v + noise()).clamp(0, 255) as u8);
+                }
+            }
+            let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+            f.extend((0..cw * ch).map(|i| (100 + (i % cw) * 50 / cw + t) as u8));
+            f.extend((0..cw * ch).map(|i| (150 - (i / cw) * 40 / ch) as u8));
+            f
+        })
+        .collect()
+}
+
+fn write_y4m_frames(path: &Path, w: usize, h: usize, frames: &[Vec<u8>]) {
+    let mut f = format!("YUV4MPEG2 W{w} H{h} F30:1 Ip A1:1 C420jpeg\n").into_bytes();
+    for fr in frames {
+        f.extend_from_slice(b"FRAME\n");
+        f.extend_from_slice(fr);
+    }
+    std::fs::write(path, f).unwrap();
+}
+
+/// PSNR of the luma planes of two frames of `w` x `h` (the first `w * h` bytes of each).
+fn luma_psnr(a: &[u8], b: &[u8], w: usize, h: usize) -> f64 {
+    let mse = a[..w * h].iter().zip(&b[..w * h]).map(|(&p, &q)| (p as f64 - q as f64).powi(2)).sum::<f64>() / (w * h) as f64;
+    10.0 * (255.0f64 * 255.0 / mse.max(1e-9)).log10()
+}
+
+/// Encodes `src` to `out` with the VP8 encoder at `qp` and returns the size of the file.
+fn vp8_encode(src: &Path, out: &Path, qp: u8) -> u64 {
+    let mut j = job(src, out);
+    j.hwaccel = "off".into();
+    j.video.codec = Some("vp8".into());
+    j.video.qp = Some(qp);
+    run(&j, &mut |_| {}).unwrap();
+    std::fs::metadata(out).unwrap().len()
+}
+
+/// VP8 written by IronAV, in WebM and Matroska, decodes to the same pictures in IronAV and in FFmpeg,
+/// and those pictures are close to the source (odd dimensions included).
+#[test]
+fn vp8_encoded_files_decode_to_what_ffmpeg_decodes() {
+    if !ffmpeg_available() {
+        eprintln!("skipped: ffmpeg is not on PATH");
+        return;
+    }
+    let dir = scratch("vp8-enc");
+    let (w, h, n) = (177, 99, 12);
+    let frames = moving_pattern(w, h, n);
+    let src = dir.join("src.y4m");
+    write_y4m_frames(&src, w, h, &frames);
+    for ext in ["webm", "mkv"] {
+        let enc = dir.join(format!("out.{ext}"));
+        vp8_encode(&src, &enc, 30);
+        let ours = dir.join(format!("ours-{ext}.y4m"));
+        let mut d = job(&enc, &ours);
+        d.hwaccel = "off".into();
+        d.video.codec = Some("rawvideo".into());
+        run(&d, &mut |_| {}).unwrap();
+        let theirs = dir.join(format!("ffmpeg-{ext}.yuv"));
+        let st = std::process::Command::new("ffmpeg").args(["-v", "error", "-y", "-i"]).arg(&enc).args(["-f", "rawvideo", "-pix_fmt", "yuv420p"]).arg(&theirs).status().unwrap();
+        assert!(st.success(), "ffmpeg could not decode {ext}");
+        let got = y4m_frames_any(&ours);
+        assert_eq!(got.len(), n, "{ext}: frame count");
+        assert!(got.concat() == std::fs::read(&theirs).unwrap(), "{ext}: IronAV's decode differs from FFmpeg's");
+        for (t, (g, s)) in got.iter().zip(&frames).enumerate() {
+            let p = luma_psnr(g, s, w, h);
+            assert!(p > 30.0, "{ext} frame {t}: PSNR {p:.1} dB");
+        }
+    }
+}
+
+/// Inter frames are what make the stream small: the same frames each coded alone (all key frames)
+/// take more bytes than the stream does.
+#[test]
+fn vp8_inter_frames_make_the_stream_smaller_than_key_frames_alone() {
+    if !ffmpeg_available() {
+        eprintln!("skipped: ffmpeg is not on PATH");
+        return;
+    }
+    let dir = scratch("vp8-inter-size");
+    let (w, h, n) = (176, 144, 10);
+    let frames = moving_pattern(w, h, n);
+    let all = dir.join("all.y4m");
+    write_y4m_frames(&all, w, h, &frames);
+    let together = vp8_encode(&all, &dir.join("all.webm"), 30);
+    let mut alone = 0;
+    for (t, fr) in frames.iter().enumerate() {
+        let one = dir.join(format!("one{t}.y4m"));
+        write_y4m_frames(&one, w, h, std::slice::from_ref(fr));
+        alone += vp8_encode(&one, &dir.join(format!("one{t}.webm")), 30);
+    }
+    assert!(together * 10 < alone * 8, "{together} bytes with inter frames, {alone} as key frames only");
+}
+
 #[test]
 fn qp_sets_the_jpeg_quality() {
     let dir = scratch("jpeg-qp");

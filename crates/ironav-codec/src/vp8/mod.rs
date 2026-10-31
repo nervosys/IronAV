@@ -5,8 +5,11 @@
 //! reads unfiltered pixels, while later frames reference the filtered ones.
 
 mod dsp;
+mod enc;
 mod pred;
 mod tables;
+
+pub use enc::Vp8Encoder;
 
 use std::sync::Arc;
 
@@ -87,6 +90,28 @@ const HEV_THRESH: [[u8; 64]; 2] = {
     }
     t
 };
+
+/// Dequantisation factors for base index `base` and the deltas `[y dc, y2 dc, y2 ac, uv dc, uv ac]`.
+fn quant_factors(base: i32, d: [i32; 5]) -> Quant {
+    let q = |d: i32| (base + d).clamp(0, 127) as usize;
+    Quant {
+        y: [DC_QLOOKUP[q(d[0])] as i32, AC_QLOOKUP[q(0)] as i32],
+        y2: [DC_QLOOKUP[q(d[1])] as i32 * 2, ((AC_QLOOKUP[q(d[2])] as i32 * 101581) >> 16).max(8)],
+        uv: [(DC_QLOOKUP[q(d[3])] as i32).min(132), AC_QLOOKUP[q(d[4])] as i32],
+    }
+}
+
+/// Puts the candidate vectors in the order the mode contexts expect, nearest first.
+fn sort_near(near: &mut [Mv; 4], cnt: &mut [usize; 4]) {
+    // with three distinct vectors the first and last may still match
+    if cnt[3] != 0 && near[1] == near[3] {
+        cnt[1] += 1;
+    }
+    if cnt[2] > cnt[1] {
+        cnt.swap(1, 2);
+        near.swap(1, 2);
+    }
+}
 
 /// The boolean entropy decoder shared by every VP8 partition.
 struct BoolDecoder<'a> {
@@ -439,12 +464,7 @@ impl Vp8Decoder {
             if self.seg.enabled {
                 base = self.seg.base_quant[i] + if self.seg.absolute { 0 } else { yac_qi };
             }
-            let q = |d: i32| (base + d).clamp(0, 127) as usize;
-            self.qmat[i] = Quant {
-                y: [DC_QLOOKUP[q(ydc)] as i32, AC_QLOOKUP[q(0)] as i32],
-                y2: [DC_QLOOKUP[q(y2dc)] as i32 * 2, ((AC_QLOOKUP[q(y2ac)] as i32 * 101581) >> 16).max(8)],
-                uv: [(DC_QLOOKUP[q(uvdc)] as i32).min(132), AC_QLOOKUP[q(uvac)] as i32],
-            };
+            self.qmat[i] = quant_factors(base, [ydc, y2dc, y2ac, uvdc, uvac]);
         }
 
         // reference buffer updates
@@ -704,20 +724,25 @@ impl Vp8Decoder {
         Ok(cur)
     }
 
-    fn decode_mvs(&mut self, rc: &mut BoolDecoder, mb: &mut Mb, idx: usize, stride: usize, mb_x: usize, mb_y: usize) {
+    /// Clamps a vector so that the macroblock at (`mb_x`, `mb_y`) stays within a margin of the frame.
+    fn clamp_mv(&self, mb_x: usize, mb_y: usize, m: Mv) -> Mv {
         let (mbw, mbh) = (self.mbw as i32, self.mbh as i32);
         const MARGIN: i32 = 16 << 2;
         let min_x = -MARGIN - 64 * mb_x as i32;
         let max_x = ((mbw - 1) << 6) + MARGIN - 64 * mb_x as i32;
         let min_y = -MARGIN - 64 * mb_y as i32;
         let max_y = ((mbh - 1) << 6) + MARGIN - 64 * mb_y as i32;
-        let clamp = |m: Mv| Mv { x: (m.x as i32).clamp(min_x, max_x) as i16, y: (m.y as i32).clamp(min_y, max_y) as i16 };
+        Mv { x: (m.x as i32).clamp(min_x, max_x) as i16, y: (m.y as i32).clamp(min_y, max_y) as i16 }
+    }
 
+    /// The candidate vectors from the above, left and above-left macroblocks (the first is zero), and
+    /// their weights, for a macroblock at `idx` predicting from `ref_frame`.
+    fn near_mvs(&self, idx: usize, stride: usize, ref_frame: u8) -> ([Mv; 4], [usize; 4]) {
         let edges = [self.mbs[idx - stride], self.mbs[idx - 1], self.mbs[idx - stride - 1]];
         let mut near = [Mv::default(); 4];
         let mut cnt = [0usize; 4];
         let mut at = 0usize;
-        let cur_bias = self.sign_bias[mb.ref_frame as usize];
+        let cur_bias = self.sign_bias[ref_frame as usize];
         for (n, e) in edges.iter().enumerate() {
             if e.ref_frame == 0 {
                 continue;
@@ -737,21 +762,20 @@ impl Vp8Decoder {
             }
             cnt[at] += weight;
         }
+        (near, cnt)
+    }
+
+    fn decode_mvs(&mut self, rc: &mut BoolDecoder, mb: &mut Mb, idx: usize, stride: usize, mb_x: usize, mb_y: usize) {
+        let (mut near, mut cnt) = self.near_mvs(idx, stride, mb.ref_frame);
+        let edges = [self.mbs[idx - stride], self.mbs[idx - 1], self.mbs[idx - stride - 1]];
 
         mb.partitioning = SPLIT_NONE;
         if rc.get(MODE_CONTEXTS[cnt[0]][0]) {
             mb.mode = MV_MV;
-            // with three distinct vectors the first and last may still match
-            if cnt[3] != 0 && near[1] == near[3] {
-                cnt[1] += 1;
-            }
-            if cnt[2] > cnt[1] {
-                cnt.swap(1, 2);
-                near.swap(1, 2);
-            }
+            sort_near(&mut near, &mut cnt);
             if rc.get(MODE_CONTEXTS[cnt[1]][1]) {
                 if rc.get(MODE_CONTEXTS[cnt[2]][2]) {
-                    mb.mv = clamp(near[(cnt[1] >= cnt[0]) as usize]);
+                    mb.mv = self.clamp_mv(mb_x, mb_y, near[(cnt[1] >= cnt[0]) as usize]);
                     let split = |m: &Mb| (m.mode == MV_SPLIT) as usize;
                     let c = (split(&edges[1]) + split(&edges[0])) * 2 + split(&edges[2]);
                     if rc.get(MODE_CONTEXTS[c][3]) {
@@ -764,11 +788,11 @@ impl Vp8Decoder {
                         mb.bmv[0] = mb.mv;
                     }
                 } else {
-                    mb.mv = clamp(near[2]);
+                    mb.mv = self.clamp_mv(mb_x, mb_y, near[2]);
                     mb.bmv[0] = mb.mv;
                 }
             } else {
-                mb.mv = clamp(near[1]);
+                mb.mv = self.clamp_mv(mb_x, mb_y, near[1]);
                 mb.bmv[0] = mb.mv;
             }
         } else {
@@ -949,6 +973,44 @@ impl Vp8Decoder {
         }
     }
 
+    /// The edges sub-block (`x`, `y`) of a macroblock predicts from: eight pixels above (the last
+    /// four above-right), four to the left and the corner.
+    fn subblock_edges(&self, p: &[u8], mb_x: usize, mb_y: usize, x: usize, y: usize) -> ([u8; 8], [u8; 4], u8) {
+        let ys = self.mbw * 16;
+        let px = mb_x * 16 + 4 * x;
+        let py = mb_y * 16 + 4 * y;
+        let mut a = [127u8; 8];
+        if py > 0 {
+            for i in 0..4 {
+                a[i] = p[(py - 1) * ys + px + i];
+            }
+            if x < 3 {
+                for i in 0..4 {
+                    a[4 + i] = p[(py - 1) * ys + px + 4 + i];
+                }
+            } else if mb_y > 0 {
+                let row = (mb_y * 16 - 1) * ys;
+                for i in 0..4 {
+                    a[4 + i] = if mb_x == self.mbw - 1 { p[row + mb_x * 16 + 15] } else { p[row + mb_x * 16 + 16 + i] };
+                }
+            }
+        }
+        let mut l = [129u8; 4];
+        if px > 0 {
+            for r in 0..4 {
+                l[r] = p[(py + r) * ys + px - 1];
+            }
+        }
+        let tl = if py == 0 {
+            127
+        } else if px == 0 {
+            129
+        } else {
+            p[(py - 1) * ys + px - 1]
+        };
+        (a, l, tl)
+    }
+
     fn intra_predict(&self, cur: &mut Picture, mb: &Mb, blocks: &[[i16; 16]; 24], mb_x: usize, mb_y: usize) {
         let (ys, cs) = (self.mbw * 16, self.mbw * 8);
         if mb.mode != MODE_I4X4 {
@@ -958,36 +1020,7 @@ impl Vp8Decoder {
                 for x in 0..4 {
                     let px = mb_x * 16 + 4 * x;
                     let py = mb_y * 16 + 4 * y;
-                    let p = &cur.y;
-                    let mut a = [127u8; 8];
-                    if py > 0 {
-                        for i in 0..4 {
-                            a[i] = p[(py - 1) * ys + px + i];
-                        }
-                        if x < 3 {
-                            for i in 0..4 {
-                                a[4 + i] = p[(py - 1) * ys + px + 4 + i];
-                            }
-                        } else if mb_y > 0 {
-                            let row = (mb_y * 16 - 1) * ys;
-                            for i in 0..4 {
-                                a[4 + i] = if mb_x == self.mbw - 1 { p[row + mb_x * 16 + 15] } else { p[row + mb_x * 16 + 16 + i] };
-                            }
-                        }
-                    }
-                    let mut l = [129u8; 4];
-                    if px > 0 {
-                        for r in 0..4 {
-                            l[r] = p[(py + r) * ys + px - 1];
-                        }
-                    }
-                    let tl = if py == 0 {
-                        127
-                    } else if px == 0 {
-                        129
-                    } else {
-                        p[(py - 1) * ys + px - 1]
-                    };
+                    let (a, l, tl) = self.subblock_edges(&cur.y, mb_x, mb_y, x, y);
                     let o = predict4x4(mb.i4[y * 4 + x], a, l, tl);
                     for r in 0..4 {
                         cur.y[(py + r) * ys + px..(py + r) * ys + px + 4].copy_from_slice(&o[r * 4..r * 4 + 4]);

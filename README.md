@@ -6,7 +6,7 @@ A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so 
 > **Status: foundation (v0.1).** The architecture, agent interface, ontology, hardware model, CLI, MCP server
 > and both GUIs are working and tested. Containers: **WAV, FLAC, Y4M, MP4, QuickTime MOV (read and write), Matroska/WebM (read and write), Ogg, ADTS, MP3, JPEG and MPEG transport streams (read and write).**
 > Audio codecs, each decoded and encoded: **PCM, FLAC, ALAC, AAC-LC (plus HE-AAC v1 decode), MP3, Opus and Vorbis.**
-> Video: **software decoders for H.264, HEVC (including 4:2:2 and 4:4:4), VP8 and VP9; a software H.264 encoder (High profile: CABAC and the 8x8 transform); JPEG/Motion-JPEG and Apple ProRes decoded and encoded in software.**
+> Video: **software decoders for H.264, HEVC (including 4:2:2 and 4:4:4), VP8 and VP9; a software H.264 encoder (High profile: CABAC and the 8x8 transform) and a software VP8 encoder; JPEG/Motion-JPEG and Apple ProRes decoded and encoded in software.**
 > NVIDIA GPUs encode H.264 and HEVC (NVENC, preferred for H.264 when usable; HEVC has no software encoder) and decode H.264, HEVC and AV1 (NVDEC).
 > AV1 is decoded on NVIDIA GPUs only (NVDEC); it has no software decoder and no encoder yet. VP9 and AV1 copy between WebM, Matroska and MP4.
 > IronAV is not yet a drop-in replacement for FFmpeg or HandBrake.
@@ -845,7 +845,15 @@ non-multiple-of-16 sizes, profiles 0 to 3, one to eight partitions, constant-qua
 segmentation and unsaved probabilities) all match on every frame, and three small clips are kept as tests with FFmpeg's per-frame
 hashes. Sixty randomly corrupted files produced no panic. Not covered by any test file: hidden altref frames and golden/altref
 sign bias (libvpx through PyAV never produced them) and keyframe size changes in mid-stream. Speed has not been tuned; the decoder
-does not use more than one thread. VP8 has no encoder here; VP8 can be copied into WebM or Matroska.
+does not use more than one thread.
+
+VP8 is also encoded in software (`ironav-codec/src/vp8/enc`): key and inter frames, intra 16x16 and 4x4 modes, whole-macroblock
+motion with quarter-pixel vectors (no SPLITMV), one token partition and the default probabilities, with the loop filter level taken
+from the quantiser. The encoder reconstructs with the decoder's own code, so the decoder's pictures are the encoder's, and FFmpeg
+decodes what it writes bit for bit. `ironav convert -i clip.y4m -o out.webm --vcodec vp8` writes WebM (Matroska too); `--qp` (0 to
+51, mapped to VP8's 0 to 127) sets the quality, and `--vbitrate` moves the quantiser toward a bit rate (within about 15% on a 720p
+clip at 1 Mbit/s; a rate below what the coarsest quantiser gives is not reached). About ten frames a second at 720p in a release build, on one thread. Not done: SPLITMV, probability updates from
+counted statistics, and golden or altref references other than the key frame.
 
 ## VP9
 
