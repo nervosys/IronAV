@@ -121,6 +121,20 @@ fn other_bit_depths_and_samplings_decode_bit_exactly() {
     }
 }
 
+/// CDEF on (libaom's default) with deblocking, loop restoration off.
+const CDEF: &str = "enable-restoration=0";
+
+#[test]
+fn cdef_decodes_bit_exactly() {
+    need_ffmpeg!();
+    check(&case("cdef", TESTSRC, CDEF, &["-crf", "30"]));
+    check(&case("cdef-strong", "mandelbrot=size=320x180:rate=25", CDEF, &["-crf", "50"]));
+    check(&case("cdef-odd", "testsrc2=size=130x74:rate=25", CDEF, &["-crf", "45"]));
+    for (name, pix_fmt) in [("cdef-10bit", "yuv420p10le"), ("cdef-12bit", "yuv420p12le"), ("cdef-444", "yuv444p"), ("cdef-422", "yuv422p10le"), ("cdef-gray", "gray")] {
+        check(&Case { pix_fmt, ..case(name, "mandelbrot=size=320x180:rate=25", CDEF, &["-crf", "40"]) });
+    }
+}
+
 #[test]
 fn tiles_decode_bit_exactly() {
     need_ffmpeg!();
@@ -152,7 +166,7 @@ fn other_containers_decode_bit_exactly() {
 fn unsupported_tools_are_refused() {
     need_ffmpeg!();
     let d = scratch("refuse");
-    let cases = [("cdef.webm", "enable-cdef=1:enable-restoration=0", vec!["-g", "1"], "CDEF"), ("inter.webm", DEBLOCK, vec!["-g", "10"], "inter frames")];
+    let cases = [("inter.webm", DEBLOCK, vec!["-g", "10"], "inter frames")];
     for (file, params, g, want) in cases {
         let src = d.join(file);
         let mut enc = vec!["-f", "lavfi", "-i", "testsrc2=size=320x180:rate=25", "-frames:v", "3", "-c:v", "libaom-av1", "-cpu-used", "6", "-crf", "30", "-aom-params", params];

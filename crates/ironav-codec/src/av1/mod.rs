@@ -1,9 +1,10 @@
 //! A software AV1 decoder. Stage 1: key frames and intra-only frames at 8, 10 and 12 bits, every
 //! subsampling, tiles, palettes, intra block filters and lossless coding, with the deblocking
-//! filter. Inter frames, CDEF, loop restoration, superres, film grain, intra block copy and
+//! filter and CDEF. Inter frames, loop restoration, superres, film grain, intra block copy and
 //! quantiser matrices are refused with an error rather than decoded wrongly.
 
 pub mod block;
+pub mod cdef;
 pub mod cdf_tables;
 pub mod ipred;
 pub mod itx;
@@ -110,7 +111,7 @@ impl Av1Decoder {
                         self.show_existing(&h, pts)?;
                         continue;
                     }
-                    check_supported(&seq, &h)?;
+                    check_supported(&h)?;
                     let cdf = Cdfs::new(h.base_q_idx);
                     let rest = h.header_bytes;
                     self.cur = Some(Current { f: FrameDec::new(seq, h), cdf, saved: None });
@@ -184,6 +185,7 @@ impl Av1Decoder {
         if f.h.lf_level[0] != 0 || f.h.lf_level[1] != 0 {
             lf::deblock(&mut f);
         }
+        cdef::cdef(&mut f);
         let mut cdfs = if f.h.disable_frame_end_update_cdf { cur.cdf } else { cur.saved.unwrap_or(cur.cdf) };
         cdfs.clear_counts();
         let h = &f.h;
@@ -269,17 +271,12 @@ impl Av1Decoder {
 }
 
 /// Refuses frames that need a tool this decoder does not have yet.
-fn check_supported(seq: &SequenceHeader, h: &FrameHeader) -> Result<()> {
+fn check_supported(h: &FrameHeader) -> Result<()> {
     if h.superres_denom != 8 {
         return Err(unsupported("superres is not decoded yet"));
     }
     if h.uses_lr {
         return Err(unsupported("loop restoration is not decoded yet"));
-    }
-    let cdef_on = seq.enable_cdef && !h.coded_lossless && !h.allow_intrabc;
-    let n = 1 << h.cdef_bits;
-    if cdef_on && (0..n).any(|i| h.cdef_y_pri[i] | h.cdef_y_sec[i] | h.cdef_uv_pri[i] | h.cdef_uv_sec[i] != 0) {
-        return Err(unsupported("CDEF is not decoded yet (encode with enable-cdef=0)"));
     }
     if h.using_qmatrix && (h.qm_y < 15 || h.qm_u < 15 || h.qm_v < 15) {
         return Err(unsupported("quantiser matrices are not decoded yet"));
