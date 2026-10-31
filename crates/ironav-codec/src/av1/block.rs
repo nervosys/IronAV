@@ -3,6 +3,7 @@
 
 use super::ipred::{predict_cfl, predict_intra, Edges, Plane};
 use super::itx::inverse_transform;
+use super::lr;
 use super::obu::{seg_qidx, FrameHeader, SequenceHeader, TX_MODE_SELECT};
 use super::qm_tables::weights;
 use super::quant_tables::*;
@@ -104,6 +105,41 @@ fn unsupported(msg: &str) -> Error {
     Error::new(ErrorCode::UnsupportedFormat, format!("AV1: {msg}"))
 }
 
+/// decode_signed_subexp_with_ref_bool: a value in [`low`, `high`) coded against `r`.
+fn decode_signed_subexp(t: &mut Tile, low: i32, high: i32, k: u32, r: i32) -> i32 {
+    let (mx, r) = (high - low, r - low);
+    let v = decode_subexp(t, mx, k);
+    let x = if (r << 1) <= mx { inverse_recenter(r, v) } else { mx - 1 - inverse_recenter(mx - 1 - r, v) };
+    x + low
+}
+
+/// decode_subexp_bool (spec 5.11.58 helpers).
+fn decode_subexp(t: &mut Tile, num_syms: i32, k: u32) -> i32 {
+    let (mut i, mut mk) = (0u32, 0i32);
+    loop {
+        let b2 = if i > 0 { k + i - 1 } else { k };
+        let a = 1i32 << b2;
+        if num_syms <= mk + 3 * a {
+            return t.sd.ns((num_syms - mk) as u32) as i32 + mk;
+        }
+        if t.sd.literal(1) == 0 {
+            return t.sd.literal(b2) as i32 + mk;
+        }
+        i += 1;
+        mk += a;
+    }
+}
+
+fn inverse_recenter(r: i32, v: i32) -> i32 {
+    if v > 2 * r {
+        v
+    } else if v & 1 != 0 {
+        r - ((v + 1) >> 1)
+    } else {
+        r + (v >> 1)
+    }
+}
+
 /// The decoding state of one frame: its pictures, the per-4x4 mode info and the tile contexts.
 pub struct FrameDec {
     pub seq: SequenceHeader,
@@ -138,6 +174,11 @@ pub struct FrameDec {
     quant: Vec<u32>,
     dq: Vec<i32>,
     res: Vec<i32>,
+    /// The restoration units of each plane (empty where the plane has none).
+    pub lr: [lr::Units; 3],
+    /// RefLrWiener and RefSgrXqd: the previous unit's values, which the next unit codes against.
+    ref_wiener: [[[i32; 3]; 2]; 3],
+    ref_sgr: [[i32; 2]; 3],
 }
 
 const DEC_STRIDE: usize = 35;
@@ -155,7 +196,20 @@ impl FrameDec {
         let lf_tx = [vec![0; lf_stride[0] * ah / 4], vec![0; lf_stride[1] * (ah >> ss[1]) / 4], vec![0; lf_stride[2] * (ah >> ss[1]) / 4]];
         let actx = || vec![0u8; aw / 4 + 32];
         let lctx = || vec![0u8; ah / 4 + 32];
+        let lr_units: [lr::Units; 3] = std::array::from_fn(|p| {
+            if p >= num_planes || h.lr_type[p] == lr::RESTORE_NONE {
+                return lr::Units::default();
+            }
+            let (sx, sy) = if p == 0 { (0, 0) } else { (ss[0], ss[1]) };
+            let unit = h.lr_size[p] as usize;
+            let cols = lr::count_units(unit, (h.upscaled_width as usize + sx) >> sx);
+            let rows = lr::count_units(unit, (h.height as usize + sy) >> sy);
+            lr::Units { cols, rows, u: vec![lr::Unit::default(); cols * rows] }
+        });
         FrameDec {
+            lr: lr_units,
+            ref_wiener: [[lr::WIENER_TAPS_MID; 2]; 3],
+            ref_sgr: [lr::SGRPROJ_XQD_MID; 3],
             pal_colors: if h.allow_screen_content_tools { vec![[0; 16]; mi_n] } else { Vec::new() },
             cdef_idx: vec![-1; cdef_stride * h.mi_rows.div_ceil(16)],
             cdef_stride,
@@ -219,6 +273,8 @@ impl FrameDec {
             self.above_lvl[p].fill(0);
             self.above_dc[p].fill(0);
         }
+        self.ref_wiener = [[lr::WIENER_TAPS_MID; 2]; 3];
+        self.ref_sgr = [lr::SGRPROJ_XQD_MID; 3];
         let sb4 = self.sb4;
         let sb_size = if sb4 == 32 { BLOCK_128X128 } else { BLOCK_64X64 };
         let [rs, re, cs, ce] = self.tile;
@@ -231,10 +287,72 @@ impl FrameDec {
                 self.read_deltas = self.h.delta_q_present;
                 self.clear_cdef(r, c);
                 self.clear_block_decoded(r, c);
+                self.read_lr(&mut t, r, c, sb4);
                 self.decode_partition(&mut t, r, c, sb_size)?;
             }
         }
         Ok(t.cdf)
+    }
+
+    /// read_lr (spec 5.11.57): the restoration units whose top-left sample lies in this superblock.
+    fn read_lr(&mut self, t: &mut Tile, r: usize, c: usize, sb4: usize) {
+        if self.h.allow_intrabc {
+            return;
+        }
+        for plane in 0..self.num_planes {
+            if self.h.lr_type[plane] == lr::RESTORE_NONE {
+                continue;
+            }
+            let (sx, sy) = self.sub(plane);
+            let unit = self.h.lr_size[plane] as usize;
+            let (rows, cols) = (self.lr[plane].rows, self.lr[plane].cols);
+            let row0 = (r * (4 >> sy)).div_ceil(unit);
+            let row1 = rows.min(((r + sb4) * (4 >> sy)).div_ceil(unit));
+            let col0 = (c * (4 >> sx)).div_ceil(unit);
+            let col1 = cols.min(((c + sb4) * (4 >> sx)).div_ceil(unit));
+            for ur in row0..row1 {
+                for uc in col0..col1 {
+                    self.read_lr_unit(t, plane, ur * cols + uc);
+                }
+            }
+        }
+    }
+
+    /// read_lr_unit (spec 5.11.58).
+    fn read_lr_unit(&mut self, t: &mut Tile, plane: usize, idx: usize) {
+        let typ = match self.h.lr_type[plane] {
+            lr::RESTORE_WIENER => if t.sd.symbol(&mut t.cdf.wiener) == 1 { lr::RESTORE_WIENER } else { lr::RESTORE_NONE },
+            lr::RESTORE_SGRPROJ => if t.sd.symbol(&mut t.cdf.sgrproj) == 1 { lr::RESTORE_SGRPROJ } else { lr::RESTORE_NONE },
+            _ => t.sd.symbol(&mut t.cdf.switchable_restore) as u8,
+        };
+        let mut u = lr::Unit { typ, ..Default::default() };
+        if typ == lr::RESTORE_WIENER {
+            for pass in 0..2 {
+                let first = if plane > 0 { 1 } else { 0 };
+                for j in first..3 {
+                    let v = decode_signed_subexp(t, lr::WIENER_TAPS_MIN[j], lr::WIENER_TAPS_MAX[j] + 1, lr::WIENER_TAPS_K[j], self.ref_wiener[plane][pass][j]);
+                    u.wiener[pass][j] = v;
+                    self.ref_wiener[plane][pass][j] = v;
+                }
+            }
+        } else if typ == lr::RESTORE_SGRPROJ {
+            let set = t.sd.literal(lr::SGRPROJ_PARAMS_BITS) as usize;
+            u.set = set;
+            for i in 0..2 {
+                let radius = lr::SGR_PARAMS[set][i * 2];
+                let (min, max) = (lr::SGRPROJ_XQD_MIN[i], lr::SGRPROJ_XQD_MAX[i]);
+                let v = if radius != 0 {
+                    decode_signed_subexp(t, min, max + 1, lr::SGRPROJ_PRJ_SUBEXP_K, self.ref_sgr[plane][i])
+                } else if i == 1 {
+                    ((1 << 7) - self.ref_sgr[plane][0]).clamp(min, max)
+                } else {
+                    0
+                };
+                u.xqd[i] = v;
+                self.ref_sgr[plane][i] = v;
+            }
+        }
+        self.lr[plane].u[idx] = u;
     }
 
     fn clear_cdef(&mut self, r: usize, c: usize) {

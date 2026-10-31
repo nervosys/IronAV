@@ -1,7 +1,7 @@
 //! A software AV1 decoder. Stage 1: key frames and intra-only frames at 8, 10 and 12 bits, every
 //! subsampling, tiles, palettes, intra block filters and lossless coding, with the deblocking
-//! filter and CDEF. Inter frames, loop restoration, superres, film grain, intra block copy and
-//! quantiser matrices are refused with an error rather than decoded wrongly.
+//! filter, CDEF, loop restoration, quantiser matrices and film grain. Inter frames, superres and
+//! intra block copy are refused with an error rather than decoded wrongly.
 
 pub mod block;
 pub mod cdef;
@@ -12,6 +12,7 @@ pub mod ipred;
 pub mod itx;
 pub mod itx1d;
 pub mod lf;
+pub mod lr;
 pub mod obu;
 pub mod qm_tables;
 pub mod quant_tables;
@@ -190,7 +191,12 @@ impl Av1Decoder {
         if f.h.lf_level[0] != 0 || f.h.lf_level[1] != 0 {
             lf::deblock(&mut f);
         }
+        // Loop restoration reads the deblocked rows beside each stripe, so keep them before CDEF.
+        let deblocked = f.h.uses_lr.then(|| f.planes.clone());
         cdef::cdef(&mut f);
+        if let Some(pre) = deblocked {
+            lr::loop_restore(&mut f, &pre);
+        }
         let mut cdfs = if f.h.disable_frame_end_update_cdf { cur.cdf } else { cur.saved.unwrap_or(cur.cdf) };
         cdfs.clear_counts();
         let h = &f.h;
@@ -287,9 +293,6 @@ impl Av1Decoder {
 fn check_supported(h: &FrameHeader) -> Result<()> {
     if h.superres_denom != 8 {
         return Err(unsupported("superres is not decoded yet"));
-    }
-    if h.uses_lr {
-        return Err(unsupported("loop restoration is not decoded yet"));
     }
     Ok(())
 }

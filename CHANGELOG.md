@@ -28,10 +28,10 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   Matroska (`V_MPEG4/*`): I, P and B pictures, half- and quarter-sample motion, four vectors, direct mode, H.263 and
   MPEG quantisation with custom matrices, resync markers. Decoding matches FFmpeg's bit for bit. Interlaced, sprite
   and global-motion streams, and data partitioning, are refused with a clear error. About 90 frames a second at 720p.
-- **Codecs (AV1, stages 1 and 2):** software decoder for key and intra-only frames: every intra prediction tool, palettes,
-  all transforms, lossless coding, tiles, the deblocking filter, CDEF, quantiser matrices and film grain, at 8, 10 and
-  12 bits in every chroma layout. It matches libaom bit for bit and is used when no NVIDIA GPU decodes AV1; loop
-  restoration, superres and intra block copy are still refused by name.
+- **Codecs (AV1, stages 1 to 3):** software decoder for key and intra-only frames: every intra prediction tool, palettes,
+  all transforms, lossless coding, tiles, the deblocking filter, CDEF, loop restoration (Wiener, self-guided and
+  switchable), quantiser matrices and film grain, at 8, 10 and 12 bits in every chroma layout. It matches libaom bit for
+  bit and is used when no NVIDIA GPU decodes AV1; superres and intra block copy are still refused by name.
 - **Containers:** WAV, FLAC, Y4M, MP4, QuickTime MOV, Matroska and WebM (read and write), Ogg (Opus, Vorbis and FLAC),
   ADTS, MP3, JPEG, and MPEG transport streams (read and write), and raw H.264 and HEVC (Annex B, write only).
 - **Containers (MP4):** fragmented MP4 is read as it arrives; the writer is constant-frame-rate and
@@ -91,7 +91,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Known limitations
 
-- The software AV1 decoder handles key and intra-only frames only, and refuses CDEF, loop restoration, superres, film grain, intra block copy and quantiser matrices; other AV1 needs an NVIDIA GPU. There is no AV1 encoder yet.
+- The software AV1 decoder handles key and intra-only frames only, and refuses superres and intra block copy; other AV1 needs an NVIDIA GPU. There is no AV1 encoder yet.
 - The software HEVC encoder is Main profile, 8-bit 4:2:0 only, with no sign data hiding or B pictures (its SAO is per-CTB band or edge offsets); wider HEVC encoding needs an NVIDIA GPU.
 - Sound output through a real device has been built but not verified by listening or measurement.
 - IronAV is not yet a drop-in replacement for FFmpeg or HandBrake.

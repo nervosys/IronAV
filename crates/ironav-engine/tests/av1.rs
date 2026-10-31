@@ -135,6 +135,27 @@ fn cdef_decodes_bit_exactly() {
     }
 }
 
+/// Loop restoration on, with deblocking and CDEF. libaom leaves restoration off at `-cpu-used` 6
+/// (the speed of the other tests), so these encode at 4; its choice of Wiener, self-guided and
+/// switchable filters per unit depends on the content and the quantiser.
+const RESTORATION: &str = "enable-cdef=1:enable-restoration=1";
+
+#[test]
+fn loop_restoration_decodes_bit_exactly() {
+    need_ffmpeg!();
+    let big = "mandelbrot=size=1280x720:rate=25";
+    check(&case("lr-wiener", big, RESTORATION, &["-crf", "20", "-cpu-used", "4"]));
+    check(&case("lr-switchable", big, RESTORATION, &["-crf", "35", "-cpu-used", "4"]));
+    check(&case("lr-sgrproj", big, RESTORATION, &["-crf", "50", "-cpu-used", "4"]));
+    check(&case("lr-1080p", "testsrc2=size=1920x1080:rate=25", RESTORATION, &["-crf", "25", "-cpu-used", "4"]));
+    check(&case("lr-odd", "testsrc2=size=130x74:rate=25", RESTORATION, &["-crf", "40", "-cpu-used", "4"]));
+    let mandel = "mandelbrot=size=640x360:rate=25";
+    for (name, pix_fmt) in [("lr-10bit", "yuv420p10le"), ("lr-12bit", "yuv420p12le"), ("lr-444", "yuv444p"), ("lr-422", "yuv422p"), ("lr-gray", "gray"), ("lr-444-10bit", "yuv444p10le")] {
+        check(&Case { pix_fmt, ..case(name, mandel, RESTORATION, &["-crf", "30", "-cpu-used", "4"]) });
+    }
+    check(&Case { pix_fmt: "yuv444p10le", ..case("lr-444-10bit-odd", "testsrc2=size=130x74:rate=25", RESTORATION, &["-crf", "40", "-cpu-used", "4"]) });
+}
+
 #[test]
 fn quantiser_matrices_decode_bit_exactly() {
     need_ffmpeg!();
