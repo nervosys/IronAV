@@ -54,6 +54,10 @@ pub struct StreamOpts {
     /// Opus encoder settings, for audio written as `opus`: mode, signal, packet length, FEC and DTX.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opus: Option<OpusJob>,
+    /// Video only: frames between key frames, for the h264, hevc, vp8 and vp9 encoders. Default 250
+    /// (one a second with `latency: low`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyint: Option<u32>,
     /// Video only, for the `prores` codec: the profile. Default `hq`. The 4444 profiles keep 4:4:4
     /// chroma (10-bit input, or 12-bit); the others are 4:2:2 at 10 bits.
     #[serde(default, skip_serializing_if = "Option::is_none")]

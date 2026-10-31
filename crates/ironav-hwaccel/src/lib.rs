@@ -289,23 +289,24 @@ pub fn providers_for(codec: CodecId, direction: Direction) -> Vec<Backend> {
     PROVIDERS.iter().filter(|p| p.direction == direction && p.codecs.contains(&codec)).map(|p| p.backend).collect()
 }
 
-/// Open a hardware video encoder on `backend`; `low_latency` sets it up for live delivery (see
-/// `NvencEncoder::new`).
+/// Open a hardware video encoder on `backend`; `low_latency` sets it up for live delivery and
+/// `keyint` the frames between key frames (see `NvencEncoder::new`).
 pub fn new_video_encoder(
     backend: Backend,
     codec: CodecId,
     params: &ironav_core::StreamParams,
     rate: RateControl,
     low_latency: bool,
+    keyint: Option<u32>,
 ) -> Result<Box<dyn ironav_core::Encoder>> {
     #[cfg(any(windows, target_os = "linux"))]
     if backend == Backend::Cuda {
         let ironav_core::StreamParams::Video { width, height, frame_rate, pix_fmt, .. } = params else {
             return Err(Error::invalid_arg("hardware video encoder needs a video stream"));
         };
-        return Ok(Box::new(nvenc::NvencEncoder::new(codec, *width, *height, pix_fmt.bit_depth(), *frame_rate, rate, low_latency)?));
+        return Ok(Box::new(nvenc::NvencEncoder::new(codec, *width, *height, pix_fmt.bit_depth(), *frame_rate, rate, low_latency, keyint)?));
     }
-    let _ = (params, rate, low_latency);
+    let _ = (params, rate, low_latency, keyint);
     Err(Error::new(
         ErrorCode::HardwareUnavailable,
         format!("no hardware encoder provider for {} on {}", codec.name(), backend.name()),

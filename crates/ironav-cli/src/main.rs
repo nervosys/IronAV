@@ -57,7 +57,7 @@ fn help() -> Value {
             "devices": "the cameras and microphones to watch (device://video/N, device://audio/NAME)",
             "onvif [URL] [--user U] [--password P] [--timeout-ms N]": "ONVIF cameras: without a URL, those on the local network; with one, its profiles and their RTSP and snapshot URIs",
             "probe <path>": "inspect a media file",
-            "convert -i IN [-i MORE]... -o OUT [-f FMT] [--acodec C] [--vcodec C] [--abitrate KBPS] [--vbitrate KBPS | --qp N] [--latency low] [--prores-profile proxy|lt|standard|hq|4444|4444xq] [--opus-mode M] [--opus-signal S] [--opus-frame-ms N] [--opus-fec PCT] [--opus-dtx] [--filter name[:k=v,..]]... [--hwaccel P] [-y] [--dry-run] [--progress]": "convert, handbrake/ffmpeg style",
+            "convert -i IN [-i MORE]... -o OUT [-f FMT] [--acodec C] [--vcodec C] [--abitrate KBPS] [--vbitrate KBPS | --qp N] [--latency low] [--keyint N] [--prores-profile proxy|lt|standard|hq|4444|4444xq] [--opus-mode M] [--opus-signal S] [--opus-frame-ms N] [--opus-fec PCT] [--opus-dtx] [--filter name[:k=v,..]]... [--hwaccel P] [-y] [--dry-run] [--progress]": "convert, handbrake/ffmpeg style",
             "analyze FILE [--analyzers a,b] [--sidecars a,b] [--level digest|events|raw] [--digest-seconds N] [--from S] [--to S] [--streams 0,1] [--max N] [--thumbnails DIR] [--hwaccel P] [--keyframes-only] [--jsonl]": "what is in a file: loudness, silence, scene cuts, black and frozen pictures, thumbnails, gaps; --jsonl prints each observation as a line as it is found",
             "watch SOURCE [--analyzers a,b] [--sidecars a,b] [--level digest|events|raw] [--digest-seconds N] [--format F] [--fps N] [--pace realtime] [--retain S] [--duration S] [--hwaccel P] [--keyframes-only] [--record OUT.ts|OUT.m3u8 [--segment-seconds S] [--keep-segments N] [-y]] [--transcode OUT.ts|OUT.m3u8 [--width N] [--qp N | --vbitrate KBPS]] [--commands]": "follow a live source (path, path?follow, -, tcp://host:port, tcp://:port, udp://:port, device://video[/N]?size=1280x720&fps=30, device://audio): every observation as a JSON line as it happens, then a summary; with --commands, stdin takes one command per line (status, query kinds=speech_end newest_first=true, configure add=silence, configure stop_recording=true record=next.ts, snapshot, clip from=1 to=5 output=c.ts, close, or the same as JSON) and each reply is a line {\"reply\":...}",
             "plan <job.json|->": "validate a JSON job without writing",
@@ -133,6 +133,7 @@ fn dispatch(mut a: Args, progress: bool) -> Result<Value> {
                     _ => Err(Error::invalid_arg(format!("--latency must be low or normal, got '{v}'"))),
                 })
                 .transpose()?;
+            job.video.keyint = a.flag(&["--keyint"])?.map(|v| v.parse::<u32>().ok().filter(|&k| k > 0).ok_or_else(|| Error::invalid_arg(format!("--keyint must be a whole number of frames, at least 1, got '{v}'")))).transpose()?;
             job.video.prores_profile = a
                 .flag(&["--prores-profile"])?
                 .map(|v| match v.as_str() {

@@ -59,6 +59,8 @@ pub struct HevcEncoder {
     /// Pictures coded, and the display index of the last IDR picture.
     count: u64,
     idr_at: u64,
+    /// Pictures between IDR pictures.
+    keyint: u64,
     /// Slices per picture, each coded on its own thread.
     slices: usize,
     /// Every picture's reconstruction by its time stamp.
@@ -67,6 +69,12 @@ pub struct HevcEncoder {
 }
 
 impl HevcEncoder {
+    /// IDR pictures every `n` frames (1 for IDR pictures only), in place of the default.
+    pub fn with_keyint(mut self, n: u64) -> Self {
+        self.keyint = n.max(1);
+        self
+    }
+
     /// An encoder for `params` at a constant quantiser (`qp`, 0-51) or an average bit rate in bits per second.
     pub fn new(params: &StreamParams, qp: Option<u8>, bitrate: Option<u32>) -> Result<Self> {
         let StreamParams::Video { width, height, pix_fmt, frame_rate } = *params else {
@@ -121,6 +129,7 @@ impl HevcEncoder {
             refs: None,
             count: 0,
             idr_at: 0,
+            keyint: KEYINT,
             // a slice per four CTB rows or so: more slices lose too much prediction across their edges
             slices: std::thread::available_parallelism().map_or(1, |n| n.get()).min(((ph / (1 << LOG2_CTB)) / 4).max(1)),
             #[cfg(test)]
@@ -274,7 +283,7 @@ impl Encoder for HevcEncoder {
             return Err(Error::invalid_input("the HEVC encoder received an audio frame"));
         };
         let src = self.source(v)?;
-        let idr = self.count == 0 || self.count - self.idr_at >= KEYINT;
+        let idr = self.count == 0 || self.count - self.idr_at >= self.keyint;
         let p = self.code_picture(&src, v.pts, idr);
         self.count += 1;
         Ok(vec![p])

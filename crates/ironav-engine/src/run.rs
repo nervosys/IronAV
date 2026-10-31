@@ -176,7 +176,7 @@ fn execute(
             let encoder = match hw {
                 Some(backend) if dst.params.media_type() == MediaType::Video => {
                     hw_name = Some(backend.name());
-                    new_video_encoder(backend, dst.codec, &dst.params, rate, st.low_latency)?
+                    new_video_encoder(backend, dst.codec, &dst.params, rate, st.low_latency, st.keyint)?
                 }
                 _ if dst.codec == CodecId::Mjpeg && dst.params.media_type() == MediaType::Video => {
                     let quality = st.qp.map_or(JpegEncoder::default_quality(), JpegEncoder::quality_for_qp);
@@ -187,7 +187,11 @@ fn execute(
                         RateControl::ConstQp(q) => (Some(q), None),
                         RateControl::Bitrate(b) => (None, Some(b)),
                     };
-                    Box::new(HevcEncoder::new(&dst.params, qp, bitrate)?)
+                    let e = HevcEncoder::new(&dst.params, qp, bitrate)?;
+                    Box::new(match st.keyint {
+                        Some(k) => e.with_keyint(k.into()),
+                        None => e,
+                    })
                 }
                 _ if dst.codec == CodecId::H264 && dst.params.media_type() == MediaType::Video => {
                     let (qp, bitrate) = match rate {
@@ -195,20 +199,32 @@ fn execute(
                         RateControl::Bitrate(b) => (None, Some(b)),
                     };
                     let e = H264Encoder::new(&dst.params, qp, bitrate)?;
-                    Box::new(if st.low_latency { e.low_latency() } else { e })
+                    let e = if st.low_latency { e.low_latency() } else { e };
+                    Box::new(match st.keyint {
+                        Some(k) => e.with_keyint(k.into()),
+                        None => e,
+                    })
                 }
                 _ if dst.codec == CodecId::Vp9 && dst.params.media_type() == MediaType::Video => {
                     let RateControl::ConstQp(q) = rate else {
                         return Err(Error::invalid_arg("the software VP9 encoder is constant quality: set qp, not a bit rate").hint("qp 18-28 is the usual range"));
                     };
-                    Box::new(Vp9Encoder::new(&dst.params, Some(q))?)
+                    let e = Vp9Encoder::new(&dst.params, Some(q))?;
+                    Box::new(match st.keyint {
+                        Some(k) => e.with_keyint(k.into()),
+                        None => e,
+                    })
                 }
                 _ if dst.codec == CodecId::Vp8 && dst.params.media_type() == MediaType::Video => {
                     let (qp, bitrate) = match rate {
                         RateControl::ConstQp(q) => (Some(q), None),
                         RateControl::Bitrate(b) => (None, Some(b)),
                     };
-                    Box::new(Vp8Encoder::new(&dst.params, qp, bitrate)?)
+                    let e = Vp8Encoder::new(&dst.params, qp, bitrate)?;
+                    Box::new(match st.keyint {
+                        Some(k) => e.with_keyint(k.into()),
+                        None => e,
+                    })
                 }
                 _ => {
                     let opus = st.opus.as_ref().map(OpusJob::codec_options);

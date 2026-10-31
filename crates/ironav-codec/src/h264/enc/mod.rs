@@ -171,6 +171,12 @@ impl H264Encoder {
         self
     }
 
+    /// IDR pictures every `n` frames (1 for IDR pictures only), in place of the default.
+    pub fn with_keyint(mut self, n: u64) -> Self {
+        self.keyint = n.max(1);
+        self
+    }
+
     fn fps(&self) -> f64 {
         let r = self.frame_rate;
         if r.num > 0 && r.den > 0 { r.num as f64 / r.den as f64 } else { 25.0 }

@@ -214,7 +214,7 @@ impl NvencEncoder {
     /// dimensions come from the stream; width and height must be even.
     /// `low_latency` uses NVENC's low-latency tuning, an IDR picture every second rather than every
     /// two, and for a bit rate CBR with a one-picture VBV buffer, so no picture's bits back up.
-    pub fn new(codec: CodecId, width: u32, height: u32, bits: u8, frame_rate: Rational, rate: RateControl, low_latency: bool) -> Result<Self> {
+    pub fn new(codec: CodecId, width: u32, height: u32, bits: u8, frame_rate: Rational, rate: RateControl, low_latency: bool, keyint: Option<u32>) -> Result<Self> {
         let codec_guid = match codec {
             CodecId::H264 => CODEC_H264,
             CodecId::Hevc => CODEC_HEVC,
@@ -326,7 +326,7 @@ impl NvencEncoder {
 
             // Overrides on the preset's own configuration.
             // rounded, so 29.97 fps gets 30 (or 60) pictures as the software encoder does
-            let gop = ((fps_num as u64 * if low_latency { 1 } else { 2 } + fps_den as u64 / 2) / fps_den as u64).clamp(1, 600) as u32;
+            let gop = keyint.unwrap_or(((fps_num as u64 * if low_latency { 1 } else { 2 } + fps_den as u64 / 2) / fps_den as u64).clamp(1, 600) as u32);
             let c = PRESET_CFG;
             preset.u32(c + 20, gop); // gopLength
             preset.u32(c + 24, 1); // frameIntervalP: IPPP, no B-frames, so output order == input order
@@ -683,8 +683,8 @@ mod tests {
         let ten = StreamParams::Video { width: 32, height: 32, pix_fmt: PixelFormat::Yuv420p10, frame_rate: Rational::new(30, 1) };
         assert!(accepts(&ten, CodecId::Hevc).is_ok());
         assert!(accepts(&ten, CodecId::H264).unwrap_err().contains("HEVC only"));
-        assert!(NvencEncoder::new(CodecId::H264, 32, 32, 10, Rational::new(30, 1), RateControl::ConstQp(23), false).is_err());
-        assert!(NvencEncoder::new(CodecId::H264, 33, 32, 8, Rational::new(30, 1), RateControl::ConstQp(23), false).is_err());
+        assert!(NvencEncoder::new(CodecId::H264, 32, 32, 10, Rational::new(30, 1), RateControl::ConstQp(23), false, None).is_err());
+        assert!(NvencEncoder::new(CodecId::H264, 33, 32, 8, Rational::new(30, 1), RateControl::ConstQp(23), false, None).is_err());
     }
 
     fn synthetic(w: u32, h: u32, n: i64) -> Vec<Frame> {
@@ -714,7 +714,7 @@ mod tests {
 
     /// Runs on a real GPU when one is present; otherwise reports why it skipped.
     fn roundtrip(codec: CodecId) {
-        let mut enc = match NvencEncoder::new(codec, 640, 360, 8, Rational::new(30, 1), RateControl::ConstQp(26), false) {
+        let mut enc = match NvencEncoder::new(codec, 640, 360, 8, Rational::new(30, 1), RateControl::ConstQp(26), false, None) {
             Ok(e) => e,
             Err(e) if e.code == ErrorCode::HardwareUnavailable => {
                 eprintln!("skipping NVENC test: {}", e.message);
@@ -742,7 +742,7 @@ mod tests {
 
     #[test]
     fn low_latency_sends_every_picture_in_order_with_a_keyframe_each_second() {
-        let mut enc = match NvencEncoder::new(CodecId::H264, 640, 360, 8, Rational::new(30, 1), RateControl::Bitrate(1_000_000), true) {
+        let mut enc = match NvencEncoder::new(CodecId::H264, 640, 360, 8, Rational::new(30, 1), RateControl::Bitrate(1_000_000), true, None) {
             Ok(e) => e,
             Err(e) if e.code == ErrorCode::HardwareUnavailable => {
                 eprintln!("skipping NVENC test: {}", e.message);
@@ -773,7 +773,7 @@ mod tests {
 
     #[test]
     fn hevc_main10_encodes_ten_bit_frames() {
-        let mut enc = match NvencEncoder::new(CodecId::Hevc, 640, 360, 10, Rational::new(30, 1), RateControl::ConstQp(26), false) {
+        let mut enc = match NvencEncoder::new(CodecId::Hevc, 640, 360, 10, Rational::new(30, 1), RateControl::ConstQp(26), false, None) {
             Ok(e) => e,
             Err(e) if e.code == ErrorCode::HardwareUnavailable => {
                 eprintln!("skipping NVENC test: {}", e.message);
@@ -799,7 +799,7 @@ mod tests {
         assert_eq!(bytes[at + 3 + 3] & 0x1F, 2, "profile_idc should be Main 10");
         // An 8-bit frame is refused by a 10-bit session, and the other way round.
         let eight = Frame::Video(ironav_core::VideoFrame { width: 640, height: 360, pix_fmt: PixelFormat::Yuv420p, pts: 0, planes: vec![vec![0; w * h], vec![0; w * h / 4], vec![0; w * h / 4]] });
-        let mut enc2 = NvencEncoder::new(CodecId::Hevc, 640, 360, 10, Rational::new(30, 1), RateControl::ConstQp(26), false).unwrap();
+        let mut enc2 = NvencEncoder::new(CodecId::Hevc, 640, 360, 10, Rational::new(30, 1), RateControl::ConstQp(26), false, None).unwrap();
         assert!(enc2.encode(&eight).is_err());
     }
 }
