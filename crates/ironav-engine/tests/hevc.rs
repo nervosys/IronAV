@@ -73,7 +73,7 @@ fn params(w: u32, h: u32) -> StreamParams {
 
 /// Encodes the pictures at `qp` with the software encoder and returns the Annex B stream, one packet per picture.
 fn encode(frames: &[Vec<u8>], w: u32, h: u32) -> Vec<Vec<u8>> {
-    let mut enc = new_encoder_with_opts(CodecId::Hevc, &params(w, h), None, None, None).unwrap();
+    let mut enc = new_encoder_with_opts(CodecId::Hevc, &params(w, h), None, None, None, None).unwrap();
     let mut out = Vec::new();
     for (t, f) in frames.iter().enumerate() {
         let (cw, ch) = (w as usize / 2, h as usize / 2);

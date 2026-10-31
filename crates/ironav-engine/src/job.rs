@@ -54,6 +54,42 @@ pub struct StreamOpts {
     /// Opus encoder settings, for audio written as `opus`: mode, signal, packet length, FEC and DTX.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opus: Option<OpusJob>,
+    /// Video only, for the `prores` codec: the profile. Default `hq`. The 4444 profiles keep 4:4:4
+    /// chroma (10-bit input, or 12-bit); the others are 4:2:2 at 10 bits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prores_profile: Option<ProResProfile>,
+}
+
+/// The ProRes profiles (see `StreamOpts::prores_profile`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProResProfile {
+    #[serde(rename = "proxy")]
+    Proxy,
+    #[serde(rename = "lt")]
+    Lt,
+    #[serde(rename = "standard")]
+    Standard,
+    #[serde(rename = "hq")]
+    Hq,
+    #[serde(rename = "4444")]
+    Fourfour,
+    #[serde(rename = "4444xq")]
+    FourfourXq,
+}
+
+impl ProResProfile {
+    /// The codec's profile for these settings.
+    pub fn codec_profile(self) -> ironav_codec::prores::Profile {
+        use ironav_codec::prores::Profile;
+        match self {
+            Self::Proxy => Profile::Proxy,
+            Self::Lt => Profile::Lt,
+            Self::Standard => Profile::Standard,
+            Self::Hq => Profile::Hq,
+            Self::Fourfour => Profile::Fourfour,
+            Self::FourfourXq => Profile::FourfourXq,
+        }
+    }
 }
 
 /// How long an encoder may hold pictures back to make the stream smaller.

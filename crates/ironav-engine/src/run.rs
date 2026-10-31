@@ -1,4 +1,4 @@
-use crate::job::{Job, OpusJob};
+use crate::job::{Job, OpusJob, ProResProfile};
 use crate::plan::{plan, rate_control, Action, Plan};
 use ironav_codec::h264::H264Encoder;
 use ironav_codec::hevc::HevcEncoder;
@@ -212,7 +212,7 @@ fn execute(
                 }
                 _ => {
                     let opus = st.opus.as_ref().map(OpusJob::codec_options);
-                    new_encoder_with_opts(dst.codec, &dst.params, dst.bits, st.bitrate_kbps, opus.as_ref())?
+                    new_encoder_with_opts(dst.codec, &dst.params, dst.bits, st.bitrate_kbps, opus.as_ref(), st.prores_profile.map(ProResProfile::codec_profile))?
                 }
             };
             let hw_dec = st.hardware.iter().find(|h| h.direction == Direction::Decode).and_then(|h| h.chosen);

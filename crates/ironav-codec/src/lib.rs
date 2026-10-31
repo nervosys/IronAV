@@ -311,7 +311,7 @@ pub fn audio_bitrate_range(codec: CodecId) -> Option<(u32, u32)> {
 
 /// Like `new_encoder`, with a target bit rate for the codecs that take one (`audio_bitrate_range`).
 pub fn new_encoder_with(codec: CodecId, params: &StreamParams, bits: Option<u8>, bitrate_kbps: Option<u32>) -> Result<Box<dyn Encoder>> {
-    new_encoder_with_opts(codec, params, bits, bitrate_kbps, None)
+    new_encoder_with_opts(codec, params, bits, bitrate_kbps, None, None)
 }
 
 /// Opus encoder settings beyond the bit rate. The defaults are the library's: CELT mode, 20 ms
@@ -342,7 +342,7 @@ impl OpusOptions {
 }
 
 /// Like `new_encoder_with`, with Opus encoder settings for the Opus codec (other codecs ignore them).
-pub fn new_encoder_with_opts(codec: CodecId, params: &StreamParams, bits: Option<u8>, bitrate_kbps: Option<u32>, opus_opts: Option<&OpusOptions>) -> Result<Box<dyn Encoder>> {
+pub fn new_encoder_with_opts(codec: CodecId, params: &StreamParams, bits: Option<u8>, bitrate_kbps: Option<u32>, opus_opts: Option<&OpusOptions>, prores_profile: Option<prores::Profile>) -> Result<Box<dyn Encoder>> {
     match (codec, params) {
         (c, StreamParams::Audio { .. }) if c.sample_format().is_some() => Ok(Box::new(pcm::PcmEncoder::new(c.sample_format().unwrap()))),
         (CodecId::Flac, StreamParams::Audio { sample_rate, channels }) => Ok(Box::new(flac::FlacEncoder::new(*sample_rate, *channels, bits)?)),
@@ -369,7 +369,7 @@ pub fn new_encoder_with_opts(codec: CodecId, params: &StreamParams, bits: Option
         }
         (CodecId::RawVideo, StreamParams::Video { .. }) => Ok(Box::new(rawvideo::RawVideoEncoder)),
         (CodecId::Mjpeg, StreamParams::Video { .. }) => Ok(Box::new(jpeg::JpegEncoder::new(jpeg::JpegEncoder::default_quality()))),
-        (CodecId::ProRes, StreamParams::Video { .. }) => Ok(Box::new(prores::ProResEncoder::new(params, prores::Profile::Hq)?)),
+        (CodecId::ProRes, StreamParams::Video { .. }) => Ok(Box::new(prores::ProResEncoder::new(params, prores_profile.unwrap_or(prores::Profile::Hq))?)),
         (CodecId::H264, StreamParams::Video { .. }) => Ok(Box::new(h264::H264Encoder::new(params, None, bitrate_kbps.map(|k| k.saturating_mul(1000)))?)),
         (CodecId::Hevc, StreamParams::Video { .. }) => Ok(Box::new(hevc::HevcEncoder::new(params, None, bitrate_kbps.map(|k| k.saturating_mul(1000)))?)),
         (CodecId::Vp8, StreamParams::Video { .. }) => Ok(Box::new(vp8::Vp8Encoder::new(params, None, bitrate_kbps.map(|k| k.saturating_mul(1000)))?)),
@@ -386,12 +386,13 @@ pub fn new_encoder_with_opts(codec: CodecId, params: &StreamParams, bits: Option
 
 /// The codec configuration for a stream from `new_encoder_with_opts` with the same arguments: as
 /// `encoder_extradata`, but an Opus head carries the pre-skip of the mode asked for.
-pub fn encoder_extradata_with_opts(codec: CodecId, params: &StreamParams, bitrate_kbps: Option<u32>, opus_opts: Option<&OpusOptions>) -> Result<Vec<u8>> {
+pub fn encoder_extradata_with_opts(codec: CodecId, params: &StreamParams, bitrate_kbps: Option<u32>, opus_opts: Option<&OpusOptions>, prores_profile: Option<prores::Profile>) -> Result<Vec<u8>> {
     match (codec, params, opus_opts) {
         (CodecId::Opus, StreamParams::Audio { sample_rate, channels }, Some(o)) => {
             let bitrate = bitrate_kbps.map_or(opus::OpusEncoder::default_bitrate(*channels as usize), |k| k * 1000);
             Ok(o.apply(opus::OpusEncoder::new(*sample_rate, *channels as usize, bitrate)?)?.head())
         }
+        (CodecId::ProRes, StreamParams::Video { .. }, _) => Ok(prores_profile.unwrap_or(prores::Profile::Hq).fourcc().to_vec()),
         _ => Ok(encoder_extradata(codec, params)),
     }
 }

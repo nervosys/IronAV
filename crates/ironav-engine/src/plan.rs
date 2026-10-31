@@ -2,7 +2,7 @@ use crate::job::{FilterCall, Job};
 use ironav_codec::{audio_bitrate_range, build_filter, encoder_extradata_with_opts, new_encoder_with_opts, FILTERS};
 use ironav_core::{CodecId, Error, ErrorCode, MediaType, PixelFormat, Result, SampleFormat, StreamInfo, StreamParams};
 use ironav_formats::{find_format, format_for_path, open_demuxer};
-use crate::job::{Latency, OpusJob, StreamOpts};
+use crate::job::{Latency, OpusJob, ProResProfile, StreamOpts};
 use ironav_hwaccel::{probe_all, provider_codecs, select, Direction, HwPolicy, RateControl, Selection, DEFAULT_QP};
 use serde::Serialize;
 use std::path::Path;
@@ -32,6 +32,9 @@ pub struct Step {
     /// The Opus encoder settings asked for, when the audio is written as Opus.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub opus: Option<OpusJob>,
+    /// The ProRes profile asked for, when the video is written as prores.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prores_profile: Option<ProResProfile>,
     /// The constant quantizer asked for the video encoder (0 to 51), when one was.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub qp: Option<u8>,
@@ -236,13 +239,22 @@ pub fn plan(job: &Job) -> Result<Plan> {
             }
         }
 
-        // ProRes is written as 10-bit 4:2:2, so other pictures are converted to it first
-        if media == MediaType::Video && to == CodecId::ProRes && s.codec != CodecId::ProRes && !matches!(&params, StreamParams::Video { pix_fmt: PixelFormat::Yuv422p10, .. }) {
-            let mut args = serde_json::Map::new();
-            args.insert("pix_fmt".into(), "yuv422p10le".into());
-            let call = FilterCall { name: "format".into(), args };
-            params = build_filter(&call.name, &call.args)?.output_params(&params);
-            chain.push(call);
+        // ProRes is written as 10-bit 4:2:2, or as 4:4:4 (10 or 12 bit, kept as they are) for the 4444
+        // profiles; other pictures are converted to the one the profile takes first
+        if media == MediaType::Video && to == CodecId::ProRes {
+            let is444 = matches!(opts.prores_profile, Some(ProResProfile::Fourfour | ProResProfile::FourfourXq));
+            let fits = match &params {
+                StreamParams::Video { pix_fmt, .. } if is444 => matches!(pix_fmt, PixelFormat::Yuv444p10 | PixelFormat::Yuv444p12),
+                StreamParams::Video { pix_fmt, .. } => *pix_fmt == PixelFormat::Yuv422p10,
+                _ => true,
+            };
+            if !fits {
+                let mut args = serde_json::Map::new();
+                args.insert("pix_fmt".into(), if is444 { "yuv444p10le" } else { "yuv422p10le" }.into());
+                let call = FilterCall { name: "format".into(), args };
+                params = build_filter(&call.name, &call.args)?.output_params(&params);
+                chain.push(call);
+            }
         }
 
         // asking for a bit rate from a codec that has one means re-encoding, not copying, and so
@@ -252,7 +264,8 @@ pub fn plan(job: &Job) -> Result<Plan> {
         let rate_wanted = (media == MediaType::Audio && opts.bitrate_kbps.is_some() && audio_bitrate_range(to).is_some())
             || (to == CodecId::Mjpeg && opts.qp.is_some())
             || (media == MediaType::Video && low && named)
-            || (media == MediaType::Audio && opts.opus.is_some());
+            || (media == MediaType::Audio && opts.opus.is_some())
+            || (media == MediaType::Video && opts.prores_profile.is_some());
         let action = if to == s.codec && chain.is_empty() && !rate_wanted { Action::Copy } else { Action::Transcode };
         if rate_wanted && to == s.codec && chain.is_empty() {
             warnings.push(format!("{at}: a rate, quality, latency or encoder setting was set, so the {} stream is re-encoded instead of copied", to.name()));
@@ -261,6 +274,7 @@ pub fn plan(job: &Job) -> Result<Plan> {
             return Err(Error::invalid_arg("qp applies to video streams only"));
         }
         let codec_opus = opts.opus.as_ref().map(OpusJob::codec_options);
+        let prores = opts.prores_profile.map(ProResProfile::codec_profile);
         if opts.opus.is_some() {
             if media == MediaType::Video {
                 return Err(Error::invalid_arg("opus settings apply to audio streams only").hint("set the audio codec to opus instead"));
@@ -268,6 +282,15 @@ pub fn plan(job: &Job) -> Result<Plan> {
             if to != CodecId::Opus {
                 return Err(Error::invalid_arg(format!("opus settings apply to the opus encoder only, and this audio is written as {}", to.name()))
                     .hint("set the audio codec to opus, or leave the opus settings out"));
+            }
+        }
+        if opts.prores_profile.is_some() {
+            if media == MediaType::Audio {
+                return Err(Error::invalid_arg("prores_profile applies to video streams only").hint("set the video codec to prores instead"));
+            }
+            if to != CodecId::ProRes {
+                return Err(Error::invalid_arg(format!("prores_profile applies to the prores encoder only, and this video is written as {}", to.name()))
+                    .hint("set the video codec to prores, or leave prores_profile out"));
             }
         }
         if let Some(p) = opts.opus.as_ref().and_then(|o| o.fec_loss_percent).filter(|&p| p > 100) {
@@ -372,7 +395,7 @@ pub fn plan(job: &Job) -> Result<Plan> {
                     "run `ironav hw probe`; NVENC needs an NVIDIA GPU with a driver that supports NVENC API 13.1"
                 }));
             } else {
-                new_encoder_with_opts(to, &params, bits, audio_kbps, codec_opus.as_ref())?;
+                new_encoder_with_opts(to, &params, bits, audio_kbps, codec_opus.as_ref(), prores)?;
             }
         }
 
@@ -391,11 +414,11 @@ pub fn plan(job: &Job) -> Result<Plan> {
             time_base,
             duration,
             bits,
-            extradata: if action == Action::Copy { s.extradata.clone() } else { encoder_extradata_with_opts(to, &params, audio_kbps, codec_opus.as_ref())? },
+            extradata: if action == Action::Copy { s.extradata.clone() } else { encoder_extradata_with_opts(to, &params, audio_kbps, codec_opus.as_ref(), prores)? },
             lead_in: if action == Action::Copy { s.lead_in } else { ironav_codec::encoder_lead_in(to) },
             params,
         });
-        steps.push(Step { input_file: file, input_stream: s.index, output_stream: steps.len(), action, from_codec: s.codec, to_codec: to, filters: chain, bitrate_kbps: audio_kbps, opus: opts.opus.clone(), qp: if media == MediaType::Video && action == Action::Transcode { opts.qp } else { None }, low_latency: media == MediaType::Video && action == Action::Transcode && low, hardware });
+        steps.push(Step { input_file: file, input_stream: s.index, output_stream: steps.len(), action, from_codec: s.codec, to_codec: to, filters: chain, bitrate_kbps: audio_kbps, opus: opts.opus.clone(), prores_profile: opts.prores_profile, qp: if media == MediaType::Video && action == Action::Transcode { opts.qp } else { None }, low_latency: media == MediaType::Video && action == Action::Transcode && low, hardware });
     }
 
     if let Some(i) = used.iter().position(|u| !u) {

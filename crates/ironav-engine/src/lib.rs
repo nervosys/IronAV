@@ -15,7 +15,7 @@ pub mod tap;
 pub mod tools;
 pub mod transcode;
 
-pub use job::{FilterCall, Job, Latency, OpusJob, OpusMode, OpusSignal, StreamOpts};
+pub use job::{FilterCall, Job, Latency, OpusJob, OpusMode, OpusSignal, ProResProfile, StreamOpts};
 pub use plan::{plan, Plan};
 pub use run::{run, Progress, Report};
 pub use analyze::{analyze, AnalyzeJob};

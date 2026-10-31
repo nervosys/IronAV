@@ -917,7 +917,7 @@ Motion-JPEG can also be written into Matroska (`V_MJPEG`, `-o clip.mkv --vcodec 
 
 ## ProRes
 
-Apple ProRes (codec `prores`, in MOV) is decoded and encoded in software: 4:2:2 at 10 bits for Proxy, LT, Standard and HQ, and 4:4:4 at 12 bits for 4444 and 4444 XQ, all progressive (interlaced pictures are refused with an error). The decoder reads the quantisation matrices and skips a 4444 alpha plane. The encoder writes HQ, which `--vcodec prores` selects, converting the picture to 4:2:2 at 10 bits first; it uses a fixed quantiser per profile and flat matrices, and the Rust API takes any profile. Decoding is bit-exact with FFmpeg's in both directions, and HQ encodes at over 45 dB PSNR (`crates/ironav-engine/tests/prores.rs`, skipped without ffmpeg on the PATH).
+Apple ProRes (codec `prores`, in MOV) is decoded and encoded in software: 4:2:2 at 10 bits for Proxy, LT, Standard and HQ, and 4:4:4 at 12 bits for 4444 and 4444 XQ, all progressive (interlaced pictures are refused with an error). The decoder reads the quantisation matrices and skips a 4444 alpha plane. The encoder writes HQ unless `--prores-profile proxy|lt|standard|hq|4444|4444xq` (or `prores_profile` in a job) picks another; the 4444 profiles keep a 4:4:4 picture's chroma (10 or 12 bits) and other pictures are converted to 4:2:2 at 10 bits (4:4:4 at 10 bits for 4444). It uses a fixed quantiser per profile and flat matrices, and the Rust API takes any profile. Decoding is bit-exact with FFmpeg's in both directions, and HQ encodes at over 45 dB PSNR (`crates/ironav-engine/tests/prores.rs`, skipped without ffmpeg on the PATH).
 
 ## MPEG-4 Part 2 (software decoder)
 

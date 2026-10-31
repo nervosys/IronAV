@@ -4,7 +4,7 @@
 
 use ironav_codec::prores::{Profile, ProResEncoder};
 use ironav_core::{CodecId, Encoder, Frame, Packet, PixelFormat, Rational, StreamInfo, StreamParams, VideoFrame};
-use ironav_engine::{run, Job};
+use ironav_engine::{plan, run, Job, ProResProfile};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -163,4 +163,93 @@ fn ironav_prores_4444_decodes_bit_exactly_in_ffmpeg() {
     let back = d.join("ours.y4m");
     run(&job(&mov, &back), &mut |_| {}).unwrap();
     assert!(y4m_payload(&read(&back)) == read(&raw), "FFmpeg decodes IronAV's 4444 ProRes differently from IronAV");
+}
+
+fn pix(p: &StreamParams) -> Option<PixelFormat> {
+    match p {
+        StreamParams::Video { pix_fmt, .. } => Some(*pix_fmt),
+        _ => None,
+    }
+}
+
+fn ffprobe_value(path: &Path, entries: &str) -> String {
+    let out = Command::new("ffprobe").args(["-v", "error", "-select_streams", "v:0", "-show_entries", entries, "-of", "csv=p=0"]).arg(path).output().unwrap();
+    assert!(out.status.success(), "ffprobe failed");
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+#[test]
+fn every_prores_profile_is_written_and_ffmpeg_reads_it() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not on PATH; skipping");
+        return;
+    }
+    let d = scratch("profiles");
+    // the profile, the name ffprobe gives it (4444 XQ is "XQ"), the source picture (8-bit, converted by IronAV), and the
+    // format FFmpeg decodes the stream to
+    let cases = [
+        (ProResProfile::Proxy, "Proxy", "yuv422p", "yuv422p10le"),
+        (ProResProfile::Lt, "LT", "yuv422p", "yuv422p10le"),
+        (ProResProfile::Standard, "Standard", "yuv422p", "yuv422p10le"),
+        (ProResProfile::Hq, "HQ", "yuv422p", "yuv422p10le"),
+        (ProResProfile::Fourfour, "4444", "yuv444p", "yuv444p12le"),
+        (ProResProfile::FourfourXq, "XQ", "yuv444p", "yuv444p12le"),
+    ];
+    for (profile, name, src_fmt, dec) in cases {
+        let (src, mov, raw, back) = (d.join(format!("{name}.y4m")), d.join(format!("{name}.mov")), d.join(format!("{name}.raw")), d.join(format!("{name}-back.y4m")));
+        pattern(&src, "130x74", 4, src_fmt);
+        let mut j = job(&src, &mov);
+        j.video.codec = Some("prores".into());
+        j.video.prores_profile = Some(profile);
+        run(&j, &mut |_| {}).unwrap();
+        assert_eq!(ffprobe_value(&mov, "stream=profile"), name, "{name}: profile as FFmpeg reports it");
+        ffmpeg(&["-i", mov.to_str().unwrap(), "-f", "rawvideo", "-pix_fmt", dec, raw.to_str().unwrap()]);
+        run(&job(&mov, &back), &mut |_| {}).unwrap();
+        assert!(y4m_payload(&read(&back)) == read(&raw), "{name}: IronAV decodes FFmpeg's stream differently");
+    }
+}
+
+#[test]
+fn prores_444_profiles_keep_the_chroma_and_422_profiles_convert_it() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not on PATH; skipping");
+        return;
+    }
+    let d = scratch("plan");
+    let (src, mov) = (d.join("src.mov"), d.join("out.mov"));
+    // a 12-bit 4:4:4 ProRes source, as FFmpeg writes it
+    ffmpeg(&["-f", "lavfi", "-i", "testsrc2=size=130x74:rate=25", "-frames:v", "2", "-c:v", "prores_ks", "-profile:v", "4", "-pix_fmt", "yuv444p12le", src.to_str().unwrap()]);
+    let mut j = job(&src, &mov);
+    j.video.codec = Some("prores".into());
+    j.video.prores_profile = Some(ProResProfile::FourfourXq);
+    let p = plan(&j).unwrap();
+    assert!(p.steps[0].filters.is_empty(), "4444 XQ from 12-bit 4:4:4 converts nothing: {:?}", p.steps[0].filters);
+    assert_eq!(pix(&p.output.streams[0].params), Some(PixelFormat::Yuv444p12));
+    j.video.prores_profile = Some(ProResProfile::Hq);
+    let p = plan(&j).unwrap();
+    assert_eq!(p.steps[0].filters.iter().map(|f| f.args["pix_fmt"].as_str().unwrap().to_string()).collect::<Vec<_>>(), ["yuv422p10le"]);
+    assert_eq!(pix(&p.output.streams[0].params), Some(PixelFormat::Yuv422p10));
+    assert_eq!(p.output.streams[0].extradata, b"apch".to_vec());
+}
+
+#[test]
+fn prores_profile_is_refused_for_other_codecs_and_audio() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not on PATH; skipping");
+        return;
+    }
+    let d = scratch("refuse");
+    let (src, mov) = (d.join("src.y4m"), d.join("out.mov"));
+    pattern(&src, "130x74", 2, "yuv422p");
+    let mut j = job(&src, &mov);
+    j.video.codec = Some("h264".into());
+    j.video.prores_profile = Some(ProResProfile::Lt);
+    let e = plan(&j).unwrap_err().to_string();
+    assert!(e.contains("prores_profile applies to the prores encoder only"), "{e}");
+    let wav = d.join("tone.wav");
+    ffmpeg(&["-f", "lavfi", "-i", "sine=frequency=440:duration=0.1", wav.to_str().unwrap()]);
+    let mut a = job(&wav, &d.join("out.wav"));
+    a.audio.prores_profile = Some(ProResProfile::Lt);
+    let e = plan(&a).unwrap_err().to_string();
+    assert!(e.contains("video streams only"), "{e}");
 }
