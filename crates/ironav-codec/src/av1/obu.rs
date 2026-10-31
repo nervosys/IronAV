@@ -166,7 +166,13 @@ pub struct SequenceHeader {
     pub use_128x128_superblock: bool,
     pub enable_filter_intra: bool,
     pub enable_intra_edge_filter: bool,
+    pub enable_interintra_compound: bool,
+    pub enable_masked_compound: bool,
+    pub enable_warped_motion: bool,
+    pub enable_dual_filter: bool,
     pub enable_order_hint: bool,
+    pub enable_jnt_comp: bool,
+    pub enable_ref_frame_mvs: bool,
     pub order_hint_bits: u32,
     pub enable_superres: bool,
     pub enable_cdef: bool,
@@ -270,14 +276,14 @@ pub fn parse_sequence_header(data: &[u8]) -> Result<SequenceHeader> {
         s.seq_force_screen_content_tools = SELECT;
         s.seq_force_integer_mv = SELECT;
     } else {
-        b.flag()?; // interintra compound
-        b.flag()?; // masked compound
-        b.flag()?; // warped motion
-        b.flag()?; // dual filter
+        s.enable_interintra_compound = b.flag()?;
+        s.enable_masked_compound = b.flag()?;
+        s.enable_warped_motion = b.flag()?;
+        s.enable_dual_filter = b.flag()?;
         s.enable_order_hint = b.flag()?;
         if s.enable_order_hint {
-            b.flag()?; // jnt comp
-            b.flag()?; // ref frame mvs
+            s.enable_jnt_comp = b.flag()?;
+            s.enable_ref_frame_mvs = b.flag()?;
         }
         s.seq_force_screen_content_tools = if b.flag()? { SELECT } else { b.bit()? as u8 };
         s.seq_force_integer_mv = SELECT;
@@ -361,8 +367,7 @@ pub const SEG_FEATURE_BITS: [u32; 8] = [8, 6, 6, 6, 6, 3, 0, 0];
 pub const SEG_FEATURE_SIGNED: [bool; 8] = [true, true, true, true, true, false, false, false];
 pub const SEG_FEATURE_MAX: [i32; 8] = [255, 63, 63, 63, 63, 7, 0, 0];
 
-/// The frame header fields the decoder uses. Inter prediction fields are absent: inter frames are
-/// rejected before their header is parsed.
+/// The frame header fields the decoder uses.
 #[derive(Clone, Debug, Default)]
 pub struct FrameHeader {
     pub show_existing_frame: bool,
@@ -373,6 +378,7 @@ pub struct FrameHeader {
     pub error_resilient_mode: bool,
     pub disable_cdf_update: bool,
     pub allow_screen_content_tools: bool,
+    pub force_integer_mv: bool,
     pub frame_size_override: bool,
     pub order_hint: u32,
     pub primary_ref_frame: u8,
@@ -380,9 +386,28 @@ pub struct FrameHeader {
     pub width: u32,
     pub height: u32,
     pub upscaled_width: u32,
+    pub render_width: u32,
+    pub render_height: u32,
     pub mi_cols: usize,
     pub mi_rows: usize,
     pub allow_intrabc: bool,
+    /// The slot of each reference (LAST_FRAME to ALTREF_FRAME, index 0 to 6).
+    pub ref_frame_idx: [usize; 7],
+    /// OrderHints and RefFrameSignBias by reference frame (index 1 to 7).
+    pub order_hints: [u32; 8],
+    pub sign_bias: [bool; 8],
+    pub allow_high_precision_mv: bool,
+    /// 0 regular, 1 smooth, 2 sharp, 3 bilinear, 4 switchable.
+    pub interp_filter: u8,
+    pub is_motion_mode_switchable: bool,
+    pub use_ref_frame_mvs: bool,
+    pub reference_select: bool,
+    pub skip_mode_present: bool,
+    pub skip_mode_frame: [i8; 2],
+    pub allow_warped_motion: bool,
+    /// GmType and gm_params by reference frame (index 1 to 7).
+    pub gm_type: [u8; 8],
+    pub gm_params: [[i32; 6]; 8],
     pub disable_frame_end_update_cdf: bool,
     pub tile_cols_log2: u32,
     pub tile_rows_log2: u32,
@@ -458,11 +483,39 @@ fn tile_log2(blk: usize, target: usize) -> u32 {
     k
 }
 
-/// The reference slots' frame types and order hints, which the frame header reads.
+pub const LF_REF_DELTAS: [i32; 8] = [1, 0, 0, 0, -1, 0, -1, -1];
+pub const GM_IDENTITY: [i32; 6] = [0, 0, 1 << 16, 0, 0, 1 << 16];
+pub const GM_TRANSLATION: u8 = 1;
+
+/// What the frame header reads of a reference slot.
+#[derive(Clone)]
+pub struct RefState {
+    pub frame_type: u8,
+    pub order_hint: u32,
+    pub upscaled_width: u32,
+    pub height: u32,
+    pub render_width: u32,
+    pub render_height: u32,
+    pub lf_ref_deltas: [i32; 8],
+    pub lf_mode_deltas: [i32; 2],
+    pub feature_enabled: [[bool; 8]; 8],
+    pub feature_data: [[i32; 8]; 8],
+    pub gm_params: [[i32; 6]; 8],
+}
+
+/// The reference slots as the frame header sees them.
 pub struct RefInfo {
-    pub valid: [bool; 8],
-    pub order_hint: [u32; 8],
-    pub frame_type: [u8; 8],
+    pub slots: [Option<RefState>; 8],
+}
+
+/// get_relative_dist.
+pub fn rel_dist(seq: &SequenceHeader, a: u32, b: u32) -> i32 {
+    if !seq.enable_order_hint {
+        return 0;
+    }
+    let m = 1i32 << (seq.order_hint_bits - 1);
+    let diff = a as i32 - b as i32;
+    (diff & (m - 1)) - (diff & m)
 }
 
 /// Parses an uncompressed frame header. `temporal_id` and `spatial_id` are the OBU extension's
@@ -486,10 +539,10 @@ pub fn parse_frame_header(data: &[u8], seq: &SequenceHeader, refs: &RefInfo, tem
             if seq.frame_id_numbers_present {
                 b.f(id_len)?;
             }
-            if !refs.valid[h.frame_to_show] {
+            let Some(s) = &refs.slots[h.frame_to_show] else {
                 return Err(invalid("show_existing_frame of an empty reference slot"));
-            }
-            h.frame_type = refs.frame_type[h.frame_to_show];
+            };
+            h.frame_type = s.frame_type;
             if h.frame_type == KEY_FRAME {
                 h.refresh_frame_flags = ALL_FRAMES;
             }
@@ -505,13 +558,14 @@ pub fn parse_frame_header(data: &[u8], seq: &SequenceHeader, refs: &RefInfo, tem
         h.showable_frame = if h.show_frame { h.frame_type != KEY_FRAME } else { b.flag()? };
         h.error_resilient_mode = if h.frame_type == SWITCH_FRAME || (h.frame_type == KEY_FRAME && h.show_frame) { true } else { b.flag()? };
     }
-    if h.frame_type != KEY_FRAME && h.frame_type != INTRA_ONLY_FRAME {
-        return Err(unsupported("inter frames are not decoded yet (stage 1 decodes key and intra-only frames)"));
-    }
+    let intra = h.frame_is_intra();
     h.disable_cdf_update = b.flag()?;
     h.allow_screen_content_tools = if seq.seq_force_screen_content_tools == SELECT { b.flag()? } else { seq.seq_force_screen_content_tools != 0 };
-    if h.allow_screen_content_tools && seq.seq_force_integer_mv == SELECT {
-        b.flag()?;
+    if h.allow_screen_content_tools {
+        h.force_integer_mv = if seq.seq_force_integer_mv == SELECT { b.flag()? } else { seq.seq_force_integer_mv != 0 };
+    }
+    if intra {
+        h.force_integer_mv = true;
     }
     if seq.frame_id_numbers_present {
         b.f(id_len)?;
@@ -524,7 +578,7 @@ pub fn parse_frame_header(data: &[u8], seq: &SequenceHeader, refs: &RefInfo, tem
         b.flag()?
     };
     h.order_hint = b.f(seq.order_hint_bits)?;
-    h.primary_ref_frame = if h.frame_is_intra() || h.error_resilient_mode { 7 } else { b.f(3)? as u8 };
+    h.primary_ref_frame = if intra || h.error_resilient_mode { 7 } else { b.f(3)? as u8 };
     if seq.decoder_model_info_present {
         let present = b.flag()?;
         if present {
@@ -540,36 +594,83 @@ pub fn parse_frame_header(data: &[u8], seq: &SequenceHeader, refs: &RefInfo, tem
         }
     }
     h.refresh_frame_flags = if h.frame_type == SWITCH_FRAME || (h.frame_type == KEY_FRAME && h.show_frame) { ALL_FRAMES } else { b.f(8)? as u8 };
-    if (!h.frame_is_intra() || h.refresh_frame_flags != ALL_FRAMES) && h.error_resilient_mode && seq.enable_order_hint {
-        for _ in 0..8 {
-            b.f(seq.order_hint_bits)?;
+    let mut ref_hint = [0u32; 8];
+    for (i, s) in refs.slots.iter().enumerate() {
+        ref_hint[i] = s.as_ref().map_or(0, |s| s.order_hint);
+    }
+    if (!intra || h.refresh_frame_flags != ALL_FRAMES) && h.error_resilient_mode && seq.enable_order_hint {
+        for r in ref_hint.iter_mut() {
+            *r = b.f(seq.order_hint_bits)?;
         }
     }
-    // frame_size, superres_params, render_size (intra frames only)
-    if h.frame_size_override {
-        h.width = b.f(seq.frame_width_bits)? + 1;
-        h.height = b.f(seq.frame_height_bits)? + 1;
+    if intra {
+        frame_size(&mut b, seq, &mut h)?;
+        render_size(&mut b, &mut h)?;
+        if h.allow_screen_content_tools && h.upscaled_width == h.width {
+            h.allow_intrabc = b.flag()?;
+        }
     } else {
-        h.width = seq.max_frame_width;
-        h.height = seq.max_frame_height;
-    }
-    h.superres_denom = 8;
-    h.upscaled_width = h.width;
-    if seq.enable_superres && b.flag()? {
-        h.superres_denom = b.f(3)? + 9;
-    }
-    h.upscaled_width = h.width;
-    h.width = (h.upscaled_width * 8 + h.superres_denom / 2) / h.superres_denom;
-    if b.flag()? {
-        b.f(16)?;
-        b.f(16)?;
-    }
-    h.mi_cols = 2 * ((h.width as usize + 7) >> 3);
-    h.mi_rows = 2 * ((h.height as usize + 7) >> 3);
-    if h.allow_screen_content_tools && h.upscaled_width == h.width {
-        h.allow_intrabc = b.flag()?;
+        let short = seq.enable_order_hint && b.flag()?;
+        if short {
+            let last = b.f(3)? as usize;
+            let gold = b.f(3)? as usize;
+            h.ref_frame_idx = set_frame_refs(seq, &ref_hint, h.order_hint, last, gold);
+        }
+        for i in 0..7 {
+            if !short {
+                h.ref_frame_idx[i] = b.f(3)? as usize;
+            }
+            if seq.frame_id_numbers_present {
+                b.f(seq.delta_frame_id_length)?;
+            }
+        }
+        if h.ref_frame_idx.iter().any(|&i| refs.slots[i].is_none()) {
+            return Err(invalid("an inter frame refers to an empty reference slot"));
+        }
+        let mut found = false;
+        if h.frame_size_override && !h.error_resilient_mode {
+            for i in 0..7 {
+                if b.flag()? {
+                    let s = refs.slots[h.ref_frame_idx[i]].as_ref().unwrap();
+                    h.upscaled_width = s.upscaled_width;
+                    h.width = s.upscaled_width;
+                    h.height = s.height;
+                    h.render_width = s.render_width;
+                    h.render_height = s.render_height;
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if found {
+            superres_params(&mut b, seq, &mut h)?;
+        } else {
+            frame_size(&mut b, seq, &mut h)?;
+            render_size(&mut b, &mut h)?;
+        }
+        h.allow_high_precision_mv = if h.force_integer_mv { false } else { b.flag()? };
+        h.interp_filter = if b.flag()? { 4 } else { b.f(2)? as u8 };
+        h.is_motion_mode_switchable = b.flag()?;
+        h.use_ref_frame_mvs = if h.error_resilient_mode || !seq.enable_ref_frame_mvs { false } else { b.flag()? };
+        for i in 0..7 {
+            let hint = ref_hint[h.ref_frame_idx[i]];
+            h.order_hints[i + 1] = hint;
+            h.sign_bias[i + 1] = rel_dist(seq, hint, h.order_hint) > 0;
+        }
     }
     h.disable_frame_end_update_cdf = if seq.reduced_still_picture_header || h.disable_cdf_update { true } else { b.flag()? };
+    // load_previous or setup_past_independence
+    let mut prev_gm = [GM_IDENTITY; 8];
+    h.lf_ref_deltas = LF_REF_DELTAS;
+    h.lf_delta_enabled = true;
+    if h.primary_ref_frame != 7 {
+        let s = refs.slots[h.ref_frame_idx[h.primary_ref_frame as usize]].as_ref().unwrap();
+        prev_gm = s.gm_params;
+        h.lf_ref_deltas = s.lf_ref_deltas;
+        h.lf_mode_deltas = s.lf_mode_deltas;
+        h.feature_enabled = s.feature_enabled;
+        h.feature_data = s.feature_data;
+    }
     tile_info(&mut b, seq, &mut h)?;
     quantization_params(&mut b, seq, &mut h)?;
     segmentation_params(&mut b, &mut h)?;
@@ -611,13 +712,245 @@ pub fn parse_frame_header(data: &[u8], seq: &SequenceHeader, refs: &RefInfo, tem
     } else {
         TX_MODE_LARGEST
     };
+    if !intra {
+        h.reference_select = b.flag()?;
+    }
+    skip_mode_params(&mut b, seq, &mut h)?;
+    h.allow_warped_motion = if intra || h.error_resilient_mode || !seq.enable_warped_motion { false } else { b.flag()? };
     h.reduced_tx_set = b.flag()?;
+    h.gm_params = [GM_IDENTITY; 8];
+    if !intra {
+        global_motion_params(&mut b, &mut h, &prev_gm)?;
+    }
     if seq.film_grain_params_present && (h.show_frame || h.showable_frame) {
         h.grain = film_grain::parse(&mut b, seq, h.frame_type == INTER_FRAME)?;
     }
     b.byte_align();
     h.header_bytes = b.byte_pos();
     Ok(h)
+}
+
+/// frame_size, with superres_params and compute_image_size.
+fn frame_size(b: &mut Bits, seq: &SequenceHeader, h: &mut FrameHeader) -> Result<()> {
+    if h.frame_size_override {
+        h.width = b.f(seq.frame_width_bits)? + 1;
+        h.height = b.f(seq.frame_height_bits)? + 1;
+    } else {
+        h.width = seq.max_frame_width;
+        h.height = seq.max_frame_height;
+    }
+    superres_params(b, seq, h)
+}
+
+fn superres_params(b: &mut Bits, seq: &SequenceHeader, h: &mut FrameHeader) -> Result<()> {
+    h.superres_denom = 8;
+    if seq.enable_superres && b.flag()? {
+        h.superres_denom = b.f(3)? + 9;
+    }
+    h.upscaled_width = h.width;
+    h.width = (h.upscaled_width * 8 + h.superres_denom / 2) / h.superres_denom;
+    h.mi_cols = 2 * ((h.width as usize + 7) >> 3);
+    h.mi_rows = 2 * ((h.height as usize + 7) >> 3);
+    Ok(())
+}
+
+fn render_size(b: &mut Bits, h: &mut FrameHeader) -> Result<()> {
+    if b.flag()? {
+        h.render_width = b.f(16)? + 1;
+        h.render_height = b.f(16)? + 1;
+    } else {
+        h.render_width = h.upscaled_width;
+        h.render_height = h.height;
+    }
+    Ok(())
+}
+
+/// set_frame_refs (7.8): the references of frame_refs_short_signaling.
+fn set_frame_refs(seq: &SequenceHeader, ref_hint: &[u32; 8], order_hint: u32, last: usize, gold: usize) -> [usize; 7] {
+    let mut idx = [-1i32; 7];
+    idx[0] = last as i32;
+    idx[3] = gold as i32;
+    let mut used = [false; 8];
+    used[last] = true;
+    used[gold] = true;
+    let cur = 1i32 << (seq.order_hint_bits - 1);
+    let shifted: Vec<i32> = (0..8).map(|i| cur + rel_dist(seq, ref_hint[i], order_hint)).collect();
+    let (mut latest, mut earliest) = (shifted[last], shifted[gold]);
+    // ALTREF: the latest backward reference
+    let mut r = -1;
+    for i in 0..8 {
+        if !used[i] && shifted[i] >= cur && (r < 0 || shifted[i] >= latest) {
+            r = i as i32;
+            latest = shifted[i];
+        }
+    }
+    if r >= 0 {
+        idx[6] = r;
+        used[r as usize] = true;
+    }
+    // BWDREF and ALTREF2: the earliest backward references
+    for slot in [4, 5] {
+        let mut r = -1;
+        for i in 0..8 {
+            if !used[i] && shifted[i] >= cur && (r < 0 || shifted[i] < earliest) {
+                r = i as i32;
+                earliest = shifted[i];
+            }
+        }
+        if r >= 0 {
+            idx[slot] = r;
+            used[r as usize] = true;
+        }
+    }
+    // the rest: the latest forward references
+    for slot in [1, 2, 4, 5, 6] {
+        if idx[slot] < 0 {
+            let mut r = -1;
+            for i in 0..8 {
+                if !used[i] && shifted[i] < cur && (r < 0 || shifted[i] >= latest) {
+                    r = i as i32;
+                    latest = shifted[i];
+                }
+            }
+            if r >= 0 {
+                idx[slot] = r;
+                used[r as usize] = true;
+            }
+        }
+    }
+    let mut r = 0;
+    for i in 0..8 {
+        if i == 0 || shifted[i] < earliest {
+            r = i;
+            earliest = shifted[i];
+        }
+    }
+    idx.map(|v| if v < 0 { r } else { v as usize })
+}
+
+fn skip_mode_params(b: &mut Bits, seq: &SequenceHeader, h: &mut FrameHeader) -> Result<()> {
+    if h.frame_is_intra() || !h.reference_select || !seq.enable_order_hint {
+        return Ok(());
+    }
+    let (mut fwd, mut bwd) = (-1i32, -1i32);
+    let (mut fwd_hint, mut bwd_hint) = (0, 0);
+    for i in 0..7 {
+        let hint = h.order_hints[i + 1];
+        let d = rel_dist(seq, hint, h.order_hint);
+        if d < 0 {
+            if fwd < 0 || rel_dist(seq, hint, fwd_hint) > 0 {
+                fwd = i as i32;
+                fwd_hint = hint;
+            }
+        } else if d > 0 && (bwd < 0 || rel_dist(seq, hint, bwd_hint) < 0) {
+            bwd = i as i32;
+            bwd_hint = hint;
+        }
+    }
+    let second = if fwd < 0 {
+        return Ok(());
+    } else if bwd >= 0 {
+        bwd
+    } else {
+        let mut s = -1i32;
+        let mut s_hint = 0;
+        for i in 0..7 {
+            let hint = h.order_hints[i + 1];
+            if rel_dist(seq, hint, fwd_hint) < 0 && (s < 0 || rel_dist(seq, hint, s_hint) > 0) {
+                s = i as i32;
+                s_hint = hint;
+            }
+        }
+        if s < 0 {
+            return Ok(());
+        }
+        s
+    };
+    h.skip_mode_frame = [1 + fwd.min(second) as i8, 1 + fwd.max(second) as i8];
+    h.skip_mode_present = b.flag()?;
+    Ok(())
+}
+
+fn decode_subexp(b: &mut Bits, num_syms: u32) -> Result<u32> {
+    let (mut i, mut mk, k) = (0, 0, 3);
+    loop {
+        let b2 = if i > 0 { k + i - 1 } else { k };
+        let a = 1 << b2;
+        if num_syms <= mk + 3 * a {
+            return Ok(b.ns(num_syms - mk)? + mk);
+        }
+        if b.flag()? {
+            i += 1;
+            mk += a;
+        } else {
+            return Ok(b.f(b2)? + mk);
+        }
+    }
+}
+
+fn inverse_recenter(r: i32, v: i32) -> i32 {
+    if v > 2 * r {
+        v
+    } else if v & 1 == 1 {
+        r - ((v + 1) >> 1)
+    } else {
+        r + (v >> 1)
+    }
+}
+
+fn global_motion_params(b: &mut Bits, h: &mut FrameHeader, prev: &[[i32; 6]; 8]) -> Result<()> {
+    for r in 1..8 {
+        let typ = if !b.flag()? {
+            0
+        } else if b.flag()? {
+            2
+        } else if b.flag()? {
+            GM_TRANSLATION
+        } else {
+            3
+        };
+        h.gm_type[r] = typ;
+        let mut read = |idx: usize, h: &mut FrameHeader| -> Result<()> {
+            let (abs_bits, prec_bits) = if idx < 2 {
+                if typ == GM_TRANSLATION {
+                    let hp = !h.allow_high_precision_mv as u32;
+                    (9 - hp, 3 - hp)
+                } else {
+                    (12, 6)
+                }
+            } else {
+                (12, 15)
+            };
+            let prec_diff = 16 - prec_bits;
+            let round = if idx % 3 == 2 { 1 << 16 } else { 0 };
+            let sub = if idx % 3 == 2 { 1 << prec_bits } else { 0 };
+            let mx = 1i32 << abs_bits;
+            let rr = (prev[r][idx] >> prec_diff) - sub;
+            // decode_signed_subexp_with_ref(-mx, mx + 1, rr)
+            let (low, high) = (-mx, mx + 1);
+            let (n, rv) = (high - low, rr - low);
+            let v = decode_subexp(b, n as u32)? as i32;
+            let x = if (rv << 1) <= n { inverse_recenter(rv, v) } else { n - 1 - inverse_recenter(n - 1 - rv, v) };
+            h.gm_params[r][idx] = ((x + low) << prec_diff) + round;
+            Ok(())
+        };
+        if typ >= 2 {
+            read(2, h)?;
+            read(3, h)?;
+            if typ == 3 {
+                read(4, h)?;
+                read(5, h)?;
+            } else {
+                h.gm_params[r][4] = -h.gm_params[r][3];
+                h.gm_params[r][5] = h.gm_params[r][2];
+            }
+        }
+        if typ >= GM_TRANSLATION {
+            read(0, h)?;
+            read(1, h)?;
+        }
+    }
+    Ok(())
 }
 
 fn tile_info(b: &mut Bits, seq: &SequenceHeader, h: &mut FrameHeader) -> Result<()> {
@@ -789,9 +1122,9 @@ pub fn seg_qidx(h: &FrameHeader, seg: usize, ignore_delta: bool, current: i32) -
 }
 
 fn loop_filter_params(b: &mut Bits, seq: &SequenceHeader, h: &mut FrameHeader) -> Result<()> {
-    h.lf_ref_deltas = [1, 0, 0, 0, -1, 0, -1, -1];
-    h.lf_mode_deltas = [0, 0];
     if h.coded_lossless || h.allow_intrabc {
+        h.lf_ref_deltas = LF_REF_DELTAS;
+        h.lf_mode_deltas = [0, 0];
         return Ok(());
     }
     h.lf_level[0] = b.f(6)? as u8;

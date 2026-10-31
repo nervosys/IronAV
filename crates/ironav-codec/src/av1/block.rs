@@ -1,9 +1,13 @@
 //! Tile decoding of intra frames (spec 5.11 and 7.10 to 7.13): superblock partitions, intra mode
 //! info, palettes, transform sizes and types, coefficients, prediction and reconstruction.
 
+use std::sync::Arc;
+
+use super::inter_tables::*;
 use super::ipred::{predict_cfl, predict_intra, Edges, Plane};
 use super::itx::inverse_transform;
 use super::lr;
+use super::mvpred::*;
 use super::obu::{seg_qidx, FrameHeader, SequenceHeader, TX_MODE_SELECT};
 use super::qm_tables::weights;
 use super::quant_tables::*;
@@ -12,11 +16,13 @@ use super::symbol::{Cdfs, SymbolDecoder};
 use super::tables::*;
 use ironav_core::{Error, ErrorCode, Result};
 
-const DC_PRED: u8 = 0;
-const SMOOTH_PRED: u8 = 9;
+pub(crate) const DC_PRED: u8 = 0;
+pub(crate) const SMOOTH_PRED: u8 = 9;
 const SMOOTH_H_PRED: u8 = 11;
 const UV_CFL_PRED: u8 = 13;
-const SEG_LVL_SKIP: usize = 6;
+pub(crate) const SEG_LVL_REF_FRAME: usize = 5;
+pub(crate) const SEG_LVL_SKIP: usize = 6;
+pub(crate) const SEG_LVL_GLOBALMV: usize = 7;
 
 /// Block size by log2 width and height in 4-sample units (22 where there is none).
 const BLOCK_BY_DIMS: [[u8; 6]; 6] = [
@@ -61,38 +67,98 @@ pub struct Mi {
     pub uv_mode: u8,
     pub skip: bool,
     pub seg: u8,
+    /// InterTxSizes: the transform size at this 4x4.
     pub tx: u8,
     pub pal: [u8; 2],
+    /// RefFrames: -1 none, 0 intra, 1 to 7 LAST_FRAME to ALTREF_FRAME.
+    pub ref_frame: [i8; 2],
+    pub mv: [Mv; 2],
+    pub skip_mode: bool,
+    /// InterpFilters by direction (0 vertical, 1 horizontal).
+    pub interp: [u8; 2],
+    pub comp_group_idx: u8,
+    pub compound_idx: u8,
+    /// Whether the block here has been decoded in this frame.
+    pub coded: bool,
 }
+
+pub(crate) const MOTION_OBMC: u8 = 1;
+pub(crate) const MOTION_LOCALWARP: u8 = 2;
+pub(crate) const COMPOUND_WEDGE: u8 = 0;
+pub(crate) const COMPOUND_DIFFWTD: u8 = 1;
+pub(crate) const COMPOUND_AVERAGE: u8 = 2;
+pub(crate) const COMPOUND_INTRA: u8 = 3;
+pub(crate) const COMPOUND_DISTANCE: u8 = 4;
 
 /// The mode info of the block being decoded.
 #[derive(Default)]
-struct Block {
-    row: usize,
-    col: usize,
-    size: usize,
-    bw4: usize,
-    bh4: usize,
-    has_chroma: bool,
-    avail_u: bool,
-    avail_l: bool,
-    avail_u_c: bool,
-    avail_l_c: bool,
-    skip: bool,
-    seg: usize,
-    lossless: bool,
-    y_mode: u8,
-    uv_mode: u8,
-    angle_y: i32,
-    angle_uv: i32,
-    cfl: [i32; 2],
-    filter: Option<u8>,
-    pal_size: [usize; 2],
-    pal: [[u16; 8]; 3],
-    tx: usize,
-    max_luma_w: usize,
-    max_luma_h: usize,
-    qidx: i32,
+pub(crate) struct Block {
+    pub row: usize,
+    pub col: usize,
+    pub size: usize,
+    pub bw4: usize,
+    pub bh4: usize,
+    pub has_chroma: bool,
+    pub avail_u: bool,
+    pub avail_l: bool,
+    pub avail_u_c: bool,
+    pub avail_l_c: bool,
+    pub skip: bool,
+    pub seg: usize,
+    pub lossless: bool,
+    pub y_mode: u8,
+    pub uv_mode: u8,
+    pub angle_y: i32,
+    pub angle_uv: i32,
+    pub cfl: [i32; 2],
+    pub filter: Option<u8>,
+    pub pal_size: [usize; 2],
+    pub pal: [[u16; 8]; 3],
+    pub tx: usize,
+    pub max_luma_w: usize,
+    pub max_luma_h: usize,
+    pub qidx: i32,
+    pub is_inter: bool,
+    pub skip_mode: bool,
+    pub ref_frame: [i8; 2],
+    pub mv: [Mv; 2],
+    pub interintra: bool,
+    pub ii_mode: u8,
+    pub wedge_ii: bool,
+    pub wedge_index: usize,
+    pub wedge_sign: usize,
+    pub mask_type: usize,
+    pub motion_mode: u8,
+    pub compound_type: u8,
+    pub comp_group_idx: u8,
+    pub compound_idx: u8,
+    pub interp: [u8; 2],
+    /// Whether the transform sizes vary inside the block (read_var_tx_size wrote them).
+    pub var_tx: bool,
+    pub local_warp: [i32; 6],
+    pub local_valid: bool,
+}
+
+/// A decoded frame as a reference: its pictures and what later frames read of its motion.
+pub struct Picture {
+    pub planes: [Plane; 3],
+    /// The upscaled width and the height.
+    pub width: usize,
+    pub height: usize,
+    pub bd: u32,
+    pub ss: [usize; 2],
+    pub mono: bool,
+    pub rgb: bool,
+    pub frame_type: u8,
+    pub order_hint: u32,
+    /// SavedOrderHints: the order hints of the frame's references, by reference frame.
+    pub saved_hints: [u32; 8],
+    pub mi_rows: usize,
+    pub mi_cols: usize,
+    /// SavedRefFrames and SavedMvs, one per 8x8.
+    pub mvs: Vec<SavedMv>,
+    /// SavedSegmentIds, one per 4x4.
+    pub seg_ids: Vec<u8>,
 }
 
 /// One tile's symbol decoder and CDFs.
@@ -159,17 +225,19 @@ pub struct FrameDec {
     pub ss: [usize; 2],
     pub bd: u32,
     pub num_planes: usize,
-    sb4: usize,
+    pub(crate) sb4: usize,
     above_lvl: [Vec<u8>; 3],
     above_dc: [Vec<u8>; 3],
     left_lvl: [Vec<u8>; 3],
     left_dc: [Vec<u8>; 3],
-    tile: [usize; 4],
+    above_seg_pred: Vec<u8>,
+    left_seg_pred: Vec<u8>,
+    pub(crate) tile: [usize; 4],
     current_q: i32,
     dlf: [i32; 4],
     read_deltas: bool,
-    decoded: [Vec<bool>; 3],
-    b: Block,
+    pub(crate) decoded: [Vec<bool>; 3],
+    pub(crate) b: Block,
     color_map: [Vec<u8>; 2],
     quant: Vec<u32>,
     dq: Vec<i32>,
@@ -179,6 +247,20 @@ pub struct FrameDec {
     /// RefLrWiener and RefSgrXqd: the previous unit's values, which the next unit codes against.
     ref_wiener: [[[i32; 3]; 2]; 3],
     ref_sgr: [[i32; 2]; 3],
+    /// The reference pictures by reference frame (LAST_FRAME to ALTREF_FRAME).
+    pub refs: [Option<Arc<Picture>>; 8],
+    /// PrevSegmentIds, when the primary reference frame has them.
+    pub prev_seg: Option<Arc<Picture>>,
+    pub(crate) tpl: Vec<Tpl>,
+    pub(crate) tpl_stride: usize,
+    pub saved_mvs: Vec<SavedMv>,
+    /// TxTypes of the luma 4x4s, for the chroma transform types of inter blocks.
+    tx_types: Vec<u8>,
+    /// Shear parameters of each global motion model, when it can warp.
+    pub(crate) gm_shear: [Option<[i32; 4]>; 8],
+    pub(crate) pred: [Vec<i32>; 2],
+    pub(crate) tmp: Vec<i32>,
+    pub(crate) mask: Vec<u8>,
 }
 
 const DEC_STRIDE: usize = 35;
@@ -237,23 +319,35 @@ impl FrameDec {
             quant: vec![0; 1024],
             dq: vec![0; 1024],
             res: vec![0; 4096],
+            above_seg_pred: vec![0; aw / 4 + 32],
+            left_seg_pred: vec![0; ah / 4 + 32],
+            refs: Default::default(),
+            prev_seg: None,
+            tpl: vec![Tpl { mv: [INVALID_MV, 0], offset: 0 }; h.mi_rows.div_ceil(2) * h.mi_cols.div_ceil(2)],
+            tpl_stride: h.mi_cols.div_ceil(2),
+            saved_mvs: vec![SavedMv { rf: -1, mv: [0, 0] }; h.mi_rows.div_ceil(2) * h.mi_cols.div_ceil(2)],
+            tx_types: vec![0; mi_n],
+            gm_shear: std::array::from_fn(|i| super::inter::setup_shear(&h.gm_params[i])),
+            pred: [vec![0; 128 * 128], vec![0; 128 * 128]],
+            tmp: vec![0; 128 * (128 * 2 + 16 + 8)],
+            mask: vec![0; 128 * 128],
             seq,
             h,
         }
     }
 
     #[inline]
-    fn mi_at(&self, r: usize, c: usize) -> &Mi {
+    pub(crate) fn mi_at(&self, r: usize, c: usize) -> &Mi {
         &self.mi[r * self.mi_stride + c]
     }
 
     #[inline]
-    fn inside(&self, r: isize, c: isize) -> bool {
+    pub(crate) fn inside(&self, r: isize, c: isize) -> bool {
         let [rs, re, cs, ce] = self.tile;
         c >= cs as isize && c < ce as isize && r >= rs as isize && r < re as isize
     }
 
-    fn sub(&self, plane: usize) -> (usize, usize) {
+    pub(crate) fn sub(&self, plane: usize) -> (usize, usize) {
         if plane == 0 {
             (0, 0)
         } else {
@@ -275,6 +369,7 @@ impl FrameDec {
         }
         self.ref_wiener = [[lr::WIENER_TAPS_MID; 2]; 3];
         self.ref_sgr = [lr::SGRPROJ_XQD_MID; 3];
+        self.above_seg_pred.fill(0);
         let sb4 = self.sb4;
         let sb_size = if sb4 == 32 { BLOCK_128X128 } else { BLOCK_64X64 };
         let [rs, re, cs, ce] = self.tile;
@@ -283,6 +378,7 @@ impl FrameDec {
                 self.left_lvl[p].fill(0);
                 self.left_dc[p].fill(0);
             }
+            self.left_seg_pred.fill(0);
             for c in (cs..ce).step_by(sb4) {
                 self.read_deltas = self.h.delta_q_present;
                 self.clear_cdef(r, c);
@@ -511,33 +607,47 @@ impl FrameDec {
             avail_u_c = false;
             avail_l_c = false;
         }
-        self.b = Block { row: r, col: c, size: bs, bw4, bh4, has_chroma, avail_u, avail_l, avail_u_c, avail_l_c, ..Default::default() };
-        self.mode_info(t)?;
+        self.b = Block { row: r, col: c, size: bs, bw4, bh4, has_chroma, avail_u, avail_l, avail_u_c, avail_l_c, ref_frame: [0, -1], compound_idx: 1, ..Default::default() };
+        if self.h.frame_is_intra() {
+            self.intra_frame_mode_info(t)?;
+        } else {
+            self.inter_frame_mode_info(t)?;
+        }
         self.b.qidx = seg_qidx(&self.h, self.b.seg, false, self.current_q);
         self.palette_tokens(t);
-        self.read_tx_size(t);
+        self.read_block_tx_size(t);
         if self.b.skip {
             self.reset_block_context();
         }
         self.store_mi();
+        if !self.h.frame_is_intra() {
+            self.save_mvs();
+        }
+        if self.b.is_inter {
+            self.predict_inter_block();
+        }
         self.residual(t)
     }
 
-    fn seg_feature(&self, seg: usize, f: usize) -> bool {
+    pub(crate) fn seg_feature(&self, seg: usize, f: usize) -> bool {
         self.h.seg_enabled && self.h.feature_enabled[seg][f]
     }
 
-    fn mode_info(&mut self, t: &mut Tile) -> Result<()> {
+    fn read_skip(&mut self, t: &mut Tile) {
         let (r, c) = (self.b.row, self.b.col);
-        if self.h.seg_id_pre_skip {
-            self.intra_segment_id(t);
-        }
         self.b.skip = if self.h.seg_id_pre_skip && self.seg_feature(self.b.seg, SEG_LVL_SKIP) {
             true
         } else {
             let ctx = (self.b.avail_u && self.mi_at(r - 1, c).skip) as usize + (self.b.avail_l && self.mi_at(r, c - 1).skip) as usize;
             t.sd.symbol(&mut t.cdf.skip[ctx]) == 1
         };
+    }
+
+    fn intra_frame_mode_info(&mut self, t: &mut Tile) -> Result<()> {
+        if self.h.seg_id_pre_skip {
+            self.intra_segment_id(t);
+        }
+        self.read_skip(t);
         if !self.h.seg_id_pre_skip {
             self.intra_segment_id(t);
         }
@@ -549,9 +659,45 @@ impl FrameDec {
         if self.h.allow_intrabc && t.sd.symbol(&mut t.cdf.intrabc) == 1 {
             return Err(unsupported("intra block copy is not decoded yet"));
         }
-        let above = if self.b.avail_u { self.mi_at(r - 1, c).y_mode } else { DC_PRED };
-        let left = if self.b.avail_l { self.mi_at(r, c - 1).y_mode } else { DC_PRED };
-        let y = t.sd.symbol(&mut t.cdf.kf_y_mode[INTRA_MODE_CONTEXT[above as usize]][INTRA_MODE_CONTEXT[left as usize]]) as u8;
+        self.intra_block_mode_info(t, true);
+        Ok(())
+    }
+
+    fn inter_frame_mode_info(&mut self, t: &mut Tile) -> Result<()> {
+        self.inter_segment_id(t, true);
+        self.read_skip_mode(t);
+        if self.b.skip_mode {
+            self.b.skip = true;
+        } else {
+            self.read_skip(t);
+        }
+        if !self.h.seg_id_pre_skip {
+            self.inter_segment_id(t, false);
+        }
+        self.b.lossless = self.h.lossless[self.b.seg];
+        self.read_cdef(t);
+        self.read_delta_q(t);
+        self.read_delta_lf(t);
+        self.read_deltas = false;
+        self.read_is_inter(t);
+        if self.b.is_inter {
+            self.inter_block_mode_info(t);
+        } else {
+            self.intra_block_mode_info(t, false);
+        }
+        Ok(())
+    }
+
+    /// The intra mode info of a block of an intra frame (`kf`) or an inter frame.
+    fn intra_block_mode_info(&mut self, t: &mut Tile, kf: bool) {
+        let (r, c) = (self.b.row, self.b.col);
+        let y = if kf {
+            let above = if self.b.avail_u { self.mi_at(r - 1, c).y_mode } else { DC_PRED };
+            let left = if self.b.avail_l { self.mi_at(r, c - 1).y_mode } else { DC_PRED };
+            t.sd.symbol(&mut t.cdf.kf_y_mode[INTRA_MODE_CONTEXT[above as usize]][INTRA_MODE_CONTEXT[left as usize]]) as u8
+        } else {
+            t.sd.symbol(&mut t.cdf.y_mode[SIZE_GROUP[self.b.size] as usize]) as u8
+        };
         self.b.y_mode = y;
         let bs = self.b.size;
         if bs >= BLOCK_8X8 && (1..=8).contains(&y) {
@@ -582,9 +728,60 @@ impl FrameDec {
         if self.seq.enable_filter_intra && y == DC_PRED && self.b.pal_size[0] == 0 && bw.max(bh) <= 32 && t.sd.symbol(&mut t.cdf.filter_intra[bs]) == 1 {
             self.b.filter = Some(t.sd.symbol(&mut t.cdf.filter_intra_mode) as u8);
         }
-        Ok(())
     }
 
+    /// inter_segment_id.
+    fn inter_segment_id(&mut self, t: &mut Tile, pre_skip: bool) {
+        if !self.h.seg_enabled {
+            self.b.seg = 0;
+            return;
+        }
+        let (r, c, bw4, bh4) = (self.b.row, self.b.col, self.b.bw4, self.b.bh4);
+        // get_segment_id: the smallest previous segment id over the block
+        let pred = match &self.prev_seg {
+            Some(p) => {
+                let mut s = 7;
+                for y in r..(r + bh4).min(self.h.mi_rows) {
+                    for x in c..(c + bw4).min(self.h.mi_cols) {
+                        s = s.min(p.seg_ids[y * self.mi_stride + x]);
+                    }
+                }
+                s as usize
+            }
+            None => 0,
+        };
+        if !self.h.seg_update_map {
+            self.b.seg = pred;
+            return;
+        }
+        if pre_skip && !self.h.seg_id_pre_skip {
+            self.b.seg = 0;
+            return;
+        }
+        if !pre_skip {
+            if self.b.skip {
+                self.above_seg_pred[c..c + bw4].fill(0);
+                self.left_seg_pred[r..r + bh4].fill(0);
+                self.intra_segment_id(t);
+                return;
+            }
+        }
+        if self.h.seg_temporal_update {
+            let ctx = self.left_seg_pred[r] as usize + self.above_seg_pred[c] as usize;
+            let p = t.sd.symbol(&mut t.cdf.segment_pred[ctx]) as u8;
+            if p == 1 {
+                self.b.seg = pred;
+            } else {
+                self.intra_segment_id(t);
+            }
+            self.above_seg_pred[c..c + bw4].fill(p);
+            self.left_seg_pred[r..r + bh4].fill(p);
+        } else {
+            self.intra_segment_id(t);
+        }
+    }
+
+    /// read_segment_id (the spatial prediction of the segment id).
     fn intra_segment_id(&mut self, t: &mut Tile) {
         if !self.h.seg_enabled {
             self.b.seg = 0;
@@ -868,7 +1065,7 @@ impl FrameDec {
         }
     }
 
-    fn read_tx_size(&mut self, t: &mut Tile) {
+    pub(crate) fn read_tx_size(&mut self, t: &mut Tile, allow_select: bool) {
         let bs = self.b.size;
         if self.b.lossless {
             self.b.tx = TX_4X4;
@@ -876,10 +1073,20 @@ impl FrameDec {
         }
         let max_rect = MAX_TX_SIZE_RECT[bs];
         let mut tx = max_rect;
-        if bs > BLOCK_4X4 && self.h.tx_mode == TX_MODE_SELECT {
+        if bs > BLOCK_4X4 && allow_select && self.h.tx_mode == TX_MODE_SELECT {
             let (r, c) = (self.b.row, self.b.col);
-            let above_w = if self.b.avail_u { 1usize << TX_W_LOG2[self.mi_at(r - 1, c).tx as usize] } else { 0 };
-            let left_h = if self.b.avail_l { 1usize << TX_H_LOG2[self.mi_at(r, c - 1).tx as usize] } else { 0 };
+            let above_w = if self.b.avail_u {
+                let m = self.mi_at(r - 1, c);
+                if m.ref_frame[0] > 0 { 4usize << MI_W_LOG2[m.size as usize] } else { 1usize << TX_W_LOG2[m.tx as usize] }
+            } else {
+                0
+            };
+            let left_h = if self.b.avail_l {
+                let m = self.mi_at(r, c - 1);
+                if m.ref_frame[0] > 0 { 4usize << MI_H_LOG2[m.size as usize] } else { 1usize << TX_H_LOG2[m.tx as usize] }
+            } else {
+                0
+            };
             let ctx = (above_w >= 1 << TX_W_LOG2[max_rect]) as usize + (left_h >= 1 << TX_H_LOG2[max_rect]) as usize;
             let cat = MAX_TX_DEPTH_OF[bs] as usize - 1;
             let depth = if cat == 0 { t.sd.symbol(&mut t.cdf.tx_size_8x8[ctx]) } else { t.sd.symbol(&mut t.cdf.tx_size[cat - 1][ctx]) };
@@ -926,8 +1133,17 @@ impl FrameDec {
                 }
                 m.skip = b.skip;
                 m.seg = b.seg as u8;
-                m.tx = b.tx as u8;
+                if !b.var_tx {
+                    m.tx = b.tx as u8;
+                }
                 m.pal = [b.pal_size[0] as u8, b.pal_size[1] as u8];
+                m.ref_frame = b.ref_frame;
+                m.mv = b.mv;
+                m.skip_mode = b.skip_mode;
+                m.interp = b.interp;
+                m.comp_group_idx = b.comp_group_idx;
+                m.compound_idx = b.compound_idx;
+                m.coded = true;
                 if pal {
                     self.pal_colors[i] = colors;
                 }
@@ -974,6 +1190,10 @@ impl FrameDec {
                     let psz = plane_block(size_chunk, ssx, ssy);
                     let (n4w, n4h) = (NUM_4X4_W[psz] as usize, NUM_4X4_H[psz] as usize);
                     let (base_x, base_y) = ((c >> ssx) * 4, (r >> ssy) * 4);
+                    if self.b.is_inter && !self.b.lossless && plane == 0 {
+                        self.transform_tree(t, base_x + cx * 64, base_y + cy * 64, n4w * 4, n4h * 4)?;
+                        continue;
+                    }
                     for y in (0..n4h).step_by(step_y) {
                         for x in (0..n4w).step_by(step_x) {
                             self.transform_block(t, plane, base_x, base_y, tx, x + ((cx << 4) >> ssx), y + ((cy << 4) >> ssy))?;
@@ -985,12 +1205,37 @@ impl FrameDec {
         Ok(())
     }
 
+    fn transform_tree(&mut self, t: &mut Tile, x: usize, y: usize, w: usize, h: usize) -> Result<()> {
+        if x >= self.h.mi_cols * 4 || y >= self.h.mi_rows * 4 {
+            return Ok(());
+        }
+        let tx = self.mi_at(y >> 2, x >> 2).tx as usize;
+        if w <= 1 << TX_W_LOG2[tx] && h <= 1 << TX_H_LOG2[tx] {
+            return self.transform_block(t, 0, x, y, tx, 0, 0);
+        }
+        if w > h {
+            self.transform_tree(t, x, y, w / 2, h)?;
+            self.transform_tree(t, x + w / 2, y, w / 2, h)
+        } else if w < h {
+            self.transform_tree(t, x, y, w, h / 2)?;
+            self.transform_tree(t, x, y + h / 2, w, h / 2)
+        } else {
+            self.transform_tree(t, x, y, w / 2, h / 2)?;
+            self.transform_tree(t, x + w / 2, y, w / 2, h / 2)?;
+            self.transform_tree(t, x, y + h / 2, w / 2, h / 2)?;
+            self.transform_tree(t, x + w / 2, y + h / 2, w / 2, h / 2)
+        }
+    }
+
     /// get_filter_type: whether a neighbour of the block uses a smooth predictor.
     fn filter_type(&self, plane: usize) -> bool {
         let (r, c) = (self.b.row, self.b.col);
         let [ssx, ssy] = self.ss;
         let smooth = |r: usize, c: usize| {
             let m = self.mi_at(r, c);
+            if plane > 0 && m.ref_frame[0] > 0 {
+                return false;
+            }
             let mode = if plane == 0 { m.y_mode } else { m.uv_mode };
             (SMOOTH_PRED..=SMOOTH_H_PRED).contains(&mode)
         };
@@ -1037,7 +1282,8 @@ impl FrameDec {
         let (log2w, log2h) = (TX_W_LOG2[tx] as u32, TX_H_LOG2[tx] as u32);
         let (step_x, step_y) = (1usize << (log2w - 2), 1usize << (log2h - 2));
         let pt = (plane > 0) as usize;
-        if self.b.pal_size[pt] > 0 {
+        if self.b.is_inter {
+        } else if self.b.pal_size[pt] > 0 {
             let (w, h) = (1usize << log2w, 1usize << log2h);
             let map = &self.color_map[pt];
             let pal = &self.b.pal[plane];
@@ -1108,12 +1354,22 @@ impl FrameDec {
         Ok(())
     }
 
-    /// get_tx_set for an intra block: 0 DCT only, 1 intra set 1, 2 intra set 2.
+    /// get_tx_set: 0 DCT only, 1 and 2 the intra sets, 3 to 5 the inter sets.
     fn tx_set(&self, tx: usize) -> u8 {
-        let up = TX_SIZE_SQR_UP[tx];
-        if up >= TX_32X32 {
+        let (sqr, up) = (TX_SIZE_SQR[tx], TX_SIZE_SQR_UP[tx]);
+        if self.b.is_inter {
+            if up > TX_32X32 {
+                0
+            } else if self.h.reduced_tx_set || up == TX_32X32 {
+                5
+            } else if sqr == TX_16X16 {
+                4
+            } else {
+                3
+            }
+        } else if up >= TX_32X32 {
             0
-        } else if self.h.reduced_tx_set || TX_SIZE_SQR[tx] == TX_16X16 {
+        } else if self.h.reduced_tx_set || sqr == TX_16X16 {
             2
         } else {
             1
@@ -1121,30 +1377,50 @@ impl FrameDec {
     }
 
     /// The transform type of a transform block: read for luma (transform_type), derived for chroma.
-    fn tx_type(&mut self, t: &mut Tile, plane: usize, tx: usize) -> u8 {
+    fn tx_type(&mut self, t: &mut Tile, plane: usize, tx: usize, x4: usize, y4: usize) -> u8 {
         let set = self.tx_set(tx);
         if plane == 0 {
             let q = if self.h.seg_enabled { seg_qidx(&self.h, self.b.seg, true, 0) } else { self.h.base_q_idx };
             if set == 0 || q == 0 {
                 return DCT_DCT;
             }
-            let dir = match self.b.filter {
-                Some(m) => FILTER_INTRA_DIR[m as usize],
-                None => self.b.y_mode,
-            } as usize;
             let sqr = TX_SIZE_SQR[tx];
-            let tt = if set == 1 {
-                TX_TYPE_INTRA_INV_SET1[t.sd.symbol(&mut t.cdf.intra_tx_1[sqr][dir])]
-            } else {
-                TX_TYPE_INTRA_INV_SET2[t.sd.symbol(&mut t.cdf.intra_tx_2[sqr][dir])]
+            let c = &mut t.cdf;
+            let tt = match set {
+                1 | 2 => {
+                    let dir = match self.b.filter {
+                        Some(m) => FILTER_INTRA_DIR[m as usize],
+                        None => self.b.y_mode,
+                    } as usize;
+                    if set == 1 {
+                        TX_TYPE_INTRA_INV_SET1[t.sd.symbol(&mut c.intra_tx_1[sqr][dir])]
+                    } else {
+                        TX_TYPE_INTRA_INV_SET2[t.sd.symbol(&mut c.intra_tx_2[sqr][dir])]
+                    }
+                }
+                3 => TX_TYPE_INTER_INV_SET1[t.sd.symbol(&mut c.inter_tx_1[sqr])],
+                4 => TX_TYPE_INTER_INV_SET2[t.sd.symbol(&mut c.inter_tx_2[sqr])],
+                _ => TX_TYPE_INTER_INV_SET3[t.sd.symbol(&mut c.inter_tx_3[sqr])],
             };
             return if self.b.lossless { DCT_DCT } else { tt };
         }
         if self.b.lossless || TX_SIZE_SQR_UP[tx] > TX_32X32 {
             return DCT_DCT;
         }
-        let tt = MODE_TO_TXFM[self.b.uv_mode as usize];
-        if tx_type_in_intra_set(set, tt) {
+        let tt = if self.b.is_inter {
+            let (ssx, ssy) = self.sub(plane);
+            let (x, y) = (self.b.col.max(x4 << ssx), self.b.row.max(y4 << ssy));
+            self.tx_types[y * self.mi_stride + x]
+        } else {
+            MODE_TO_TXFM[self.b.uv_mode as usize]
+        };
+        let ok = match set {
+            0..=2 => tx_type_in_intra_set(set, tt),
+            3 => true,
+            4 => tt < 12,
+            _ => tt == DCT_DCT || tt == IDTX,
+        };
+        if ok {
             tt
         } else {
             DCT_DCT
@@ -1192,7 +1468,7 @@ impl FrameDec {
         let mut eob = 0;
         let mut tt = DCT_DCT;
         if !all_zero {
-            tt = self.tx_type(t, plane, tx);
+            tt = self.tx_type(t, plane, tx, x4, y4);
             let class = tx_class(tt);
             let scan = scan_for(tx, tt);
             let eob_multi = log2w.min(5) + log2h.min(5) - 4;
@@ -1325,6 +1601,11 @@ impl FrameDec {
         for i in y4..y4 + h4 {
             self.left_lvl[plane][i] = cul as u8;
             self.left_dc[plane][i] = dc_cat;
+        }
+        if plane == 0 && self.b.is_inter {
+            for y in y4..(y4 + h4).min(self.h.mi_rows) {
+                self.tx_types[y * self.mi_stride + x4..y * self.mi_stride + (x4 + w4).min(self.h.mi_cols)].fill(tt);
+            }
         }
         Ok((eob, tt))
     }

@@ -127,7 +127,59 @@ pub(crate) fn update_cdf(cdf: &mut [u16], sym: usize) {
     }
 }
 
-/// Every adaptive CDF of a tile. Intra frames use the first group; inter frames will use the rest.
+/// The CDFs of one motion vector component.
+#[derive(Clone)]
+pub struct MvComp {
+    pub sign: [u16; 2],
+    pub class: [u16; 11],
+    pub class0: [u16; 2],
+    pub class0_fr: [[u16; 4]; 2],
+    pub class0_hp: [u16; 2],
+    pub fr: [u16; 4],
+    pub hp: [u16; 2],
+    pub bits: [[u16; 2]; 10],
+}
+
+/// The motion vector CDFs of one MV context.
+#[derive(Clone)]
+pub struct MvCdfs {
+    pub joint: [u16; 4],
+    pub comp: [MvComp; 2],
+}
+
+impl MvCdfs {
+    fn new() -> MvCdfs {
+        let c = MvComp {
+            sign: default_mv_sign_cdf,
+            class: default_mv_class_cdf,
+            class0: default_mv_class0_cdf,
+            class0_fr: default_mv_class0_fr_cdf,
+            class0_hp: default_mv_class0_hp_cdf,
+            fr: default_mv_fr_cdf,
+            hp: default_mv_hp_cdf,
+            bits: default_mv_bits_cdf,
+        };
+        MvCdfs { joint: default_mv_joint_cdf, comp: [c.clone(), c] }
+    }
+}
+
+impl Counted for MvCdfs {
+    fn clear_counts(&mut self) {
+        self.joint.clear_counts();
+        for c in self.comp.iter_mut() {
+            c.sign.clear_counts();
+            c.class.clear_counts();
+            c.class0.clear_counts();
+            c.class0_fr.clear_counts();
+            c.class0_hp.clear_counts();
+            c.fr.clear_counts();
+            c.hp.clear_counts();
+            c.bits.clear_counts();
+        }
+    }
+}
+
+/// Every adaptive CDF of a tile. Intra frames use the first group, inter frames all of them.
 #[derive(Clone)]
 pub struct Cdfs {
     pub kf_y_mode: [[[u16; INTRA_MODES]; KF_MODE_CONTEXTS]; KF_MODE_CONTEXTS],
@@ -174,6 +226,37 @@ pub struct Cdfs {
     pub coeff_base_eob: [[[[u16; 3]; SIG_COEF_CONTEXTS_EOB]; PLANE_TYPES]; TX_SIZES],
     pub coeff_base: [[[[u16; 4]; SIG_COEF_CONTEXTS]; PLANE_TYPES]; TX_SIZES],
     pub coeff_br: [[[[u16; BR_CDF_SIZE]; LEVEL_CONTEXTS]; PLANE_TYPES]; TX_SIZES],
+    pub y_mode: [[u16; INTRA_MODES]; BLOCK_SIZE_GROUPS],
+    pub inter_tx_1: [[u16; 16]; TX_SIZE_SQR_CONTEXTS],
+    pub inter_tx_2: [[u16; 12]; TX_SIZE_SQR_CONTEXTS],
+    pub inter_tx_3: [[u16; 2]; TX_SIZE_SQR_CONTEXTS],
+    pub interp_filter: [[u16; 3]; 16],
+    pub newmv: [[u16; 2]; 6],
+    pub zeromv: [[u16; 2]; 2],
+    pub refmv: [[u16; 2]; 6],
+    pub drl: [[u16; 2]; 3],
+    pub compound_mode: [[u16; 8]; 8],
+    pub interintra: [[u16; 2]; BLOCK_SIZE_GROUPS],
+    pub interintra_mode: [[u16; 4]; BLOCK_SIZE_GROUPS],
+    pub wedge_interintra: [[u16; 2]; BLOCK_SIZES_ALL],
+    pub compound_type: [[u16; 2]; BLOCK_SIZES_ALL],
+    pub wedge_idx: [[u16; 16]; BLOCK_SIZES_ALL],
+    pub motion_mode: [[u16; 3]; BLOCK_SIZES_ALL],
+    pub obmc: [[u16; 2]; BLOCK_SIZES_ALL],
+    pub intra_inter: [[u16; 2]; 4],
+    pub comp_mode: [[u16; 2]; 5],
+    pub comp_ref_type: [[u16; 2]; 5],
+    pub uni_comp_ref: [[[u16; 2]; 3]; 3],
+    pub single_ref: [[[u16; 2]; 6]; 3],
+    pub comp_ref: [[[u16; 2]; 3]; 3],
+    pub comp_bwdref: [[[u16; 2]; 2]; 3],
+    pub txfm_partition: [[u16; 2]; 21],
+    pub skip_mode: [[u16; 2]; 3],
+    pub compound_idx: [[u16; 2]; 6],
+    pub comp_group_idx: [[u16; 2]; 6],
+    pub segment_pred: [[u16; 2]; 3],
+    /// By MV context: 0 inter prediction, 1 intra block copy.
+    pub mv: [MvCdfs; 2],
 }
 
 /// The quantiser context of the coefficient CDFs for a base quantiser index.
@@ -236,6 +319,36 @@ impl Cdfs {
             coeff_base_eob: av1_default_coeff_base_eob_multi_cdfs[q],
             coeff_base: av1_default_coeff_base_multi_cdfs[q],
             coeff_br: av1_default_coeff_lps_multi_cdfs[q],
+            y_mode: default_if_y_mode_cdf,
+            inter_tx_1: default_inter_tx_1_cdf,
+            inter_tx_2: default_inter_tx_2_cdf,
+            inter_tx_3: default_inter_tx_3_cdf,
+            interp_filter: default_switchable_interp_cdf,
+            newmv: default_newmv_cdf,
+            zeromv: default_zeromv_cdf,
+            refmv: default_refmv_cdf,
+            drl: default_drl_cdf,
+            compound_mode: default_compound_mode_cdf,
+            interintra: default_interintra_cdf,
+            interintra_mode: default_interintra_mode_cdf,
+            wedge_interintra: default_wedge_interintra_cdf,
+            compound_type: default_compound_type_cdf,
+            wedge_idx: default_wedge_idx_cdf,
+            motion_mode: default_motion_mode_cdf,
+            obmc: default_obmc_cdf,
+            intra_inter: default_intra_inter_cdf,
+            comp_mode: default_comp_mode_cdf,
+            comp_ref_type: default_comp_ref_type_cdf,
+            uni_comp_ref: default_uni_comp_ref_cdf,
+            single_ref: default_single_ref_cdf,
+            comp_ref: default_comp_ref_cdf,
+            comp_bwdref: default_comp_bwdref_cdf,
+            txfm_partition: default_txfm_partition_cdf,
+            skip_mode: default_skip_mode_cdfs,
+            compound_idx: default_compound_idx_cdfs,
+            comp_group_idx: default_comp_group_idx_cdfs,
+            segment_pred: default_segment_pred_cdf,
+            mv: [MvCdfs::new(), MvCdfs::new()],
         })
     }
 
@@ -248,6 +361,9 @@ impl Cdfs {
         clear!(palette_y_size, palette_uv_size, palette_y_mode, palette_uv_mode, intrabc, filter_intra_mode, filter_intra, skip, delta_q, delta_lf_multi);
         clear!(delta_lf, seg_tree, spatial_seg, tx_size_8x8, tx_size, switchable_restore, wiener, sgrproj, dc_sign, txb_skip, eob_extra, eob16, eob32);
         clear!(eob64, eob128, eob256, eob512, eob1024, coeff_base_eob, coeff_base, coeff_br);
+        clear!(y_mode, inter_tx_1, inter_tx_2, inter_tx_3, interp_filter, newmv, zeromv, refmv, drl, compound_mode, interintra, interintra_mode);
+        clear!(wedge_interintra, compound_type, wedge_idx, motion_mode, obmc, intra_inter, comp_mode, comp_ref_type, uni_comp_ref, single_ref);
+        clear!(comp_ref, comp_bwdref, txfm_partition, skip_mode, compound_idx, comp_group_idx, segment_pred, mv);
         // a palette colour CDF of n symbols keeps its counter at n - 1
         for (i, (y, uv)) in self.palette_y_color.iter_mut().zip(self.palette_uv_color.iter_mut()).enumerate() {
             for c in y.iter_mut().chain(uv.iter_mut()) {

@@ -51,6 +51,9 @@ struct Case<'a> {
     params: &'a str,
     args: &'a [&'a str],
     frames: u32,
+    /// The key frame interval and libaom's speed.
+    gop: &'a str,
+    cpu: &'a str,
 }
 
 /// Encodes the case, decodes it with IronAV (software) and FFmpeg's libaom, and requires equal
@@ -61,7 +64,7 @@ fn check(c: &Case) -> usize {
     let raw = d.join("ref.raw");
     let y4m = d.join("out.y4m");
     let n = c.frames.to_string();
-    let mut enc = vec!["-f", "lavfi", "-i", c.src, "-frames:v", &n, "-c:v", "libaom-av1", "-g", "1", "-cpu-used", "6", "-pix_fmt", c.pix_fmt, "-aom-params", c.params];
+    let mut enc = vec!["-f", "lavfi", "-i", c.src, "-frames:v", &n, "-c:v", "libaom-av1", "-g", c.gop, "-cpu-used", c.cpu, "-pix_fmt", c.pix_fmt, "-aom-params", c.params];
     enc.extend_from_slice(c.args);
     enc.push(src.to_str().unwrap());
     assert!(ffmpeg(&enc), "{}: ffmpeg could not encode the stream", c.name);
@@ -79,8 +82,16 @@ fn check(c: &Case) -> usize {
 }
 
 fn case<'a>(name: &'a str, src: &'a str, params: &'a str, args: &'a [&'a str]) -> Case<'a> {
-    Case { name, container: "webm", src, pix_fmt: "yuv420p", params, args, frames: 2 }
+    Case { name, container: "webm", src, pix_fmt: "yuv420p", params, args, frames: 2, gop: "1", cpu: "6" }
 }
+
+/// An inter-coded case: one key frame, then `frames - 1` inter frames.
+fn inter<'a>(name: &'a str, src: &'a str, params: &'a str, args: &'a [&'a str], frames: u32, cpu: &'a str) -> Case<'a> {
+    Case { frames, gop: "1000", cpu, ..case(name, src, params, args) }
+}
+
+/// The inter tools libaom can turn off, off: single and plain compound prediction only.
+const NO_TOOLS: &str = "enable-cdef=0:enable-restoration=0:enable-obmc=0:enable-warped-motion=0:enable-global-motion=0:enable-masked-comp=0:enable-interintra-comp=0:enable-dist-wtd-comp=0:enable-diff-wtd-comp=0:enable-dual-filter=0:enable-ref-frame-mvs=0";
 
 /// The deblocking filter on, CDEF and loop restoration off.
 const DEBLOCK: &str = "enable-cdef=0:enable-restoration=0";
@@ -221,4 +232,20 @@ fn unsupported_tools_are_refused() {
         assert!(e.to_string().contains(want), "{file}: {e}");
     }
     let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn inter_dev() {
+    need_ffmpeg!();
+    let name = std::env::var("AV1_CASE").unwrap_or_default();
+    if name.is_empty() {
+        return;
+    }
+    let params = std::env::var("AV1_PARAMS").unwrap_or(NO_TOOLS.into());
+    let args: Vec<String> = std::env::var("AV1_ARGS").unwrap_or("-crf 30 -lag-in-frames 0".into()).split(' ').map(String::from).collect();
+    let args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let src = std::env::var("AV1_SRC").unwrap_or(TESTSRC.into());
+    let frames: u32 = std::env::var("AV1_FRAMES").map_or(3, |v| v.parse().unwrap());
+    let cpu = std::env::var("AV1_CPU").unwrap_or("6".into());
+    eprintln!("{name}: {} bytes equal", check(&inter(&name, &src, &params, &args, frames, &cpu)));
 }

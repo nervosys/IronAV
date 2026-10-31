@@ -1,8 +1,9 @@
-//! The deblocking loop filter (spec 7.14), for intra frames.
+//! The deblocking loop filter (spec 7.14).
 
-use super::block::FrameDec;
+use super::block::{plane_block, FrameDec};
 use super::ipred::Plane;
-use super::tables::{TX_H_LOG2, TX_W_LOG2};
+use super::mvpred::{GLOBALMV, GLOBAL_GLOBALMV};
+use super::tables::{MI_H_LOG2, MI_W_LOG2, TX_H_LOG2, TX_W_LOG2};
 
 pub fn deblock(f: &mut FrameDec) {
     for plane in 0..f.num_planes {
@@ -32,9 +33,16 @@ fn edge(f: &mut FrameDec, plane: usize, pass: usize, row: usize, col: usize, sx:
     let ls = f.lf_stride[plane];
     let tx = f.lf_tx[plane][(row >> sy) * ls + (col >> sx)] as usize;
     let ptx = f.lf_tx[plane][(prow >> sy) * ls + (pcol >> sx)] as usize;
-    // Every block is intra, so every transform edge is filtered (skip only matters for inter blocks).
     let (tl, ptl) = if pass == 0 { (TX_W_LOG2[tx], TX_W_LOG2[ptx]) } else { (TX_H_LOG2[tx], TX_H_LOG2[ptx]) };
-    if (if pass == 0 { xp } else { yp }) & ((1 << tl) - 1) != 0 {
+    let pos = if pass == 0 { xp } else { yp };
+    if pos & ((1 << tl) - 1) != 0 {
+        return;
+    }
+    // Inside a block, an edge between two skipped inter transform blocks is not filtered.
+    let (m, pm) = (&f.mi[row * f.mi_stride + col], &f.mi[prow * f.mi_stride + pcol]);
+    let psz = plane_block(m.size as usize, sx, sy);
+    let bl = if pass == 0 { MI_W_LOG2[psz] } else { MI_H_LOG2[psz] } + 2;
+    if pos & ((1 << bl) - 1) != 0 && m.skip && m.ref_frame[0] > 0 && pm.skip && pm.ref_frame[0] > 0 {
         return;
     }
     let size = (1usize << tl.min(ptl)).min(if plane == 0 { 16 } else { 8 });
@@ -69,7 +77,14 @@ fn level(f: &FrameDec, row: usize, col: usize, plane: usize, pass: usize) -> i32
         lvl = (lvl + h.feature_data[seg][1 + i]).clamp(0, 63);
     }
     if h.lf_delta_enabled {
-        lvl = (lvl + h.lf_ref_deltas[0] * (1 << (lvl >> 5))).clamp(0, 63);
+        let m = &f.mi[at];
+        let scale = 1 << (lvl >> 5);
+        let rf = m.ref_frame[0].max(0) as usize;
+        lvl += h.lf_ref_deltas[rf] * scale;
+        if rf > 0 {
+            lvl += h.lf_mode_deltas[(m.y_mode != GLOBALMV && m.y_mode != GLOBAL_GLOBALMV) as usize] * scale;
+        }
+        lvl = lvl.clamp(0, 63);
     }
     lvl
 }

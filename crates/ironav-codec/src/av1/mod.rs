@@ -1,7 +1,8 @@
-//! A software AV1 decoder. Stage 1: key frames and intra-only frames at 8, 10 and 12 bits, every
-//! subsampling, tiles, palettes, intra block filters and lossless coding, with the deblocking
-//! filter, CDEF, loop restoration, quantiser matrices and film grain. Inter frames, superres and
-//! intra block copy are refused with an error rather than decoded wrongly.
+//! A software AV1 decoder: key, intra-only and inter frames at 8, 10 and 12 bits, every
+//! subsampling, tiles, palettes, intra block filters, lossless coding, every inter tool (compound
+//! modes, masks, inter-intra, OBMC, warped and global motion, reference scaling, temporal motion
+//! vectors), the deblocking filter, CDEF, loop restoration, quantiser matrices and film grain.
+//! Superres and intra block copy are refused with an error rather than decoded wrongly.
 
 pub mod block;
 pub mod cdef;
@@ -9,11 +10,15 @@ pub mod cdf_tables;
 pub mod enc;
 pub mod film_grain;
 pub mod grain_tables;
+pub mod inter;
+pub mod inter_tables;
+pub mod intermode;
 pub mod ipred;
 pub mod itx;
 pub mod itx1d;
 pub mod lf;
 pub mod lr;
+pub mod mvpred;
 pub mod obu;
 pub mod qm_tables;
 pub mod quant_tables;
@@ -25,7 +30,7 @@ use std::sync::Arc;
 
 use ironav_core::{Decoder, Error, ErrorCode, Frame, Packet, PixelFormat, Result, VideoFrame};
 
-use block::FrameDec;
+use block::{FrameDec, Picture};
 use ipred::Plane;
 use obu::*;
 use symbol::Cdfs;
@@ -34,24 +39,11 @@ fn unsupported(msg: &str) -> Error {
     Error::new(ErrorCode::UnsupportedFormat, format!("AV1: {msg}"))
 }
 
-/// A decoded picture as the reference slots keep it.
-struct Picture {
-    planes: [Plane; 3],
-    width: usize,
-    height: usize,
-    bd: u32,
-    ss: [usize; 2],
-    mono: bool,
-    rgb: bool,
-}
-
 #[derive(Clone)]
 struct RefSlot {
     pic: Arc<Picture>,
-    frame_type: u8,
-    order_hint: u32,
-    /// The CDFs the frame ended with, for frames that load them (inter frames, later stages).
-    #[allow(dead_code)]
+    state: RefState,
+    /// The CDFs the frame ended with, for frames that load them.
     cdfs: Arc<Cdfs>,
     /// The grain parameters of the frame, which a show_existing_frame of it applies.
     grain: Option<film_grain::FilmGrain>,
@@ -87,15 +79,37 @@ impl Av1Decoder {
     }
 
     fn ref_info(&self) -> RefInfo {
-        let mut r = RefInfo { valid: [false; 8], order_hint: [0; 8], frame_type: [0; 8] };
-        for (i, s) in self.refs.iter().enumerate() {
-            if let Some(s) = s {
-                r.valid[i] = true;
-                r.order_hint[i] = s.order_hint;
-                r.frame_type[i] = s.frame_type;
+        RefInfo { slots: std::array::from_fn(|i| self.refs[i].as_ref().map(|s| s.state.clone())) }
+    }
+
+    /// The frame's decoding state: its references, the CDFs and segment ids of its primary
+    /// reference frame, and its motion field.
+    fn start_frame(&self, seq: SequenceHeader, h: FrameHeader) -> Result<Current> {
+        let primary = (h.primary_ref_frame != 7).then(|| h.ref_frame_idx[h.primary_ref_frame as usize]);
+        let cdf = match primary {
+            Some(i) => {
+                let s = self.refs[i].as_ref().ok_or_else(|| invalid("the primary reference frame is missing"))?;
+                Box::new((*s.cdfs).clone())
+            }
+            None => Cdfs::new(h.base_q_idx),
+        };
+        let intra = h.frame_is_intra();
+        let mut f = FrameDec::new(seq, h);
+        if !intra {
+            for i in 0..7 {
+                let s = self.refs[f.h.ref_frame_idx[i]].as_ref().ok_or_else(|| invalid("a reference frame is missing"))?;
+                f.refs[i + 1] = Some(s.pic.clone());
             }
         }
-        r
+        if let Some(s) = primary.and_then(|i| self.refs[i].as_ref()) {
+            if s.pic.mi_rows == f.h.mi_rows && s.pic.mi_cols == f.h.mi_cols && !s.pic.seg_ids.is_empty() {
+                f.prev_seg = Some(s.pic.clone());
+            }
+        }
+        if f.h.use_ref_frame_mvs {
+            f.setup_motion_field();
+        }
+        Ok(Current { f, cdf, saved: None })
     }
 
     fn temporal_unit(&mut self, data: &[u8], pts: i64) -> Result<()> {
@@ -119,9 +133,8 @@ impl Av1Decoder {
                         continue;
                     }
                     check_supported(&h)?;
-                    let cdf = Cdfs::new(h.base_q_idx);
                     let rest = h.header_bytes;
-                    self.cur = Some(Current { f: FrameDec::new(seq, h), cdf, saved: None });
+                    self.cur = Some(self.start_frame(seq, h)?);
                     if o.kind == OBU_FRAME {
                         self.tile_group(&o.payload[rest..], pts)?;
                     }
@@ -201,6 +214,14 @@ impl Av1Decoder {
         let mut cdfs = if f.h.disable_frame_end_update_cdf { cur.cdf } else { cur.saved.unwrap_or(cur.cdf) };
         cdfs.clear_counts();
         let h = &f.h;
+        // SavedSegmentIds: libaom keeps the previous map where the frame does not update it.
+        let seg_ids = if !h.seg_enabled {
+            Vec::new()
+        } else if !h.seg_update_map {
+            f.prev_seg.as_ref().map_or_else(Vec::new, |p| p.seg_ids.clone())
+        } else {
+            f.mi.iter().map(|m| m.seg).collect()
+        };
         let pic = Arc::new(Picture {
             width: h.upscaled_width as usize,
             height: h.height as usize,
@@ -209,8 +230,28 @@ impl Av1Decoder {
             mono: f.num_planes == 1,
             rgb: f.seq.rgb,
             planes: std::mem::replace(&mut f.planes, [Plane::new(0, 0), Plane::new(0, 0), Plane::new(0, 0)]),
+            frame_type: h.frame_type,
+            order_hint: h.order_hint,
+            saved_hints: h.order_hints,
+            mi_rows: h.mi_rows,
+            mi_cols: h.mi_cols,
+            mvs: std::mem::take(&mut f.saved_mvs),
+            seg_ids,
         });
-        let slot = RefSlot { pic: pic.clone(), frame_type: h.frame_type, order_hint: h.order_hint, cdfs: Arc::from(cdfs), grain: h.grain.clone() };
+        let state = RefState {
+            frame_type: h.frame_type,
+            order_hint: h.order_hint,
+            upscaled_width: h.upscaled_width,
+            height: h.height,
+            render_width: h.render_width,
+            render_height: h.render_height,
+            lf_ref_deltas: h.lf_ref_deltas,
+            lf_mode_deltas: h.lf_mode_deltas,
+            feature_enabled: h.feature_enabled,
+            feature_data: h.feature_data,
+            gm_params: h.gm_params,
+        };
+        let slot = RefSlot { pic: pic.clone(), state, cdfs: Arc::from(cdfs), grain: h.grain.clone() };
         for i in 0..8 {
             if h.refresh_frame_flags >> i & 1 == 1 {
                 self.refs[i] = Some(slot.clone());
@@ -224,7 +265,7 @@ impl Av1Decoder {
 
     fn show_existing(&mut self, h: &FrameHeader, pts: i64) -> Result<()> {
         let slot = self.refs[h.frame_to_show].clone().ok_or_else(|| invalid("show_existing_frame of an empty reference slot"))?;
-        if slot.frame_type == KEY_FRAME {
+        if slot.state.frame_type == KEY_FRAME {
             for r in self.refs.iter_mut() {
                 *r = Some(slot.clone());
             }
