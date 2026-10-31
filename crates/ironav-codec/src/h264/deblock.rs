@@ -173,10 +173,16 @@ fn strength(m: &MbInfo, other: &MbInfo, dir: usize, e: usize) -> [u8; 4] {
 }
 
 pub fn deblock_picture(pic: &mut Picture, bd: u32) {
-    let (w, h) = (pic.mb_w, pic.mb_h);
+    deblock_rows(pic, bd, 0..pic.mb_h);
+}
+
+/// Filters the macroblock rows `rows`; in raster order with the rows above, this filters the picture.
+/// Filtering a row changes up to three luma rows at the bottom of the row above.
+pub fn deblock_rows(pic: &mut Picture, bd: u32, rows: std::ops::Range<usize>) {
+    let w = pic.mb_w;
     let ls = w * 16;
     let cs = w * 8;
-    for mby in 0..h {
+    for mby in rows {
         for mbx in 0..w {
             let idx = mby * w + mbx;
             let m = &pic.mbs[idx];

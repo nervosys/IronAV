@@ -285,6 +285,8 @@ pub struct SliceDec<'a> {
     /// Inter prediction scratch: luma per list, and chroma per list and component.
     mcl: [[u16; 256]; 2],
     mcc: [[[u16; 256]; 2]; 2],
+    /// Called when a macroblock row's last macroblock is decoded.
+    on_row: Option<&'a mut dyn FnMut(&mut Picture)>,
 }
 
 /// A motion partition: (x, y, width, height) in 4x4 units, list mask, prediction direction, direct.
@@ -342,7 +344,7 @@ fn block_pos(n: usize) -> (usize, usize) {
 
 impl<'a> SliceDec<'a> {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(sps: &'a Sps, pps: &'a Pps, hdr: &'a SliceHeader, pic: &'a mut Picture, scale: &'a LevelScale, slice_id: u16, rbsp: &'a [u8], refs: &'a [RefList; 2], cur_poc: i32) -> Result<Self> {
+    pub fn new(sps: &'a Sps, pps: &'a Pps, hdr: &'a SliceHeader, pic: &'a mut Picture, scale: &'a LevelScale, slice_id: u16, rbsp: &'a [u8], refs: &'a [RefList; 2], cur_poc: i32, on_row: Option<&'a mut dyn FnMut(&mut Picture)>) -> Result<Self> {
         let rd = if pps.cabac {
             // cabac_alignment_one_bit up to the next byte
             let start = hdr.data_pos.div_ceil(8);
@@ -352,7 +354,7 @@ impl<'a> SliceDec<'a> {
             r.skip(hdr.data_pos);
             Reader::Cavlc(r)
         };
-        Ok(SliceDec { sps, pps, hdr, pic, scale, slice_id, qp: hdr.qp, last_dqp: false, mbx: 0, mby: 0, cur: MbInfo::default(), rd, refs, done: [0; 2], cur_poc, bd: sps.bit_depth_luma, maxv: (1 << sps.bit_depth_luma) - 1, qp_off: 6 * (sps.bit_depth_luma as i32 - 8), mcl: [[0; 256]; 2], mcc: [[[0; 256]; 2]; 2] })
+        Ok(SliceDec { sps, pps, hdr, pic, scale, slice_id, qp: hdr.qp, last_dqp: false, mbx: 0, mby: 0, cur: MbInfo::default(), rd, refs, done: [0; 2], cur_poc, bd: sps.bit_depth_luma, maxv: (1 << sps.bit_depth_luma) - 1, qp_off: 6 * (sps.bit_depth_luma as i32 - 8), mcl: [[0; 256]; 2], mcc: [[[0; 256]; 2]; 2], on_row })
     }
 
     fn start_mb(&mut self, addr: usize) -> Result<()> {
@@ -370,6 +372,11 @@ impl<'a> SliceDec<'a> {
         self.cur.qp = if self.cur.kind == Kind::IPcm { 0 } else { self.qp as i8 };
         self.cur.keep = self.cur.kind == Kind::IPcm || self.bypass();
         self.pic.mbs[addr] = self.cur;
+        if addr % self.pic.mb_w == self.pic.mb_w - 1 {
+            if let Some(f) = self.on_row.as_mut() {
+                f(&mut *self.pic);
+            }
+        }
     }
 
     pub fn decode(&mut self) -> Result<()> {
@@ -897,7 +904,7 @@ impl<'a> SliceDec<'a> {
         let Some(Some(e)) = self.refs[1].first() else {
             return Err(Error::invalid_input("H.264 direct prediction needs a picture in reference list 1"));
         };
-        let m = match e.pic.mbs.get(self.idx()) {
+        let m = match e.pic.data.mb(self.idx()) {
             Some(m) => m,
             None => return Ok(None),
         };
@@ -1473,17 +1480,21 @@ impl<'a> SliceDec<'a> {
                 _ => return Err(Error::invalid_input("H.264 macroblock refers to a reference picture that is not available")),
             };
             let mv = self.cur.mv[l][by * 4 + bx];
-            inter::luma_mc(&entry.pic.planes[0], pw, ph, x, y, mv[0] as i32, mv[1] as i32, bw, bh, &mut self.mcl[l], self.maxv);
+            // the reference's macroblock rows down to the last luma row the 6-tap filter reads, edge
+            // clamped; chroma reads no further down
+            let last = (y + (mv[1] as i32 >> 2) + bh as i32 + 3).clamp(0, ph as i32 - 1) as usize;
+            let rows = last / 16 + 1;
+            inter::luma_mc(entry.pic.data.plane(0, rows), pw, ph, x, y, mv[0] as i32, mv[1] as i32, bw, bh, &mut self.mcl[l], self.maxv);
             if c444 {
                 // 4:4:4 chroma is interpolated exactly like luma
                 for c in 0..2usize {
-                    inter::luma_mc(&entry.pic.planes[1 + c], cpw, cph, cx, cy, mv[0] as i32, mv[1] as i32, cw, ch, &mut self.mcc[l][c], self.maxv);
+                    inter::luma_mc(entry.pic.data.plane(1 + c, rows), cpw, cph, cx, cy, mv[0] as i32, mv[1] as i32, cw, ch, &mut self.mcc[l][c], self.maxv);
                 }
             } else if self.pic.cf != 0 {
                 // 4:2:2 chroma has full vertical resolution, so its vertical vector is in quarter samples
                 let my = if c422 { mv[1] as i32 * 2 } else { mv[1] as i32 };
                 for c in 0..2usize {
-                    inter::chroma_mc(&entry.pic.planes[1 + c], cpw, cph, x / 2, cy, mv[0] as i32, my, cw, ch, &mut self.mcc[l][c]);
+                    inter::chroma_mc(entry.pic.data.plane(1 + c, rows), cpw, cph, x / 2, cy, mv[0] as i32, my, cw, ch, &mut self.mcc[l][c]);
                 }
             }
             pics[l] = Some((entry.pic.poc, entry.long));

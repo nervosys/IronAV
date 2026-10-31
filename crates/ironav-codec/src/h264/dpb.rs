@@ -1,21 +1,24 @@
 //! Picture order count, reference picture marking and reference list construction
 //! (ITU-T H.264 8.2.1, 8.2.4 and 8.2.5), for frame pictures.
 
-use super::mb::{MbInfo, Spare};
+use super::mb::Spare;
 use super::ps::{Marking, SliceHeader, SliceType, Sps};
-use ironav_core::{Error, Result};
-use std::sync::Arc;
+use super::shared::Published;
+use ironav_core::{Error, Result, VideoFrame};
+use std::sync::{Arc, Mutex};
 
-/// A decoded, loop-filtered picture, kept for reference and for output.
+/// A decoded, loop-filtered picture, kept for reference and for output. While it is decoded on
+/// another thread, its rows become readable as they are finished.
 pub struct DecodedPic {
-    pub planes: [Vec<u16>; 3],
+    pub data: Published,
+    /// The output frame, when the thread that decoded the picture made it.
+    pub frame: Mutex<Option<VideoFrame>>,
     pub mb_w: usize,
     pub mb_h: usize,
     /// chroma_format_idc: 0 monochrome, 1 4:2:0, 2 4:2:2.
     pub cf: u8,
     /// Width of a macroblock's chroma samples.
     pub cw: usize,
-    pub mbs: Vec<MbInfo>,
     pub poc: i32,
     /// Unique across the stream; deblocking and direct prediction compare references by it.
     pub id: i32,
@@ -66,6 +69,8 @@ pub struct Dpb {
     pub late: u64,
     /// Buffers of finished pictures, for the next pictures to reuse.
     pub spare: Vec<Spare>,
+    /// How many buffers to keep beyond 4.
+    pub spare_extra: usize,
 }
 
 /// MaxDpbMbs for a level_idc (Table A-1).
@@ -370,13 +375,15 @@ impl Dpb {
     /// Keeps the buffers of a picture that nothing refers to any more. Only a complete picture is
     /// kept: an incomplete one may hold samples and macroblocks that a new picture must not inherit.
     pub fn release(&mut self, pic: Arc<DecodedPic>) {
-        if self.spare.len() >= 4 {
-            return;
-        }
         if let Ok(p) = Arc::try_unwrap(pic) {
-            if p.mbs.iter().all(|m| m.slice != 0) {
-                self.spare.push((p.planes, p.mbs));
-            }
+            self.keep(p.data.into_spare());
+        }
+    }
+
+    /// Keeps the buffers of a picture if all its macroblocks were decoded.
+    pub fn keep(&mut self, (planes, mbs): Spare) {
+        if self.spare.len() < 4 + self.spare_extra && mbs.iter().all(|m| m.slice != 0) {
+            self.spare.push((planes, mbs));
         }
     }
 

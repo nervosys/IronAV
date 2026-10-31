@@ -2,7 +2,8 @@
 //! (none is checked in: make one with FFmpeg, e.g. `ffmpeg -f lavfi -i testsrc2=size=1280x720:rate=30
 //! -frames:v 240 -c:v libx264 -bf 3 -bsf:v h264_mp4toannexb bf.h264`). If `IRONAV_H264_REF` names
 //! FFmpeg's decode of it as raw planar video (`ffmpeg -i bf.h264 -f rawvideo bf.yuv`), the output
-//! must match it byte for byte.
+//! must match it byte for byte. `IRONAV_H264_THREADS` sets how many pictures are decoded at once
+//! (the decoder's default otherwise; 1 decodes on the calling thread).
 //! Run with `cargo test --release -p ironav-codec --test h264_perf -- --ignored --nocapture`.
 
 use ironav_codec::h264::H264Decoder;
@@ -19,8 +20,9 @@ fn h264_decode_throughput() {
     let data = std::fs::read(path).unwrap();
     let mut best = f64::MAX;
     let mut frames = Vec::new();
+    let threads: Option<usize> = std::env::var("IRONAV_H264_THREADS").ok().and_then(|v| v.parse().ok());
     for _ in 0..3 {
-        let mut d = H264Decoder::new();
+        let mut d = threads.map_or_else(H264Decoder::new, H264Decoder::with_threads);
         let t = Instant::now();
         // the whole stream as one packet: the decoder finds the pictures in it
         frames = d.decode(&Packet { stream: 0, pts: 0, duration: 0, data: data.clone() }).unwrap();

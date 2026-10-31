@@ -661,7 +661,8 @@ mod tests {
         let (w, h) = (64, 48);
         let params = StreamParams::Video { width: w as u32, height: h as u32, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational::new(25, 1) };
         let mut enc = H264Encoder::new(&params, None, Some(150_000)).unwrap().low_latency();
-        let mut dec = H264Decoder::new();
+        // on one thread: decoding on several holds pictures back while others are decoded
+        let mut dec = H264Decoder::with_threads(1);
         let mut idrs = Vec::new();
         for t in 0..60 {
             let pkts = enc.encode(&Frame::Video(scene(w, h, t))).unwrap();
