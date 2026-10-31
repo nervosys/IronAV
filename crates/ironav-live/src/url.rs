@@ -20,8 +20,9 @@ use std::collections::BTreeMap;
 /// - `audio`: the HLS audio rendition to play, by language or name;
 /// - `height`: the tallest HLS (or YouTube) variant to play, in lines;
 /// - `cookies`: for a YouTube URL, the browser whose signed-in session yt-dlp reads (`firefox`,
-///   `chrome`, ...), as its `--cookies-from-browser` does.
-pub const OPTIONS: [&str; 16] = ["format", "fps", "pace", "follow", "idle", "listen", "transport", "audio", "size", "reconnect", "stall", "retries", "rate", "duration", "height", "cookies"];
+///   `chrome`, ...), as its `--cookies-from-browser` does;
+/// - `captions`: the HLS (or YouTube) subtitles to follow, by language or name, or `off`.
+pub const OPTIONS: [&str; 17] = ["format", "fps", "pace", "follow", "idle", "listen", "transport", "audio", "size", "reconnect", "stall", "retries", "rate", "duration", "height", "cookies", "captions"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SourceUrl {

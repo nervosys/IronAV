@@ -702,6 +702,8 @@ impl Session {
         let mut shift = 0.0f64;
         let mut last_data = Instant::now();
         let mut clocks: BTreeMap<usize, f64> = BTreeMap::new();
+        // captions from the source, held until the media reaches them
+        let mut captions: VecDeque<ironav_live::Caption> = VecDeque::new();
         while !ended {
             if self.idle_expired() {
                 self.stop.store(true, Ordering::Relaxed);
@@ -713,6 +715,21 @@ impl Session {
             let chunk = source.read(&mut buf, READ_WAIT);
             if let Some(h) = source.health() {
                 self.health(h);
+            }
+            for c in source.captions() {
+                match c {
+                    Ok(c) => captions.push_back(c),
+                    Err(message) => {
+                        let t = lock(&self.shared).media_seconds;
+                        self.log(Observation::new("captions_failed", "source", t, json!({ "message": message })), None)?;
+                    }
+                }
+            }
+            let now = lock(&self.shared).media_seconds;
+            while let Some(c) = captions.front().filter(|c| c.start <= now) {
+                let o = Observation::new("caption", "source", c.start, json!({ "text": c.text, "language": c.language })).until(c.end);
+                captions.pop_front();
+                self.log(o, None)?;
             }
             let chunk = chunk?;
             let arrival = Instant::now();

@@ -112,7 +112,11 @@ decodes, no taller than `?height=` when given; TS or fMP4 segments with
 else as it arrives. A variant whose audio is a separate rendition (`EXT-X-MEDIA` with `TYPE=AUDIO`) plays with it: the
 default one, or the one `?audio=` names by language or name (`?audio=fr`). The two playlists are fetched side by side
 and their packets merged in time order; packed AAC with Apple's ID3 timestamp lines up with the video. Encrypted
-playlists are not supported.
+playlists are not supported. A variant with WebVTT subtitles (`TYPE=SUBTITLES`) has them followed as well: the default
+track, else the first, or the one `?captions=` names (`?captions=de`; `?captions=off` for none). Each cue becomes a
+`caption` event (`t` to `t_end`, `data.text`, `data.language`) logged when the media reaches it, with tags removed,
+`X-TIMESTAMP-MAP` applied, and rolling captions (each cue repeating the line before, as automatic captions do) cut to
+what is new; if the track stops, a `captions_failed` event says why and the media goes on.
 A YouTube URL (`youtube.com/watch?v=`, `youtu.be/`, `/shorts/`, `/live/`, `/embed/`) plays the video or live stream
 through its HLS master playlist, found by [yt-dlp](https://github.com/yt-dlp/yt-dlp) (`yt-dlp -J`, from `IRONAV_YTDLP`
 or the `PATH`), which keeps up with YouTube's player API; IronAV reads only its answer and fetches the playlist and its
@@ -121,7 +125,8 @@ around YouTube's checks, and it keeps its requests few: one question to yt-dlp p
 to expire (a reconnect or a second session asks nothing), at least two seconds apart. When YouTube asks the address to
 sign in ("confirm you're not a bot"), the error says so, and `?cookies=firefox` (or `chrome`, `edge`, ...) lets yt-dlp
 use the caller's own signed-in browser session. `?height=480` caps the variant; AV1 variants are passed over. "Me at the
-zoo" (`watch?v=jNQXAC9IVRw`) streams as H.264 320x240 and AAC stereo through every analyzer. A video with no HLS
+zoo" (`watch?v=jNQXAC9IVRw`) streams as H.264 320x240 and AAC stereo through every analyzer. YouTube's playlists list
+the video's caption tracks (uploaded and automatic) as WebVTT subtitles, so they come as `caption` events too. A video with no HLS
 playlist (only separate progressive files) is refused with a hint to download it first. Fetching from YouTube is
 subject to its terms of service.
 `https://` and `rtsps://` (port 322 by default) are the same over TLS 1.3, using IronSocketLayer, with IronPKI checking

@@ -104,6 +104,8 @@ pub const KINDS: &[KindInfo] = &[
     KindInfo { name: "freeze_end", level: Level::Events, description: "A frozen span from `t` to `t_end` ended." },
     KindInfo { name: "speech_start", level: Level::Events, description: "Speech from `t` (voice activity; the start is placed at the first voiced frame)." },
     KindInfo { name: "speech_end", level: Level::Events, description: "Speech from `t` to `t_end` ended." },
+    KindInfo { name: "caption", level: Level::Events, description: "A caption from the source (an HLS or YouTube subtitle track), shown from `t` to `t_end`: `data.text`, and `data.language` when the track says." },
+    KindInfo { name: "captions_failed", level: Level::Events, description: "The source's captions stopped coming; `data.message` says why. The media goes on." },
     KindInfo { name: "analyzer_failed", level: Level::Events, description: "A sidecar analyzer crashed, hung or could not be restarted; `data.message` says why (with the end of its error output) and `data.restarting` whether it comes back." },
     KindInfo { name: "analyzer_lagging", level: Level::Events, description: "A sidecar fell behind a live source and `data.dropped` inputs were not sent to it; at most one every 10 s." },
     KindInfo { name: "clipping", level: Level::Events, description: "Audio samples at full scale near `t` (`data.samples`); at most one per second." },

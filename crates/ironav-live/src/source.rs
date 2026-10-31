@@ -36,6 +36,15 @@ pub struct SourceInfo {
     pub synthetic: bool,
 }
 
+/// A caption that came with the media: from `start` to `end` in the media's seconds.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct Caption {
+    pub start: f64,
+    pub end: f64,
+    pub text: String,
+    pub language: Option<String>,
+}
+
 pub trait Source: Send {
     fn info(&self) -> &SourceInfo;
     /// Bytes into `buf`, waiting at most `wait` for some to arrive. A datagram source gives one
@@ -44,6 +53,11 @@ pub trait Source: Send {
     /// How a source that is kept up is doing (see [`crate::reconnect`]); `None` for the others.
     fn health(&self) -> Option<crate::reconnect::Health> {
         None
+    }
+    /// The captions that came since the last call (from an HLS subtitle rendition), and why they
+    /// stopped coming if they did; none for most sources.
+    fn captions(&mut self) -> Vec<std::result::Result<Caption, String>> {
+        Vec::new()
     }
 }
 

@@ -19,10 +19,16 @@
 //! requests. Encrypted playlists are not supported; they are refused when the source is opened, and
 //! so is a playlist reached over HTTPS that lists segments
 //! over plain HTTP, which anyone on the way could change.
+//!
+//! A variant with subtitles (`EXT-X-MEDIA` of `TYPE=SUBTITLES` in its `SUBTITLES` group, WebVTT)
+//! has them followed too, on a thread of their own: the one the `captions` option names by language
+//! or name, else the default, else the first; `captions=off` takes none. Their cues come out as
+//! [`Caption`]s from [`Source::captions`], with rolling captions (each cue repeating the line the
+//! one before ended with, as YouTube's automatic captions do) cut to what is new.
 
 use crate::http::{self, join, HttpUrl};
 use crate::net::Allow;
-use crate::source::{Source, SourceInfo, ThreadSource};
+use crate::source::{Caption, Chunk, Source, SourceInfo, ThreadSource};
 use crate::url::{redact, SourceUrl};
 use ironav_core::{Error, ErrorCode, Result};
 use std::collections::VecDeque;
@@ -73,11 +79,14 @@ struct Variant {
     height: Option<u32>,
     /// The `GROUP-ID` of the audio renditions it plays with.
     audio: Option<String>,
+    /// The `GROUP-ID` of its subtitle renditions.
+    subtitles: Option<String>,
 }
 
-/// An audio rendition (`EXT-X-MEDIA` with `TYPE=AUDIO`).
+/// An audio or subtitle rendition (`EXT-X-MEDIA` with `TYPE=AUDIO` or `TYPE=SUBTITLES`).
 #[derive(Debug, Clone, PartialEq)]
 struct Rendition {
+    subtitles: bool,
     group: String,
     /// Absent when the audio is in the variant's own segments.
     uri: Option<String>,
@@ -134,7 +143,7 @@ fn parse(text: &str, base: &str) -> Result<Playlist> {
     let mut media = Media { target: 6.0, ..Media::default() };
     let mut seq = 0u64;
     let mut duration = 0.0;
-    let mut pending_variant: Option<(u64, Option<String>, Option<String>, Option<u32>)> = None;
+    let mut pending_variant: Option<(u64, Option<String>, Option<String>, Option<u32>, Option<String>)> = None;
     let mut range: Option<String> = None;
     let mut map: Option<(String, Option<(u64, u64)>)> = None;
     // where the last range of each resource ended, for ranges without an offset
@@ -150,14 +159,17 @@ fn parse(text: &str, base: &str) -> Result<Playlist> {
                     let a = attributes(value);
                     let get = |key: &str| a.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
                     let height = get("RESOLUTION").and_then(|r| r.split_once(['x', 'X']).and_then(|(_, h)| h.parse().ok()));
-                    pending_variant = Some((get("BANDWIDTH").and_then(|v| v.parse().ok()).unwrap_or(0), get("AUDIO"), get("CODECS"), height));
+                    pending_variant = Some((get("BANDWIDTH").and_then(|v| v.parse().ok()).unwrap_or(0), get("AUDIO"), get("CODECS"), height, get("SUBTITLES")));
                 }
                 "EXT-X-MEDIA" => {
                     let a = attributes(value);
                     let get = |key: &str| a.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
-                    if get("TYPE").is_some_and(|t| t.eq_ignore_ascii_case("AUDIO")) {
+                    let kind = get("TYPE").unwrap_or_default();
+                    let subtitles = kind.eq_ignore_ascii_case("SUBTITLES");
+                    if subtitles || kind.eq_ignore_ascii_case("AUDIO") {
                         if let Some(group) = get("GROUP-ID") {
                             renditions.push(Rendition {
+                                subtitles,
                                 group,
                                 uri: get("URI").map(|u| join(base, &u)),
                                 language: get("LANGUAGE"),
@@ -194,8 +206,8 @@ fn parse(text: &str, base: &str) -> Result<Playlist> {
             continue;
         }
         let uri = join(base, line);
-        if let Some((bandwidth, audio, codecs, height)) = pending_variant.take() {
-            variants.push(Variant { bandwidth, uri, audio, codecs, height });
+        if let Some((bandwidth, audio, codecs, height, subtitles)) = pending_variant.take() {
+            variants.push(Variant { bandwidth, uri, audio, codecs, height, subtitles });
             continue;
         }
         let prev = last_end.as_ref().filter(|(u, _)| *u == uri).and_then(|(_, e)| e.checked_add(1));
@@ -268,10 +280,12 @@ pub(crate) fn open(u: &SourceUrl, shown: String) -> Result<Box<dyn Source>> {
     let mut playlist = parse(&String::from_utf8_lossy(&text), &at)?;
     let mut playlist_url = at;
     let mut audio = None;
+    let mut captions = None;
     if let Playlist::Master(variants, renditions) = &playlist {
         let height = u.option("height").map(|h| h.parse::<u32>().map_err(|_| Error::invalid_arg(format!("height must be a number of lines, got '{h}'")))).transpose()?;
         let best = pick_variant(variants, height);
         audio = pick_audio(&best, renditions, u.option("audio"), &shown)?;
+        captions = pick_captions(&best, renditions, u.option("captions"), &shown)?;
         let (at, p) = fetch_playlist(&best.uri, &allow)?;
         if matches!(p, Playlist::Master(..)) {
             return Err(Error::invalid_input(format!("{shown}: a variant of the master playlist is itself a master playlist")));
@@ -281,6 +295,25 @@ pub(crate) fn open(u: &SourceUrl, shown: String) -> Result<Box<dyn Source>> {
     } else if u.option("audio").is_some() {
         return Err(Error::invalid_arg(format!("{shown} is a media playlist: it has no audio renditions to choose from")));
     }
+    let source = open_media(playlist, playlist_url, audio, &allow, &shown)?;
+    let Some((uri, language)) = captions else { return Ok(source) };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let follow = (allow, shown);
+    std::thread::Builder::new()
+        .name("ironav-captions".into())
+        .spawn(move || {
+            if let Err(e) = follow_captions(&uri, language, &follow.0, &tx) {
+                let _ = tx.send(Err(format!("{}: captions: {}", follow.1, e.message)));
+            }
+        })
+        .map_err(|e| Error::new(ErrorCode::Io, format!("cannot start the captions thread: {e}")))?;
+    Ok(Box::new(Captioned { inner: source, rx }))
+}
+
+/// The media of a variant (or a media playlist), with its audio rendition when it has one.
+fn open_media(playlist: Playlist, playlist_url: String, audio: Option<String>, allow: &Allow, shown: &str) -> Result<Box<dyn Source>> {
+    let shown = shown.to_string();
+    let allow = allow.clone();
     let Playlist::Media(media) = playlist else { unreachable!() };
     let video = HlsReader::new(allow.clone(), playlist_url, shown.clone(), media)?;
     let info = SourceInfo { url: shown.clone(), kind: "hls", live: true, synthetic: false };
@@ -293,6 +326,96 @@ pub(crate) fn open(u: &SourceUrl, shown: String) -> Result<Box<dyn Source>> {
     };
     let audio = HlsReader::new(allow, media.0, shown, media.1)?;
     Ok(Box::new(ThreadSource::new(info, Box::new(Renditions { parts: [video, audio], done: [false; 2], out: std::io::Cursor::new(ironav_formats::renditions::MAGIC.to_vec()) }))))
+}
+
+/// The URI and language of the subtitle rendition to follow with `variant`: the one `wanted` names
+/// by language or name, else the default, else the first; none for `off`.
+fn pick_captions(variant: &Variant, renditions: &[Rendition], wanted: Option<&str>, shown: &str) -> Result<Option<(String, Option<String>)>> {
+    if wanted.is_some_and(|w| ["off", "none", "0", "no", "false"].iter().any(|o| w.eq_ignore_ascii_case(o))) {
+        return Ok(None);
+    }
+    let group: Vec<&Rendition> = variant.subtitles.as_ref().map_or(Vec::new(), |g| renditions.iter().filter(|r| r.subtitles && &r.group == g && r.uri.is_some()).collect());
+    let found = match wanted {
+        Some(w) => {
+            let is = |s: &Option<String>| s.as_ref().is_some_and(|s| s.eq_ignore_ascii_case(w));
+            let found = group.iter().find(|r| is(&r.language)).or_else(|| group.iter().find(|r| is(&r.name)));
+            if found.is_none() {
+                let names = group.iter().filter_map(|r| r.language.clone().or_else(|| r.name.clone()));
+                return Err(Error::invalid_arg(format!("{shown} has no captions '{w}'")).alternatives(names.chain(["off".to_string()])));
+            }
+            found
+        }
+        None => group.iter().find(|r| r.default).or(group.first()),
+    };
+    Ok(found.map(|r| (r.uri.clone().unwrap(), r.language.clone())))
+}
+
+/// The largest WebVTT segment taken.
+const MAX_CAPTION_SEGMENT: usize = 4 << 20;
+
+/// Follows a subtitle playlist, sending its cues as their segments come, until it ends or no one
+/// takes them.
+fn follow_captions(url: &str, language: Option<String>, allow: &Allow, tx: &std::sync::mpsc::Sender<std::result::Result<Caption, String>>) -> Result<()> {
+    let mut next_seq = None;
+    let mut last: Option<crate::webvtt::Cue> = None;
+    loop {
+        let (_, p) = fetch_playlist(url, allow)?;
+        let Playlist::Media(media) = p else {
+            return Err(Error::invalid_input("a subtitle rendition is a master playlist"));
+        };
+        if media.encrypted.is_some() {
+            return Err(Error::new(ErrorCode::UnsupportedFormat, "encrypted subtitles are not supported"));
+        }
+        // a live playlist starts near its end, as its media does
+        let start = next_seq.unwrap_or_else(|| if media.ended { 0 } else { media.segments.iter().rev().nth(2).map_or(0, |s| s.seq) });
+        for seg in media.segments.iter().filter(|s| s.seq >= start) {
+            let body = http::get(&seg.uri, seg.range, allow)?.bytes(MAX_CAPTION_SEGMENT)?;
+            let cues = crate::webvtt::parse(&String::from_utf8_lossy(&body))?;
+            // the last cue of the segment before goes first, so a cue rolling over from it is cut too
+            let had = last.is_some() as usize;
+            let cues: Vec<_> = last.take().into_iter().chain(cues).collect();
+            last = cues.last().cloned();
+            for c in crate::webvtt::dedupe_rolling(cues).into_iter().skip(had) {
+                if tx.send(Ok(Caption { start: c.start, end: c.end, text: c.text, language: language.clone() })).is_err() {
+                    return Ok(());
+                }
+            }
+            next_seq = Some(seg.seq + 1);
+        }
+        if media.ended {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_secs_f64(media.target / 2.0));
+        // nobody reads them any more
+        if tx.send(Err(String::new())).is_err() {
+            return Ok(());
+        }
+    }
+}
+
+/// A source with captions alongside.
+struct Captioned {
+    inner: Box<dyn Source>,
+    rx: std::sync::mpsc::Receiver<std::result::Result<Caption, String>>,
+}
+
+impl Source for Captioned {
+    fn info(&self) -> &SourceInfo {
+        self.inner.info()
+    }
+
+    fn read(&mut self, buf: &mut [u8], wait: Duration) -> Result<Chunk> {
+        self.inner.read(buf, wait)
+    }
+
+    fn health(&self) -> Option<crate::reconnect::Health> {
+        self.inner.health()
+    }
+
+    fn captions(&mut self) -> Vec<std::result::Result<Caption, String>> {
+        // empty errors are the follower checking that someone still listens
+        self.rx.try_iter().filter(|c| !matches!(c, Err(e) if e.is_empty())).collect()
+    }
 }
 
 /// Codecs (by their `CODECS` names' first part) that IronAV decodes.
@@ -321,7 +444,7 @@ fn pick_variant(variants: &[Variant], height: Option<u32>) -> Variant {
 /// The URI of the audio rendition to play with `variant`: the one `wanted` names (by language or
 /// name), else the default, else the first; `None` when its audio is in its own segments.
 fn pick_audio(variant: &Variant, renditions: &[Rendition], wanted: Option<&str>, shown: &str) -> Result<Option<String>> {
-    let group: Vec<&Rendition> = variant.audio.as_ref().map_or(Vec::new(), |g| renditions.iter().filter(|r| &r.group == g).collect());
+    let group: Vec<&Rendition> = variant.audio.as_ref().map_or(Vec::new(), |g| renditions.iter().filter(|r| !r.subtitles && &r.group == g).collect());
     if let Some(w) = wanted {
         let is = |s: &Option<String>| s.as_ref().is_some_and(|s| s.eq_ignore_ascii_case(w));
         let found = group.iter().find(|r| is(&r.language)).or_else(|| group.iter().find(|r| is(&r.name)));
@@ -702,6 +825,75 @@ a0.aac
         let e = drain(&format!("{url}?audio=de"), Duration::from_secs(10)).unwrap_err();
         assert_eq!(e.code, ErrorCode::InvalidArgument);
         assert!(e.alternatives.contains(&"en".to_string()), "{e:?}");
+    }
+
+    #[test]
+    fn a_variant_brings_its_captions() -> Result<()> {
+        let routes: Routes = Default::default();
+        {
+            let mut r = routes.lock().unwrap();
+            r.insert("/master.m3u8".into(), b"#EXTM3U
+#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"vtt\",NAME=\"English\",LANGUAGE=\"en\",DEFAULT=NO,URI=\"en/s.m3u8\"
+#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"vtt\",NAME=\"Deutsch\",LANGUAGE=\"de\",DEFAULT=NO,URI=\"de/s.m3u8\"
+#EXT-X-STREAM-INF:BANDWIDTH=500000,SUBTITLES=\"vtt\"
+v.m3u8
+".to_vec());
+            r.insert("/v.m3u8".into(), b"#EXTM3U
+#EXT-X-TARGETDURATION:2
+#EXTINF:2.0,
+v0.ts
+#EXT-X-ENDLIST
+".to_vec());
+            r.insert("/v0.ts".into(), fixture("h264_aac.ts"));
+            for l in ["en", "de"] {
+                r.insert(format!("/{l}/s.m3u8"), b"#EXTM3U
+#EXT-X-TARGETDURATION:2
+#EXTINF:1.0,
+s0.vtt
+#EXTINF:1.0,
+s1.vtt
+#EXT-X-ENDLIST
+".to_vec());
+                // the second segment's cue rolls over from the first's
+                r.insert(format!("/{l}/s0.vtt"), format!("WEBVTT
+
+00:00.100 --> 00:00.900
+{l} one
+").into_bytes());
+                r.insert(format!("/{l}/s1.vtt"), format!("WEBVTT
+
+00:01.000 --> 00:01.800
+{l} one
+{l} <c>two</c>
+").into_bytes());
+            }
+        }
+        let port = server(routes, |_, _| {});
+        let url = format!("http://127.0.0.1:{port}/master.m3u8");
+        let captions = |q: &str| -> Result<Vec<Caption>> {
+            let mut s = crate::open_source(&format!("{url}{q}"))?;
+            let mut buf = vec![0u8; 65536];
+            let mut got = Vec::new();
+            // until both cues are in, or a second after the media ends
+            let (start, mut ended) = (Instant::now(), None::<Instant>);
+            while start.elapsed() < Duration::from_secs(10) && got.len() < 2 && ended.is_none_or(|t| t.elapsed() < Duration::from_secs(1)) {
+                got.extend(s.captions().into_iter().map(|c| c.unwrap()));
+                if ended.is_none() && matches!(s.read(&mut buf, Duration::from_millis(50))?, Chunk::End) {
+                    ended = Some(Instant::now());
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(got)
+        };
+        // none is the default, so the first; each cue says only what is new
+        let c = captions("")?;
+        assert_eq!(c.iter().map(|c| (c.start, c.text.as_str())).collect::<Vec<_>>(), [(0.1, "en one"), (1.0, "en two")]);
+        assert_eq!(c[0].language.as_deref(), Some("en"));
+        assert_eq!(captions("?captions=Deutsch")?[1].text, "de two");
+        assert!(captions("?captions=off")?.is_empty());
+        let e = captions("?captions=fr").unwrap_err();
+        assert!(e.alternatives.contains(&"de".to_string()) && e.alternatives.contains(&"off".to_string()), "{e:?}");
+        Ok(())
     }
 
     #[test]

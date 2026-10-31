@@ -100,6 +100,14 @@ impl Source for YouTube {
     fn read(&mut self, buf: &mut [u8], wait: Duration) -> Result<Chunk> {
         self.inner.read(buf, wait)
     }
+
+    fn health(&self) -> Option<crate::reconnect::Health> {
+        self.inner.health()
+    }
+
+    fn captions(&mut self) -> Vec<std::result::Result<crate::source::Caption, String>> {
+        self.inner.captions()
+    }
 }
 
 /// The video's playlist, from the cache or from yt-dlp.
@@ -143,10 +151,11 @@ fn ask_ytdlp(id: &str, cookies: Option<&str>) -> Result<Vec<u8>> {
         let mut v = Vec::new();
         out.read_to_end(&mut v).map(|_| v)
     });
+    // not always UTF-8: on Windows yt-dlp writes in the console's code page
     let err_reader = std::thread::spawn(move || {
-        let mut s = String::new();
-        let _ = err.read_to_string(&mut s);
-        s
+        let mut v = Vec::new();
+        let _ = err.read_to_end(&mut v);
+        String::from_utf8_lossy(&v).into_owned()
     });
     let started = Instant::now();
     let status = loop {

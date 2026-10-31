@@ -33,6 +33,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   Linux (Video4Linux2, including Motion-JPEG cameras), ONVIF discovery and media profiles, a synthetic
   test source, and an address allow-list for outbound connections.
 - **Live input and streaming (YouTube):** YouTube URLs stream through their HLS playlist, resolved by yt-dlp.
+- **Captions:** HLS (and YouTube) WebVTT subtitle tracks are followed and logged as `caption` events.
+- **Taps at open:** `live::open_with_taps` attaches taps that see a session's first picture and sound.
 - **Live sessions:** `stream_*` tools and `ironav watch`, with commands on stdin, backoff and health
   states for RTSP sources, an idle timeout, recording to a file or HLS segments while media arrives,
   and a live transcode sink.

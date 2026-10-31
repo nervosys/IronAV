@@ -20,10 +20,11 @@ mod source;
 pub mod synthetic;
 pub mod tls;
 mod url;
+pub mod webvtt;
 mod youtube;
 
 pub use net::{Allow, ALLOW_VAR};
 pub use reconnect::{Health, HealthState, Policy};
-pub use source::{open_source, Chunk, Source, SourceInfo};
+pub use source::{open_source, Caption, Chunk, Source, SourceInfo};
 pub use tls::CA_FILE_VAR;
 pub use url::{redact, SourceUrl};
