@@ -26,6 +26,23 @@ fn drain(tap: &Tap) -> Vec<TapFrame> {
 }
 
 #[test]
+fn taps_given_at_open_see_the_first_picture_and_sound() {
+    // a test:// source starts at once, so a tap added after open would miss its first frames
+    let open = |src: &str, c: TapConfig| {
+        let args: OpenArgs = serde_json::from_value(json!({ "source": src })).unwrap();
+        let (s, mut taps) = live::open_with_taps(&args, vec![TapConfig { queue: 64, ..c }]).unwrap();
+        (s, taps.pop().unwrap())
+    };
+    let (_v, video) = open("test://video?duration=1&fps=20&size=160x90", TapConfig::video());
+    let pictures = drain(&video);
+    assert_eq!(pictures.len(), 20, "every picture");
+    assert_eq!((pictures[0].seq, pictures[0].t), (0, 0.0));
+    let (_a, audio) = open("test://audio?duration=1", TapConfig::audio());
+    let sound = drain(&audio);
+    assert!(!sound.is_empty() && sound[0].t == 0.0, "{:?}", sound.first().map(|f| f.t));
+}
+
+#[test]
 fn a_letterbox_can_sit_top_left_with_its_own_padding() {
     let s = open();
     // as YOLOX takes its input: the picture at the top left, the rest 114

@@ -229,6 +229,10 @@ while let Some(f) = tap.recv_timeout(Duration::from_secs(5))? {
 }
 ```
 
+A tap made this way joins with the next packet, so it can miss a fast source's first frames; taps given to
+`live::open_with_taps(&args, vec![config, ...])`, which returns the session and its taps, are attached before the
+session reads anything and see its first picture and sound.
+
 A video tap gives at most `fps` pictures a second (every one when not given), scaled to fit `width` x `height` (aspect
 kept) and, with `letterbox`, padded to exactly that size (centred, or `placement: TopLeft` as YOLOX-style detectors
 take it; padding `pad`, 0 by default, 114 for those), as RGB, BGR or grey bytes. An audio tap

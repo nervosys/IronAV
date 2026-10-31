@@ -298,6 +298,13 @@ fn parse_fps(s: &str) -> Result<Rational> {
 
 /// Opens a live session on `args.source` and starts reading it.
 pub fn open(args: &OpenArgs) -> Result<Arc<Session>> {
+    open_with_taps(args, Vec::new()).map(|(s, _)| s)
+}
+
+/// Opens a live session as [`open`] does, with `taps` attached before its first packet: unlike
+/// [`Session::tap`] on a running session, these see the session's first picture and sound.
+pub fn open_with_taps(args: &OpenArgs, taps: Vec<TapConfig>) -> Result<(Arc<Session>, Vec<Tap>)> {
+    let (taps, feeders): (Vec<Tap>, Vec<_>) = taps.into_iter().map(crate::tap::tap).collect::<Result<Vec<_>>>()?.into_iter().unzip();
     let url = SourceUrl::parse(&args.source)?;
     if args.keyframe_jpegs > MAX_KEYFRAME_JPEGS {
         return Err(Error::invalid_arg(format!("keyframe_jpegs is at most {MAX_KEYFRAME_JPEGS}")));
@@ -396,7 +403,7 @@ pub fn open(args: &OpenArgs) -> Result<Arc<Session>> {
             recording: args.record.clone(),
             transcoding: args.transcode.as_ref().map(|t| t.output.clone()),
             reconfigure: VecDeque::new(),
-            taps: Vec::new(),
+            taps: feeders,
             health: None,
             keyframes: VecDeque::new(),
             clocks: BTreeMap::new(),
@@ -459,7 +466,7 @@ pub fn open(args: &OpenArgs) -> Result<Arc<Session>> {
         }
         s.1.insert(id, session.clone());
     }
-    Ok(session)
+    Ok((session, taps))
 }
 
 /// Stops a session, waits for its thread, and removes it. Returns its final status.
