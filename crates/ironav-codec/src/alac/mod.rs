@@ -1,5 +1,8 @@
 //! Apple Lossless (ALAC), following the bitstream that Apple's reference decoder and FFmpeg read and write.
 //!
+//! Translated from FFmpeg's `libavcodec/alac.c` (Copyright (c) 2005 David Hammerton) and
+//! `libavcodec/alacenc.c` (Copyright (c) 2008 Jaikrishnan Menon), LGPL-2.1-or-later.
+//!
 //! * [`decoder`] handles compressed frames (adaptive predictor, adaptive Rice codes with zero runs,
 //!   stereo decorrelation, extra low bits) and uncompressed frames, at 16, 20 and 24 bits, and 32-bit mono.
 //! * [`encoder`] writes 16 and 24-bit frames: a second-order predictor per channel, the best of
