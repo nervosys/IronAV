@@ -374,9 +374,11 @@ impl FrameDec {
             let py = y as i32 * 16 + ((2 * mv[0]) >> ssy);
             let (ix, iy) = (px >> 4, py >> 4);
             let (hf, vf) = (&fx[(px & 15) as usize], &fy[(py & 15) as usize]);
+            let (hcopy, vcopy) = (px & 15 == 0, py & 15 == 0);
             let mut line = [0i32; 128 + 7];
             let inside = ix - 3 >= 0 && ix + w as i32 + 4 <= last_x;
-            for r in 0..h + 7 {
+            // Phase 0 is a copy (Subpel_Filters[..][0] is 128 at tap 3): only the rows it reads.
+            for r in if vcopy { 3..h + 3 } else { 0..h + 7 } {
                 let yy = (iy + r as i32 - 3).clamp(0, last_y) as usize;
                 let src = &rp.data[yy * rp.stride..];
                 if inside {
@@ -390,15 +392,27 @@ impl FrameDec {
                     }
                 }
                 let t = &mut tmp[r * w..(r + 1) * w];
-                for (c, o) in t.iter_mut().enumerate() {
-                    let s: i32 = (0..8).map(|k| hf[k] as i32 * line[c + k]).sum();
-                    *o = round2(s, r0);
+                if hcopy {
+                    for (o, &v) in t.iter_mut().zip(&line[3..w + 3]) {
+                        *o = v << (7 - r0);
+                    }
+                } else {
+                    for (c, o) in t.iter_mut().enumerate() {
+                        let s: i32 = (0..8).map(|k| hf[k] as i32 * line[c + k]).sum();
+                        *o = round2(s, r0);
+                    }
                 }
             }
-            for r in 0..h {
-                for c in 0..w {
-                    let s: i32 = (0..8).map(|k| vf[k] as i32 * tmp[(r + k) * w + c]).sum();
-                    out[r * w + c] = round2(s, r1);
+            if vcopy {
+                for (o, &v) in out[..w * h].iter_mut().zip(&tmp[3 * w..(h + 3) * w]) {
+                    *o = round2(v << 7, r1);
+                }
+            } else {
+                for r in 0..h {
+                    for c in 0..w {
+                        let s: i32 = (0..8).map(|k| vf[k] as i32 * tmp[(r + k) * w + c]).sum();
+                        out[r * w + c] = round2(s, r1);
+                    }
                 }
             }
             return;

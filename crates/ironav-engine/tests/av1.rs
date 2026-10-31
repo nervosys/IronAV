@@ -247,5 +247,18 @@ fn inter_dev() {
     let src = std::env::var("AV1_SRC").unwrap_or(TESTSRC.into());
     let frames: u32 = std::env::var("AV1_FRAMES").map_or(3, |v| v.parse().unwrap());
     let cpu = std::env::var("AV1_CPU").unwrap_or("6".into());
-    eprintln!("{name}: {} bytes equal", check(&inter(&name, &src, &params, &args, frames, &cpu)));
+    let pix_fmt = std::env::var("AV1_PIXFMT").ok().filter(|s| !s.is_empty()).unwrap_or("yuv420p".into());
+    let container = std::env::var("AV1_CONTAINER").ok().filter(|s| !s.is_empty()).unwrap_or("webm".into());
+    eprintln!("{name}: {} bytes equal", check(&Case { pix_fmt: &pix_fmt, container: &container, ..inter(&name, &src, &params, &args, frames, &cpu) }));
+}
+
+#[test]
+fn speed_dev() {
+    let Ok(src) = std::env::var("AV1_SPEED") else { return };
+    let out = std::env::temp_dir().join("ironav-av1-speed.y4m");
+    let j = Job { input: src.clone(), output: out.display().to_string(), hwaccel: "off".into(), ..Job::default() };
+    let t = std::time::Instant::now();
+    run(&j, &mut |_| {}).unwrap();
+    eprintln!("{src}: {:?}", t.elapsed());
+    let _ = std::fs::remove_file(&out);
 }
