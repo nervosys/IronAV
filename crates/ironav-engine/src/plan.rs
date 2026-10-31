@@ -1,6 +1,6 @@
 use crate::job::{FilterCall, Job};
 use ironav_codec::{audio_bitrate_range, build_filter, encoder_extradata_with_opts, new_encoder_with_opts, FILTERS};
-use ironav_core::{CodecId, Error, ErrorCode, MediaType, Result, StreamInfo, StreamParams};
+use ironav_core::{CodecId, Error, ErrorCode, MediaType, Result, SampleFormat, StreamInfo, StreamParams};
 use ironav_formats::{find_format, format_for_path, open_demuxer};
 use crate::job::{Latency, OpusJob, StreamOpts};
 use ironav_hwaccel::{probe_all, provider_codecs, select, Direction, HwPolicy, RateControl, Selection, DEFAULT_QP};
@@ -184,6 +184,19 @@ pub fn plan(job: &Job) -> Result<Plan> {
             if let [c] = only[..] {
                 warnings.push(format!("{at}: '{}' holds only {}, so the stream is encoded as {} instead of {}", spec.name, c.name(), c.name(), to.name()));
                 to = c;
+            }
+        }
+        // a format that holds only PCM (a .wav) takes other audio as PCM: at the source's depth when
+        // it says one (FLAC), else 16 bits
+        if opts.codec.is_none() && media == MediaType::Audio && !spec.codecs.contains(&to) && spec.codecs.iter().filter(|c| c.media_type() == media).all(|c| c.sample_format().is_some()) {
+            let pcm = CodecId::pcm_for(match s.bits {
+                Some(b) if b > 24 => SampleFormat::S32,
+                Some(b) if b > 16 => SampleFormat::S24,
+                _ => SampleFormat::S16,
+            });
+            if spec.codecs.contains(&pcm) {
+                warnings.push(format!("{at}: '{}' holds PCM only, so the stream is decoded to {}", spec.name, pcm.name()));
+                to = pcm;
             }
         }
         if to.media_type() != media {

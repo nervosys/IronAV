@@ -287,8 +287,8 @@ fn decodes_reference_libflac_files_bit_exactly() {
 fn wav_to_flac_to_wav_is_lossless_at_16_and_24_bits() {
     let d = scratch("flacrt");
     let a = d.join("a.wav");
-    // 16-bit: from the libFLAC reference WAV
-    for (src, codec) in [(fixture("ref_stereo16.wav"), "pcm_s16le"), (fixture("ref_mono24.wav"), "pcm_s24le")] {
+    // 16-bit: from the libFLAC reference WAV; back to WAV at the FLAC's depth without naming a codec
+    for src in [fixture("ref_stereo16.wav"), fixture("ref_mono24.wav")] {
         let (f, back) = (d.join("x.flac"), d.join("back.wav"));
         let _ = std::fs::remove_file(&f);
         let _ = std::fs::remove_file(&back);
@@ -296,9 +296,7 @@ fn wav_to_flac_to_wav_is_lossless_at_16_and_24_bits() {
         j.audio.codec = Some("flac".into());
         let r = run(&j, &mut |_| {}).unwrap();
         assert!(r.bytes_out < r.bytes_in, "FLAC should compress this signal");
-        let mut j = job(&f, &back);
-        j.audio.codec = Some(codec.into());
-        run(&j, &mut |_| {}).unwrap();
+        run(&job(&f, &back), &mut |_| {}).unwrap();
         assert_eq!(wav_data(&back), wav_data(&src));
     }
     let _ = a;
@@ -315,8 +313,16 @@ fn flac_plan_picks_bit_depth_and_explains_wav_mismatch() {
     .unwrap();
     assert_eq!(p.output.streams[0].bits, Some(24));
 
-    // FLAC cannot be written into WAV: the error must say which codecs would work.
-    let e = plan(&job(&fixture("ref_stereo16.flac"), &d.join("o.wav"))).unwrap_err();
+    // FLAC into WAV is decoded to PCM at its depth, unless FLAC is asked for: then the error says
+    // which codecs would work
+    let p = plan(&job(&fixture("ref_stereo16.flac"), &d.join("o.wav"))).unwrap();
+    assert_eq!(p.output.streams[0].codec, ironav_core::CodecId::PcmS16Le);
+    let e = plan(&{
+        let mut j = job(&fixture("ref_stereo16.flac"), &d.join("o.wav"));
+        j.audio.codec = Some("flac".into());
+        j
+    })
+    .unwrap_err();
     assert_eq!(e.code, ErrorCode::UnsupportedCodec);
     assert!(e.alternatives.contains(&"pcm_s16le".to_string()));
 }

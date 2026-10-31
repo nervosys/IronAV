@@ -1,139 +1,323 @@
-"""IronAV against the FFmpeg libraries (through PyAV) on one machine.
+"""IronAV against the ffmpeg command-line program, on one machine.
 
-    pip install av numpy
-    IRONAV_BIN=target/release/ironav python bench/vs_ffmpeg.py [media-dir]
+    IRONAV_BIN=C:/cargo-target-ironav/release/ironav.exe FFMPEG=ffmpeg python -I bench/vs_ffmpeg.py [media-dir]
 
-The FFmpeg side runs in-process, so it pays no process start-up; the IronAV side is a fresh process
-per run, start-up included. That leans against IronAV (start-up is about 13 ms on the machine this was written on). Each figure is the median of 5 runs. The audio part generates its own signal. The video part
-needs av.mp4 (H.264, 720p), bf.mp4 (H.264 with B-frames) and src.y4m in the media directory and is
-skipped when they are missing. FFmpeg's decode figures do not write the pictures anywhere, while
-IronAV writes a Y4M file, so they overstate FFmpeg's advantage on decoding. (Writing the same file through
-PyAV's Y4M muxer took 7.6 s for 240 frames, which says more about that path than about FFmpeg, so no like-for-like
-number is given; run the `ffmpeg` command-line program for one.)"""
-import subprocess, json, os, time, statistics, sys
-import numpy as np, av
-IA = r"E:\cargo-target\release\ironav.exe"
-V = (sys.argv[1] if len(sys.argv) > 1 else "bench-media").rstrip("/") + "/"
+Both sides are command-line programs, one fresh process per run, start-up included. Each job runs the IronAV
+command and the ffmpeg command in turn, five runs each, and both write their real output to a temporary directory.
+Wall time is time.perf_counter around subprocess.run. The table gives the median and the minimum; the ratio is
+FFmpeg median over IronAV median, so above 1 means IronAV was faster. After the timing, each IronAV output is
+probed with ffprobe and fully decoded, and audio outputs are compared by MD5 of their decoded samples.
+
+Inputs that are missing from the media directory are generated there: a.wav (180 s, stereo, 44.1 kHz, 16-bit,
+numpy signal), ref.flac (ffmpeg's FLAC of a.wav), src.y4m (testsrc2, 240 frames, 1280x720, 30 fps), av.mp4
+(H.264 720p, no B-frames) and bf.mp4 (H.264 720p, 3 B-frames, libx264 only). av.mp4 uses libx264 when present,
+else h264_nvenc. A job whose encoder or input is unavailable is skipped, and the table says why.
+
+IRONAV_BIN defaults to C:/cargo-target-ironav/release/ironav.exe and FFMPEG to ffmpeg (ffprobe is taken from the
+same place). Figures are from one machine with a warm file cache. Encoders run with their own defaults, so output
+sizes differ and are not a quality comparison.
+"""
+import json, os, re, shutil, statistics, subprocess, sys, tempfile, time, wave
+
+IRONAV = os.environ.get("IRONAV_BIN", "C:/cargo-target-ironav/release/ironav.exe")
+FFMPEG = os.environ.get("FFMPEG", "ffmpeg")
+_d, _b = os.path.split(FFMPEG)
+FFPROBE = os.path.join(_d, _b.replace("ffmpeg", "ffprobe"))
+V = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else "bench-media")
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 N = 5
+TMP = tempfile.mkdtemp(prefix="ironav-vs-ffmpeg-")
+rows = []
 
-def ironav(*a):
+
+class Fail(Exception):
+    pass
+
+
+def sh(cmd):
+    return subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace")
+
+
+def ffmpeg_args(*a):
+    return [FFMPEG, "-nostdin", "-hide_banner", "-nostats", "-v", "error", *a]
+
+
+def J(name):
+    return os.path.join(TMP, name)
+
+
+def p(name):
+    return os.path.join(V, name)
+
+
+def size(path):
+    return os.path.getsize(path) if path and os.path.exists(path) else None
+
+
+def fmt_n(x):
+    return "missing" if x is None else f"{x:,} B"
+
+
+def encoders():
+    out = sh([FFMPEG, "-hide_banner", "-encoders"]).stdout
+    return {m.group(1) for m in re.finditer(r"^\s*[VAS][.A-Za-z]{5}\s+(\S+)", out, re.M)}
+
+
+def ff_make(*a):
+    r = sh(ffmpeg_args("-y", *a))
+    if r.returncode:
+        raise SystemExit(f"generating input failed: {r.stderr.strip()}")
+
+
+def make_inputs(enc):
+    os.makedirs(V, exist_ok=True)
+    wav = p("a.wav")
+    if not os.path.exists(wav):
+        import numpy as np
+        rng = np.random.default_rng(7); sr = 44100; n = sr * 180; t = np.arange(n) / sr
+        sig = sum(a_ * np.sin(2*np.pi*f*t + ph) for a_, f, ph in [(.3,220,0),(.2,330,1),(.12,495,2),(.08,1320,.5),(.05,3100,3)])
+        sig = sig * (0.4 + 0.6*np.abs(np.sin(2*np.pi*0.7*t))**3) + rng.normal(0, .01, n)
+        st = (np.stack([sig, .8*sig + rng.normal(0, .008, n)], 1) * .7)
+        pcm = (st * 32767).astype(np.int16)
+        with wave.open(wav + ".part", "wb") as w:
+            w.setnchannels(2); w.setsampwidth(2); w.setframerate(sr); w.writeframes(pcm.tobytes())
+        os.replace(wav + ".part", wav)
+    if not os.path.exists(p("ref.flac")):
+        ff_make("-i", wav, "-c:a", "flac", p("ref.flac"))
+    src = p("src.y4m")
+    if not os.path.exists(src):
+        ff_make("-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30", "-frames:v", "240", "-pix_fmt", "yuv420p", src)
+    if not os.path.exists(p("av.mp4")) and ("libx264" in enc or "h264_nvenc" in enc):
+        codec = (["-c:v", "libx264", "-preset", "medium", "-crf", "23", "-bf", "0"] if "libx264" in enc
+                 else ["-c:v", "h264_nvenc", "-bf", "0"])
+        ff_make("-i", src, *codec, "-pix_fmt", "yuv420p", p("av.mp4"))
+    if not os.path.exists(p("bf.mp4")) and "libx264" in enc:
+        ff_make("-i", src, "-c:v", "libx264", "-preset", "medium", "-crf", "23", "-bf", "3",
+                "-pix_fmt", "yuv420p", p("bf.mp4"))
+
+
+def timed(cmd, outs, is_ironav):
+    for o in outs:
+        if os.path.exists(o):
+            os.remove(o)
     t = time.perf_counter()
-    r = subprocess.run([IA, *a], capture_output=True, text=True)
+    r = sh(cmd)
     dt = time.perf_counter() - t
-    j = json.loads(r.stdout)
-    assert j["ok"], j
+    if is_ironav:
+        try:
+            j = json.loads(r.stdout)
+        except ValueError:
+            j = None
+        if r.returncode or not (j and j.get("ok")):
+            raise Fail(f"exit {r.returncode}, output: " + (r.stdout.strip() or r.stderr.strip())[:800])
+    elif r.returncode:
+        raise Fail(f"exit {r.returncode}: " + r.stderr.strip()[:800])
+    for o in outs:
+        if not os.path.exists(o) or os.path.getsize(o) == 0:
+            raise Fail(f"no output written: {o}")
     return dt
 
-def med(f, n=N):
-    xs = [f() for _ in range(n)]
-    return statistics.median(xs), min(xs)
 
-def rm(*fs):
-    for f in fs:
-        if os.path.exists(f): os.remove(f)
+def job(name, ia_cmd, ff_cmd, ia_out=None, ff_out=None, extra="", md5_ref=None):
+    row = {"name": name, "ia": [], "ff": [], "err": {}, "ia_out": ia_out, "ff_out": ff_out,
+           "extra": extra, "md5_ref": md5_ref}
+    rows.append(row)
+    print(f"running {name} ...", flush=True)
+    for _ in range(N):
+        for side, cmd, out in (("ia", ia_cmd, ia_out), ("ff", ff_cmd, ff_out)):
+            if side in row["err"]:
+                continue
+            try:
+                row[side].append(timed(cmd, [out] if out else [], side == "ia"))
+            except Fail as e:
+                row["err"][side] = str(e)
 
-def line(name, a, b, unit_work, work):
-    print(f"{name:34s} IronAV {a[0]*1000:8.0f} ms (min {a[1]*1000:6.0f})   FFmpeg {b[0]*1000:8.0f} ms (min {b[1]*1000:6.0f})   ratio {b[0]/a[0]:5.2f}x   {work/a[0]:7.0f} vs {work/b[0]:7.0f} {unit_work}")
 
-# ---------- startup / probe latency ----------
-def pyav_probe():
-    t = time.perf_counter()
-    c = av.open(V + "av.mp4"); _ = [(s.type, s.codec_context.name) for s in c.streams]; c.close()
-    return time.perf_counter() - t
-if os.path.exists(V + "av.mp4"):
-  a = med(lambda: ironav("probe", V + "av.mp4"), 15)
-  b = med(pyav_probe, 15)
-  print(f"probe av.mp4: IronAV process {a[0]*1000:.0f} ms median (incl. process start); FFmpeg in-process open {b[0]*1000:.1f} ms (python already running)")
+def skip(name, why):
+    rows.append({"name": name, "skip": why})
+    print(f"skipped {name}: {why}", flush=True)
 
-# ---------- audio: 180 s stereo 44.1k WAV <-> FLAC ----------
-rng = np.random.default_rng(7); sr = 44100; n = sr * 180; t = np.arange(n) / sr
-sig = sum(a_ * np.sin(2*np.pi*f*t + p) for a_, f, p in [(.3,220,0),(.2,330,1),(.12,495,2),(.08,1320,.5),(.05,3100,3)])
-sig = sig * (0.4 + 0.6*np.abs(np.sin(2*np.pi*0.7*t))**3) + rng.normal(0, .01, n)
-st = (np.stack([sig, .8*sig + rng.normal(0, .008, n)], 1) * .7)
-pcm = (st * 32767).astype(np.int16)
-import wave
-with wave.open("b_in.wav", "wb") as w:
-    w.setnchannels(2); w.setsampwidth(2); w.setframerate(sr); w.writeframes(pcm.tobytes())
-raw = os.path.getsize("b_in.wav")
 
-def ff_flac_enc():
-    rm("b_ff.flac")
-    t = time.perf_counter()
-    ic = av.open("b_in.wav"); oc = av.open("b_ff.flac", "w")
-    os_ = oc.add_stream("flac", rate=sr); os_.layout = "stereo"
-    for fr in ic.decode(audio=0):
-        for p in os_.encode(fr): oc.mux(p)
-    for p in os_.encode(None): oc.mux(p)
-    oc.close(); ic.close()
-    return time.perf_counter() - t
-def ia_flac_enc():
-    rm("b_ia.flac")
-    return ironav("convert", "-i", "b_in.wav", "-o", "b_ia.flac", "--acodec", "flac")
-a = med(ia_flac_enc); b = med(ff_flac_enc)
-line("WAV->FLAC encode, 180 s audio", a, b, "x realtime", 180)
-print(f"   sizes: IronAV {os.path.getsize('b_ia.flac')/raw:.4f}  FFmpeg {os.path.getsize('b_ff.flac')/raw:.4f}  (fraction of WAV)")
+def machine():
+    cpu = sh(["powershell", "-NoProfile", "-Command", "(Get-CimInstance Win32_Processor).Name"]).stdout.strip().splitlines()
+    gpu = sh(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"]).stdout.strip().splitlines()
+    ffv = (sh([FFMPEG, "-version"]).stdout.splitlines() or ["unknown"])[0]
+    git = sh(["git", "-C", REPO, "rev-parse", "--short", "HEAD"]).stdout.strip()
+    return [
+        f"CPU: {cpu[0].strip() if cpu else 'unknown'}",
+        f"logical cores: {os.cpu_count()}",
+        f"GPU: {'; '.join(g.strip() for g in gpu) or 'nvidia-smi unavailable'}",
+        f"FFmpeg: {ffv}",
+        f"IronAV binary: {IRONAV}; repo HEAD {git or 'unknown'}",
+    ]
 
-def ff_flac_dec():
-    t = time.perf_counter()
-    c = av.open("b_ia.flac"); n_ = 0
-    for fr in c.decode(audio=0): n_ += fr.samples
-    c.close()
-    return time.perf_counter() - t
-def ia_flac_dec():
-    rm("b_back.wav")
-    return ironav("convert", "-i", "b_ia.flac", "-o", "b_back.wav", "--acodec", "pcm_s16le")
-a = med(ia_flac_dec); b = med(ff_flac_dec)
-line("FLAC->WAV decode, 180 s (FFmpeg: decode only)", a, b, "x realtime", 180)
-# FFmpeg decode of FLAC *produced by IronAV* also proves interop; IronAV's output WAV must be lossless
-back = av.open("b_back.wav"); arr = np.concatenate([f.to_ndarray() for f in back.decode(audio=0)], axis=1)
-print("   roundtrip lossless (IronAV FLAC -> IronAV WAV == source):", np.array_equal(arr.reshape(-1), pcm.reshape(-1)) or np.array_equal(arr, pcm.T))
-back.close(); rm("b_in.wav", "b_ia.flac", "b_ff.flac", "b_back.wav")
 
-# ---------- video ----------
-if not all(os.path.exists(V + f) for f in ("av.mp4", "bf.mp4", "src.y4m")):
-    print(f"video part skipped: need av.mp4, bf.mp4 and src.y4m in {V}")
-    sys.exit(0)
-# ---------- video decode: 720p H.264, 240 frames ----------
-def ff_dec(hw=None, src="av.mp4"):
-    t = time.perf_counter()
-    kw = {}
-    if hw:
-        from av.codec.hwaccel import HWAccel
-        kw["hwaccel"] = HWAccel(device_type=hw)
-    c = av.open(V + src, **kw); c.streams.video[0].thread_type = "AUTO"; k = 0
-    for fr in c.decode(video=0): k += 1
-    c.close()
-    return time.perf_counter() - t, k
-def ia_dec(src="av.mp4", hw="auto"):
-    rm("b_dec.y4m")
-    d = ironav("convert", "-i", V + src, "-o", "b_dec.y4m", "-f", "y4m", "--vcodec", "rawvideo", "-y", "--hwaccel", hw)
-    rm("b_dec.y4m"); return d
-for src, frames in (("av.mp4", 240), ("bf.mp4", 50)):
-    print(f"--- decode {src} ({frames} frames)")
-    a = med(lambda: ia_dec(src)); line("IronAV NVDEC -> y4m file vs FFmpeg CPU", a, med(lambda: ff_dec(None, src)[0]), "fps", frames)
-    try:
-        b = med(lambda: ff_dec("cuda", src)[0]); line("IronAV NVDEC -> y4m file vs FFmpeg cuda", a, b, "fps", frames)
-    except Exception as e:
-        print("   FFmpeg cuda hwaccel via PyAV failed:", repr(e)[:200])
+def fmt_t(ts):
+    if not ts:
+        return "FAIL"
+    return f"{statistics.median(ts)*1000:,.0f} ms (min {min(ts)*1000:,.0f})"
 
-# ---------- video encode: NVENC, 240 frames 720p from y4m ----------
-print("--- encode src.y4m -> H.264 NVENC")
-def ia_enc():
-    rm("b_enc.h264")
-    return ironav("convert", "-i", V + "src.y4m", "-o", "b_enc.h264", "--vcodec", "h264", "--hwaccel", "nvenc", "--vbitrate", "4000", "-y")
-def ff_enc(codec="h264_nvenc"):
-    rm("b_ff.h264")
-    t = time.perf_counter()
-    ic = av.open(V + "src.y4m"); oc = av.open("b_ff.h264", "w", format="h264")
-    s = ic.streams.video[0]
-    os_ = oc.add_stream(codec, rate=s.average_rate); os_.width = s.width; os_.height = s.height; os_.pix_fmt = "yuv420p"; os_.bit_rate = 4_000_000
-    for fr in ic.decode(video=0):
-        for p in os_.encode(fr): oc.mux(p)
-    for p in os_.encode(None): oc.mux(p)
-    oc.close(); ic.close()
-    return time.perf_counter() - t
-a = med(ia_enc); b = med(ff_enc)
-line("IronAV NVENC vs FFmpeg h264_nvenc", a, b, "fps", 240)
-print(f"   sizes: IronAV {os.path.getsize('b_enc.h264')} B  FFmpeg {os.path.getsize('b_ff.h264')} B")
-b2 = med(lambda: ff_enc("libx264"), 3); line("IronAV NVENC vs FFmpeg libx264 (CPU)", a, b2, "fps", 240)
-rm("b_enc.h264", "b_ff.h264")
+
+def notes(r):
+    parts = [r["extra"]] if r["extra"] else []
+    if size(r["ia_out"]) is not None or size(r["ff_out"]) is not None:
+        parts.append(f"output bytes: IronAV {fmt_n(size(r['ia_out']))}, FFmpeg {fmt_n(size(r['ff_out']))}")
+    for side, label in (("ia", "IronAV"), ("ff", "FFmpeg")):
+        if side in r["err"]:
+            parts.append(f"{label} FAILED, see below")
+    return "; ".join(parts)
+
+
+def ffprobe_line(path):
+    r = sh([FFPROBE, "-v", "error", "-count_frames", "-show_entries",
+            "format=format_name,duration:stream=codec_type,codec_name,width,height,sample_rate,channels,nb_read_frames",
+            "-of", "json", path])
+    if r.returncode:
+        return f"ffprobe FAILED: {r.stderr.strip()[:300]}"
+    j = json.loads(r.stdout)
+    parts = []
+    for s in j.get("streams", []):
+        t = s.get("codec_type")
+        if t == "video":
+            parts.append(f"video {s.get('codec_name')} {s.get('width')}x{s.get('height')} frames={s.get('nb_read_frames')}")
+        elif t == "audio":
+            parts.append(f"audio {s.get('codec_name')} {s.get('sample_rate')} Hz {s.get('channels')} ch")
+        else:
+            parts.append(str(t))
+    fmt = j.get("format", {})
+    return f"{fmt.get('format_name')}, {fmt.get('duration')} s; " + ", ".join(parts)
+
+
+def decodes_clean(path):
+    r = sh(ffmpeg_args("-i", path, "-map", "0", "-f", "null", "-"))
+    if r.returncode == 0 and not r.stderr.strip():
+        return "decodes clean"
+    return "decode problems: " + (r.stderr.strip() or f"exit {r.returncode}")[:300]
+
+
+def md5(path):
+    m = re.search(r"MD5=([0-9a-f]+)", sh(ffmpeg_args("-i", path, "-map", "0:a:0", "-f", "md5", "-")).stdout)
+    return m.group(1) if m else None
+
+
+def frame_types(path):
+    return sh([FFPROBE, "-v", "error", "-select_streams", "v:0", "-show_entries", "frame=pict_type",
+               "-of", "csv=p=0", path]).stdout.split()
+
+
+def main():
+    if not os.path.exists(IRONAV):
+        raise SystemExit(f"IronAV binary not found: {IRONAV} (set IRONAV_BIN)")
+    print("Machine")
+    for line in machine():
+        print("  " + line)
+    print(f"Media dir: {V}", flush=True)
+    enc = encoders()
+    make_inputs(enc)
+    wav, ref, src, av, bf = p("a.wav"), p("ref.flac"), p("src.y4m"), p("av.mp4"), p("bf.mp4")
+    has_av, has_bf = os.path.exists(av), os.path.exists(bf)
+
+    # 1. WAV -> FLAC
+    job("1. WAV -> FLAC, 180 s stereo",
+        [IRONAV, "convert", "-i", wav, "-o", J("j1_ia.flac"), "-y"],
+        ffmpeg_args("-y", "-i", wav, "-c:a", "flac", J("j1_ff.flac")),
+        J("j1_ia.flac"), J("j1_ff.flac"), extra=f"input {fmt_n(size(wav))}", md5_ref=wav)
+
+    # 2. FLAC -> WAV (the FLAC is ffmpeg's)
+    job("2. FLAC -> WAV, 180 s stereo",
+        [IRONAV, "convert", "-i", ref, "-o", J("j2_ia.wav"), "-y"],
+        ffmpeg_args("-y", "-i", ref, J("j2_ff.wav")),
+        J("j2_ia.wav"), J("j2_ff.wav"), extra=f"input {fmt_n(size(ref))}", md5_ref=ref)
+    job("2b. FLAC -> WAV, IronAV with --acodec pcm_s16le",
+        [IRONAV, "convert", "-i", ref, "-o", J("j2b_ia.wav"), "--acodec", "pcm_s16le", "-y"],
+        ffmpeg_args("-y", "-i", ref, J("j2b_ff.wav")),
+        J("j2b_ia.wav"), J("j2b_ff.wav"), extra="same as 2 with the PCM codec named", md5_ref=ref)
+
+    # 3. WAV -> Opus
+    if "libopus" in enc:
+        job("3. WAV -> Opus 128 kb/s (stereo)",
+            [IRONAV, "convert", "-i", wav, "-o", J("j3_ia.opus"), "--acodec", "opus", "--abitrate", "128", "-y"],
+            ffmpeg_args("-y", "-i", wav, "-c:a", "libopus", "-b:a", "128k", J("j3_ff.opus")),
+            J("j3_ia.opus"), J("j3_ff.opus"), extra="lossy: no sample comparison")
+    else:
+        skip("3. WAV -> Opus", "no libopus encoder in this FFmpeg")
+
+    # 4. Y4M -> H.264 on NVENC
+    if not os.path.exists(src):
+        skip("4. Y4M -> H.264 NVENC", "src.y4m missing")
+    elif "h264_nvenc" not in enc:
+        skip("4. Y4M -> H.264 NVENC", "no h264_nvenc encoder in this FFmpeg")
+    else:
+        job("4. Y4M -> H.264 NVENC, 240 frames 720p",
+            [IRONAV, "convert", "-i", src, "-o", J("j4_ia.mp4"), "--vcodec", "h264", "--hwaccel", "require", "-y"],
+            ffmpeg_args("-y", "-i", src, "-c:v", "h264_nvenc", J("j4_ff.mp4")),
+            J("j4_ia.mp4"), J("j4_ff.mp4"), extra="each with its own default bitrate")
+
+    # 5. H.264 MP4 -> Y4M, GPU decode
+    if not has_av:
+        skip("5. H.264 -> Y4M, GPU decode", "av.mp4 missing")
+    else:
+        job("5. H.264 -> Y4M, GPU decode, 240 frames",
+            [IRONAV, "convert", "-i", av, "-o", J("j5_ia.y4m"), "--hwaccel", "auto", "-y"],
+            ffmpeg_args("-y", "-hwaccel", "cuda", "-i", av, "-f", "yuv4mpegpipe", "-pix_fmt", "yuv420p", J("j5_ff.y4m")),
+            J("j5_ia.y4m"), J("j5_ff.y4m"), extra="both write the decoded frames")
+
+    # 6. H.264 MP4 -> Y4M, software decode
+    if not has_av:
+        skip("6. H.264 -> Y4M, software decode", "av.mp4 missing")
+    else:
+        job("6a. H.264 -> Y4M, software, av.mp4",
+            [IRONAV, "convert", "-i", av, "-o", J("j6a_ia.y4m"), "--hwaccel", "off", "-y"],
+            ffmpeg_args("-y", "-threads", "0", "-i", av, "-f", "yuv4mpegpipe", "-pix_fmt", "yuv420p", J("j6a_ff.y4m")),
+            J("j6a_ia.y4m"), J("j6a_ff.y4m"), extra="no hwaccel on either side")
+    if has_bf:
+        job("6b. H.264 -> Y4M, software, bf.mp4 (B-frames)",
+            [IRONAV, "convert", "-i", bf, "-o", J("j6b_ia.y4m"), "--hwaccel", "off", "-y"],
+            ffmpeg_args("-y", "-threads", "0", "-i", bf, "-f", "yuv4mpegpipe", "-pix_fmt", "yuv420p", J("j6b_ff.y4m")),
+            J("j6b_ia.y4m"), J("j6b_ff.y4m"), extra="no hwaccel on either side")
+    else:
+        skip("6b. H.264 -> Y4M, software, bf.mp4", "bf.mp4 missing (needs libx264)")
+
+    # 7. Start-up
+    job("7. Process start-up",
+        [IRONAV, "capabilities"], [FFMPEG, "-version"], extra="no output file; fixed cost per process")
+
+    print("\n## Results (median, min over 5 runs; ratio = FFmpeg / IronAV, above 1 means IronAV faster)\n")
+    print("| Job | IronAV median (min) | FFmpeg median (min) | FFmpeg / IronAV | Notes |")
+    print("|---|---|---|---|---|")
+    for r in rows:
+        if "skip" in r:
+            print(f"| {r['name']} | skipped | skipped | | {r['skip']} |")
+            continue
+        ratio = (f"{statistics.median(r['ff'])/statistics.median(r['ia']):.2f}x"
+                 if r["ia"] and r["ff"] else "n/a")
+        print(f"| {r['name']} | {fmt_t(r['ia'])} | {fmt_t(r['ff'])} | {ratio} | {notes(r)} |")
+
+    errs = [(r["name"], side, e) for r in rows if "skip" not in r for side, e in r["err"].items()]
+    if errs:
+        print("\n## Failures")
+        for name, side, e in errs:
+            print(f"- {name} [{'IronAV' if side == 'ia' else 'FFmpeg'}]: {e}")
+
+    print("\n## Verification of IronAV outputs (after timing)")
+    if has_av:
+        print(f"- av.mp4 B-frames: {frame_types(av).count('B')} of {len(frame_types(av))} frames")
+    if has_bf:
+        print(f"- bf.mp4 B-frames: {frame_types(bf).count('B')} of {len(frame_types(bf))} frames")
+    for r in rows:
+        if "skip" in r or "ia" in r["err"] or not r["ia"] or not r["ia_out"]:
+            continue
+        out = r["ia_out"]
+        print(f"- {r['name']}: {ffprobe_line(out)}; {decodes_clean(out)}")
+        if r["md5_ref"]:
+            got, want = md5(out), md5(r["md5_ref"])
+            print(f"    audio MD5 IronAV {got} vs source {want}: {'match' if got == want else 'DIFFERENT'}")
+
+    print("\n## Machine")
+    for line in machine():
+        print("- " + line)
+    shutil.rmtree(TMP, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    main()
