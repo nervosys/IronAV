@@ -94,16 +94,11 @@ fn an_audio_tap_measures_its_windows() {
             // the 440 Hz tone at 0.3
             assert!((x.rms_dbfs - -13.5).abs() < 0.5 && (x.peak_dbfs - -10.5).abs() < 0.3, "{x:?} at {}", f.t);
             assert!((x.centroid_hz - 440.0).abs() < 60.0 && x.flatness < 0.05, "{x:?} at {}", f.t);
-            if f.t > 0.9 {
-                assert!(x.speech > 0.5, "{x:?} at {}", f.t);
-            }
         } else {
             assert!(x.rms_dbfs < -90.0, "{x:?} at {}", f.t);
-            // the detector's hangover covers the start of a pause, not its second half
-            if (f.t + 0.01).fract() > 0.7 {
-                assert_eq!(x.speech, 0.0, "{x:?} at {}", f.t);
-            }
         }
+        // a steady tone is not speech, and nor is silence
+        assert_eq!(x.speech, 0.0, "{x:?} at {}", f.t);
     }
     assert!(seen >= 7);
 }

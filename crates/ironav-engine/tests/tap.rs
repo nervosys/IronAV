@@ -1,7 +1,7 @@
 //! Taps on a live session: decoded pictures and sound handed to code in the same process.
 
 use ironav_engine::live::{self, OpenArgs};
-use ironav_engine::tap::{PixelLayout, Tap, TapConfig, TapData, TapFrame};
+use ironav_engine::tap::{PixelLayout, Placement, Tap, TapConfig, TapData, TapFrame};
 use serde_json::json;
 use std::time::Duration;
 
@@ -22,6 +22,23 @@ fn drain(tap: &Tap) -> Vec<TapFrame> {
             Ok(None) => panic!("nothing for 10 s"),
             Err(_) => return got,
         }
+    }
+}
+
+#[test]
+fn a_letterbox_can_sit_top_left_with_its_own_padding() {
+    let s = open();
+    // as YOLOX takes its input: the picture at the top left, the rest 114
+    let tap = s.tap(TapConfig { fps: Some(5.0), width: Some(160), height: Some(90), letterbox: true, placement: Placement::TopLeft, pad: 114, queue: 64, ..TapConfig::video() }).unwrap();
+    let got = drain(&tap);
+    assert!(!got.is_empty());
+    for f in &got {
+        let TapData::Video { width: 160, height: 90, pixels, .. } = &f.data else { panic!("not 160x90") };
+        // 4:3 in 16:9: the picture is 120 wide, so columns 120 to 159 are padding
+        for y in 0..90 {
+            assert!(pixels[(y * 160 + 120) * 3..(y + 1) * 160 * 3].iter().all(|&p| p == 114), "row {y}");
+        }
+        assert!(pixels[..120 * 3].iter().any(|&p| p != 114), "the picture starts at the left");
     }
 }
 

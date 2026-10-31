@@ -9,7 +9,7 @@
 //! sequence number, so a gap is visible, its media time (from the source's timestamps: for RTSP,
 //! the RTP clock from the start of the stream) and the wall-clock time it was decoded.
 
-use ironav_codec::voice::{SpectrumMeter, StreamResampler, Vad};
+use ironav_codec::voice::{SpectrumMeter, StreamResampler};
 use ironav_core::{AudioFrame, Error, ErrorCode, MediaType, Result, VideoFrame};
 use serde::Deserialize;
 use std::collections::VecDeque;
@@ -45,9 +45,16 @@ pub struct TapConfig {
     pub width: Option<u32>,
     #[serde(default)]
     pub height: Option<u32>,
-    /// Pad the scaled picture with black to exactly `width` x `height`, centred.
+    /// Pad the scaled picture to exactly `width` x `height`, at `placement`, with `pad`.
     #[serde(default)]
     pub letterbox: bool,
+    /// Where a letterboxed picture goes: `centre` (the default) or `top_left` (as YOLOX-style
+    /// detectors expect, with `pad` 114).
+    #[serde(default)]
+    pub placement: Placement,
+    /// The value of a letterbox's padding in every channel; 0 (black) by default.
+    #[serde(default)]
+    pub pad: u8,
     #[serde(default = "default_layout")]
     pub layout: PixelLayout,
     /// Sound: the sample rate of the mono windows.
@@ -64,6 +71,16 @@ pub struct TapConfig {
     /// Items kept for a slow reader before the oldest is dropped.
     #[serde(default = "default_queue")]
     pub queue: usize,
+}
+
+/// Where a letterboxed picture sits in its box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Placement {
+    #[default]
+    #[serde(alias = "center")]
+    Centre,
+    TopLeft,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
@@ -88,7 +105,7 @@ fn default_queue() -> usize {
 
 impl TapConfig {
     pub fn video() -> Self {
-        Self { media: TapMedia::Video, stream: None, fps: None, width: None, height: None, letterbox: false, layout: PixelLayout::Rgb, rate: 16_000, window_ms: 1000, hop_ms: None, features: false, queue: 1 }
+        Self { media: TapMedia::Video, stream: None, fps: None, width: None, height: None, letterbox: false, placement: Placement::Centre, pad: 0, layout: PixelLayout::Rgb, rate: 16_000, window_ms: 1000, hop_ms: None, features: false, queue: 1 }
     }
 
     pub fn audio() -> Self {
@@ -149,8 +166,10 @@ pub struct AudioFeatures {
     pub rolloff_hz: f32,
     /// Near 1 for noise, near 0 for a tone.
     pub flatness: f32,
-    /// The share of the window's 20 ms frames a speech detector (energy over an adaptive noise
-    /// floor, not hiss) took for speech, from 0 to 1.
+    /// The share of the window's 20 ms frames that sound like speech, from 0 to 1: each well above
+    /// an adaptive noise floor, not hiss, and among loud frames that vary as syllables do (by 3 dB
+    /// or more over the last second), as the `voice_activity` analyzer takes them. Silence, a
+    /// steady tone or hum, and hiss read 0; each frame counts for itself, with no hangover.
     pub speech: f32,
 }
 
@@ -274,10 +293,44 @@ pub struct TapFeeder {
     /// Audio features: the spectrum, and the speech detector run over 20 ms frames as they come,
     /// with each frame's start time and verdict.
     meter: Option<SpectrumMeter>,
-    vad: Option<Vad>,
+    vad: Option<SpeechFrames>,
     vad_buf: Vec<f32>,
     vad_t: f64,
     flags: VecDeque<(f64, bool)>,
+}
+
+/// Each 20 ms frame's verdict for [`AudioFeatures::speech`].
+struct SpeechFrames {
+    floor: f32,
+    /// The levels of the loud frames among the last 50 (a second), oldest first; `None` for the others.
+    last: VecDeque<Option<f32>>,
+}
+
+impl Default for SpeechFrames {
+    fn default() -> Self {
+        Self { floor: -50.0, last: VecDeque::with_capacity(51) }
+    }
+}
+
+impl SpeechFrames {
+    fn process(&mut self, x: &[f32]) -> bool {
+        let e = 10.0 * (x.iter().map(|v| v * v).sum::<f32>() / x.len().max(1) as f32 + 1e-12).log10();
+        let zcr = x.windows(2).filter(|w| (w[0] >= 0.0) != (w[1] >= 0.0)).count() as f32 / x.len().max(1) as f32;
+        // the floor follows the quietest frames down at once and rises 1 dB a second
+        self.floor = if e < self.floor { e.max(-75.0) } else { self.floor + 0.02 };
+        let loud = e > self.floor + 10.0 && e > -55.0;
+        self.last.push_back(loud.then_some(e));
+        if self.last.len() > 50 {
+            self.last.pop_front();
+        }
+        let levels: Vec<f32> = self.last.iter().flatten().copied().collect();
+        let modulated = levels.len() >= 10 && {
+            let n = levels.len() as f32;
+            let mean = levels.iter().sum::<f32>() / n;
+            (levels.iter().map(|l| (l - mean).powi(2)).sum::<f32>() / n).sqrt() >= 3.0
+        };
+        loud && zcr < 0.35 && modulated
+    }
 }
 
 /// A tap and its feeder, unattached.
@@ -342,8 +395,11 @@ impl TapFeeder {
         if c.letterbox {
             let (bw, bh) = (c.width.unwrap(), c.height.unwrap());
             if (w, h) != (bw, bh) {
-                let mut boxed = vec![0u8; bw as usize * bh as usize * 3];
-                let (x0, y0) = (((bw - w.min(bw)) / 2) as usize, ((bh - h.min(bh)) / 2) as usize);
+                let mut boxed = vec![c.pad; bw as usize * bh as usize * 3];
+                let (x0, y0) = match c.placement {
+                    Placement::Centre => (((bw - w.min(bw)) / 2) as usize, ((bh - h.min(bh)) / 2) as usize),
+                    Placement::TopLeft => (0, 0),
+                };
                 let row = w.min(bw) as usize * 3;
                 for y in 0..h.min(bh) as usize {
                     let to = ((y0 + y) * bw as usize + x0) * 3;
@@ -408,7 +464,7 @@ impl TapFeeder {
             let got = r.pull(&mut self.pulled);
             self.pending.extend(&self.pulled[..got]);
             if features {
-                let vad = self.vad.get_or_insert_with(|| Vad::new(20.0, 200.0));
+                let vad = self.vad.get_or_insert_with(SpeechFrames::default);
                 for &v in &self.pulled[..got] {
                     self.vad_buf.push(v);
                     if self.vad_buf.len() == vad_frame {
@@ -470,5 +526,40 @@ impl Drop for TapFeeder {
         }
         drop(st);
         self.shared.ready.notify_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The share of the 20 ms frames of `x` (16 kHz) after its first second taken for speech.
+    fn share(x: &[f32]) -> f32 {
+        let mut d = SpeechFrames::default();
+        let flags: Vec<bool> = x.chunks_exact(320).map(|f| d.process(f)).collect();
+        flags[50..].iter().filter(|&&f| f).count() as f32 / (flags.len() - 50) as f32
+    }
+
+    #[test]
+    fn syllables_are_speech_and_tones_silence_and_hiss_are_not() {
+        let rate = 16_000.0;
+        let pi = std::f32::consts::PI;
+        let t = |i: usize| i as f32 / rate;
+        let n = 4 * 16_000;
+        // a voiced sound under a 4 Hz syllable envelope
+        let voiced: Vec<f32> = (0..n).map(|i| (0.55 - 0.45 * (2.0 * pi * 4.0 * t(i)).cos()) * 0.2 * (1..8).map(|k| (2.0 * pi * 120.0 * k as f32 * t(i)).sin() / k as f32).sum::<f32>()).collect();
+        let tone: Vec<f32> = (0..n).map(|i| 0.3 * (2.0 * pi * 440.0 * t(i)).sin()).collect();
+        // the tone on half of each second, as test://audio makes it
+        let gated: Vec<f32> = tone.iter().enumerate().map(|(i, &v)| if t(i).fract() < 0.5 { v } else { 0.0 }).collect();
+        let mut s = 1u32;
+        let hiss: Vec<f32> = (0..n).map(|_| {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            0.1 * ((s >> 8) as f32 / (1 << 23) as f32 - 1.0)
+        }).collect();
+        let silence = vec![0f32; n];
+        assert!(share(&voiced) > 0.6, "{}", share(&voiced));
+        for (name, x) in [("tone", &tone), ("gated tone", &gated), ("hiss", &hiss), ("silence", &silence)] {
+            assert_eq!(share(x), 0.0, "{name}");
+        }
     }
 }

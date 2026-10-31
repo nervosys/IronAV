@@ -218,7 +218,8 @@ fn a_transcode_is_started_and_moved_to_a_new_file_while_a_session_runs() {
     // a second transcode needs the first stopped
     let e = call_tool("stream_configure", &json!({ "session": id, "transcode": tc(&b) })).unwrap_err();
     assert_eq!(e.code, ErrorCode::InvalidArgument, "{e:?}");
-    std::thread::sleep(std::time::Duration::from_millis(700));
+    // well before the 1.1 s clip ends, even on a loaded machine
+    std::thread::sleep(std::time::Duration::from_millis(300));
     let c = call_tool("stream_configure", &json!({ "session": id, "stop_transcode": true, "transcode": tc(&b) })).unwrap();
     assert_eq!(c["applied"], true, "{c}");
     wait_end(&id);
