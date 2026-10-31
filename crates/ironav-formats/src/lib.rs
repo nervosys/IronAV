@@ -86,11 +86,11 @@ pub static FORMATS: &[FormatSpec] = &[
     FormatSpec {
         name: "mp4",
         extensions: &["mp4", "m4a", "m4v"],
-        description: "MP4 (ISO BMFF) with H.264 or HEVC video (or VP9 or AV1 copied from another file) and optionally FLAC audio, or AAC audio (copied or encoded). Read as well as written; written with the index first (fast-start); fragmented files (moof) are read but never written",
+        description: "MP4 (ISO BMFF) with H.264 or HEVC video (or VP9 or AV1 copied from another file) and optionally AAC, FLAC or ALAC audio (AAC copied or encoded). Read as well as written; written with the index first (fast-start); fragmented files (moof) are read but never written",
         media: MediaType::Video,
         demux: true,
         mux: true,
-        codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Vp9, CodecId::Av1, CodecId::Aac, CodecId::Flac],
+        codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Vp9, CodecId::Av1, CodecId::Aac, CodecId::Flac, CodecId::Alac],
     },
     FormatSpec {
         name: "mkv",

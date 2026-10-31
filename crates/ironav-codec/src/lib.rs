@@ -4,6 +4,7 @@
 //! "what can IronAV actually do"; the ontology and the planner both read them.
 
 pub mod aac;
+pub mod alac;
 pub mod change;
 pub mod flac;
 pub mod h264;
@@ -52,6 +53,9 @@ pub fn implemented() -> Vec<CodecImpl> {
             }
             if c == CodecId::Mp3 {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-mp3" });
+            }
+            if c == CodecId::Alac {
+                return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-alac" });
             }
             if c == CodecId::Opus {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-opus" });
@@ -155,6 +159,7 @@ pub fn new_decoder_for(s: &ironav_core::StreamInfo) -> Result<Box<dyn Decoder>> 
                 _ => d,
             })
         }
+        CodecId::Alac => Ok(Box::new(alac::AlacDecoder::new(&s.extradata, &s.params)?)),
         CodecId::Opus => Ok(trimmed(s, Box::new(opus::OpusDecoder::new(&s.extradata, &s.params)?))),
         CodecId::Vorbis => Ok(trimmed(s, Box::new(vorbis::VorbisDecoder::new(&s.extradata, &s.params)?))),
         CodecId::Vp8 => Ok(Box::new(vp8::Vp8Decoder::new())),
@@ -326,6 +331,7 @@ pub fn new_encoder_with_opts(codec: CodecId, params: &StreamParams, bits: Option
     match (codec, params) {
         (c, StreamParams::Audio { .. }) if c.sample_format().is_some() => Ok(Box::new(pcm::PcmEncoder::new(c.sample_format().unwrap()))),
         (CodecId::Flac, StreamParams::Audio { sample_rate, channels }) => Ok(Box::new(flac::FlacEncoder::new(*sample_rate, *channels, bits)?)),
+        (CodecId::Alac, StreamParams::Audio { sample_rate, channels }) => Ok(Box::new(alac::AlacEncoder::new(*sample_rate, *channels, bits)?)),
         (CodecId::Opus, StreamParams::Audio { sample_rate, channels }) => {
             let bitrate = bitrate_kbps.map_or(opus::OpusEncoder::default_bitrate(*channels as usize), |k| k * 1000);
             let enc = opus::OpusEncoder::new(*sample_rate, *channels as usize, bitrate)?;

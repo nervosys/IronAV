@@ -13,17 +13,19 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   CAVLC and CABAC P and B slices, lossless), HEVC (Main, Main 10, 4:2:2, 4:4:4, 12-bit), VP8, VP9
   (profiles 0-1, tile columns and a multi-threaded loop filter), baseline and progressive JPEG and
   Motion-JPEG, AAC-LC with HE-AAC v1, MP3 (MPEG-1/2/2.5 Layer III), Vorbis, Opus (SILK, CELT and hybrid)
-  and FLAC (4 to 32 bits).
+  FLAC (4 to 32 bits) and ALAC (16 to 24 bits, mono and stereo).
 - **Codecs (encoders):** software H.264 (Constrained Baseline, then Main with CABAC and High with the 8x8
   transform, B pictures, rate-distortion mode decisions), AAC-LC with an ADTS writer, MP3 Layer III with
   an MP3 writer, Vorbis, Opus (CELT, wideband SILK, hybrid, DTX, in-band FEC, automatic mode switching,
-  2.5 to 60 ms frames; the CLI and job JSON select the mode, signal, frame size, FEC and DTX), JPEG and Motion-JPEG, and FLAC.
+  2.5 to 60 ms frames; the CLI and job JSON select the mode, signal, frame size, FEC and DTX), JPEG and Motion-JPEG, FLAC, and
+  ALAC (16 and 24 bits, mono and stereo).
 - **Codecs (voice link):** a playout buffer, a streaming resampler, speech detection with push-to-talk
   trimming, automatic gain control, noise suppression, and Opus packet-loss concealment.
 - **Containers:** WAV, FLAC, Y4M, MP4, Matroska and WebM (read and write), Ogg (Opus, Vorbis and FLAC),
   ADTS, MP3, JPEG, and MPEG transport streams (read and write).
 - **Containers (MP4):** fragmented MP4 is read as it arrives; the writer is constant-frame-rate and
-  writes fast-start files; B-frames are copied with `ctts` and an edit list.
+  writes fast-start files; B-frames are copied with `ctts` and an edit list; ALAC audio is read and written
+  in the `alac` sample entry.
 - **Containers (copy):** VP9 and AV1 are copied between WebM, Matroska and MP4; AAC keeps its encoder
   delay in MP4; Opus ends where the source did in Matroska (DiscardPadding) and Ogg.
 - **Live input and streaming (HTTP authentication):** Digest (MD5 and MD5-sess, RFC 7616 and RFC 2069 forms) and

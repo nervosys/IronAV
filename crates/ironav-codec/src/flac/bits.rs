@@ -1,7 +1,7 @@
 use ironav_core::{Error, Result};
 
 fn eof() -> Error {
-    Error::invalid_input("FLAC frame ends unexpectedly")
+    Error::invalid_input("frame ends unexpectedly")
 }
 
 /// MSB-first bit reader over a byte slice.
@@ -41,6 +41,14 @@ impl<'a> BitReader<'a> {
         };
         self.pos += n;
         Ok(acc as u32)
+    }
+
+    /// The next `n` (0..=32) bits without consuming them; bits past the end read as zero.
+    pub fn peek(&self, n: u32) -> u32 {
+        let avail = (self.end - self.pos).min(n as usize) as u32;
+        let mut c = Self { data: self.data, pos: self.pos, end: self.end };
+        let v = c.read(avail).unwrap_or(0) as u64;
+        (v << (n - avail)) as u32
     }
 
     /// Read up to 33 bits as an unsigned value.

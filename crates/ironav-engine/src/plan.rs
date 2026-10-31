@@ -69,10 +69,19 @@ pub struct Plan {
 
 /// Bit depth of the coded output. FLAC keeps the source depth when it has one; from PCM it
 /// uses 8/16 bits for 8/16-bit sources and 24 bits for wider ones (32-bit and float).
+/// ALAC is 16 or 24 bits: a source of 16 bits or less codes at 16, anything wider at 24.
 fn output_bits(to: CodecId, src: &StreamInfo) -> Option<u8> {
     use ironav_core::SampleFormat;
     if let Some(f) = to.sample_format() {
         return Some(f.bytes() as u8 * 8);
+    }
+    if to == CodecId::Alac {
+        let bits = match (src.codec, src.codec.sample_format()) {
+            (CodecId::Flac | CodecId::Alac, _) => src.bits.unwrap_or(16),
+            (_, Some(SampleFormat::U8 | SampleFormat::S16)) => 16,
+            _ => 24,
+        };
+        return Some(if bits <= 16 { 16 } else { 24 });
     }
     if to == CodecId::Flac {
         return Some(match (src.codec, src.codec.sample_format()) {

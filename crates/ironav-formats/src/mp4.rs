@@ -1,4 +1,4 @@
-//! MP4 (ISO BMFF) writer for H.264, HEVC, VP9 or AV1 video and AAC or FLAC audio, at most one track of each.
+//! MP4 (ISO BMFF) writer for H.264, HEVC, VP9 or AV1 video and AAC, FLAC or ALAC audio, at most one track of each.
 //!
 //! H.264 and HEVC packets are Annex B access units from the encoder. They are rewritten as
 //! length-prefixed samples, parameter sets are lifted out into the `avcC` / `hvcC` box, and the
@@ -6,7 +6,8 @@
 //! copies the file once with the index moved in front ("fast start"). Decode times are constant
 //! frame rate. A stream whose presentation order differs from decode order (B-frames) gets a `ctts`
 //! box of composition offsets and an edit list that starts the track at its first shown frame.
-//! FLAC frames are stored as they come, one per sample, with the STREAMINFO block in a `dfLa` box;
+//! FLAC and ALAC frames are stored as they come, one per sample, with the STREAMINFO block in a `dfLa` box
+//! or the ALACSpecificConfig in an `alac` box;
 //! AAC frames likewise, described by an `esds` box built from the stream's AudioSpecificConfig.
 //! VP9 frames are stored as they come, with a `vpcC` box built from the first key frame's header;
 //! AV1 temporal units lose their temporal delimiter and padding OBUs and keep the stream's `av1C`.
@@ -17,6 +18,7 @@
 
 use crate::flac::{flac_audio_params, FlacStats};
 use crate::vpxav1::{av1_sample, vp9_key, vpcc_body};
+use ironav_codec::alac::specific_config;
 use crate::WriteSeek;
 use ironav_core::{CodecId, Error, ErrorCode, Muxer, Packet, Rational, Result, StreamInfo, StreamParams};
 use std::io::{Seek, SeekFrom};
@@ -144,6 +146,7 @@ impl Track {
         match self.kind {
             Kind::Video { width, height } => self.video_entry(width, height),
             Kind::Audio { rate, channels, bits } if self.codec == CodecId::Aac => Ok(self.aac_entry(rate, channels, bits)),
+            Kind::Audio { rate, channels, bits } if self.codec == CodecId::Alac => Ok(self.alac_entry(rate, channels, bits)),
             Kind::Audio { rate, channels, bits } => Ok(self.audio_entry(rate, channels, bits)),
         }
     }
@@ -211,6 +214,26 @@ impl Track {
         dfla.extend_from_slice(&self.flac.streaminfo(rate, channels, bits));
         e.extend_from_slice(&full(b"dfLa", 0, 0, &dfla));
         bx(b"fLaC", &e)
+    }
+
+    /// `alac` sample entry with an `alac` box holding the ALACSpecificConfig. The config comes from the
+    /// stream's extradata when it has one (a copied ALAC track), otherwise it is built from the rate,
+    /// channels and bit depth.
+    fn alac_entry(&self, rate: u32, channels: u16, bits: u8) -> Vec<u8> {
+        let mut e = vec![0u8; 6];
+        e.extend_from_slice(&1u16.to_be_bytes()); // data reference index
+        e.extend_from_slice(&[0u8; 8]);
+        e.extend_from_slice(&channels.to_be_bytes());
+        e.extend_from_slice(&16u16.to_be_bytes()); // sample size; the real depth is in the config
+        e.extend_from_slice(&[0u8; 4]);
+        e.extend_from_slice(&(if rate <= 65535 { rate << 16 } else { 0 }).to_be_bytes());
+        let cfg: [u8; 24] = match self.config.len() {
+            24 => self.config[..].try_into().unwrap(),
+            36 => self.config[12..].try_into().unwrap(),
+            _ => specific_config(rate, channels as u8, bits),
+        };
+        e.extend_from_slice(&full(b"alac", 0, 0, &cfg));
+        bx(b"alac", &e)
     }
 
     fn avcc(&self, missing: &dyn Fn(&str) -> Error) -> Result<Vec<u8>> {
@@ -615,9 +638,15 @@ impl Muxer for Mp4Muxer {
                     let (rate, channels, bits) = flac_audio_params(s)?;
                     (Kind::Audio { rate, channels, bits }, rate, 0)
                 }
+                (StreamParams::Audio { sample_rate, channels }, CodecId::Alac) => {
+                    if *channels > 2 {
+                        return Err(Error::invalid_arg("the ALAC track in an MP4 is mono or stereo"));
+                    }
+                    (Kind::Audio { rate: *sample_rate, channels: *channels, bits: s.bits.unwrap_or(16) }, *sample_rate, 0)
+                }
                 _ => {
-                    return Err(Error::new(ErrorCode::UnsupportedCodec, format!("this MP4 writer holds h264, hevc, vp9 and av1 (copied), aac (copied) and flac, not {}", s.codec.name()))
-                        .alternatives(["h264", "hevc", "vp9", "av1", "aac", "flac"]));
+                    return Err(Error::new(ErrorCode::UnsupportedCodec, format!("this MP4 writer holds h264, hevc, vp9 and av1 (copied), aac (copied), flac and alac, not {}", s.codec.name()))
+                        .alternatives(["h264", "hevc", "vp9", "av1", "aac", "flac", "alac"]));
                 }
             };
             // the av1C record's configuration OBUs may hold the sequence header

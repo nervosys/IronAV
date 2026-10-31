@@ -5,7 +5,7 @@ A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so 
 
 > **Status: foundation (v0.1).** The architecture, agent interface, ontology, hardware model, CLI, MCP server
 > and both GUIs are working and tested. Containers: **WAV, FLAC, Y4M, MP4, Matroska/WebM (read and write), Ogg, ADTS, MP3, JPEG and MPEG transport streams (read and write).**
-> Audio codecs, each decoded and encoded: **PCM, FLAC, AAC-LC (plus HE-AAC v1 decode), MP3, Opus and Vorbis.**
+> Audio codecs, each decoded and encoded: **PCM, FLAC, ALAC, AAC-LC (plus HE-AAC v1 decode), MP3, Opus and Vorbis.**
 > Video: **software decoders for H.264, HEVC (including 4:2:2 and 4:4:4), VP8 and VP9; a software H.264 encoder (High profile: CABAC and the 8x8 transform); JPEG/Motion-JPEG decoded and encoded in software.**
 > NVIDIA GPUs encode H.264 and HEVC (NVENC, preferred for H.264 when usable; HEVC has no software encoder) and decode H.264, HEVC and AV1 (NVDEC).
 > AV1 is decoded on NVIDIA GPUs only (NVDEC); it has no software decoder and no encoder yet. VP9 and AV1 copy between WebM, Matroska and MP4.
@@ -419,7 +419,7 @@ half-second chunks, so audio and video for the same moment sit close together in
 ironav convert -i in.y4m -i in.wav -o out.mp4 --vcodec h264 --acodec flac
 ```
 
-The only audio codec MP4 can hold here is FLAC (the standard "FLAC in ISO BMFF" mapping). It plays in FFmpeg-based
+The lossless audio MP4 can hold here is FLAC (the standard "FLAC in ISO BMFF" mapping) or ALAC (see "ALAC" below). FLAC plays in FFmpeg-based
 players, VLC, Chrome and Firefox, but **not in QuickTime or most hardware players**; AAC is the codec those expect and
 it is not implemented. Checked with FFmpeg's decoders: a Y4M + WAV conversion gives an 8.000 s file whose 240 video
 frames decode and whose 352,800 audio samples are identical to the WAV, with the two tracks never more than 0.46 s
@@ -475,6 +475,18 @@ sources are written as 24-bit FLAC.
 channels, 1-100,003 samples, and three libFLAC compression levels, in both directions (IronAV→libFLAC and
 libFLAC→IronAV), all bit-exact. Small libFLAC-produced fixtures are committed so `cargo test` keeps checking this.
 On one synthetic 3-minute stereo signal the output size equals libFLAC's mid compression level (0.652 of the WAV).
+
+## ALAC
+
+Apple Lossless, implemented from the bitstream that Apple's reference decoder and FFmpeg read and write (no code from
+either). Decodes mono and stereo at 16, 20 and 24 bits, and mono at 32: adaptive predictor, adaptive Rice codes with zero runs,
+stereo decorrelation, the split-off low bits, and uncompressed frames. Encodes mono and stereo at 16 and 24 bits with a
+second-order predictor, the best stereo mode per block, and an uncompressed frame where compression does not help.
+More than two channels is not implemented. Written and read in MP4 (`--acodec alac -o out.m4a`, the `alac` sample entry).
+
+**Conformance**: FFmpeg's `-c:a alac` output decodes to the source PCM bit-exactly at 16 and 24 bits, mono and stereo,
+and FFmpeg decodes IronAV's output bit-exactly in those cases; IronAV to IronAV is bit-exact too. These tests are in
+`crates/ironav-engine/tests/alac.rs` and need `ffmpeg` on the PATH (they skip without it).
 
 ## AAC
 

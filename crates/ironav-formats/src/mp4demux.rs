@@ -558,6 +558,19 @@ fn parse_trak(trak: &[u8], index: usize, samples: &mut Vec<Sample>) -> Result<Op
         if codec == CodecId::Aac {
             extradata = aac_config(need(e.get(kids_at..).unwrap_or(&[]), b"esds", "the mp4a entry")?)?;
         }
+        if codec == CodecId::Alac {
+            // the box holds a version and flags, then the 24-byte ALACSpecificConfig, which has the true rate, channels and depth
+            let body = need(e.get(kids_at..).unwrap_or(&[]), b"alac", "the alac entry")?;
+            let cfg = match body.len() {
+                28 => &body[4..],
+                24 => body,
+                _ => return Err(corrupt("alac is not a 24-byte ALACSpecificConfig")),
+            };
+            extradata = cfg.to_vec();
+            bits = Some(cfg[5]);
+            channels = cfg[9] as u16;
+            rate = u32::from_be_bytes([cfg[20], cfg[21], cfg[22], cfg[23]]);
+        }
         let params = StreamParams::Audio { sample_rate: rate, channels };
         (codec, params, bits, Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma: 1 }, false)
     };
