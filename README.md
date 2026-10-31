@@ -502,7 +502,9 @@ all four framing codes, in-band redundancy frames, and the output gain and pre-s
 dropped, so a file starts where its audio does). The band-energy, bit-allocation, pulse-vector, inverse-MDCT, linear-prediction
 and excitation stages follow FFmpeg's native Opus decoder, with its tables (`tools/gen_opus_tables.py` reads them from
 `libavcodec/opus/tab.c`, so none were typed in). The 8/12/16 kHz SILK output is brought to 48 kHz by a polyphase
-windowed-sinc filter of our own, with the same delay (4, 8 and 11 input samples) as the reference decoder.
+windowed-sinc filter of our own, with the same delay (4, 8 and 11 input samples) as the reference decoder. Each SILK
+frame is put out one sample late, mono or stereo, as libopus does (FFmpeg's native decoder keeps two samples back in mono,
+so its mono SILK output runs a 16 kHz sample behind libopus's and ours; the tests allow for that).
 
 **Checked against FFmpeg's native Opus decoder** (through PyAV) on fifteen streams made by libopus, plus a pure sine in CELT
 and in SILK: SILK narrow band at 20 ms, medium band at 10 ms and wide band at 20, 40 and 60 ms (mono and stereo); hybrid at 10
@@ -511,8 +513,7 @@ SILK and hybrid frames match at 42-48 dB for wide and medium band and **only 24 
 from our upsampling filter (FFmpeg's resampler is longer than a filter with a fixed delay of 8 taps per phase can be), though
 I did not isolate it further. Three of those streams are committed with FFmpeg's decode as regression tests (CELT to within 3
 LSB, SILK and hybrid above 35 dB).
-Not covered: multichannel Opus (channel-mapping families 1 and 255 are refused), a packet-loss concealment pass (a damaged or
-empty frame decodes to silence), and the way the reference decoder flushes its resampler when the stream switches between SILK
+Not covered: multichannel Opus (channel-mapping families 1 and 255 are refused), and the way the reference decoder flushes its resampler when the stream switches between SILK
 and CELT, which our fixed-delay filter does not reproduce, so the few samples at such a switch can differ. The libopus encoder
 only produced streams in one mode at a time, so **mode switches within a stream were not tested**, nor were redundancy frames.
 Opus is read from Matroska/WebM (`.mka`, `.webm`) and from Ogg (`.opus`, `.ogg`); for writing see "Opus encoder" below. The Ogg reader (pages are checksummed; the file is read into memory, up to 1 GiB) takes only the first Opus, Vorbis or FLAC stream: Speex and Theora in Ogg are refused with a message naming the codec, and chained streams after the first are ignored. The final page's granule position shortens the last packet, so the output ends where the file says (for Opus the length is the granule minus the pre-skip). Tested on libopus files remuxed to Ogg (identical samples to the Matroska copies); multi-page packets are covered by a synthetic unit test only. FLAC in Ogg (the native-FLAC mapping, as FFmpeg's muxer writes it) decodes bit for bit to the PCM it was made from.
@@ -570,7 +571,7 @@ spectrum's tilt, was tried and measured 1 to 4 dB worse here, so the trim stays 
 `IRONAV_OPUS_OUT=dir` writes the streams for such a check.
 
 For speech at low rates there is SILK mode (`OpusEncoder::with_mode(OpusMode::Silk)`): wideband (audio to 8 kHz),
-mono (stereo input is coded as its mix), frames of 10 or 20 ms, at a variable rate that averages the one asked for
+mono or stereo, frames of 10 or 20 ms, at a variable rate that averages the one asked for
 (about 8 to 30 kb/s). It is written from the decoder, like the CELT side: LPC by autocorrelation and Levinson, turned
 into NLSFs and quantized with the two-stage codebook and its backward prediction; an open-loop pitch search on the LPC
 residual, checked against fractions of the lag, with the per-subframe contour chosen jointly; five-tap long-term
@@ -583,6 +584,26 @@ and resampling plus the frame (`delay_ms()`), and `head()` carries the matching 
 speech-like test signal at 16 kb/s, libopus decodes the stream at 24.3 dB SNR (20 ms frames) and 21.9 dB (10 ms), and
 FFmpeg's decoder at 25.4 and 22.0; the CELT stream at 32 kb/s gets 21.7.
 
+Stereo SILK is coded as the decoder takes it apart: mid (the mean) and side (half the difference), with the side's
+prediction from the mid taken out. The decoder applies two weights, on the mid's low-passed part and on the mid itself,
+interpolated from the last frame's over 8 ms; the encoder fits each band on its own (a fit of both at once ran away where
+the mid has little treble and left more side than there was) and keeps the weights at zero when that leaves less. The
+side gets a share of the bits by how much of it is left, and a side with nothing left (a mono or panned source) is not
+coded at all, so a panned signal costs what mono does (24.9 dB in both channels at 32 kb/s, against 24.9 for mono). On
+a signal with a delayed copy and a tone on the right, libopus decodes our stereo SILK at 19.6 and 18.2 dB (32 kb/s) and
+our stereo hybrid at 19.4 and 17.9 dB (40 kb/s). Hybrid's CELT side is stereo with it.
+
+Packets of 40 and 60 ms (`with_frame_ms(40.0)`, `60.0`) hold two or three 20 ms frames, in any mode: a code 3 packet,
+with the frame sizes stated only when they differ. libopus decodes them at the 20 ms streams' SNR.
+
+Discontinuous transmission (`with_dtx(true)`): after 200 ms without activity (a frame's level against a background level
+that follows the quietest frames down at once and rises 3 dB a second, never above -45 dBFS), frames are coded but only
+their TOC byte is sent, with one real frame every 400 ms. A decoder conceals the empty frames as lost ones (ours does,
+and so does libopus, which fills a SILK pause with its comfort noise). The first frame after a pause codes its energies
+without prediction, and the SILK coder starts again from the state a decoder has after a loss. On speech with a 1.5 s
+pause of faint noise, 61 of the pause's 75 frames go as one byte, the stream is about 35 % smaller, and the speech on
+either side decodes at the same SNR as without DTX, in every mode.
+
 Hybrid mode (`OpusMode::Hybrid`) adds the band above 8 kHz: each frame is SILK as above, then CELT from band 17 (8 kHz)
 to full band in the same range coder, without the pitch post-filter, as the decoder expects there. CELT takes a steady
 share (3 kb/s and a quarter of the rate above 16), SILK the rest, and the frame ends after both, so the rate is variable
@@ -590,9 +611,8 @@ share (3 kb/s and a quarter of the rate above 16), SILK the rest, and the frame 
 side's delay, so the two meet in step and the stream has SILK's pre-skip. Mono, like SILK mode (configurations 14 and
 15: full band, 10 or 20 ms). On the speech-like test with hiss added from 10 to 14 kHz, hybrid gives back 73 % of the
 energy above 9 kHz, which SILK alone drops entirely. libopus decodes the hybrid streams at 28.5 dB (20 ms, 24 kb/s) and
-26.3 dB (10 ms), FFmpeg's decoder at 31.9 and 26.4. Not yet: in-band redundancy (LBRR), 40 and 60 ms packets, NLSF
-interpolation, stereo SILK, discontinuous transmission, switching modes mid-stream, and libopus's rate-distortion pulse
-search, so silence still costs about 15 bytes a frame.
+26.3 dB (10 ms), FFmpeg's decoder at 31.9 and 26.4. Not yet: in-band redundancy (LBRR), NLSF interpolation, switching
+modes mid-stream, and libopus's rate-distortion pulse search, so silence still costs about 15 bytes a frame without DTX.
 
 ### Voice link
 

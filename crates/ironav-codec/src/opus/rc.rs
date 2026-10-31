@@ -289,6 +289,7 @@ impl Coder for RangeDecoder<'_> {
 
 /// The Opus range encoder (RFC 6716 section 5.1): range-coded symbols go to the front of a
 /// fixed-size frame, raw bits to its back.
+#[derive(Clone)]
 pub struct RangeEncoder {
     buf: Vec<u8>,
     offs: usize,

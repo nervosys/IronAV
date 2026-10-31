@@ -350,6 +350,12 @@ impl OpusDecoder {
         }
         let mut w = 0;
         for &(off, len) in frames.iter() {
+            if len == 0 {
+                // nothing sent for the frame (discontinuous transmission): concealed as a lost one
+                self.conceal(t.duration)?;
+                w = self.put(t.duration, out, w);
+                continue;
+            }
             if self.decode_frame(&t, &packet[off..off + len]).is_err() {
                 // a damaged or empty frame is replaced by silence rather than ending the stream
                 for p in self.planes.iter_mut() {
@@ -372,10 +378,17 @@ impl OpusDecoder {
     /// [`decode_into`](Self::decode_into) writes; returns the samples per channel.
     pub fn conceal_into(&mut self, out: &mut [f32]) -> Result<usize> {
         let ch = self.channels;
-        let (n, celt) = self.last.unwrap_or((960, false));
+        let n = self.last.map_or(960, |l| l.0);
         if out.len() < n * ch {
             return Err(Error::invalid_arg(format!("a concealed frame is {n} samples per channel; the buffer holds {}", out.len() / ch)));
         }
+        self.conceal(n)?;
+        Ok(self.put(n, out, 0) / ch)
+    }
+
+    /// Fills `n` samples of the planes for a frame that did not arrive.
+    fn conceal(&mut self, n: usize) -> Result<()> {
+        let celt = self.last.is_some_and(|l| l.1);
         let mut planes = std::mem::take(&mut self.planes);
         if celt && n <= 960 {
             self.celt.conceal(&mut planes, n)?;
@@ -388,7 +401,7 @@ impl OpusDecoder {
         }
         self.plc.conceal(&mut planes, n);
         self.planes = planes;
-        Ok(self.put(n, out, 0) / ch)
+        Ok(())
     }
 
     /// Interleaves `n` samples of the planes into `out` from `w`, after the gain and pre-skip;

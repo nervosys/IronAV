@@ -1,4 +1,5 @@
-//! A SILK encoder: the layer `silk.rs` decodes, for wideband (16 kHz) mono frames of 10 or 20 ms.
+//! A SILK encoder: the layer `silk.rs` decodes, for wideband (16 kHz) frames of 10 or 20 ms, mono
+//! or stereo (mid and side, with the side's prediction from the mid taken out).
 //!
 //! The analysis is the classic one: LPC by autocorrelation over a window centred on the frame,
 //! turned into NLSFs and quantized with the two-stage codebook; an open-loop pitch search on the
@@ -305,20 +306,38 @@ impl SilkEncoder {
         Self { st: State::new(), lk: 0.0, frames: 0, scratch: RangeEncoder::new(1275) }
     }
 
-    /// Codes the frame of `subframes` (2 or 4) subframes at `x[PAST..]` (with `PAST` samples
+    /// Starts again from the state a decoder has after a frame it did not get (it resets), but
+    /// keeps the rate control.
+    pub fn reset(&mut self) {
+        self.st = State::new();
+    }
+
+    /// Codes the mono frame of `subframes` (2 or 4) subframes at `x[PAST..]` (with `PAST` samples
     /// before it and `LOOKAHEAD` after) into `rc`, aiming at `target_bits` on average and never
     /// more than `max_bits`. Returns the bits the range coder has used.
     pub fn encode(&mut self, rc: &mut RangeEncoder, x: &[f32], subframes: usize, target_bits: f64, max_bits: i32) -> i32 {
         debug_assert_eq!(x.len(), PAST + subframes * SFL + LOOKAHEAD);
         let an = self.analyze(x, subframes);
+        // the header: the VAD flag and the (absent) redundancy flag
+        rc.log(1, an.active as u32);
+        rc.log(1, 0);
+        self.code_frame(rc, &an, x, target_bits, max_bits)
+    }
+
+    /// Codes the frame `an` describes, after what `rc` holds, aiming at `target_bits` for the
+    /// frame on average and never more than `max_bits` in all. Returns the bits the range coder
+    /// has used in all.
+    fn code_frame(&mut self, rc: &mut RangeEncoder, an: &Analysis, x: &[f32], target_bits: f64, max_bits: i32) -> i32 {
+        let subframes = an.subframes;
+        let start = rc.tell();
         let mut lk = self.lk;
         // over the limit, coarser steps until it fits, and at the last no pulses at all
         let mut used = 0;
         let mut silent = false;
         for tries in 1.. {
-            self.scratch.reset(1275);
+            self.scratch.clone_from(rc);
             let mut st = self.st.clone();
-            used = code(&an, lk, x, &mut self.scratch, &mut st, self.frames, silent);
+            used = code(an, lk, x, &mut self.scratch, &mut st, self.frames, silent);
             if used <= max_bits || silent {
                 break;
             }
@@ -329,13 +348,13 @@ impl SilkEncoder {
             }
         }
         let mut st = self.st.clone();
-        let bits = code(&an, lk, x, rc, &mut st, self.frames, silent);
+        let bits = code(an, lk, x, rc, &mut st, self.frames, silent);
         debug_assert_eq!(bits, used);
         self.st = st;
         if an.active {
             // the step that would have hit the target, approached slowly
             let per_doubling = 0.4 * (subframes * SFL) as f64;
-            self.lk = (self.lk + 0.3 * (bits as f64 - target_bits) / per_doubling).clamp(-6.0, 5.0);
+            self.lk = (self.lk + 0.3 * ((bits - start) as f64 - target_bits) / per_doubling).clamp(-6.0, 5.0);
         }
         self.frames += 1;
         bits
@@ -534,6 +553,139 @@ impl Default for SilkEncoder {
     }
 }
 
+/// The stereo weight nearest `w`: its interval of the table and step within it (the symbols),
+/// and its value in Q13.
+fn quantize_weight(w: f64) -> (usize, usize, i32) {
+    let mut best = (0, 0, 0, f64::MAX);
+    for wi in 0..15 {
+        let (a, b) = (SILK_STEREO_WEIGHTS[wi] as i32, SILK_STEREO_WEIGHTS[wi + 1] as i32);
+        for ws in 0..5 {
+            let q = a + (((b - a) * 6554) >> 16) * (2 * ws as i32 + 1);
+            let d = (q as f64 / 8192.0 - w).abs();
+            if d < best.3 {
+                best = (wi, ws, q, d);
+            }
+        }
+    }
+    (best.0, best.1, best.2)
+}
+
+/// The second channel of a stereo stream. Left and right are coded as mid (their mean) and side
+/// (half their difference); the decoder predicts the side from the mid with two weights, on the
+/// mid's low-passed part and on the mid itself, interpolated from the last frame's over the
+/// first 8 ms, and this codes what is left. A side with nothing left is not coded at all.
+pub struct SilkStereo {
+    side: SilkEncoder,
+    /// The last frame's weights as the decoder holds them: on the low-passed mid, on the mid.
+    prev: [f32; 2],
+    /// The side's residual before the next frame, `PAST` samples, and the side encoder's input.
+    res: Vec<f32>,
+    x: Vec<f32>,
+}
+
+impl Default for SilkStereo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SilkStereo {
+    pub fn new() -> Self {
+        Self { side: SilkEncoder::new(), prev: [0.0; 2], res: vec![0.0; PAST], x: Vec::with_capacity(PAST + 4 * SFL + LOOKAHEAD) }
+    }
+
+    /// Starts again from the state a decoder has after a frame it did not get, as
+    /// [`SilkEncoder::reset`] does.
+    pub fn reset(&mut self) {
+        self.side.reset();
+        self.prev = [0.0; 2];
+    }
+
+    /// Codes a stereo frame into `rc`, the mid with `mid_enc`: `m` and `s` hold the mid and the
+    /// side as [`SilkEncoder::encode`] takes a mono frame. Returns the bits used.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode(&mut self, mid_enc: &mut SilkEncoder, rc: &mut RangeEncoder, m: &[f32], s: &[f32], subframes: usize, target_bits: f64, max_bits: i32) -> i32 {
+        let fl = subframes * SFL;
+        let n = fl + LOOKAHEAD;
+        debug_assert!(m.len() == PAST + n && s.len() == PAST + n);
+        // the low-passed signal around a sample, as the decoder takes it
+        let lp = |x: &[f32], i: usize| 0.25 * (x[i - 1] as f64 + 2.0 * x[i] as f64 + x[(i + 1).min(x.len() - 1)] as f64);
+        // the weights, each band on its own: the side's low-passed part from the mid's, and the
+        // high-passed rests (a fit of both at once runs away where the mid has little treble)
+        let (mut ll, mut hh, mut sl, mut sh, mut em) = (1e-9, 1e-9, 0.0, 0.0, 0.0);
+        for i in PAST..PAST + fl {
+            let (l, sl_) = (lp(m, i), lp(s, i));
+            let (h, sh_) = (m[i] as f64 - l, s[i] as f64 - sl_);
+            (ll, hh) = (ll + l * l, hh + h * h);
+            (sl, sh) = (sl + sl_ * l, sh + sh_ * h);
+            em += m[i] as f64 * m[i] as f64;
+        }
+        let (q0, q1) = (quantize_weight(sl / ll), quantize_weight(sh / hh));
+        let interp = SILK_STEREO_INTERP_LEN[2] as usize;
+        // what the weights leave of the side, as the decoder puts it back, from sample `k` of the
+        // frame: it leaves the decoder as sample k + 1, where the weights are those
+        let residual = |cur: [f32; 2], k: usize| {
+            let j = k + 1;
+            let (a, b) = if j < interp {
+                let t = j as f32 / interp as f32;
+                (self.prev[0] + t * (cur[0] - self.prev[0]), self.prev[1] + t * (cur[1] - self.prev[1]))
+            } else {
+                (cur[0], cur[1])
+            };
+            let i = PAST + k;
+            s[i] - a * lp(m, i) as f32 - b * m[i]
+        };
+        let left = |cur: [f32; 2]| (0..fl).map(|k| (residual(cur, k) as f64).powi(2)).sum::<f64>();
+        // as the decoder has them: on the low-passed mid, and on the mid; no prediction when
+        // that leaves less (the zero weight is not in the table: the nearest pair is used)
+        let (mut q0, mut q1) = (q0, q1);
+        let mut cur = [(q0.2 - q1.2) as f32 / 8192.0, q1.2 as f32 / 8192.0];
+        let mut er = left(cur);
+        let (z0, z1) = (quantize_weight(0.0), quantize_weight(0.0));
+        let zero = [(z0.2 - z1.2) as f32 / 8192.0, z1.2 as f32 / 8192.0];
+        let ez = left(zero);
+        if ez < er {
+            (q0, q1, cur, er) = (z0, z1, zero, ez);
+        }
+        self.x.clear();
+        self.x.extend_from_slice(&self.res);
+        for k in 0..n {
+            self.x.push(residual(cur, k));
+        }
+        // nothing left of the side (a mono or panned signal): the mid alone
+        let mid_only = er < 1e-4 * em || er < 1e-7 * fl as f64;
+        let man = mid_enc.analyze(m, subframes);
+        let san = self.side.analyze(&self.x, subframes);
+        let side_vad = !mid_only && san.active;
+        rc.log(1, man.active as u32);
+        rc.log(1, 0);
+        rc.log(1, side_vad as u32);
+        rc.log(1, 0);
+        rc.cdf(&SILK_MODEL_STEREO_S1, 5 * (q0.0 / 3) + q1.0 / 3);
+        rc.cdf(&SILK_MODEL_STEREO_S2, q0.0 % 3);
+        rc.cdf(&SILK_MODEL_STEREO_S3, q0.1);
+        rc.cdf(&SILK_MODEL_STEREO_S2, q1.0 % 3);
+        rc.cdf(&SILK_MODEL_STEREO_S3, q1.1);
+        if !side_vad {
+            rc.cdf(&SILK_MODEL_MID_ONLY, mid_only as usize);
+        }
+        // the side's share of the bits by how much of it is left
+        let share = if mid_only { 0.0 } else { (0.08 + 0.42 * (er / em.max(1e-9)).sqrt()).min(0.5) };
+        let reserve = if mid_only { 0 } else { (target_bits * share * 0.5).max(24.0) as i32 };
+        let mut used = mid_enc.code_frame(rc, &man, m, target_bits * (1.0 - share), max_bits - reserve);
+        if mid_only {
+            // the decoder resets its side channel
+            self.side.reset();
+        } else {
+            used = self.side.code_frame(rc, &san, &self.x, target_bits * share, max_bits);
+        }
+        self.res.drain(..fl);
+        self.res.extend_from_slice(&self.x[PAST..PAST + fl]);
+        self.prev = cur;
+        used
+    }
+}
+
 /// Chooses the gains with step scale `2^lk`, quantizes the excitation (of the frame at
 /// `x[PAST..]`) against the decoder's state
 /// `st` (which it advances), and writes frame number `frames` to `rc`. Returns the bits used.
@@ -693,9 +845,7 @@ fn code(an: &Analysis, lk: f64, x: &[f32], rc: &mut RangeEncoder, st: &mut State
     st.coded = true;
     st.nlsf = an.nlsf;
 
-    // the bitstream, in the decoder's order: the VAD flag and the (absent) redundancy flag
-    rc.log(1, active as u32);
-    rc.log(1, 0);
+    // the bitstream, in the decoder's order (after the header the caller writes)
     if active {
         rc.cdf(&SILK_MODEL_FRAME_TYPE_ACTIVE, (voiced as usize) << 1 | an.qoffset_high);
     } else {

@@ -758,7 +758,7 @@ impl Silk {
                 self.frame[1].flush();
             }
             if coded_channels == 1 || self.output_channels == 1 {
-                let src = HISTORY - fl - 2;
+                let src = HISTORY - fl - 1;
                 for j in 0..self.output_channels {
                     output[j][i * fl..(i + 1) * fl].copy_from_slice(&self.frame[0].output[src..src + fl]);
                 }
