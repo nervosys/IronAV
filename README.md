@@ -1010,7 +1010,7 @@ any directory the process can read, so treat the launch URL like a credential.
 `ironav-player` (playback engine) · `ironav-engine` (jobs, planner, pipeline, tool registry) · `ironav-gui` (native, egui) · `ironav-webui` (browser) ·
 `ironav-cli`
 
-Build: `cargo build --release` · Test: `cargo test`
+Build: `cargo build --release` · Test: `cargo test` · Rust 1.95 or newer for `ironav-cli` and `ironav-gui` (egui sets that floor), 1.88 for the library crates; IronAV is built and tested with the current stable release
 Lean build for servers/agents without the graphics or sound stack: `cargo build --release --no-default-features -p ironav-cli`
 
 ## License
