@@ -57,6 +57,10 @@ pub struct Silk {
     prev_stereo_weights: [f32; 2],
     stereo_weights: [f32; 2],
     prev_coded_channels: usize,
+    /// Whether the last redundancy (LBRR) frame read of each channel was voiced, and its lag: the
+    /// next one's lag can be a step from it. Reading the copies leaves the channels' state alone.
+    lbrr_voiced: [bool; 2],
+    lbrr_lag: [i32; 2],
 }
 
 fn round_mull(a: i32, b: i32, s: u32) -> i32 {
@@ -299,6 +303,8 @@ impl Silk {
             prev_stereo_weights: [0.0; 2],
             stereo_weights: [0.0; 2],
             prev_coded_channels: 0,
+            lbrr_voiced: [false; 2],
+            lbrr_lag: [0; 2],
         }
     }
 
@@ -309,7 +315,7 @@ impl Silk {
     }
 
     #[allow(clippy::type_complexity)]
-    fn decode_lpc(&mut self, ch: usize, rc: &mut RangeDecoder, voiced: bool) -> ([f32; 16], [f32; 16], usize, bool) {
+    fn decode_lpc(&mut self, ch: usize, rc: &mut RangeDecoder, voiced: bool, redundant: bool) -> ([f32; 16], [f32; 16], usize, bool) {
         let wb = self.wb;
         let order = if wb { 16 } else { 10 };
         let mut lsf_i2 = [0i32; 16];
@@ -385,9 +391,11 @@ impl Silk {
             self.nlsf_interp_factor = 4;
             body = lsf2lpc(&nlsf, order);
         }
-        let frame = &mut self.frame[ch];
-        frame.nlsf[..order].copy_from_slice(&nlsf[..order]);
-        frame.lpc[..order].copy_from_slice(&body[..order]);
+        if !redundant {
+            let frame = &mut self.frame[ch];
+            frame.nlsf[..order].copy_from_slice(&nlsf[..order]);
+            frame.lpc[..order].copy_from_slice(&body[..order]);
+        }
         (leadin, body, order, has_leadin)
     }
 
@@ -493,7 +501,11 @@ impl Silk {
         }
     }
 
-    fn decode_frame(&mut self, rc: &mut RangeDecoder, frame_num: usize, ch: usize, coded_channels: usize, active: bool, active1: bool, redundant: bool) {
+    /// Decodes a frame of channel `ch`; a `redundant` one (an LBRR copy) is only read.
+    /// `cond` reads it as coded after the frame before it (its first gain and its lag as steps),
+    /// and `scale` reads the long-term predictor's scale.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_frame(&mut self, rc: &mut RangeDecoder, ch: usize, coded_channels: usize, active: bool, active1: bool, redundant: bool, cond: bool, scale: bool) {
         let subframes = self.subframes;
         let sflength = self.sflength;
         let bw = self.bandwidth;
@@ -529,19 +541,20 @@ impl Silk {
 
         // subframe gains
         let mut gains = [0f32; 4];
+        let mut last = self.frame[ch].log_gain;
         for i in 0..subframes {
             let mut log_gain: i32;
-            if i == 0 && (frame_num == 0 || !self.frame[ch].coded) {
+            if i == 0 && !cond {
                 let x = rc.cdf(&SILK_MODEL_GAIN_HIGHBITS[active as usize + voiced as usize]) as i32;
                 log_gain = (x << 3) | rc.cdf(&SILK_MODEL_GAIN_LOWBITS) as i32;
                 if self.frame[ch].coded {
-                    log_gain = log_gain.max(self.frame[ch].log_gain - 16);
+                    log_gain = log_gain.max(last - 16);
                 }
             } else {
                 let delta = rc.cdf(&SILK_MODEL_GAIN_DELTA) as i32;
-                log_gain = ((delta << 1) - 16).max(self.frame[ch].log_gain + delta - 4).clamp(0, 63);
+                log_gain = ((delta << 1) - 16).max(last + delta - 4).clamp(0, 63);
             }
-            self.frame[ch].log_gain = log_gain;
+            last = log_gain;
 
             // approximate 2**(x/128) with a Q7 input
             let lg = (log_gain * 0x1D1C71 >> 16) + 2090;
@@ -550,19 +563,23 @@ impl Silk {
             let lingain = (1 << ipart) + ((-174 * fpart * (128 - fpart) >> 16) + fpart) * ((1 << ipart) >> 7);
             gains[i] = lingain as f32 / 65536.0;
         }
+        if !redundant {
+            self.frame[ch].log_gain = last;
+        }
 
-        let (leadin, body, order, has_leadin) = self.decode_lpc(ch, rc, voiced);
+        let (leadin, body, order, has_leadin) = self.decode_lpc(ch, rc, voiced, redundant);
 
         // pitch lags and LTP filters of a voiced frame
         let mut pitchlag = [0i32; 4];
         let mut ltptaps = [[0f32; 5]; 4];
         if voiced {
-            let mut lag_absolute = frame_num == 0 || !self.frame[ch].prev_voiced;
+            let (prev_voiced, prev_lag) = if redundant { (self.lbrr_voiced[ch], self.lbrr_lag[ch]) } else { (self.frame[ch].prev_voiced, self.frame[ch].primarylag) };
+            let mut lag_absolute = !cond || !prev_voiced;
             let mut primarylag = 0;
             if !lag_absolute {
                 let delta = rc.cdf(&SILK_MODEL_PITCH_DELTA) as i32;
                 if delta != 0 {
-                    primarylag = self.frame[ch].primarylag + delta - 9;
+                    primarylag = prev_lag + delta - 9;
                 } else {
                     lag_absolute = true;
                 }
@@ -577,7 +594,11 @@ impl Silk {
                 let low = rc.cdf(model) as i32;
                 primarylag = SILK_PITCH_MIN_LAG[bw] as i32 + high * SILK_PITCH_SCALE[bw] as i32 + low;
             }
-            self.frame[ch].primarylag = primarylag;
+            if redundant {
+                self.lbrr_lag[ch] = primarylag;
+            } else {
+                self.frame[ch].primarylag = primarylag;
+            }
 
             let offsets: &[i8] = if subframes == 2 {
                 if bw == 0 {
@@ -607,7 +628,10 @@ impl Silk {
             }
         }
 
-        let ltpscale = if voiced && frame_num == 0 {
+        if redundant {
+            self.lbrr_voiced[ch] = voiced;
+        }
+        let ltpscale = if voiced && scale {
             SILK_LTP_SCALE_FACTOR[rc.cdf(&SILK_MODEL_LTP_SCALE_INDEX)] as f32 / 16384.0
         } else {
             15565.0 / 16384.0
@@ -704,9 +728,9 @@ impl Silk {
         self.prev_stereo_weights = self.stereo_weights;
     }
 
-    /// Decode the LP layer of one Opus frame (up to three SILK frames) into `output`, one slice per
-    /// output channel, at the SILK rate. Returns the number of samples per channel.
-    pub fn decode_superframe(&mut self, rc: &mut RangeDecoder, output: &mut [Vec<f32>; 2], bandwidth: usize, coded_channels: usize, duration_ms: usize) -> usize {
+    /// Sets the frame layout for a packet and reads its header: each channel's VAD flags and
+    /// which frames have redundancy (LBRR) copies. Returns the frame count.
+    fn header(&mut self, rc: &mut RangeDecoder, bandwidth: usize, coded_channels: usize, duration_ms: usize, active: &mut [[bool; 3]; 2], redundancy: &mut [u32; 2]) -> usize {
         let nb_frames = 1 + (duration_ms > 20) as usize + (duration_ms > 40) as usize;
         self.subframes = duration_ms / nb_frames / 5;
         self.sflength = 20 * (bandwidth + 2);
@@ -720,8 +744,6 @@ impl Silk {
         }
         self.prev_coded_channels = coded_channels;
 
-        let mut active = [[false; 6]; 2];
-        let mut redundancy = [0u32; 2];
         for i in 0..coded_channels {
             for j in 0..nb_frames {
                 active[i][j] = rc.log(1) != 0;
@@ -733,41 +755,87 @@ impl Silk {
                 redundancy[i] = rc.cdf(if duration_ms == 40 { &SILK_MODEL_LBRR_FLAGS_40[..] } else { &SILK_MODEL_LBRR_FLAGS_60[..] }) as u32;
             }
         }
+        nb_frames
+    }
 
-        // the in-band redundancy frames are decoded to keep the range coder in step, then dropped
+    /// Puts frame `i`'s output (mono, or left and right from mid and side) into `output`.
+    fn put(&mut self, output: &mut [Vec<f32>; 2], i: usize, coded_channels: usize) {
+        let fl = self.flength;
+        // reset the side channel if it is not coded
+        if self.midonly && self.frame[1].coded {
+            self.frame[1].flush();
+        }
+        if coded_channels == 1 || self.output_channels == 1 {
+            let src = HISTORY - fl - 1;
+            for j in 0..self.output_channels {
+                output[j][i * fl..(i + 1) * fl].copy_from_slice(&self.frame[0].output[src..src + fl]);
+            }
+        } else {
+            let [o0, o1] = output;
+            self.unmix_ms(&mut o0[i * fl..(i + 1) * fl], &mut o1[i * fl..(i + 1) * fl]);
+        }
+        self.midonly = false;
+    }
+
+    /// Decode the LP layer of one Opus frame (up to three SILK frames) into `output`, one slice per
+    /// output channel, at the SILK rate. Returns the number of samples per channel.
+    pub fn decode_superframe(&mut self, rc: &mut RangeDecoder, output: &mut [Vec<f32>; 2], bandwidth: usize, coded_channels: usize, duration_ms: usize) -> usize {
+        let (mut active, mut redundancy) = ([[false; 3]; 2], [0u32; 2]);
+        let nb_frames = self.header(rc, bandwidth, coded_channels, duration_ms, &mut active, &mut redundancy);
+
+        // the in-band redundancy frames are read to keep the range coder in step, then dropped;
+        // each is coded after the copy before it, if there is one
         for i in 0..nb_frames {
             for j in 0..coded_channels {
                 if redundancy[j] & (1 << i) != 0 {
                     let active1 = !(j == 0 && redundancy[1] & (1 << i) == 0);
-                    self.decode_frame(rc, i, j, coded_channels, true, active1, true);
+                    let cond = i > 0 && redundancy[j] & (1 << (i - 1)) != 0;
+                    self.decode_frame(rc, j, coded_channels, true, active1, true, cond, !cond);
                 }
             }
             self.midonly = false;
         }
 
-        let fl = self.flength;
         for i in 0..nb_frames {
             let mut j = 0;
             while j < coded_channels && !self.midonly {
                 let active1 = if coded_channels > 1 { active[1][i] } else { false };
-                self.decode_frame(rc, i, j, coded_channels, active[j][i], active1, false);
+                let cond = i > 0 && self.frame[j].coded;
+                self.decode_frame(rc, j, coded_channels, active[j][i], active1, false, cond, i == 0);
                 j += 1;
             }
-            // reset the side channel if it is not coded
-            if self.midonly && self.frame[1].coded {
-                self.frame[1].flush();
-            }
-            if coded_channels == 1 || self.output_channels == 1 {
-                let src = HISTORY - fl - 1;
-                for j in 0..self.output_channels {
-                    output[j][i * fl..(i + 1) * fl].copy_from_slice(&self.frame[0].output[src..src + fl]);
-                }
-            } else {
-                let [o0, o1] = output;
-                self.unmix_ms(&mut o0[i * fl..(i + 1) * fl], &mut o1[i * fl..(i + 1) * fl]);
-            }
-            self.midonly = false;
+            self.put(output, i, coded_channels);
         }
-        nb_frames * fl
+        nb_frames * self.flength
+    }
+
+    /// Decodes the redundancy (LBRR) copies in a packet in place of the frames of the packet
+    /// before it, which was lost, into `output` as [`decode_superframe`](Self::decode_superframe)
+    /// does. A frame without a copy (it was not speech) comes out silent. Returns the samples per
+    /// channel, or `None` if the packet has no copies (and nothing was changed but the layout).
+    pub fn decode_lbrr(&mut self, rc: &mut RangeDecoder, output: &mut [Vec<f32>; 2], bandwidth: usize, coded_channels: usize, duration_ms: usize) -> Option<usize> {
+        let (mut active, mut redundancy) = ([[false; 3]; 2], [0u32; 2]);
+        let nb_frames = self.header(rc, bandwidth, coded_channels, duration_ms, &mut active, &mut redundancy);
+        if redundancy[0] == 0 {
+            return None;
+        }
+        let fl = self.flength;
+        for i in 0..nb_frames {
+            if redundancy[0] & (1 << i) == 0 {
+                for o in output.iter_mut().take(self.output_channels) {
+                    o[i * fl..(i + 1) * fl].fill(0.0);
+                }
+                continue;
+            }
+            let side = coded_channels > 1 && redundancy[1] & (1 << i) != 0;
+            let mut j = 0;
+            while j < coded_channels && !self.midonly {
+                let cond = i > 0 && redundancy[j] & (1 << (i - 1)) != 0;
+                self.decode_frame(rc, j, coded_channels, true, side, false, cond, !cond);
+                j += 1;
+            }
+            self.put(output, i, coded_channels);
+        }
+        Some(nb_frames * fl)
     }
 }

@@ -1,8 +1,10 @@
 //! An Opus encoder at 48 kHz, mono or stereo: CELT mode (the default) with frames of 2.5, 5, 10 or
 //! 20 ms at a constant bit rate, or SILK mode for speech, wideband, with frames of 10 or 20 ms at a
 //! variable rate around the one asked for (stereo as mid and side). Packets of 40 or
-//! 60 ms hold two or three 20 ms frames (a code 3 packet), in any mode. With discontinuous
-//! transmission ([`OpusEncoder::with_dtx`]) a pause sends packets of a TOC byte alone.
+//! 60 ms hold two or three 20 ms frames: one SILK frame of 40 or 60 ms in SILK mode, a code 3
+//! packet in the others. With discontinuous transmission ([`OpusEncoder::with_dtx`]) a pause
+//! sends packets of a TOC byte alone, and with in-band FEC ([`OpusEncoder::with_fec`]) each
+//! SILK packet carries a coarser copy of the speech of the one before.
 //!
 //! The frame coding is in `celt/enc.rs` and `silk_enc.rs`; this file turns a stream of samples into
 //! packets: the pre-emphasis filter, or for SILK the resampling to 16 kHz, buffering for the
@@ -114,14 +116,18 @@ struct SilkPath {
 
 impl SilkPath {
     fn new(stereo: bool) -> Result<Self> {
-        let mut buf = Vec::with_capacity(silk_enc::PAST + 2 * 320 + SILK_LEAD);
-        buf.resize(silk_enc::PAST + SILK_LEAD, 0.0);
+        // three frames and their look-ahead, and one more arriving
+        let lead = |on: bool| {
+            let mut v = Vec::with_capacity(if on { silk_enc::PAST + 4 * 320 + SILK_LEAD } else { 0 });
+            v.resize(if on { silk_enc::PAST + SILK_LEAD } else { 0 }, 0.0);
+            v
+        };
         Ok(Self {
             enc: SilkEncoder::new(),
             stereo: stereo.then(SilkStereo::new),
             rs: StreamResampler::new(RATE, 16_000, 1 + stereo as usize, FRAME)?,
-            side: if stereo { buf.clone() } else { Vec::new() },
-            buf,
+            side: lead(stereo),
+            buf: lead(true),
             mono: Vec::with_capacity(2 * FRAME),
             out: Vec::with_capacity(2 * FRAME),
         })
@@ -155,13 +161,20 @@ impl SilkPath {
         Ok(())
     }
 
-    /// Codes the frame of `fl` samples at the front of the buffers into `rc`, as
+    /// Codes `n` frames of `fl` samples at the front of the buffers into `rc`, as
     /// [`SilkEncoder::encode`] does.
-    fn code(&mut self, rc: &mut RangeEncoder, fl: usize, target_bits: f64, max_bits: i32) -> i32 {
-        let need = silk_enc::PAST + fl + silk_enc::LOOKAHEAD;
+    fn code(&mut self, rc: &mut RangeEncoder, fl: usize, n: usize, target_bits: f64, max_bits: i32, keep: bool) -> i32 {
+        let need = silk_enc::PAST + n * fl + silk_enc::LOOKAHEAD;
         match &mut self.stereo {
-            None => self.enc.encode(rc, &self.buf[..need], fl / 80, target_bits, max_bits),
-            Some(st) => st.encode(&mut self.enc, rc, &self.buf[..need], &self.side[..need], fl / 80, target_bits, max_bits),
+            None => self.enc.encode(rc, &self.buf[..need], n, fl / 80, target_bits, max_bits, keep),
+            Some(st) => st.encode(&mut self.enc, rc, &self.buf[..need], &self.side[..need], n, fl / 80, target_bits, max_bits, keep),
+        }
+    }
+
+    fn set_fec(&mut self, loss: u32) {
+        self.enc.set_fec(loss);
+        if let Some(st) = &mut self.stereo {
+            st.set_fec(loss);
         }
     }
 
@@ -173,11 +186,19 @@ impl SilkPath {
         }
     }
 
-    /// Starts again as a decoder does after a frame it did not get.
-    fn reset(&mut self) {
-        self.enc.reset();
+    /// Notes the coders' state after a packet that is sent.
+    fn mark_sent(&mut self) {
+        self.enc.mark_sent();
         if let Some(st) = &mut self.stereo {
-            st.reset();
+            st.mark_sent();
+        }
+    }
+
+    /// Goes back to the state after the last packet sent, as a decoder has it after a pause.
+    fn rewind(&mut self) {
+        self.enc.rewind();
+        if let Some(st) = &mut self.stereo {
+            st.rewind();
         }
     }
 
@@ -235,8 +256,12 @@ pub struct OpusEncoder {
     part_lens: [usize; 3],
     nparts: usize,
     dtx: Dtx,
-    /// Frames not sent, in pauses with discontinuous transmission.
+    /// Frames (of up to 20 ms) not sent, in pauses with discontinuous transmission.
     pub skipped: u64,
+    /// The packet loss in-band FEC is for, in percent (0: off).
+    fec: u32,
+    /// The frame of the packet being coded (0 to 2).
+    part: usize,
 }
 
 impl OpusEncoder {
@@ -275,6 +300,8 @@ impl OpusEncoder {
             nparts: 0,
             dtx: Dtx::new(),
             skipped: 0,
+            fec: 0,
+            part: 0,
         })
     }
 
@@ -288,7 +315,11 @@ impl OpusEncoder {
         }
         self.silk = match mode {
             OpusMode::Celt => None,
-            OpusMode::Silk | OpusMode::Hybrid => Some(Box::new(SilkPath::new(self.channels == 2)?)),
+            OpusMode::Silk | OpusMode::Hybrid => {
+                let mut s = SilkPath::new(self.channels == 2)?;
+                s.set_fec(self.fec);
+                Some(Box::new(s))
+            }
         };
         // a hybrid frame's CELT input waits for the SILK side
         let lead = if mode == OpusMode::Hybrid { LOOKAHEAD + HYBRID_SHIFT } else { LOOKAHEAD };
@@ -309,17 +340,38 @@ impl OpusEncoder {
         self
     }
 
+    /// In-band forward error correction (LBRR) for `loss` percent of packets lost; 0, the default,
+    /// is off. Each active SILK frame (in SILK and hybrid modes) is coded again, coarser, into the
+    /// next packet, so a decoder that lost a packet rebuilds its speech from the next one
+    /// ([`OpusDecoder::decode_fec_into`](super::OpusDecoder::decode_fec_into)); the more loss, the
+    /// finer the copy. The copies come out of the bit rate. In 40 and 60 ms hybrid packets only
+    /// the last frame has a copy (the others would travel with their own frames), and CELT
+    /// frames have none.
+    pub fn with_fec(mut self, loss: u32) -> Self {
+        self.fec = loss.min(100);
+        if let Some(s) = &mut self.silk {
+            s.set_fec(self.fec);
+        }
+        self
+    }
+
+    /// SILK frames in a packet: a SILK packet of 40 or 60 ms is one SILK frame of 40 or 60 ms,
+    /// which holds two or three 20 ms frames.
+    fn silk_frames(&self) -> usize {
+        if self.mode == OpusMode::Silk { self.per_packet } else { 1 }
+    }
+
     /// The mode the encoder codes with.
     pub fn mode(&self) -> OpusMode {
         self.mode
     }
 
-    /// The most bytes a packet takes: CELT's are all this size, SILK's and hybrid's twice the bit
-    /// rate's share at most.
+    /// The most bytes a frame takes (a SILK packet of 40 or 60 ms counts as one): CELT's are all
+    /// this size, SILK's and hybrid's twice the bit rate's share at most.
     fn max_bytes(&self) -> usize {
         match self.mode {
             OpusMode::Celt => Self::frame_bytes(self.bitrate, self.frame, self.channels),
-            OpusMode::Silk | OpusMode::Hybrid => (2 * self.bitrate as usize * self.frame / RATE as usize / 8 + 1).clamp(80, 1275),
+            OpusMode::Silk | OpusMode::Hybrid => (2 * self.bitrate as usize * self.frame * self.silk_frames() / RATE as usize / 8 + 1).clamp(80, 1275),
         }
     }
 
@@ -373,7 +425,7 @@ impl OpusEncoder {
     /// The most bytes a packet takes, TOC included. In CELT mode every packet of 2.5 to 20 ms but
     /// those of digital silence (3) is this long.
     pub fn packet_bytes(&self) -> usize {
-        if self.per_packet == 1 {
+        if self.per_packet == 1 || self.mode == OpusMode::Silk {
             self.bytes
         } else {
             // the TOC, the frame count, the lengths of all frames but the last (up to two bytes),
@@ -419,12 +471,14 @@ impl OpusEncoder {
         if self.nparts != 0 {
             return Err(Error::invalid_arg("audio from encode() is waiting for the rest of its packet"));
         }
-        if self.per_packet == 1 {
+        if self.per_packet == 1 || self.mode == OpusMode::Silk {
+            self.part = 0;
             return self.encode_one(&get, out);
         }
         let step = self.frame * self.channels;
         let mut parts = std::mem::take(&mut self.parts);
         for k in 0..self.per_packet {
+            self.part = k;
             let at = k * self.bytes;
             let r = self.encode_one(&|i| get(k * step + i), &mut parts[at..at + self.bytes]);
             match r {
@@ -476,11 +530,14 @@ impl OpusEncoder {
 
     /// Codes one frame of `frame` samples per channel into `out`, TOC first.
     fn encode_one(&mut self, get: &dyn Fn(usize) -> f32, out: &mut [u8]) -> Result<usize> {
+        let (total, ch) = (self.frame * self.silk_frames(), self.channels);
         if let Some(s) = &mut self.silk {
             if !self.input.is_multiple_of(self.frame as u64) {
                 return Err(Error::invalid_arg("audio from encode() is waiting for the rest of its frame"));
             }
-            s.feed(self.frame, self.channels, get)?;
+            for start in (0..total).step_by(FRAME) {
+                s.feed(total.min(start + FRAME) - start, ch, |i| get(start * ch + i))?;
+            }
             if self.mode == OpusMode::Hybrid {
                 for i in 0..self.frame {
                     for c in 0..self.channels {
@@ -488,7 +545,7 @@ impl OpusEncoder {
                     }
                 }
             }
-            self.input += self.frame as u64;
+            self.input += total as u64;
             return self.code_one(out);
         }
         if self.sig[0].len() != LOOKAHEAD {
@@ -510,25 +567,27 @@ impl OpusEncoder {
 
     /// Codes the SILK frame at the front of the buffer into `out`, and returns the packet's length.
     fn code_silk(&mut self, out: &mut [u8]) -> Result<usize> {
+        let n = self.silk_frames();
         let s = self.silk.as_mut().expect("SILK mode");
         let fl = self.frame / 3;
-        let need = silk_enc::PAST + fl + silk_enc::LOOKAHEAD;
+        let need = silk_enc::PAST + n * fl + silk_enc::LOOKAHEAD;
         if s.buf.len() < need {
             return Err(Error::new(ErrorCode::Internal, "Opus: the SILK frame is not all here"));
         }
         let size = self.bytes;
         self.rc.reset(size - 1);
-        let target = self.bitrate as f64 * self.frame as f64 / RATE as f64 - 8.0;
-        let used = s.code(&mut self.rc, fl, target, ((size - 1) * 8) as i32);
+        let target = self.bitrate as f64 * (n * self.frame) as f64 / RATE as f64 - 8.0;
+        let used = s.code(&mut self.rc, fl, n, target, ((size - 1) * 8) as i32, true);
         self.rc.finish_in_place().map_err(|_| Error::new(ErrorCode::Internal, "Opus: a frame did not fit its packet"))?;
         // the frame ends where the coder's bits do: any more would read as a redundancy frame
         let len = (used as usize).div_ceil(8);
         debug_assert!(self.rc.bytes()[len..].iter().all(|&b| b == 0));
-        // configurations 8 and 9: SILK, wideband, 10 or 20 ms; one frame per packet
-        out[0] = ((8 + self.size as u8 - 2) << 3) | (((self.channels == 2) as u8) << 2);
+        // configurations 8 to 11: SILK, wideband, 10, 20, 40 or 60 ms; one frame per packet
+        let config = if n == 1 { 8 + self.size as u8 - 2 } else { 8 + n as u8 };
+        out[0] = (config << 3) | (((self.channels == 2) as u8) << 2);
         out[1..1 + len].copy_from_slice(&self.rc.bytes()[..len]);
-        s.advance(fl);
-        self.frames += 1;
+        s.advance(n * fl);
+        self.frames += n as u64;
         Ok(1 + len)
     }
 
@@ -550,7 +609,9 @@ impl OpusEncoder {
         let per_frame = |bps: f64| bps * self.frame as f64 / RATE as f64;
         let celt_bits = per_frame(celt_bps) as i32;
         let target = per_frame(self.bitrate as f64 - celt_bps) - 8.0;
-        let used = s.code(&mut self.rc, fl, target, ((cap - 1) * 8) as i32 - celt_bits - 12);
+        // a copy of the packet's last frame only: the others would travel with their own frames
+        let keep = self.part + 1 == self.per_packet;
+        let used = s.code(&mut self.rc, fl, 1, target, ((cap - 1) * 8) as i32 - celt_bits - 12, keep);
         let size = (1 + (used + 12 + celt_bits) as usize).div_ceil(8).clamp(3, cap);
         self.rc.shrink(size - 1);
         let total = ((size - 1) * 8) as i32;
@@ -578,7 +639,7 @@ impl OpusEncoder {
     /// Whether a whole frame is waiting to be coded.
     fn frame_ready(&self) -> bool {
         match &self.silk {
-            Some(s) => s.buf.len() >= silk_enc::PAST + self.frame / 3 + silk_enc::LOOKAHEAD,
+            Some(s) => s.buf.len() >= silk_enc::PAST + self.silk_frames() * self.frame / 3 + silk_enc::LOOKAHEAD,
             None => self.sig[0].len() >= self.frame + LOOKAHEAD,
         }
     }
@@ -644,7 +705,7 @@ impl OpusEncoder {
     fn code_one(&mut self, out: &mut [u8]) -> Result<usize> {
         let send = !self.dtx.on || {
             let energy = match &self.silk {
-                Some(s) => s.energy(self.frame / 3),
+                Some(s) => s.energy(self.silk_frames() * self.frame / 3),
                 None => {
                     let mut e = 0.0;
                     for i in 0..self.frame {
@@ -655,12 +716,12 @@ impl OpusEncoder {
                     e / self.frame as f64
                 }
             };
-            self.dtx.send(energy, self.frame as f64 * 1000.0 / RATE as f64)
+            self.dtx.send(energy, (self.silk_frames() * self.frame) as f64 * 1000.0 / RATE as f64)
         };
-        // a decoder starts SILK again from nothing after a frame it did not get
+        // a decoder keeps SILK's state through the frames it did not get
         if send && self.dtx.skipped {
             if let Some(s) = &mut self.silk {
-                s.reset();
+                s.rewind();
             }
         }
         let len = match self.mode {
@@ -670,9 +731,12 @@ impl OpusEncoder {
         }?;
         self.dtx.skipped = !send;
         if send {
+            if let (true, Some(s)) = (self.dtx.on, &mut self.silk) {
+                s.mark_sent();
+            }
             return Ok(len);
         }
-        self.skipped += 1;
+        self.skipped += self.silk_frames() as u64;
         Ok(1)
     }
 
@@ -680,7 +744,8 @@ impl OpusEncoder {
     /// the packet to `packets`, `duration` samples long.
     fn emit(&mut self, packets: &mut Vec<Packet>, duration: i64) -> Result<()> {
         let pts = (self.frames as usize - self.nparts) as i64 * self.frame as i64;
-        if self.per_packet == 1 {
+        if self.per_packet == 1 || self.mode == OpusMode::Silk {
+            self.part = 0;
             let mut data = vec![0u8; self.bytes];
             let len = self.code_one(&mut data)?;
             data.truncate(len);
@@ -688,6 +753,7 @@ impl OpusEncoder {
             return Ok(());
         }
         let k = self.nparts;
+        self.part = k;
         let mut parts = std::mem::take(&mut self.parts);
         let r = self.code_one(&mut parts[k * self.bytes..(k + 1) * self.bytes]);
         self.parts = parts;
@@ -985,14 +1051,12 @@ mod attacks {
             packets.extend(enc.encode(&f).unwrap());
         }
         packets.extend(enc.flush().unwrap());
-        // configurations by mode for 10 and 20 ms frames; longer packets hold 20 ms frames
-        let frame_ms = ms.min(20.0);
-        let config = match mode {
-            OpusMode::Silk => 8,
-            OpusMode::Hybrid => 14,
-            OpusMode::Celt => 30,
-        } + (frame_ms == 20.0) as u8;
-        let code = if ms > 20.0 { 3 } else { 0 };
+        // configurations by mode: SILK has frames of 10 to 60 ms, the others' longer packets hold
+        // 20 ms frames
+        let (config, code) = match mode {
+            OpusMode::Silk => (8 + [10.0, 20.0, 40.0, 60.0].iter().position(|&m| m == ms).unwrap() as u8, 0),
+            _ => (if mode == OpusMode::Hybrid { 14 } else { 30 } + (ms.min(20.0) == 20.0) as u8, if ms > 20.0 { 3 } else { 0 }),
+        };
         for p in &packets {
             assert!(p.data.len() <= enc.packet_bytes(), "{} > {}", p.data.len(), enc.packet_bytes());
             assert_eq!((p.data[0] >> 3, p.data[0] & 3), (config, code), "{mode:?} {ms} ms");
@@ -1181,6 +1245,72 @@ mod attacks {
             assert!(snr[0] > snr0[0] - 0.5 && snr[1] > snr0[1] - 1.5, "{snr:?} vs {snr0:?}");
             // the noise was at -71 dB; what comes out of the pause is no louder
             assert!(level < -60.0, "{level}");
+        }
+    }
+
+    /// Speech through the encoder with FEC for `loss` percent (0: off), and our decoder with
+    /// every tenth packet lost: the SNR of the left channel with nothing lost, with the lost
+    /// packets concealed, and with them rebuilt from the next packet's copy; and the bits.
+    fn fec_round_trip(mode: OpusMode, channels: usize, ms: f64, rate: u32, loss: u32) -> [f64; 4] {
+        let x = super::super::silk_enc::tests::speechlike(96_000, 48_000.0);
+        let input: Vec<f32> = (0..x.len()).flat_map(|i| [x[i], 0.6 * x[i.saturating_sub(96)]].into_iter().take(channels)).collect();
+        let mut enc = OpusEncoder::new(48_000, channels, rate).unwrap().with_mode(mode).unwrap().with_frame_ms(ms).unwrap().with_fec(loss);
+        let n = enc.frame_samples();
+        let mut buf = vec![0u8; enc.packet_bytes()];
+        let packets: Vec<Vec<u8>> = input
+            .chunks_exact(n * channels)
+            .map(|f| {
+                let len = enc.encode_frame_into(f, &mut buf).unwrap();
+                buf[..len].to_vec()
+            })
+            .collect();
+        let params = StreamParams::Audio { sample_rate: 48_000, channels: channels as u16 };
+        let lost = |k: usize| k % 10 == 5 && k + 1 < packets.len();
+        let mut snrs = [0.0; 4];
+        for (way, snr) in snrs.iter_mut().take(3).enumerate() {
+            let mut dec = super::super::OpusDecoder::new(&enc.head(), &params).unwrap();
+            let mut pcm = vec![0f32; n * channels];
+            let mut out: Vec<f32> = Vec::new();
+            for (k, p) in packets.iter().enumerate() {
+                let got = match way {
+                    // a frame at a time
+                    1 if lost(k) => {
+                        let mut got = 0;
+                        while got < n {
+                            got += dec.conceal_into(&mut pcm[got * channels..]).unwrap();
+                        }
+                        got
+                    }
+                    2 if lost(k) => dec.decode_fec_into(&packets[k + 1], &mut pcm).unwrap(),
+                    _ => dec.decode_into(p, &mut pcm).unwrap(),
+                };
+                out.extend(pcm[..got * channels].iter().step_by(channels).copied());
+            }
+            let (mut sig, mut err) = (0f64, 0f64);
+            for i in 500..out.len().min(x.len()) - 500 {
+                sig += (x[i] as f64).powi(2);
+                err += (x[i] as f64 - out[i] as f64).powi(2);
+            }
+            *snr = 10.0 * (sig / err.max(1e-30)).log10();
+        }
+        snrs[3] = packets.iter().map(|p| 8.0 * p.len() as f64).sum();
+        snrs
+    }
+
+    #[test]
+    fn fec_rebuilds_a_lost_packet_from_the_next() {
+        for (mode, channels, ms, rate) in [(OpusMode::Silk, 1, 20.0, 24_000), (OpusMode::Silk, 1, 10.0, 24_000), (OpusMode::Silk, 1, 60.0, 24_000), (OpusMode::Silk, 2, 20.0, 32_000), (OpusMode::Hybrid, 1, 20.0, 32_000), (OpusMode::Hybrid, 1, 40.0, 32_000)] {
+            let off = fec_round_trip(mode, channels, ms, rate, 0);
+            let [all, concealed, rebuilt, bits] = fec_round_trip(mode, channels, ms, rate, 10);
+            eprintln!("{mode:?} {channels} ch {ms} ms at {rate}: nothing lost {all:.1} dB ({:.1} without FEC), a tenth lost: concealed {concealed:.1}, rebuilt {rebuilt:.1}; {bits} bits ({} without)", off[0], off[3]);
+            // a frame rebuilt from its copy is closer than one concealed: far closer for 20 ms
+            // frames; of a 40 ms hybrid packet, only the last frame has a copy
+            assert!(rebuilt > concealed + if ms == 20.0 && channels == 1 { 5.0 } else { 0.5 }, "{rebuilt} vs {concealed}");
+            // without FEC there is nothing to rebuild from
+            assert!((off[2] - off[1]).abs() < 0.1, "{off:?}");
+            // the copies come out of the same rate: up to 60 % of an active frame's bits, mostly
+            // their side information
+            assert!(all > off[0] - 7.0 && (bits / off[3] - 1.0).abs() < 0.1, "{all} vs {}, {bits} vs {}", off[0], off[3]);
         }
     }
 

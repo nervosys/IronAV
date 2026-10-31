@@ -1,5 +1,7 @@
-//! A SILK encoder: the layer `silk.rs` decodes, for wideband (16 kHz) frames of 10 or 20 ms, mono
-//! or stereo (mid and side, with the side's prediction from the mid taken out).
+//! A SILK encoder: the layer `silk.rs` decodes, for wideband (16 kHz) packets of one frame of 10 or
+//! 20 ms or of two or three 20 ms frames, mono or stereo (mid and side, with the side's prediction
+//! from the mid taken out), with in-band redundancy (LBRR) when asked: a coarser copy of each
+//! active frame in the next packet.
 //!
 //! The analysis is the classic one: LPC by autocorrelation over a window centred on the frame,
 //! turned into NLSFs and quantized with the two-stage codebook; an open-loop pitch search on the
@@ -8,8 +10,7 @@
 //! rate control moves. The excitation is then quantized in closed loop: the encoder runs the
 //! decoder's own synthesis (the same re-whitening, the same long- and short-term filters, in the
 //! same order) and picks each pulse so that the decoder's output follows the input, so the two
-//! stay in step. There is no noise shaping, no NLSF interpolation between frames, and no in-band
-//! redundancy (LBRR).
+//! stay in step. There is no NLSF interpolation between frames.
 
 use super::rc::{Coder, RangeEncoder};
 use super::silk::{lsf2lpc, stabilize_lsf, HISTORY};
@@ -49,6 +50,10 @@ struct State {
     lpc_history: [f32; 2 * HISTORY],
     /// The encoder's own: the last output errors, newest last, for the noise feedback.
     err: [f32; ORDER],
+    /// Whether the last frame was voiced, and its pitch lag: a frame after it in the same packet
+    /// codes its lag as a step from there.
+    voiced: bool,
+    lag: i32,
 }
 
 impl State {
@@ -57,11 +62,12 @@ impl State {
         for (i, v) in nlsf.iter_mut().enumerate() {
             *v = ((i + 1) * 32768 / 17) as i16;
         }
-        Self { coded: false, log_gain: 0, nlsf, output: [0.0; 2 * HISTORY], lpc_history: [0.0; 2 * HISTORY], err: [0.0; ORDER] }
+        Self { coded: false, log_gain: 0, nlsf, output: [0.0; 2 * HISTORY], lpc_history: [0.0; 2 * HISTORY], err: [0.0; ORDER], voiced: false, lag: 0 }
     }
 }
 
 /// What a frame's analysis decided, before the gains and the excitation.
+#[derive(Clone, Default)]
 struct Analysis {
     subframes: usize,
     active: bool,
@@ -87,6 +93,30 @@ pub struct SilkEncoder {
     lk: f64,
     frames: u64,
     scratch: RangeEncoder,
+    /// In-band redundancy, when on: how much coarser (in log2 of the step) a frame's copy is.
+    fec: Option<f64>,
+    /// The copies of the last packet's frames, for this one, and that packet's input; and the
+    /// state the last copy made leaves a decoder in.
+    lbrr: [Option<Lbrr>; 3],
+    lbrr_x: Vec<f32>,
+    lbrr_st: State,
+    /// The state after the last packet sent, for discontinuous transmission.
+    sent: State,
+}
+
+/// The most of a frame's bits its copy may take: a coarser copy is tried, then none. Less
+/// starves the copies of 20 ms frames, more the frames of 10 ms (whose side information is
+/// most of a copy).
+const LBRR_SHARE: f64 = 0.6;
+
+/// A frame's redundant copy, waiting for the next packet: the frame's analysis, the decoder's
+/// state before it, the step scale and the frame's number.
+#[derive(Clone)]
+struct Lbrr {
+    an: Analysis,
+    st: State,
+    lk: f64,
+    frame: u64,
 }
 
 /// The cost in bits of `s` under `cdf`.
@@ -303,33 +333,123 @@ fn whiten(x: &[f32], lpc: &[f32; 16], from: usize) -> Vec<f64> {
 
 impl SilkEncoder {
     pub fn new() -> Self {
-        Self { st: State::new(), lk: 0.0, frames: 0, scratch: RangeEncoder::new(1275) }
+        Self {
+            st: State::new(),
+            lk: 0.0,
+            frames: 0,
+            scratch: RangeEncoder::new(1275),
+            fec: None,
+            lbrr: Default::default(),
+            lbrr_x: Vec::with_capacity(PAST + 3 * 4 * SFL + LOOKAHEAD),
+            lbrr_st: State::new(),
+            sent: State::new(),
+        }
     }
 
-    /// Starts again from the state a decoder has after a frame it did not get (it resets), but
-    /// keeps the rate control.
-    pub fn reset(&mut self) {
-        self.st = State::new();
+    /// Notes the state after a packet that is sent, which [`rewind`](Self::rewind) goes back to.
+    pub fn mark_sent(&mut self) {
+        self.sent.clone_from(&self.st);
     }
 
-    /// Codes the mono frame of `subframes` (2 or 4) subframes at `x[PAST..]` (with `PAST` samples
-    /// before it and `LOOKAHEAD` after) into `rc`, aiming at `target_bits` on average and never
-    /// more than `max_bits`. Returns the bits the range coder has used.
-    pub fn encode(&mut self, rc: &mut RangeEncoder, x: &[f32], subframes: usize, target_bits: f64, max_bits: i32) -> i32 {
-        debug_assert_eq!(x.len(), PAST + subframes * SFL + LOOKAHEAD);
-        let an = self.analyze(x, subframes);
-        // the header: the VAD flag and the (absent) redundancy flag
-        rc.log(1, an.active as u32);
-        rc.log(1, 0);
-        self.code_frame(rc, &an, x, target_bits, max_bits)
+    /// Goes back to the state after the last packet sent, as a decoder that was sent nothing
+    /// since (it conceals, and keeps its state) has it; with no copies for the next packet.
+    pub fn rewind(&mut self) {
+        self.st.clone_from(&self.sent);
+        self.lbrr = Default::default();
     }
 
-    /// Codes the frame `an` describes, after what `rc` holds, aiming at `target_bits` for the
-    /// frame on average and never more than `max_bits` in all. Returns the bits the range coder
-    /// has used in all.
-    fn code_frame(&mut self, rc: &mut RangeEncoder, an: &Analysis, x: &[f32], target_bits: f64, max_bits: i32) -> i32 {
+    /// In-band redundancy for `loss` percent of packets lost, or none for 0: each active frame
+    /// is coded again, coarser, into the next packet, where a decoder that lost the frame's own
+    /// packet finds it. The copy is libopus's 7 gain steps (of 1.37 dB) coarser, a step less
+    /// for each 5 % of loss, and never less than 3.
+    pub fn set_fec(&mut self, loss: u32) {
+        self.fec = (loss > 0).then(|| (7.0 - 0.2 * loss as f64).max(3.0) * 1.365 / 6.02);
+        if self.fec.is_none() {
+            self.lbrr = Default::default();
+        }
+    }
+
+    /// Codes `n` (1 to 3) frames of `subframes` (2 or 4) subframes each, at `x[PAST..]` (with
+    /// `PAST` samples before them and `LOOKAHEAD` after), as one mono packet into `rc`, after the
+    /// copies of the last packet's frames; `keep` keeps this packet's for the next. Aims at
+    /// `target_bits` on average and never more than `max_bits`. Returns the bits used.
+    pub fn encode(&mut self, rc: &mut RangeEncoder, x: &[f32], n: usize, subframes: usize, target_bits: f64, max_bits: i32, keep: bool) -> i32 {
+        let fl = subframes * SFL;
+        debug_assert_eq!(x.len(), PAST + n * fl + LOOKAHEAD);
+        let ans: [Analysis; 3] = std::array::from_fn(|i| if i < n { self.analyze(&x[i * fl..PAST + (i + 1) * fl + LOOKAHEAD], subframes) } else { Analysis::default() });
+        // the header: each frame's VAD flag, the redundancy flag, and which frames have a copy
+        let mask = self.lbrr_mask(n);
+        Self::write_flags(rc, &ans[..n], mask);
+        Self::write_mask(rc, n, mask);
+        let start = rc.tell();
+        let mut chain = State::new();
+        for i in 0..n {
+            if mask >> i & 1 != 0 {
+                self.write_lbrr(rc, i, mask, &mut chain);
+            }
+        }
+        self.lbrr = Default::default();
+        let spent = (rc.tell() - start) as f64;
+        let mut used = rc.tell();
+        for (i, an) in ans[..n].iter().enumerate() {
+            // room left for the frames after this one
+            let room = max_bits - 40 * (n - 1 - i) as i32;
+            used = self.code_frame(rc, an, &x[i * fl..PAST + (i + 1) * fl + LOOKAHEAD], (target_bits - spent) / n as f64, room, i, keep);
+        }
+        self.keep_input(x);
+        used
+    }
+
+    /// Which of the last packet's `n` frames have a copy, a bit each.
+    fn lbrr_mask(&self, n: usize) -> u32 {
+        (0..n).filter(|&i| self.lbrr[i].is_some()).fold(0, |m, i| m | 1 << i)
+    }
+
+    /// A channel's flags in the packet's header: each frame's VAD flag and the redundancy flag.
+    fn write_flags(rc: &mut RangeEncoder, ans: &[Analysis], mask: u32) {
+        for an in ans {
+            rc.log(1, an.active as u32);
+        }
+        rc.log(1, (mask != 0) as u32);
+    }
+
+    /// Which of a 40 or 60 ms packet's frames have a copy, after every channel's flags.
+    fn write_mask(rc: &mut RangeEncoder, n: usize, mask: u32) {
+        if mask != 0 && n > 1 {
+            rc.cdf(if n == 2 { &SILK_MODEL_LBRR_FLAGS_40[..] } else { &SILK_MODEL_LBRR_FLAGS_60[..] }, mask as usize);
+        }
+    }
+
+    /// Codes the copy of the last packet's frame `i` as a decoder that lost that packet decodes
+    /// it, in place of the frame: after the copy of the frame before it if there is one
+    /// (`chain` holds the state it leaves), else from the state before the frame.
+    fn write_lbrr(&self, rc: &mut RangeEncoder, i: usize, mask: u32, chain: &mut State) {
+        let l = self.lbrr[i].as_ref().expect("a copy of the frame");
+        let cond = i > 0 && mask >> (i - 1) & 1 != 0;
+        if !cond {
+            chain.clone_from(&l.st);
+        }
+        let fl = l.an.subframes * SFL;
+        code(&l.an, l.lk, &self.lbrr_x[i * fl..PAST + (i + 1) * fl + LOOKAHEAD], rc, chain, l.frame, false, cond, !cond);
+    }
+
+    /// Keeps the packet's input for the copies of its frames, if there are any.
+    fn keep_input(&mut self, x: &[f32]) {
+        if self.lbrr.iter().any(Option::is_some) {
+            self.lbrr_x.clear();
+            self.lbrr_x.extend_from_slice(x);
+        }
+    }
+
+    /// Codes frame `i` of a packet, which `an` describes, after what `rc` holds, aiming at
+    /// `target_bits` for the frame on average and never more than `max_bits` in all; with `keep`
+    /// and redundancy on, keeps its copy for the next packet. A frame after the first codes its
+    /// gain and lag from the frame before. Returns the bits the range coder has used in all.
+    #[allow(clippy::too_many_arguments)]
+    fn code_frame(&mut self, rc: &mut RangeEncoder, an: &Analysis, x: &[f32], target_bits: f64, max_bits: i32, i: usize, keep: bool) -> i32 {
         let subframes = an.subframes;
         let start = rc.tell();
+        let (cond, scale) = (i > 0 && self.st.coded, i == 0);
         let mut lk = self.lk;
         // over the limit, coarser steps until it fits, and at the last no pulses at all
         let mut used = 0;
@@ -337,7 +457,7 @@ impl SilkEncoder {
         for tries in 1.. {
             self.scratch.clone_from(rc);
             let mut st = self.st.clone();
-            used = code(an, lk, x, &mut self.scratch, &mut st, self.frames, silent);
+            used = code(an, lk, x, &mut self.scratch, &mut st, self.frames, silent, cond, scale);
             if used <= max_bits || silent {
                 break;
             }
@@ -348,9 +468,24 @@ impl SilkEncoder {
             }
         }
         let mut st = self.st.clone();
-        let bits = code(an, lk, x, rc, &mut st, self.frames, silent);
+        let bits = code(an, lk, x, rc, &mut st, self.frames, silent, cond, scale);
         debug_assert_eq!(bits, used);
-        self.st = st;
+        let before = std::mem::replace(&mut self.st, st);
+        if let (Some(d), true, true) = (self.fec, keep, an.active) {
+            // the copy as the decoder will decode it, coarser until it takes no more than its
+            // share; none if it never does
+            let cond = i > 0 && self.lbrr[i - 1].is_some();
+            for extra in 0..3 {
+                self.scratch.reset(1275);
+                let mut st = if cond { self.lbrr_st.clone() } else { before.clone() };
+                let lk = lk + d + extra as f64;
+                if (code(an, lk, x, &mut self.scratch, &mut st, self.frames, false, cond, !cond) - 1) as f64 <= LBRR_SHARE * target_bits {
+                    self.lbrr[i] = Some(Lbrr { an: an.clone(), st: before, lk, frame: self.frames });
+                    self.lbrr_st = st;
+                    break;
+                }
+            }
+        }
         if an.active {
             // the step that would have hit the target, approached slowly
             let per_doubling = 0.4 * (subframes * SFL) as f64;
@@ -578,10 +713,17 @@ pub struct SilkStereo {
     side: SilkEncoder,
     /// The last frame's weights as the decoder holds them: on the low-passed mid, on the mid.
     prev: [f32; 2],
-    /// The side's residual before the next frame, `PAST` samples, and the side encoder's input.
+    /// The side's residual before the next packet, `PAST` samples, and the side encoder's input.
     res: Vec<f32>,
     x: Vec<f32>,
+    /// The weights' symbols of the last packet's frames, for their copies.
+    lbrr_w: [Weights; 3],
+    /// The weights after the last packet sent, for discontinuous transmission.
+    sent: [f32; 2],
 }
+
+/// A frame's stereo weights: each as its interval of the table, step within it and value (Q13).
+type Weights = [(usize, usize, i32); 2];
 
 impl Default for SilkStereo {
     fn default() -> Self {
@@ -591,97 +733,158 @@ impl Default for SilkStereo {
 
 impl SilkStereo {
     pub fn new() -> Self {
-        Self { side: SilkEncoder::new(), prev: [0.0; 2], res: vec![0.0; PAST], x: Vec::with_capacity(PAST + 4 * SFL + LOOKAHEAD) }
+        Self { side: SilkEncoder::new(), prev: [0.0; 2], res: vec![0.0; PAST], x: Vec::with_capacity(PAST + 3 * 4 * SFL + LOOKAHEAD), lbrr_w: [[(0, 0, 0); 2]; 3], sent: [0.0; 2] }
     }
 
-    /// Starts again from the state a decoder has after a frame it did not get, as
-    /// [`SilkEncoder::reset`] does.
-    pub fn reset(&mut self) {
-        self.side.reset();
-        self.prev = [0.0; 2];
+    /// [`SilkEncoder::mark_sent`] for the side and the weights.
+    pub fn mark_sent(&mut self) {
+        self.side.mark_sent();
+        self.sent = self.prev;
     }
 
-    /// Codes a stereo frame into `rc`, the mid with `mid_enc`: `m` and `s` hold the mid and the
-    /// side as [`SilkEncoder::encode`] takes a mono frame. Returns the bits used.
+    /// [`SilkEncoder::rewind`] for the side and the weights.
+    pub fn rewind(&mut self) {
+        self.side.rewind();
+        self.prev = self.sent;
+    }
+
+    /// In-band redundancy for the side, as [`SilkEncoder::set_fec`].
+    pub fn set_fec(&mut self, loss: u32) {
+        self.side.set_fec(loss);
+    }
+
+    fn write_weights(rc: &mut RangeEncoder, q: &Weights) {
+        rc.cdf(&SILK_MODEL_STEREO_S1, 5 * (q[0].0 / 3) + q[1].0 / 3);
+        rc.cdf(&SILK_MODEL_STEREO_S2, q[0].0 % 3);
+        rc.cdf(&SILK_MODEL_STEREO_S3, q[0].1);
+        rc.cdf(&SILK_MODEL_STEREO_S2, q[1].0 % 3);
+        rc.cdf(&SILK_MODEL_STEREO_S3, q[1].1);
+    }
+
+    /// Codes a stereo packet of `n` frames into `rc`, the mid with `mid_enc`: `m` and `s` hold the
+    /// mid and the side as [`SilkEncoder::encode`] takes a mono packet. Returns the bits used.
     #[allow(clippy::too_many_arguments)]
-    pub fn encode(&mut self, mid_enc: &mut SilkEncoder, rc: &mut RangeEncoder, m: &[f32], s: &[f32], subframes: usize, target_bits: f64, max_bits: i32) -> i32 {
+    pub fn encode(&mut self, mid_enc: &mut SilkEncoder, rc: &mut RangeEncoder, m: &[f32], s: &[f32], n: usize, subframes: usize, target_bits: f64, max_bits: i32, keep: bool) -> i32 {
         let fl = subframes * SFL;
-        let n = fl + LOOKAHEAD;
-        debug_assert!(m.len() == PAST + n && s.len() == PAST + n);
+        let len = n * fl + LOOKAHEAD;
+        debug_assert!(m.len() == PAST + len && s.len() == PAST + len);
         // the low-passed signal around a sample, as the decoder takes it
         let lp = |x: &[f32], i: usize| 0.25 * (x[i - 1] as f64 + 2.0 * x[i] as f64 + x[(i + 1).min(x.len() - 1)] as f64);
-        // the weights, each band on its own: the side's low-passed part from the mid's, and the
-        // high-passed rests (a fit of both at once runs away where the mid has little treble)
-        let (mut ll, mut hh, mut sl, mut sh, mut em) = (1e-9, 1e-9, 0.0, 0.0, 0.0);
-        for i in PAST..PAST + fl {
-            let (l, sl_) = (lp(m, i), lp(s, i));
-            let (h, sh_) = (m[i] as f64 - l, s[i] as f64 - sl_);
-            (ll, hh) = (ll + l * l, hh + h * h);
-            (sl, sh) = (sl + sl_ * l, sh + sh_ * h);
-            em += m[i] as f64 * m[i] as f64;
-        }
-        let (q0, q1) = (quantize_weight(sl / ll), quantize_weight(sh / hh));
         let interp = SILK_STEREO_INTERP_LEN[2] as usize;
-        // what the weights leave of the side, as the decoder puts it back, from sample `k` of the
-        // frame: it leaves the decoder as sample k + 1, where the weights are those
-        let residual = |cur: [f32; 2], k: usize| {
-            let j = k + 1;
-            let (a, b) = if j < interp {
-                let t = j as f32 / interp as f32;
-                (self.prev[0] + t * (cur[0] - self.prev[0]), self.prev[1] + t * (cur[1] - self.prev[1]))
-            } else {
-                (cur[0], cur[1])
-            };
-            let i = PAST + k;
-            s[i] - a * lp(m, i) as f32 - b * m[i]
-        };
-        let left = |cur: [f32; 2]| (0..fl).map(|k| (residual(cur, k) as f64).powi(2)).sum::<f64>();
-        // as the decoder has them: on the low-passed mid, and on the mid; no prediction when
-        // that leaves less (the zero weight is not in the table: the nearest pair is used)
-        let (mut q0, mut q1) = (q0, q1);
-        let mut cur = [(q0.2 - q1.2) as f32 / 8192.0, q1.2 as f32 / 8192.0];
-        let mut er = left(cur);
-        let (z0, z1) = (quantize_weight(0.0), quantize_weight(0.0));
-        let zero = [(z0.2 - z1.2) as f32 / 8192.0, z1.2 as f32 / 8192.0];
-        let ez = left(zero);
-        if ez < er {
-            (q0, q1, cur, er) = (z0, z1, zero, ez);
-        }
+        let as_decoded = |q: &Weights| [(q[0].2 - q[1].2) as f32 / 8192.0, q[1].2 as f32 / 8192.0];
+        let mut q = [[(0, 0, 0); 2]; 3];
+        let mut mid_only = [false; 3];
+        let mut share = [0.0; 3];
         self.x.clear();
         self.x.extend_from_slice(&self.res);
-        for k in 0..n {
-            self.x.push(residual(cur, k));
+        let mut prev = self.prev;
+        for f in 0..n {
+            let at = PAST + f * fl;
+            // the weights, each band on its own: the side's low-passed part from the mid's, and
+            // the high-passed rests (a fit of both at once runs away where the mid has little
+            // treble)
+            let (mut ll, mut hh, mut sl, mut sh, mut em) = (1e-9, 1e-9, 0.0, 0.0, 0.0);
+            for i in at..at + fl {
+                let (l, sl_) = (lp(m, i), lp(s, i));
+                let (h, sh_) = (m[i] as f64 - l, s[i] as f64 - sl_);
+                (ll, hh) = (ll + l * l, hh + h * h);
+                (sl, sh) = (sl + sl_ * l, sh + sh_ * h);
+                em += m[i] as f64 * m[i] as f64;
+            }
+            // what the weights leave of the side, as the decoder puts it back, from sample `k` of
+            // the frame: it leaves the decoder as sample k + 1, where the weights are those
+            let residual = |cur: [f32; 2], k: usize| {
+                let j = k + 1;
+                let (a, b) = if j < interp {
+                    let t = j as f32 / interp as f32;
+                    (prev[0] + t * (cur[0] - prev[0]), prev[1] + t * (cur[1] - prev[1]))
+                } else {
+                    (cur[0], cur[1])
+                };
+                s[at + k] - a * lp(m, at + k) as f32 - b * m[at + k]
+            };
+            let left = |cur: [f32; 2]| (0..fl).map(|k| (residual(cur, k) as f64).powi(2)).sum::<f64>();
+            // no prediction when that leaves less
+            let fit = [quantize_weight(sl / ll), quantize_weight(sh / hh)];
+            let zero = [quantize_weight(0.0), quantize_weight(0.0)];
+            let (ef, ez) = (left(as_decoded(&fit)), left(as_decoded(&zero)));
+            let (w, er) = if ez < ef { (zero, ez) } else { (fit, ef) };
+            let cur = as_decoded(&w);
+            let last = if f + 1 == n { fl + LOOKAHEAD } else { fl };
+            for k in 0..last {
+                self.x.push(residual(cur, k));
+            }
+            // nothing left of the side (a mono or panned signal): the mid alone
+            mid_only[f] = er < 1e-4 * em || er < 1e-7 * fl as f64;
+            // the side's share of the bits by how much of it is left
+            share[f] = if mid_only[f] { 0.0 } else { (0.08 + 0.42 * (er / em.max(1e-9)).sqrt()).min(0.5) };
+            q[f] = w;
+            prev = cur;
         }
-        // nothing left of the side (a mono or panned signal): the mid alone
-        let mid_only = er < 1e-4 * em || er < 1e-7 * fl as f64;
-        let man = mid_enc.analyze(m, subframes);
-        let san = self.side.analyze(&self.x, subframes);
-        let side_vad = !mid_only && san.active;
-        rc.log(1, man.active as u32);
-        rc.log(1, 0);
-        rc.log(1, side_vad as u32);
-        rc.log(1, 0);
-        rc.cdf(&SILK_MODEL_STEREO_S1, 5 * (q0.0 / 3) + q1.0 / 3);
-        rc.cdf(&SILK_MODEL_STEREO_S2, q0.0 % 3);
-        rc.cdf(&SILK_MODEL_STEREO_S3, q0.1);
-        rc.cdf(&SILK_MODEL_STEREO_S2, q1.0 % 3);
-        rc.cdf(&SILK_MODEL_STEREO_S3, q1.1);
-        if !side_vad {
-            rc.cdf(&SILK_MODEL_MID_ONLY, mid_only as usize);
+        let frame = |f: usize| (f * fl, PAST + (f + 1) * fl + LOOKAHEAD);
+        let man: [Analysis; 3] = std::array::from_fn(|f| if f < n { let (a, b) = frame(f); mid_enc.analyze(&m[a..b], subframes) } else { Analysis::default() });
+        let san: [Analysis; 3] = std::array::from_fn(|f| if f < n { let (a, b) = frame(f); self.side.analyze(&self.x[a..b], subframes) } else { Analysis::default() });
+        let side_vad: [bool; 3] = std::array::from_fn(|f| f < n && !mid_only[f] && san[f].active);
+
+        // the header: each channel's flags, then which frames have copies
+        let (mm, sm) = (mid_enc.lbrr_mask(n), self.side.lbrr_mask(n) & mid_enc.lbrr_mask(n));
+        SilkEncoder::write_flags(rc, &man[..n], mm);
+        for &v in &side_vad[..n] {
+            rc.log(1, v as u32);
         }
-        // the side's share of the bits by how much of it is left
-        let share = if mid_only { 0.0 } else { (0.08 + 0.42 * (er / em.max(1e-9)).sqrt()).min(0.5) };
-        let reserve = if mid_only { 0 } else { (target_bits * share * 0.5).max(24.0) as i32 };
-        let mut used = mid_enc.code_frame(rc, &man, m, target_bits * (1.0 - share), max_bits - reserve);
-        if mid_only {
-            // the decoder resets its side channel
-            self.side.reset();
-        } else {
-            used = self.side.code_frame(rc, &san, &self.x, target_bits * share, max_bits);
+        rc.log(1, (sm != 0) as u32);
+        SilkEncoder::write_mask(rc, n, mm);
+        SilkEncoder::write_mask(rc, n, sm);
+        // the copies: the mid with its weights (and the side left out when it has none), then
+        // the side
+        let start = rc.tell();
+        let (mut cm, mut cs) = (State::new(), State::new());
+        for f in 0..n {
+            if mm >> f & 1 != 0 {
+                Self::write_weights(rc, &self.lbrr_w[f]);
+                if sm >> f & 1 == 0 {
+                    rc.cdf(&SILK_MODEL_MID_ONLY, 1);
+                }
+                mid_enc.write_lbrr(rc, f, mm, &mut cm);
+                if sm >> f & 1 != 0 {
+                    self.side.write_lbrr(rc, f, sm, &mut cs);
+                }
+            }
         }
-        self.res.drain(..fl);
-        self.res.extend_from_slice(&self.x[PAST..PAST + fl]);
-        self.prev = cur;
+        mid_enc.lbrr = Default::default();
+        self.side.lbrr = Default::default();
+        let spent = (rc.tell() - start) as f64;
+        // the frames
+        let per_frame = (target_bits - spent) / n as f64;
+        let mut used = rc.tell();
+        for f in 0..n {
+            Self::write_weights(rc, &q[f]);
+            if !side_vad[f] {
+                rc.cdf(&SILK_MODEL_MID_ONLY, mid_only[f] as usize);
+            }
+            let room = max_bits - 60 * (n - 1 - f) as i32;
+            let reserve = if mid_only[f] { 0 } else { (per_frame * share[f] * 0.5).max(24.0) as i32 };
+            let (a, b) = frame(f);
+            used = mid_enc.code_frame(rc, &man[f], &m[a..b], per_frame * (1.0 - share[f]), room - reserve, f, keep);
+            if mid_only[f] {
+                // the decoder resets its side channel
+                self.side.st = State::new();
+            } else {
+                let (a, b) = frame(f);
+                used = self.side.code_frame(rc, &san[f], &self.x[a..b], per_frame * share[f], room, f, keep);
+            }
+            // a copy of the side goes only with one of the mid
+            if mid_enc.lbrr[f].is_none() {
+                self.side.lbrr[f] = None;
+            }
+            self.lbrr_w[f] = q[f];
+        }
+        mid_enc.keep_input(m);
+        let x = std::mem::take(&mut self.x);
+        self.side.keep_input(&x);
+        self.res.copy_from_slice(&x[n * fl..n * fl + PAST]);
+        self.x = x;
+        self.prev = prev;
         used
     }
 }
@@ -690,15 +893,20 @@ impl SilkStereo {
 /// `x[PAST..]`) against the decoder's state
 /// `st` (which it advances), and writes frame number `frames` to `rc`. Returns the bits used.
 /// `silent` codes no pulses, which always fits.
-fn code(an: &Analysis, lk: f64, x: &[f32], rc: &mut RangeEncoder, st: &mut State, frames: u64, silent: bool) -> i32 {
+///
+/// `cond` codes the frame after the one before it in the packet (its first gain as a step, its lag
+/// as a step when near), and `scale` writes the long-term predictor's scale (the first frame).
+#[allow(clippy::too_many_arguments)]
+fn code(an: &Analysis, lk: f64, x: &[f32], rc: &mut RangeEncoder, st: &mut State, frames: u64, silent: bool, cond: bool, scale: bool) -> i32 {
     let subframes = an.subframes;
     let fl = subframes * SFL;
     let (active, voiced) = (an.active, an.voiced);
+    let (prev_voiced, prev_lag) = (st.voiced, st.lag);
 
     // the gains: subframe 0 absolute, the rest relative to the one before
     let mut gain_syms = [0usize; 4];
     let mut gains = [0f32; 4];
-    let first_abs = true;
+    let first_abs = !cond;
     for s in 0..subframes {
         let step = (2f64.powf(lk) * an.rms[s]).max(STEP_FLOOR);
         let want = step * 32768.0;
@@ -844,6 +1052,10 @@ fn code(an: &Analysis, lk: f64, x: &[f32], rc: &mut RangeEncoder, st: &mut State
     st.output.copy_within(fl..fl + HISTORY, 0);
     st.coded = true;
     st.nlsf = an.nlsf;
+    st.voiced = voiced;
+    if voiced {
+        st.lag = an.lag;
+    }
 
     // the bitstream, in the decoder's order (after the header the caller writes)
     if active {
@@ -876,9 +1088,17 @@ fn code(an: &Analysis, lk: f64, x: &[f32], rc: &mut RangeEncoder, st: &mut State
         rc.cdf(&SILK_MODEL_LSF_INTERPOLATION_OFFSET, 4);
     }
     if voiced {
-        let rel = an.lag - MIN_LAG;
-        rc.cdf(&SILK_MODEL_PITCH_HIGHBITS, (rel / 8) as usize);
-        rc.cdf(&SILK_MODEL_GAIN_LOWBITS, (rel % 8) as usize);
+        // after a voiced frame of the packet, a step from its lag when near (0 is the escape)
+        let step = an.lag - prev_lag + 9;
+        let relative = cond && prev_voiced;
+        if relative {
+            rc.cdf(&SILK_MODEL_PITCH_DELTA, if (1..=20).contains(&step) { step as usize } else { 0 });
+        }
+        if !relative || !(1..=20).contains(&step) {
+            let rel = an.lag - MIN_LAG;
+            rc.cdf(&SILK_MODEL_PITCH_HIGHBITS, (rel / 8) as usize);
+            rc.cdf(&SILK_MODEL_GAIN_LOWBITS, (rel % 8) as usize);
+        }
         if subframes == 4 {
             rc.cdf(&SILK_MODEL_PITCH_CONTOUR_MBWB20MS, an.contour);
         } else {
@@ -893,7 +1113,9 @@ fn code(an: &Analysis, lk: f64, x: &[f32], rc: &mut RangeEncoder, st: &mut State
         for s in 0..subframes {
             rc.cdf(sel, an.ltp_index[s]);
         }
-        rc.cdf(&SILK_MODEL_LTP_SCALE_INDEX, 0);
+        if scale {
+            rc.cdf(&SILK_MODEL_LTP_SCALE_INDEX, 0);
+        }
     }
     rc.cdf(&SILK_MODEL_LCG_SEED, seed0 as usize);
     write_excitation(rc, &pulses[..fl], active, voiced, an.qoffset_high);
@@ -1044,7 +1266,7 @@ pub(super) mod tests {
         for f in 0..frames {
             let mut rc = RangeEncoder::new(1275);
             let target = bitrate * fl as f64 / 16_000.0;
-            let used = enc.encode(&mut rc, &buf[f * fl..f * fl + PAST + fl + LOOKAHEAD], subframes, target, 1275 * 8);
+            let used = enc.encode(&mut rc, &buf[f * fl..f * fl + PAST + fl + LOOKAHEAD], 1, subframes, target, 1275 * 8, false);
             rc.finish_in_place().unwrap();
             let nb = (used as usize + 7) / 8;
             assert!(rc.bytes()[nb..].iter().all(|&b| b == 0), "frame {f}: bytes past the length");
@@ -1055,10 +1277,10 @@ pub(super) mod tests {
             assert_eq!(rd.tell(), used, "frame {f}: the decoder read a different length");
             y.extend_from_slice(&out[0][..fl]);
         }
-        // the decoder's output is two samples late
+        // the decoder's output is a sample late
         let (mut sig, mut err) = (0f64, 0f64);
-        for n in 0..frames * fl - 2 {
-            let (a, b) = (x[n] as f64, y[n + 2] as f64);
+        for n in 0..frames * fl - 1 {
+            let (a, b) = (x[n] as f64, y[n + 1] as f64);
             sig += a * a;
             err += (a - b) * (a - b);
         }

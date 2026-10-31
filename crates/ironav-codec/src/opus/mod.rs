@@ -386,6 +386,63 @@ impl OpusDecoder {
         Ok(self.put(n, out, 0) / ch)
     }
 
+    /// The packet lost before `packet`, rebuilt from the in-band redundancy (LBRR) `packet`
+    /// carries, as libopus's decoder does with FEC: a SILK or hybrid packet from an encoder with
+    /// FEC on holds a coarser copy of the speech of the packet before it. Written to `out` as
+    /// [`decode_into`](Self::decode_into) writes, as long as `packet` (the lost one is taken to
+    /// be as long); returns the samples per channel. The copy is of the SILK layer: the high
+    /// band of a hybrid packet is not in it; and of the last frame of a packet of several (a 40 or
+    /// 60 ms hybrid packet): the ones before it are concealed. Without a copy (a CELT packet, a
+    /// pause, FEC off) it conceals as [`conceal_into`](Self::conceal_into) does.
+    /// Then decode `packet` itself with `decode_into`.
+    pub fn decode_fec_into(&mut self, packet: &[u8], out: &mut [f32]) -> Result<usize> {
+        if packet.is_empty() {
+            return self.conceal_into(out);
+        }
+        let frames = frames_of(packet)?;
+        let t = toc(packet[0]);
+        let (off, len) = frames.at[0];
+        if t.mode == Mode::Celt || len < 2 {
+            return self.conceal_into(out);
+        }
+        let (ch, n, m) = (self.channels, t.duration, frames.len());
+        if out.len() < m * n * ch {
+            return Err(Error::invalid_arg(format!("the packet decodes to {} samples per channel; the buffer holds {}", m * n, out.len() / ch)));
+        }
+        // in a packet of several frames, the copy is of the lost packet's last frame: those
+        // before it are concealed
+        let mut w = 0;
+        for _ in 1..m {
+            self.conceal(n)?;
+            w = self.put(n, out, w);
+        }
+        let sbw = t.bandwidth.min(2);
+        if self.up_bandwidth != sbw {
+            self.up = [Some(Upsampler::new(sbw)), Some(Upsampler::new(sbw))];
+            self.up_bandwidth = sbw;
+        }
+        let mut rc = RangeDecoder::new(&packet[off..off + len]);
+        let mut silk = std::mem::take(&mut self.silk_out);
+        let got = self.silk.decode_lbrr(&mut rc, &mut silk, sbw, t.stereo as usize + 1, SILK_FRAME_MS[t.config]);
+        let Some(got) = got.filter(|&g| g * [6, 4, 3][sbw] == n) else {
+            self.silk_out = silk;
+            self.conceal(n)?;
+            return Ok(self.put(n, out, w) / ch);
+        };
+        let mut planes = std::mem::take(&mut self.planes);
+        for c in 0..ch {
+            self.up[c].as_mut().unwrap().process(&silk[c][..got], &mut planes[c][..n]);
+        }
+        if t.mode == Mode::Hybrid {
+            // the high band of the lost frame is not in the copy
+            self.celt.flush();
+        }
+        self.plc.decoded(&mut planes, n);
+        (self.planes, self.silk_out) = (planes, silk);
+        self.last = Some((n, false));
+        Ok(self.put(n, out, w) / ch)
+    }
+
     /// Fills `n` samples of the planes for a frame that did not arrive.
     fn conceal(&mut self, n: usize) -> Result<()> {
         let celt = self.last.is_some_and(|l| l.1);
@@ -393,10 +450,11 @@ impl OpusDecoder {
         if celt && n <= 960 {
             self.celt.conceal(&mut planes, n)?;
         } else {
+            // SILK keeps its state, as the frames after a loss were coded from it (an encoder
+            // with DTX takes this as the state after a pause, and an FEC copy is coded from it)
             for p in planes.iter_mut() {
                 p[..n].fill(0.0);
             }
-            self.silk.flush();
             self.celt.flush();
         }
         self.plc.conceal(&mut planes, n);
