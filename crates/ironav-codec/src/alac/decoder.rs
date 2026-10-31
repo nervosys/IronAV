@@ -1,4 +1,4 @@
-use super::{bad, frame_mult, lpc_adapt, lpc_base, parse_config, rice_k, run_k, sign_extend, unzigzag, update_history, Config, INITIAL_HISTORY, LIMIT};
+use super::{bad, frame_mult, lpc_adapt, lpc_base, parse_config, rice_k, run_k, sign_extend, unzigzag, update_history, Config, CHANNEL_OFFSETS, INITIAL_HISTORY, LIMIT};
 use crate::flac::bits::BitReader;
 use ironav_core::{AudioFrame, Decoder, Error, Frame, Packet, Result, StreamParams};
 
@@ -190,6 +190,9 @@ fn element(r: &mut BitReader, cfg: &Config, count: u32) -> Result<Vec<Vec<i32>>>
 
 /// One ALAC frame as per-channel samples at the configured bit depth.
 pub(crate) fn decode_frame(data: &[u8], cfg: &Config) -> Result<Vec<Vec<i32>>> {
+    if !(1..=8).contains(&cfg.channels) {
+        return Err(bad("ALAC has one to eight channels"));
+    }
     let mut r = BitReader::new(data);
     let mut chans: Vec<Vec<i32>> = Vec::new();
     loop {
@@ -212,7 +215,11 @@ pub(crate) fn decode_frame(data: &[u8], cfg: &Config) -> Result<Vec<Vec<i32>>> {
     if chans.iter().any(|c| c.len() != chans[0].len()) {
         return Err(bad("channels of a frame differ in length"));
     }
-    Ok(chans)
+    let mut out = vec![Vec::new(); chans.len()];
+    for (c, samples) in chans.into_iter().enumerate() {
+        out[CHANNEL_OFFSETS[cfg.channels as usize - 1][c]] = samples;
+    }
+    Ok(out)
 }
 
 /// Packet-level decoder: each packet is exactly one ALAC frame.
@@ -231,8 +238,8 @@ impl AlacDecoder {
         if cfg.channels != *channels as u32 {
             return Err(bad("the configuration's channel count differs from the stream's"));
         }
-        if cfg.channels > 2 {
-            return Err(Error::new(ironav_core::ErrorCode::UnsupportedCodec, "ALAC with more than two channels is not implemented").hint("the stream is not decoded; convert it to stereo or mono first"));
+        if !(1..=8).contains(&cfg.channels) {
+            return Err(Error::new(ironav_core::ErrorCode::UnsupportedCodec, "ALAC has one to eight channels").hint("the stream is not decoded; convert it to a layout ALAC holds"));
         }
         if !matches!(cfg.bits, 16 | 20 | 24 | 32) {
             return Err(bad("sample size must be 16, 20, 24 or 32 bits"));

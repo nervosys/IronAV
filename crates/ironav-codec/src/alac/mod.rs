@@ -1,12 +1,13 @@
 //! Apple Lossless (ALAC), following the bitstream that Apple's reference decoder and FFmpeg read and write.
 //!
-//! Translated from FFmpeg's `libavcodec/alac.c` (Copyright (c) 2005 David Hammerton) and
-//! `libavcodec/alacenc.c` (Copyright (c) 2008 Jaikrishnan Menon), LGPL-2.1-or-later.
+//! Translated from FFmpeg's `libavcodec/alac.c` (Copyright (c) 2005 David Hammerton), `libavcodec/alacenc.c`
+//! (Copyright (c) 2008 Jaikrishnan Menon) and the channel tables of `libavcodec/alac_data.c`, LGPL-2.1-or-later.
 //!
 //! * [`decoder`] handles compressed frames (adaptive predictor, adaptive Rice codes with zero runs,
-//!   stereo decorrelation, extra low bits) and uncompressed frames, at 16, 20 and 24 bits, and 32-bit mono.
+//!   stereo decorrelation, extra low bits) and uncompressed frames, at 16, 20 and 24 bits, and 32-bit
+//!   mono, with one to eight channels in the elements the layout asks for.
 //! * [`encoder`] writes 16 and 24-bit frames: a second-order predictor per channel, the best of
-//!   left-right, left-side and mid-side for stereo, and an uncompressed frame where that is smaller.
+//!   left-right, left-side and mid-side for each pair, and an uncompressed frame where that is smaller.
 //!
 //! Each packet is exactly one ALAC frame of up to 4096 samples. The codec configuration is the
 //! 24-byte ALACSpecificConfig, which an MP4 carries in an `alac` box (see [`specific_config`]).
@@ -21,6 +22,12 @@ use ironav_core::{Error, Result};
 
 /// Samples per frame in the configuration; a shorter frame says its length in the frame.
 pub const FRAME_LENGTH: u32 = 4096;
+/// Where each channel of a frame is in the output: the `i`-th channel of the bitstream (counting the
+/// elements in order, a pair as two) is output channel `CHANNEL_OFFSETS[channels - 1][i]`, so the
+/// output is in the usual order (front left, front right, centre, LFE, back left, back right, ...).
+/// As FFmpeg's `ff_alac_channel_layout_offsets`.
+pub(crate) const CHANNEL_OFFSETS: [&[usize]; 8] = [&[0], &[0, 1], &[2, 0, 1], &[2, 0, 1, 3], &[2, 0, 1, 3, 4], &[2, 0, 1, 4, 5, 3], &[2, 0, 1, 4, 5, 6, 3], &[2, 6, 7, 0, 1, 4, 5, 3]];
+
 /// The Rice history multiplier, the initial history and the largest Rice parameter the encoder uses.
 const PB: u32 = 40;
 const MB: u32 = 10;

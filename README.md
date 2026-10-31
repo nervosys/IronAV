@@ -479,13 +479,14 @@ On one synthetic 3-minute stereo signal the output size equals libFLAC's mid com
 ## ALAC
 
 Apple Lossless, implemented from the bitstream that Apple's reference decoder and FFmpeg read and write (no code from
-either). Decodes mono and stereo at 16, 20 and 24 bits, and mono at 32: adaptive predictor, adaptive Rice codes with zero runs,
-stereo decorrelation, the split-off low bits, and uncompressed frames. Encodes mono and stereo at 16 and 24 bits with a
-second-order predictor, the best stereo mode per block, and an uncompressed frame where compression does not help.
-More than two channels is not implemented. Written and read in MP4 (`--acodec alac -o out.m4a`, the `alac` sample entry) and in MOV.
+either). Decodes one to eight channels at 16, 20 and 24 bits, and mono at 32: adaptive predictor, adaptive Rice codes with zero runs,
+stereo decorrelation, the split-off low bits, and uncompressed frames. Encodes one to eight channels at 16 and 24 bits with a
+second-order predictor, the best stereo mode per pair, and an uncompressed frame where compression does not help. Channels
+go in the elements the layout asks for (single channels and pairs, the LFE as a single channel), in the usual order
+(front left, front right, centre, LFE, back left, back right, ...), as FFmpeg reads and writes them. Written and read in MP4 (`--acodec alac -o out.m4a`, the `alac` sample entry) and in MOV.
 
-**Conformance**: FFmpeg's `-c:a alac` output decodes to the source PCM bit-exactly at 16 and 24 bits, mono and stereo,
-and FFmpeg decodes IronAV's output bit-exactly in those cases; IronAV to IronAV is bit-exact too. These tests are in
+**Conformance**: FFmpeg's `-c:a alac` output decodes to the source PCM bit-exactly at 16 and 24 bits, mono, stereo, 5.1 and
+8 channels, and FFmpeg decodes IronAV's output bit-exactly in those cases; IronAV to IronAV is bit-exact too. These tests are in
 `crates/ironav-engine/tests/alac.rs` and need `ffmpeg` on the PATH (they skip without it).
 
 ## AAC

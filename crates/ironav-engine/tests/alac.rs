@@ -86,7 +86,9 @@ fn ffmpeg_alac_decodes_to_the_source_pcm() {
         return;
     }
     let d = scratch("ffmpeg-to-ironav");
-    for &(bits, ch) in &[(16u16, 1u16), (16, 2), (24, 1), (24, 2)] {
+    // eight channels are left out: FFmpeg 9.0 writes an 8-channel ALAC that says it has seven, so there is no
+    // 8-channel file of its own to read here (IronAV's eight-channel file is checked in FFmpeg below)
+    for &(bits, ch) in &[(16u16, 1u16), (16, 2), (24, 1), (24, 2), (16, 6), (24, 6)] {
         let tag = format!("{bits}b{ch}ch");
         let (wav, m4a, back) = (d.join(format!("{tag}.wav")), d.join(format!("{tag}.m4a")), d.join(format!("{tag}-back.wav")));
         // a tone with noise, so the frames mix predicted and near-raw coding; 20000 frames ends mid-frame
@@ -112,10 +114,11 @@ fn ironav_alac_decodes_bit_exactly_in_ffmpeg() {
     let d = scratch("ironav-to-ffmpeg");
     // frames of every kind: tonal (predicted), full-scale noise (raw fallback) and silence (zero runs)
     let mut cases: Vec<(String, u16, u16, Vec<i32>)> = Vec::new();
-    for &(bits, ch) in &[(16u16, 1u16), (16, 2), (24, 1), (24, 2)] {
+    for &(bits, ch) in &[(16u16, 1u16), (16, 2), (24, 1), (24, 2), (16, 6), (24, 6), (16, 8)] {
         cases.push((format!("tone{bits}b{ch}"), bits, ch, signal(20_000, ch as usize, bits as u32, 0.02)));
     }
     cases.push(("noise16b2".into(), 16, 2, signal(9_000, 2, 16, 1.0)));
+    cases.push(("noise16b6".into(), 16, 6, signal(9_000, 6, 16, 1.0)));
     cases.push(("silence24b1".into(), 24, 1, vec![0; 10_000]));
     for (tag, bits, ch, samples) in cases {
         let (wav, m4a, raw) = (d.join(format!("{tag}.wav")), d.join(format!("{tag}.m4a")), d.join(format!("{tag}.pcm")));
@@ -133,7 +136,7 @@ fn ironav_alac_decodes_bit_exactly_in_ffmpeg() {
 #[test]
 fn ironav_alac_round_trips_bit_exactly() {
     let d = scratch("roundtrip");
-    for &(bits, ch) in &[(16u16, 1u16), (16, 2), (24, 1), (24, 2)] {
+    for &(bits, ch) in &[(16u16, 1u16), (16, 2), (24, 1), (24, 2), (16, 6), (24, 6), (16, 8)] {
         let tag = format!("{bits}b{ch}ch");
         let (wav, m4a, back) = (d.join(format!("{tag}.wav")), d.join(format!("{tag}.m4a")), d.join(format!("{tag}-back.wav")));
         write_wav(&wav, &signal(12_345, ch as usize, bits as u32, 0.01), ch, 48_000, bits);
@@ -154,11 +157,11 @@ fn alac_is_refused_where_it_cannot_be_made() {
     let mut j = job(&wav, &out);
     j.audio.codec = Some("alac".into());
     run(&j, &mut |_| {}).unwrap();
-    // three channels are not implemented: the planner says so before anything is written
-    let (wav3, out3) = (d.join("in3.wav"), d.join("out3.m4a"));
-    write_wav(&wav3, &signal(100, 3, 16, 0.0), 3, 44_100, 16);
-    let mut j = job(&wav3, &out3);
+    // nine channels are more than ALAC holds: the encoder says so before anything is written
+    let (wav9, out9) = (d.join("in9.wav"), d.join("out9.m4a"));
+    write_wav(&wav9, &signal(100, 9, 16, 0.0), 9, 44_100, 16);
+    let mut j = job(&wav9, &out9);
     j.audio.codec = Some("alac".into());
     assert!(run(&j, &mut |_| {}).is_err());
-    assert!(!out3.exists());
+    assert!(!out9.exists());
 }

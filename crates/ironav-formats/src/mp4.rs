@@ -694,9 +694,6 @@ impl Muxer for Mp4Muxer {
                     (Kind::Audio { rate, channels, bits }, rate, 0)
                 }
                 (StreamParams::Audio { sample_rate, channels }, CodecId::Alac) => {
-                    if *channels > 2 {
-                        return Err(Error::invalid_arg("the ALAC track in an MP4 is mono or stereo"));
-                    }
                     (Kind::Audio { rate: *sample_rate, channels: *channels, bits: s.bits.unwrap_or(16) }, *sample_rate, 0)
                 }
                 _ => {

@@ -3,7 +3,7 @@
 //! runs through a second-order adaptive predictor, and its residuals through the adaptive Rice
 //! coder. A frame that would not come out smaller than its samples is written uncompressed.
 
-use super::{lpc_adapt, lpc_base, rice_k, run_k, sign_extend, update_history, zigzag, FRAME_LENGTH, INITIAL_HISTORY, LIMIT, MULT};
+use super::{lpc_adapt, lpc_base, rice_k, run_k, sign_extend, update_history, zigzag, CHANNEL_OFFSETS, FRAME_LENGTH, INITIAL_HISTORY, LIMIT, MULT};
 use crate::flac::bits::BitWriter;
 use ironav_core::{Encoder, Error, Frame, Packet, Result};
 
@@ -16,6 +16,8 @@ const FRAME_MULT: u32 = 4;
 const END: u64 = 7;
 const SCE: u64 = 0;
 const CPE: u64 = 1;
+/// The elements of a frame by channel count, as FFmpeg writes them: the LFE is a single channel element.
+const CHANNEL_ELEMENTS: [&[u64]; 8] = [&[SCE], &[CPE], &[SCE, CPE], &[SCE, CPE, SCE], &[SCE, CPE, CPE], &[SCE, CPE, CPE, SCE], &[SCE, CPE, CPE, SCE, SCE], &[SCE, CPE, CPE, CPE, SCE]];
 
 /// Rice-codes one value: `x` as a unary prefix of ones and a zero, then `k` bits of remainder; a
 /// prefix of 9 ones is an escape, followed by `bps` raw bits.
@@ -90,9 +92,9 @@ fn stereo(l: &[i32], r: &[i32]) -> ((u32, u32), [Vec<i32>; 2]) {
     candidates.into_iter().min_by_key(|(_, c)| cost(c)).unwrap()
 }
 
-fn header(w: &mut BitWriter, channels: usize, n: usize, compressed: bool, low: u32) {
-    w.write(if channels == 2 { CPE } else { SCE }, 3);
-    w.write(0, 4); // element instance tag
+fn header(w: &mut BitWriter, tag: u64, instance: u64, n: usize, compressed: bool, low: u32) {
+    w.write(tag, 3);
+    w.write(instance, 4); // element instance tag
     w.write(0, 12); // unused
     let has_size = n as u32 != FRAME_LENGTH;
     w.write(has_size as u64, 1);
@@ -103,25 +105,21 @@ fn header(w: &mut BitWriter, channels: usize, n: usize, compressed: bool, low: u
     }
 }
 
-/// One frame's bytes: compressed when that is smaller, uncompressed otherwise.
-fn encode_frame(chans: &[Vec<i32>], bits: u32) -> Vec<u8> {
-    let n = chans[0].len();
-    // Above 16 bits the low byte goes raw and the predictor codes the rest: the Rice history saturates
-    // at 16 bits, so full-width residuals of a 24-bit signal would mostly escape. FFmpeg's encoder does the same.
-    let low = bits.saturating_sub(16);
-    let high: Vec<Vec<i32>> = chans.iter().map(|c| c.iter().map(|&s| s >> low).collect()).collect();
-    let bps = bits - low + chans.len() as u32 - 1;
+/// One element of a compressed frame: its stereo mode, the predictor and the Rice coded residuals.
+fn compressed_element(w: &mut BitWriter, group: &[&Vec<i32>], tag: u64, instance: u64, bits: u32, low: u32) {
+    let n = group[0].len();
+    let high: Vec<Vec<i32>> = group.iter().map(|c| c.iter().map(|&s| s >> low).collect()).collect();
+    let bps = bits - low + group.len() as u32 - 1;
     let ((shift, weight), coded): ((u32, u32), Vec<Vec<i32>>) = match high.as_slice() {
         [l, r] => {
             let ((s, w), c) = stereo(l, r);
             ((s, w), c.to_vec())
         }
         [m] => ((0, 0), vec![m.clone()]),
-        _ => unreachable!("ALAC frames hold one or two channels"),
+        _ => unreachable!("an ALAC element holds one or two channels"),
     };
 
-    let mut w = BitWriter::new();
-    header(&mut w, chans.len(), n, true, low);
+    header(w, tag, instance, n, true, low);
     w.write(shift as u64, 8);
     w.write(weight as u64, 8);
     for _ in &coded {
@@ -136,29 +134,57 @@ fn encode_frame(chans: &[Vec<i32>], bits: u32) -> Vec<u8> {
     if low > 0 {
         let mask = (1u32 << low) - 1;
         for i in 0..n {
-            for ch in chans {
+            for ch in group {
                 w.write((ch[i] as u32 & mask) as u64, low);
             }
         }
     }
     for c in &coded {
-        write_residuals(&mut w, &residuals(c, bps), bps);
+        write_residuals(w, &residuals(c, bps), bps);
     }
-    w.write(END, 3);
-    w.align();
+}
 
-    let mut raw = BitWriter::new();
-    header(&mut raw, chans.len(), n, false, 0);
+/// One element of an uncompressed frame: its samples as they are.
+fn raw_element(w: &mut BitWriter, group: &[&Vec<i32>], tag: u64, instance: u64, bits: u32) {
+    let n = group[0].len();
+    header(w, tag, instance, n, false, 0);
     for i in 0..n {
-        for ch in chans {
-            raw.write_signed(ch[i] as i64, bits);
+        for ch in group {
+            w.write_signed(ch[i] as i64, bits);
         }
     }
+}
+
+/// One frame's bytes: compressed when that is smaller, uncompressed otherwise.
+fn encode_frame(chans: &[Vec<i32>], bits: u32) -> Vec<u8> {
+    // Above 16 bits the low byte goes raw and the predictor codes the rest: the Rice history saturates
+    // at 16 bits, so full-width residuals of a 24-bit signal would mostly escape. FFmpeg's encoder does the same.
+    let low = bits.saturating_sub(16);
+    // the channels in element order, as the layout's elements take them
+    let order: Vec<&Vec<i32>> = CHANNEL_OFFSETS[chans.len() - 1].iter().map(|&o| &chans[o]).collect();
+    let (mut compressed, mut raw) = (BitWriter::new(), BitWriter::new());
+    let (mut at, mut sce, mut cpe): (usize, u64, u64) = (0, 0, 0);
+    for &el in CHANNEL_ELEMENTS[chans.len() - 1] {
+        let width = if el == CPE { 2 } else { 1 };
+        let group = &order[at..at + width];
+        at += width;
+        let instance = if el == CPE {
+            cpe += 1;
+            cpe - 1
+        } else {
+            sce += 1;
+            sce - 1
+        };
+        compressed_element(&mut compressed, group, el, instance, bits, low);
+        raw_element(&mut raw, group, el, instance, bits);
+    }
+    compressed.write(END, 3);
+    compressed.align();
     raw.write(END, 3);
     raw.align();
 
-    if w.bytes.len() < raw.bytes.len() {
-        w.bytes
+    if compressed.bytes.len() < raw.bytes.len() {
+        compressed.bytes
     } else {
         raw.bytes
     }
@@ -178,8 +204,8 @@ impl AlacEncoder {
         if bits != 16 && bits != 24 {
             return Err(Error::invalid_arg(format!("the ALAC encoder supports 16 and 24 bits per sample, not {bits}")));
         }
-        if !(1..=2).contains(&channels) {
-            return Err(Error::invalid_arg("the ALAC encoder writes mono and stereo"));
+        if !(1..=8).contains(&channels) {
+            return Err(Error::invalid_arg("the ALAC encoder writes one to eight channels"));
         }
         if sample_rate == 0 {
             return Err(Error::invalid_arg("ALAC needs a sample rate"));
@@ -280,6 +306,20 @@ mod tests {
             assert_eq!(got.len(), samples.len(), "sample count for n={n} ch={ch} bits={bits}");
             assert!(got == samples, "lossless mismatch for n={n} ch={ch} bits={bits}");
         }
+    }
+
+    #[test]
+    fn up_to_eight_channels_are_lossless_in_the_layout_elements() {
+        for ch in 3..=8u16 {
+            for bits in [16u8, 24] {
+                let samples = signal(5000, ch as usize, bits as u32, 0.01, ch as u64);
+                let (got, _, _) = roundtrip(&samples, ch, bits);
+                assert!(got == samples, "lossless mismatch for ch={ch} bits={bits}");
+            }
+        }
+        // full-scale noise: the raw fallback holds every element
+        let noise = signal(4096, 6, 16, 1.0, 3);
+        assert!(roundtrip(&noise, 6, 16).0 == noise);
     }
 
     #[test]

@@ -13,12 +13,12 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   CAVLC and CABAC P and B slices, lossless, several pictures decoded at once), HEVC (Main, Main 10, 4:2:2, 4:4:4, 12-bit), VP8, VP9
   (profiles 0-3, tile columns and a multi-threaded loop filter), baseline and progressive JPEG and
   Motion-JPEG, AAC-LC with HE-AAC v1, MP3 (MPEG-1/2/2.5 Layer III), Vorbis, Opus (SILK, CELT and hybrid)
-  FLAC (4 to 32 bits) and ALAC (16 to 24 bits, mono and stereo).
+  FLAC (4 to 32 bits) and ALAC (16 to 24 bits, one to eight channels).
 - **Codecs (encoders):** software HEVC (Main profile, 8-bit 4:2:0: 32x32 coding tree units, CABAC, intra and P pictures with merge and skip, AMVP motion, quarter-sample search, deblocking, rate control by QP or bit rate; MP4 and Matroska), software H.264 (Constrained Baseline, then Main with CABAC and High with the 8x8
   transform, B pictures, rate-distortion mode decisions), VP8 (key and inter frames, quarter-pixel motion, rate control), VP9 (key and inter frames, profile 0, WebM, Matroska and MP4), AAC-LC with an ADTS writer, MP3 Layer III with
   an MP3 writer, Vorbis, Opus (CELT, wideband SILK, hybrid, DTX, in-band FEC, automatic mode switching,
   2.5 to 60 ms frames; the CLI and job JSON select the mode, signal, frame size, FEC and DTX), JPEG and Motion-JPEG, FLAC, and
-  ALAC (16 and 24 bits, mono and stereo). `--keyint N` (or `keyint` in a job) sets the key frame interval of H.264, HEVC, VP8 and VP9.
+  ALAC (16 and 24 bits, one to eight channels). `--keyint N` (or `keyint` in a job) sets the key frame interval of H.264, HEVC, VP8 and VP9.
 - **Codecs (voice link):** a playout buffer, a streaming resampler, speech detection with push-to-talk
   trimming, automatic gain control, noise suppression, and Opus packet-loss concealment.
 - **Codecs (ProRes):** Apple ProRes decoder and encoder in MOV: 4:2:2 at 10 bits (Proxy, LT, Standard, HQ) and 4:4:4 at
