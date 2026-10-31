@@ -200,7 +200,7 @@ fn sample(grain: &Grain, off: &[[usize; 2]; 2], sub: [usize; 2], bx: usize, by: 
     let r = off[bx][by];
     let offx = 3 + (2 >> sub[0]) * (3 + (r >> 4));
     let offy = 3 + (2 >> sub[1]) * (3 + (r & 0xF));
-    grain[offy + y + (BLOCK >> sub[1]) * by][offx + x + (BLOCK >> sub[0]) * bx] as i32
+    grain[offy + y + (BLOCK >> sub[1]) * by][offx + x + (BLOCK >> sub[0]) * bx]
 }
 
 /// The weights blending overlapped grain: two taps for luma, one pair for subsampled chroma.

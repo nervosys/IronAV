@@ -897,12 +897,12 @@ layout from the `av1C` configuration record, and its configuration OBUs (the seq
 `cuviddec` does. 8-bit and 10-bit 4:2:0 come out as `yuv420p` and `yuv420p10le`; anything else is refused before the GPU is touched. The GPU says which sizes it
 takes, and IronAV checks them: the RTX 3090 Ti used here decodes 128x128 to 8192x8192, and a smaller stream is refused with that range in the message.
 
-Without a usable GPU, or with `--hwaccel off`, the software AV1 decoder takes over. It is at its first stage: key frames and intra-only frames, with
+Without a usable GPU, or with `--hwaccel off`, the software AV1 decoder takes over. It is at its second stage: key frames and intra-only frames, with
 every intra tool (partitions to 128x128, directional, smooth, Paeth, CFL, palette and filter-intra prediction, all transforms, lossless), tiles, the deblocking
-filter, 8, 10 and 12 bits, 4:2:0, 4:2:2, 4:4:4 (RGB as `rgb24`) and monochrome. Inter frames, CDEF, loop restoration, superres, film grain, intra block copy
-and quantiser matrices are refused with an error naming the tool, so a typical AV1 file (inter frames, CDEF) is still GPU only. On libaom's intra-only output
-(`ffmpeg -c:v libaom-av1 -g 1 -aom-params enable-cdef=0`) the pictures equal libaom's bit for bit: 128x72 to 1280x720, odd sizes, crf 0 to 63, 4x2 tiles,
-the bit depths and samplings above, palettes and lossless coding, in WebM, Matroska and MP4 (tests/av1.rs). About 30 frames a second at 720p. AV1 is not encoded
+filter, CDEF, quantiser matrices, film grain (added to the output only), 8, 10 and 12 bits, 4:2:0, 4:2:2, 4:4:4 (RGB as `rgb24`) and monochrome.
+Inter frames, loop restoration, superres and intra block copy are refused with an error naming the tool, so a typical AV1 file (inter frames) is still GPU only.
+On libaom's intra-only output (`ffmpeg -c:v libaom-av1 -g 1`) the pictures equal libaom's bit for bit: 128x72 to 1280x720, odd sizes, crf 0 to 63, 4x2 tiles,
+the bit depths and samplings above, palettes, lossless coding, CDEF, quantiser matrices and film grain, in WebM, Matroska and MP4 (tests/av1.rs). About 9 frames a second at 720p with CDEF, quantiser matrices and film grain on (release build, `convert` to Y4M). AV1 is not encoded
 (consumer NVENC before the RTX 40 series cannot encode it), but it can be copied between WebM, Matroska and MP4 with no GPU (see "Matroska output").
 
 Checked bit for bit against FFmpeg's libdav1d (through PyAV) on SVT-AV1 output: 27 clips from 128x128 to 3840x2160, including odd sizes, 10-bit, film grain
