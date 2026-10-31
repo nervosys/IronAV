@@ -1,7 +1,7 @@
 # Design: agentic-first real-time streaming, parsing and understanding
 
-Status: M1 (understanding files) and most of M2 (live bytes) are implemented; the rest is a proposal
-(2026-10-29). Nothing beyond that is implemented yet unless it says so. §8 lists what M2 left for later. TLS (`https://`, `rtsps://`) uses IronSocketLayer, with
+Status: M1 to M5 are implemented and M6 is in part (TLS, HTTPS and RTSPS, capture devices); the rest is a proposal
+(2026-10-29). Nothing beyond that is implemented yet unless it says so. §8 lists what is still open. TLS (`https://`, `rtsps://`) uses IronSocketLayer, with
 IronPKI validating certificates.
 
 IronAV already treats agents as first-class for **files**: one tool registry feeds the CLI, the MCP server and the
@@ -14,16 +14,16 @@ transcode), all within stated latency and resource budgets.
 
 | Area | Today | Gap for live use |
 |---|---|---|
-| Input | `open_demuxer(path)`; every demuxer is `Read + Seek` and most call `seek(End)` at open; Ogg, ADTS, MP3 and JPEG read the whole file | nothing can read a pipe, socket, growing file or device |
-| Containers | WAV, FLAC, Y4M, MP4 (fragmented read), Matroska/WebM, Ogg, ADTS, MP3, JPEG | no MPEG-TS, RTP, RTSP, HLS, DASH, SRT or WebRTC; `mpegts` is listed only as planned in the ontology |
-| Packet | `stream, pts, duration, data` | no DTS, keyframe flag, loss/corruption flag, arrival time or sequence number |
-| Muxers | all seek back at `finish` (MP4 moov, MKV sizes and Cues) | no progressive output: no fragmented MP4 or TS writer, no segmenting |
-| Decoders | `decode(packet) -> Vec<Frame>`, `flush()` (incremental already) | H.264 and HEVC hold frames for reordering by the SPS depth; no low-delay or keyframe-only mode |
-| Encoders | software H.264 with two B pictures and look-ahead-free rate control; NVENC | the B pictures add two pictures of delay; the software encoder is far from real time at 720p (about 0.2 s of CPU per picture) |
+| Input | `open_demuxer(path)` for files (every demuxer is `Read + Seek`); Ogg, ADTS, MP3 and JPEG read the whole file | live sources exist (M2, M4): pipes, sockets, growing files, RTSP, HLS and devices; what is still missing is in §8 |
+| Containers | WAV, FLAC, Y4M, MP4 (fragmented read), Matroska/WebM, Ogg, ADTS, MP3, JPEG | MPEG-TS, RTP, RTSP and HLS exist now (M3, M4); no DASH, SRT or WebRTC |
+| Packet | `stream, pts, duration, data` | the keyframe flag and arrival time are held in `StreamPacket` (M2), not in `Packet`; `Packet` has no DTS field |
+| Muxers | all seek back at `finish` (MP4 moov, MKV sizes and Cues) | progressive fMP4 and TS recording and HLS segmenting exist (M3); the file muxers still seek back at `finish` |
+| Decoders | `decode(packet) -> Vec<Frame>`, `flush()` | low-delay output for H.264 (HEVC outputs by its SPS) and keyframe-only decoding exist (M2); the software H.264 decoder runs pictures on threads, low-delay mode on one |
+| Encoders | software H.264, HEVC, VP8 and VP9 encoders; NVENC | B pictures add delay unless the `latency: low` profile drops them (M3); the software H.264 encoder is much slower than x264 (see the README's Performance section) |
 | Execution | thread per stage, `sync_channel` depth 64, blocking back-pressure | a live source must never block on a slow consumer |
-| Understanding | `probe` (stream metadata); player `snapshot`; scene-cut scoring hidden inside the H.264 encoder | no analysis tools, no event model |
-| MCP | stdio JSON-RPC 2.0 (`2025-06-18`): `tools/*`, `resources/list|read`; requests are handled one at a time | no progress notifications, cancellation, subscriptions or concurrent calls; `run` reports no progress over MCP |
-| Sessions | player sessions (`play_open` etc., at most 8) | no live sessions, no event log, no retention |
+| Understanding | `probe` (stream metadata); player `snapshot` | `analyze` and its analyzers, observations and digests (M1), and sidecars (M5); model-backed analysis stays in sidecars |
+| MCP | stdio JSON-RPC 2.0 (`2025-06-18`): `tools/*`, `resources/list|read` | concurrent calls, progress and cancellation (M1); resource subscriptions (`resources/subscribe`) are not built yet |
+| Sessions | player sessions (`play_open` etc., at most 8) | live sessions (`stream_*`, M2) with a ring buffer, idle timeout and recording (M3); keeping logs past the process is still open (§10) |
 
 ## 2. Principles
 
@@ -94,7 +94,7 @@ Source URLs, in rough order of delivery:
 | `http://` | HLS and progressive download over plain HTTP using `std::net` |
 | `https://`, `rtsps://` | the same over TLS 1.3: IronSocketLayer, with IronPKI checking the chain and name against the platform's PEM bundle and `IRONAV_CA_FILE` (`ironav-live/src/tls.rs`) |
 | `srt://` | needs a dependency decision (§10) |
-| `device://video[/N]`, `device://audio[/NAME]` | capture through each platform's own API, written here (`ironav-live/src/capture/`): Media Foundation on Windows (done); V4L2 and AVFoundation to follow. A camera arrives as Y4M (NV12/YUY2 converted to 4:2:0), a microphone as open-ended 16-bit WAV, so the stream demuxers read them like any other bytes |
+| `device://video[/N]`, `device://audio[/NAME]` | capture through each platform's own API, written here (`ironav-live/src/capture/`): Media Foundation on Windows and V4L2 on Linux (done); AVFoundation to follow. A camera arrives as Y4M (NV12/YUY2 converted to 4:2:0), a microphone as open-ended 16-bit WAV, so the stream demuxers read them like any other bytes |
 
 ### 3.2 Incremental demux (L1)
 
@@ -243,7 +243,7 @@ Each observation is one JSON object with a stable envelope; the ontology lists e
   no B-frames, so each picture leaves as soon as it is coded and the SPS declares no reordering; an IDR picture
   every second; no look-ahead; and a bit rate held to a quarter of a second's bits in software, or CBR with a
   one-frame VBV buffer under NVENC's low-latency tuning (which a constant quantiser also gets). Naming a codec with it re-encodes even a stream of the
-  same codec, since the source may hold B-frames. Today the software H.264 encoder is suitable only for
+  same codec, since the source may hold B-frames. When this was written, the software H.264 encoder was suitable only for
   recording at a reduced resolution, or offline. A faster software preset is separate encoder work, and this
   document does not promise it. The transcode sink came later as `transcode` on `stream_open`
 (`engine/src/transcode.rs`): its own decoder, the `format` and `scale` filters as needed, the software encoder with
@@ -355,11 +355,11 @@ Each milestone is usable on its own and passes the test gate.
 | # | Delivers | New dependencies |
 |---|---|---|
 | **M1: understand files** (done) | `ironav-analyze` with `structure`, `levels`, `loudness`, `silence`, `scene` (shared with the encoder), `black`, `freeze`, `thumbnails`; the `analyze` tool and CLI; digests; MCP concurrency, progress and cancellation | none |
-| **M2: live bytes** (done in part) | the `Source` trait; `pipe:`, `?follow`, `?pace=realtime`, `tcp://`, `udp://`; `StreamDemuxer` for Annex B, ADTS, Y4M, WAV, Ogg and MP3; packet metadata; `LiveSession`, the ring buffer, the `stream_*` tools and `ironav watch`; low-delay H.264 and HEVC output | none |
+| **M2: live bytes** (done) | the `Source` trait; `pipe:`, `?follow`, `?pace=realtime`, `tcp://`, `udp://`; `StreamDemuxer` for Annex B, ADTS, Y4M, WAV, Ogg and MP3; packet metadata; `LiveSession`, the ring buffer, the `stream_*` tools and `ironav watch`; low-delay H.264 and HEVC output | none |
 | **M3: broadcast** (done) | the MPEG-TS demuxer and muxer; live fMP4 and MKV reading; a progressive fMP4/TS recorder; `stream_clip`; segmenting; the `latency: low` encode profile | none |
 | **M4: cameras and the web** (done) | RTSP and RTP depacketizers with a jitter buffer and RTCP; HLS over plain HTTP | none |
 | **M5: models** (done) | the sidecar protocol, voice-activity gating and two reference sidecars kept out of tree (speech-to-text, detection) | none in the core; each sidecar chooses its own |
-| **M6: optional transports** | HTTPS/HLS, RTSPS, SRT, capture devices, WebRTC ingest | each one by decision (§10) |
+| **M6: optional transports** (in part) | HTTPS and HLS over TLS, RTSPS, and capture devices (Media Foundation, V4L2) are done; SRT, WebRTC ingest and AVFoundation are not | each one by decision (§10) |
 
 M2 as built: the `Source` trait and every source above; `StreamDemuxer` for Annex B H.264/HEVC, ADTS, Y4M and WAV;
 live sessions with the ring buffer and log; `stream_open`, `stream_events`, `stream_status`, `stream_snapshot`,
@@ -409,7 +409,7 @@ segment that uses it: concatenated TS segments are a transport stream and fragme
 are a fragmented MP4, so the existing stream demuxers read the result unchanged. Live playlists start three segments
 from the end, reload every target duration (half when nothing was added), and use media sequence numbers so no segment
 is given twice. Every connection and redirect passes the allow-list, and credentials go only to the URL's own server.
-Encrypted playlists and HTTPS segments are refused at open. Separate audio renditions came later: the HLS source
+Encrypted playlists are refused at open; HTTPS came later, with TLS. Separate audio renditions came later: the HLS source
 follows the variant's playlist and its audio rendition's side by side and writes them as tagged pieces of one byte
 stream (`ironav_formats::renditions`), which a merging demuxer splits, reads with a demuxer per part and puts back in
 time order, so the session and everything after it are unchanged. Checked with
@@ -451,7 +451,7 @@ files at once, and it fixes the event model, analyzer trait and MCP plumbing bef
 2. **Async**: this design deliberately uses no async runtime. Confirm that, or choose `tokio` for M4 and later
    (needed only if session counts grow into the hundreds).
 3. **Capture devices**: decided. Each platform's own API, written here: Media Foundation through the `windows` crate
-   already in the lockfile (done), then V4L2 and AVFoundation. `ironav devices` and the `devices` tool list them.
+   already in the lockfile (done), then V4L2 (done) and AVFoundation (not yet). `ironav devices` and the `devices` tool list them.
 4. **Reference sidecars**: decided. faster-whisper for speech-to-text and ONNX Runtime (a YOLOv8 export) for detection,
    as Python files in `examples/sidecars/`, outside the build, plus a model-free DTMF detector in Rust that the tests use.
 5. **Persistence**: should observation logs and recordings outlive the process (a session directory), or stay in memory only?

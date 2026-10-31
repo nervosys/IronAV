@@ -189,7 +189,7 @@ fn h_capabilities(_: &Value) -> Result<Value> {
         "observation_kinds": ironav_analyze::KINDS,
         "error_codes": ErrorCode::ALL,
         "ontology": ontology().summary(),
-        "not_implemented": "Implemented: software decoders for H.264, HEVC (Main, Main 10), VP8, VP9 (profiles 0-3), JPEG, ProRes, AAC-LC (plus HE-AAC v1), MP3, ALAC, Vorbis, Opus, FLAC and PCM; software encoders for H.264 (High profile: CABAC, the 8x8 transform, I, P and B frames, 8-bit yuv420p with even dimensions), HEVC (Main profile: intra and P pictures, 8-bit yuv420p with even dimensions), VP8 (key and inter frames), VP9 (key and inter frames), JPEG, ProRes (4:2:2 at 10 bits, HQ profile), AAC-LC, MP3, ALAC, Vorbis, Opus, FLAC and PCM. NVIDIA GPUs encode H.264 and HEVC (NVENC, preferred when usable); GPU decoding (NVDEC) is also available for them. AV1 is decoded only on NVIDIA GPUs (NVDEC, no software decoder) and cannot be encoded. Not implemented (planned in the ontology): MPEG-4 Part 2. AV1 cannot be written (copied into a file); VP9 is written by the software encoder (key and inter frames). A video file and an audio file are combined into one output with extra_inputs."
+        "not_implemented": "Implemented: software decoders for H.264, HEVC (Main, Main 10, 4:2:2, 4:4:4), VP8, VP9 (profiles 0-3), MPEG-4 Part 2 (Simple and Advanced Simple), JPEG, ProRes, AAC-LC (plus HE-AAC v1), MP3, ALAC, Vorbis, Opus, FLAC and PCM; software encoders for H.264 (High profile: CABAC, the 8x8 transform, I, P and B frames, 8-bit yuv420p with even dimensions), HEVC (Main profile: intra and P pictures with merge and skip, no SAO, 8-bit yuv420p with even dimensions), VP8 (key and inter frames), VP9 (key and inter frames, profile 0), JPEG, ProRes (4:2:2 at 10 bits, HQ profile), AAC-LC, MP3, ALAC, Vorbis, Opus, FLAC and PCM. NVIDIA GPUs encode H.264 and HEVC (NVENC, preferred when usable); GPU decoding (NVDEC) is also available for them. AV1 is decoded only on NVIDIA GPUs (NVDEC, no software decoder) and cannot be encoded. Not implemented: MPEG-4 Part 2 encoding. AV1 cannot be written (copied into a file); VP9 is written by the software encoder (key and inter frames). A video file and an audio file are combined into one output with extra_inputs."
     }))
 }
 
@@ -692,7 +692,7 @@ pub fn tools() -> &'static [Tool] {
             },
             Tool {
                 name: "play_open",
-                description: "Open a media file for playback and return a session id and the player status. Plays from the start unless autoplay is false. Sessions last until play_close or the end of the process. hevc video needs the GPU decoder (h264 falls back to software); audio is silent when there is no sound device.",
+                description: "Open a media file for playback and return a session id and the player status. Plays from the start unless autoplay is false. Sessions last until play_close or the end of the process. hevc and h264 video fall back to the software decoder when no GPU decoder is usable; audio is silent when there is no sound device.",
                 cli: "ironav play <file> --json   (JSON lines on stdin/stdout)",
                 input_schema: object(
                     json!({

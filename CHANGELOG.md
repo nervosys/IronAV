@@ -10,8 +10,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 ### Added
 
 - **Codecs (decoders):** software decoders for H.264 (8- and 10-bit, 4:2:0, 4:2:2, 4:4:4 and monochrome,
-  CAVLC and CABAC P and B slices, lossless), HEVC (Main, Main 10, 4:2:2, 4:4:4, 12-bit), VP8, VP9
-  (profiles 0-1, tile columns and a multi-threaded loop filter), baseline and progressive JPEG and
+  CAVLC and CABAC P and B slices, lossless, several pictures decoded at once), HEVC (Main, Main 10, 4:2:2, 4:4:4, 12-bit), VP8, VP9
+  (profiles 0-3, tile columns and a multi-threaded loop filter), baseline and progressive JPEG and
   Motion-JPEG, AAC-LC with HE-AAC v1, MP3 (MPEG-1/2/2.5 Layer III), Vorbis, Opus (SILK, CELT and hybrid)
   FLAC (4 to 32 bits) and ALAC (16 to 24 bits, mono and stereo).
 - **Codecs (encoders):** software HEVC (Main profile, 8-bit 4:2:0: 32x32 coding tree units, CABAC, intra and P pictures with merge and skip, AMVP motion, quarter-sample search, deblocking, rate control by QP or bit rate; MP4 and Matroska), software H.264 (Constrained Baseline, then Main with CABAC and High with the 8x8
@@ -28,18 +28,18 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   MPEG quantisation with custom matrices, resync markers. Decoding matches FFmpeg's bit for bit. Interlaced, sprite
   and global-motion streams, and data partitioning, are refused with a clear error. About 90 frames a second at 720p.
 - **Containers:** WAV, FLAC, Y4M, MP4, QuickTime MOV, Matroska and WebM (read and write), Ogg (Opus, Vorbis and FLAC),
-  ADTS, MP3, JPEG, and MPEG transport streams (read and write).
+  ADTS, MP3, JPEG, and MPEG transport streams (read and write), and raw H.264 and HEVC (Annex B, write only).
 - **Containers (MP4):** fragmented MP4 is read as it arrives; the writer is constant-frame-rate and
   writes fast-start files; B-frames are copied with `ctts` and an edit list; ALAC audio is read and written
-  in the `alac` sample entry.
+  in the `alac` sample entry, in MP4 and MOV.
 - **Containers (QuickTime):** MOV is read as MP4 is, including QuickTime sound entries (versions 1 and 2, `wave`
   atoms, and PCM in `twos`, `sowt`, `in24`, `in32`, `fl32`, `fl64`, `raw ` and `lpcm` form) and files with no `ftyp`;
-  written with a `qt  ` brand, H.264, HEVC, AAC, Motion-JPEG and PCM. FFmpeg decodes the PCM bit-exact and reads the copied
+  written with a `qt  ` brand, H.264, HEVC, ProRes, Motion-JPEG, AAC, ALAC and PCM. FFmpeg decodes the PCM bit-exact and reads the copied
   packets the same as IronAV does.
 - **Containers (copy):** VP9 and AV1 are copied between WebM, Matroska and MP4; AAC keeps its encoder
   delay in MP4; Opus ends where the source did in Matroska (DiscardPadding) and Ogg.
 - **Live input and streaming (HTTP authentication):** Digest (MD5 and MD5-sess, RFC 7616 and RFC 2069 forms) and
-  Basic credentials in http(s) URLs, answered per host so that later segments need no extra round trip.
+  Basic credentials in http(s) URLs, answered per host so that later segments need no extra round trip. SHA-256 Digest is not supported.
 - **Live input and streaming:** byte sources for growing files, standard input, named pipes, TCP, UDP,
   RTSP (cameras and servers, RTP over UDP), HTTP (HLS, including alternate audio renditions, and
   progressive download), and HTTPS and RTSPS through IronSocketLayer with IronPKI certificate checks.

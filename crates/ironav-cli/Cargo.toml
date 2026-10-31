@@ -45,4 +45,5 @@ path = "src/main.rs"
 [[bin]]
 name = "ironav-gui"
 path = "src/gui_main.rs"
+doc = false
 required-features = ["native-gui"]

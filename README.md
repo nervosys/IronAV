@@ -4,7 +4,7 @@ Audio and video conversion in Rust, built to be driven by AI agents as well as p
 A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so they cannot drift apart.
 
 > **Status: foundation (v0.1).** The architecture, agent interface, ontology, hardware model, CLI, MCP server
-> and both GUIs are working and tested. Containers: **WAV, FLAC, Y4M, MP4, QuickTime MOV (read and write), Matroska/WebM (read and write), Ogg, ADTS, MP3, JPEG and MPEG transport streams (read and write).**
+> and both GUIs are working and tested. Containers: **WAV, FLAC, Y4M, MP4, QuickTime MOV (read and write), Matroska/WebM (read and write), Ogg, ADTS, MP3, JPEG and MPEG transport streams (read and write); raw H.264 and HEVC (Annex B, write only).**
 > Audio codecs, each decoded and encoded: **PCM, FLAC, ALAC, AAC-LC (plus HE-AAC v1 decode), MP3, Opus and Vorbis.**
 > Video: **software decoders for H.264, HEVC (including 4:2:2 and 4:4:4), VP8 and VP9; a software H.264 encoder (High profile: CABAC and the 8x8 transform), a software HEVC encoder (Main profile, 8-bit 4:2:0, merge and skip, no SAO), a software VP8 encoder, and a software VP9 encoder (key and inter frames); JPEG/Motion-JPEG and Apple ProRes decoded and encoded in software; MPEG-4 Part 2 (Simple and Advanced Simple profiles) decoded in software.**
 > NVIDIA GPUs encode H.264 and HEVC (NVENC, preferred when usable) and decode H.264, HEVC and AV1 (NVDEC).
@@ -482,7 +482,7 @@ Apple Lossless, implemented from the bitstream that Apple's reference decoder an
 either). Decodes mono and stereo at 16, 20 and 24 bits, and mono at 32: adaptive predictor, adaptive Rice codes with zero runs,
 stereo decorrelation, the split-off low bits, and uncompressed frames. Encodes mono and stereo at 16 and 24 bits with a
 second-order predictor, the best stereo mode per block, and an uncompressed frame where compression does not help.
-More than two channels is not implemented. Written and read in MP4 (`--acodec alac -o out.m4a`, the `alac` sample entry).
+More than two channels is not implemented. Written and read in MP4 (`--acodec alac -o out.m4a`, the `alac` sample entry) and in MOV.
 
 **Conformance**: FFmpeg's `-c:a alac` output decodes to the source PCM bit-exactly at 16 and 24 bits, mono and stereo,
 and FFmpeg decodes IronAV's output bit-exactly in those cases; IronAV to IronAV is bit-exact too. These tests are in
@@ -782,7 +782,7 @@ is not is decoded differently by the specification and by some FFmpeg builds, so
 
 ## H.264 (software decoder)
 
-`ironav-codec` has a software H.264 decoder written from the specification, with the constant tables read out of FFmpeg's source by `tools/gen_h264_tables.py`. It decodes **I, P and B slices** with CAVLC or CABAC: Intra 4x4, 8x8 and 16x16 prediction, I_PCM, the 8x8 transform, scaling matrices, several slices per picture, every inter partition size, quarter-sample motion compensation, several reference frames with list modification and MMCO marking, spatial and temporal direct prediction, bi-prediction with explicit and implicit weights, output reordering, cropping constrained intra prediction and the loop filter. It handles 8-bit and 10-bit (High 10) progressive video in monochrome, 4:2:0, 4:2:2 and 4:4:4, including the lossless transform-bypass mode. Output is `gray` (8-bit monochrome), `yuv420p` or `yuv420p10le`, `yuv422p` or `yuv422p10le`, and `yuv444p` or `yuv444p10le`. NVDEC cannot decode 10-bit H.264 and cannot take 4:2:2, 4:4:4 or monochrome, so those streams always take the software path. Interlaced coding (field pictures, MBAFF), slice groups, separate colour planes, SP/SI slices and bit depths above 10 are refused with a clear error. It is correct but not fast: the CABAC engine and the interpolation are not optimised.
+`ironav-codec` has a software H.264 decoder written from the specification, with the constant tables read out of FFmpeg's source by `tools/gen_h264_tables.py`. It decodes **I, P and B slices** with CAVLC or CABAC: Intra 4x4, 8x8 and 16x16 prediction, I_PCM, the 8x8 transform, scaling matrices, several slices per picture, every inter partition size, quarter-sample motion compensation, several reference frames with list modification and MMCO marking, spatial and temporal direct prediction, bi-prediction with explicit and implicit weights, output reordering, cropping constrained intra prediction and the loop filter. It handles 8-bit and 10-bit (High 10) progressive video in monochrome, 4:2:0, 4:2:2 and 4:4:4, including the lossless transform-bypass mode. Output is `gray` (8-bit monochrome), `yuv420p` or `yuv420p10le`, `yuv422p` or `yuv422p10le`, and `yuv444p` or `yuv444p10le`. NVDEC cannot decode 10-bit H.264 and cannot take 4:2:2, 4:4:4 or monochrome, so those streams always take the software path. Interlaced coding (field pictures, MBAFF), slice groups, separate colour planes, SP/SI slices and bit depths above 10 are refused with a clear error. Pictures are decoded on several threads: `H264Decoder::new` keeps as many pictures in flight as there are cores, at most 12, one thread each, and `with_threads(n)` sets the count (`with_threads(1)` decodes on the caller's thread). Low-delay output (`H264Decoder::low_delay`, used by live sessions) stays on one thread, so its pictures never wait for others. The CABAC engine and the interpolation are not optimised.
 
 When a GPU decoder is usable (`--hwaccel auto`) it is still chosen for 4:2:0 H.264; the software decoder runs with `--hwaccel off` or when no GPU backend works. About 50 small streams (a further 75 8-bit and 50 10-bit random libx264 configurations also matched) (libx264 in many configurations, with B-frames, pyramids, weighted prediction, several slices and reference frames, plus hand-built all-I_PCM streams) decode bit-for-bit like FFmpeg's decoder; hundreds of corrupted streams made it return errors, never panic.
 
@@ -832,6 +832,10 @@ cost 0.5 % on the noisy clip, and take about a fifth more encoding time. A secon
 loses most of that). Not done: partitions below 8x8,
 multiple references, 10-bit.
 
+## HEVC encoder (software)
+
+`--vcodec hevc` is encoded in software when no GPU encoder is usable, or with `--hwaccel off`. The encoder (`ironav-codec/src/hevc/enc`) makes Main profile pictures of any even size, 8-bit 4:2:0. Coding tree units are 32x32, split down to 8x8 by a rate-distortion decision on the reconstruction. Intra units choose one of 35 modes and a transform size; inter units are merged or skipped, or take one motion vector with quarter-sample refinement (AMVP). Residuals are quantised and coded with CABAC, and the deblocking filter runs; SAO is off. Every picture is an IDR picture or a P picture that refers to the one before, so there are no B pictures and no reordering delay. Slices are coded on threads. `--qp` or `--vbitrate` sets the quality or the rate. Output goes to MP4 or Matroska, or to a raw `.h265` Annex B stream. FFmpeg decodes the output to the same pictures as IronAV's decoder (`crates/ironav-engine/tests/hevc.rs`).
+
 ## VP8
 
 VP8 video is decoded in software (`ironav-codec/src/vp8`, a port of FFmpeg's `vp8.c` and `vp8dsp.c`; the probability, quantiser and
@@ -867,7 +871,7 @@ Checked bit for bit against FFmpeg's decoder (through PyAV) on libvpx output: ab
 sequences with alt-ref and compound prediction, odd sizes down to 33x17, 640x360, noise, segmentation modes 1 to 3, error-resilient and frame-parallel streams,
 tile columns and rows, 4:2:2, 4:4:4, lossless) all match on every frame, and six small clips are kept as the `vp9_streams_decode_to_what_ffmpeg_decodes` test.
 **Not tested against any stream:** 10-bit output (the libvpx build used here cannot encode it), intra-only frames, and corrupted-stream robustness beyond what is noted in the
-changelog. VP9 has no encoder here; it can be copied between WebM, Matroska and MP4 (see "Matroska output").
+changelog. VP9 is also encoded in software (`--vcodec vp9`, profile 0, 8-bit 4:2:0): a key frame every 250 frames by default, and inter frames between them that predict from the frame before, with quarter-pixel motion vectors and one reference frame. It writes WebM, Matroska or MP4, and its output is checked against FFmpeg's decoder in the tests (`vp9_encoded_files_decode_to_what_ffmpeg_decodes`). VP9 can also be copied between WebM, Matroska and MP4 (see "Matroska output").
 
 Tile columns are decoded on separate threads (one per core, at most one per tile column), each into its own copy of the picture, and merged
 afterwards; streams with one tile column (every stream 448 pixels wide or narrower, and any the encoder made with one) still decode on one thread.
@@ -910,6 +914,10 @@ Motion-JPEG can also be written into Matroska (`V_MJPEG`, `-o clip.mkv --vcodec 
 ## ProRes
 
 Apple ProRes (codec `prores`, in MOV) is decoded and encoded in software: 4:2:2 at 10 bits for Proxy, LT, Standard and HQ, and 4:4:4 at 12 bits for 4444 and 4444 XQ, all progressive (interlaced pictures are refused with an error). The decoder reads the quantisation matrices and skips a 4444 alpha plane. The encoder writes HQ, which `--vcodec prores` selects, converting the picture to 4:2:2 at 10 bits first; it uses a fixed quantiser per profile and flat matrices, and the Rust API takes any profile. Decoding is bit-exact with FFmpeg's in both directions, and HQ encodes at over 45 dB PSNR (`crates/ironav-engine/tests/prores.rs`, skipped without ffmpeg on the PATH).
+
+## MPEG-4 Part 2 (software decoder)
+
+Simple and Advanced Simple profile video (`mp4v` in MP4, `V_MPEG4/*` in Matroska) is decoded in software: I, P and B pictures, half- and quarter-sample motion, four vectors per macroblock, direct mode, H.263 and MPEG quantisation with custom matrices, and resync markers. Decoding matches FFmpeg's decoder bit for bit (`crates/ironav-engine/tests/mpeg4.rs`, which skips without ffmpeg on the PATH). Interlaced pictures, sprites and global motion, data partitioning and scalable layers are refused with an error. There is no MPEG-4 encoder.
 
 ## MP3
 
@@ -957,7 +965,7 @@ becomes 160 kb/s MP3 in about 2 s. Converting an MP3 to MP3 is a copy unless a b
 
 ## Matroska output
 
-`.mkv` and `.mka` can be written: H.264 (from the software or hardware encoder, or copied) or HEVC video (from the hardware encoder or copied), or VP8, VP9, AV1 or Motion-JPEG video, with AAC, FLAC, MP3, Opus or Vorbis
+`.mkv` and `.mka` can be written: H.264 or HEVC video (from the software or hardware encoder, or copied), or VP8, VP9, AV1 or Motion-JPEG video (copied, or encoded by IronAV for VP8, VP9 and Motion-JPEG), with AAC, FLAC, MP3, Opus or Vorbis
 audio, copied or encoded, at most one stream of each kind. Timestamps are in milliseconds; clusters are gathered in memory and
 written whole, so there are no unknown-size elements, and the file ends with Cues for the video key frames (or the clusters, for
 audio only). The header is held back until every stream has delivered a packet and the video's SPS/PPS have been seen.
@@ -968,7 +976,7 @@ FFmpeg decodes all 50 frames of each video. IronAV's own tests copy audio throug
 configuration, and decode FLAC through Matroska to the PCM it was made from.
 
 `.webm` is written with VP8, VP9 or AV1 video and Opus or Vorbis audio (document type `webm`; FFmpeg opens the files and decodes them).
-IronAV has no encoder for WebM's video codecs, so the video is copied, from WebM, Matroska or (VP9 and AV1) MP4. Key frames come from
+VP8 and VP9 video can be encoded by IronAV (see "VP8" and "VP9"); otherwise the video is copied, from WebM, Matroska or (VP9 and AV1) MP4. Key frames come from
 the bitstream: VP8's frame tag, the first frame header of a VP9 packet (or superframe), and for AV1 the first frame header of the temporal unit,
 which must be a shown key frame. So the Cues are right. VP8 and VP9 have no CodecPrivate. AV1's is its `av1C` record (a stream without one is
 refused), and temporal delimiter and padding OBUs are dropped, as the Matroska AV1 mapping asks. FFmpeg (through PyAV) checked the copies:
@@ -978,8 +986,7 @@ as in the source. The `vp9_and_av1_copy_between_webm_matroska_and_mp4` test make
 and decodes the VP9 copies in MP4.
 
 Not done: no SeekHead, tags, chapters or attachments; PCM and more than one stream per kind are refused; an MP3's gapless trim (from its LAME tag) is not
-carried over and the Opus pre-skip is carried only as the OpusHead plus CodecDelay. I did not test B-frame video, because the
-encoder here does not produce it.
+carried over and the Opus pre-skip is carried only as the OpusHead plus CodecDelay. I did not test B-frame video in Matroska: the NVENC files above have none, and the MPEG-TS section covers B-frames.
 
 ## MPEG transport streams
 
@@ -1018,11 +1025,12 @@ resident. Measured (release build, one Windows machine, 10 min of 48 kHz stereo 
 | WAV to Opus, 128 kb/s stereo | 1.87 s | 1.19 s (libopus) | FFmpeg 1.6x faster |
 | NVENC H.264, 240 frames 720p from Y4M | 465 ms | 511 ms (`h264_nvenc`) | about level (runs vary 10-20 %); default rates differ, so sizes do |
 | NVDEC H.264 to Y4M, 240 frames 720p | 406 ms | 456 ms (`-hwaccel cuda`) | about level |
-| Software H.264 to Y4M, 240 frames 720p | 2.2-2.6 s | 0.23 s | FFmpeg about 10x faster: its decoder runs on every core, this one on one |
+| Software H.264 to Y4M, 240 frames 720p | 1.33 s (min 1.05) | 0.59 s (min 0.43) | FFmpeg about 2.3x faster; this decoder runs pictures on up to 12 threads |
+| Software H.264 to Y4M, 240 frames 720p, with B-frames | 1.59 s (min 1.16) | 0.97 s (min 0.41) | FFmpeg about 1.6x faster |
 | Process start-up | 18 ms | 28 ms | IronAV 1.6x faster |
 
 **So IronAV is level with FFmpeg where the GPU does the work and slower everywhere else** (most of all in software
-H.264 decoding, which is single-threaded). The "lower latency, higher throughput" goal is a goal, not a result. The FLAC encoder alone (no file, no process) takes 0.18 s for the 3-minute file on this
+H.264 decoding, where FFmpeg is still about 2.3 times faster; the decoder now runs pictures on several threads). The "lower latency, higher throughput" goal is a goal, not a result. The FLAC encoder alone (no file, no process) takes 0.18 s for the 3-minute file on this
 machine (`cargo test --release -p ironav-codec --test flac_perf -- --ignored --nocapture`); it was 1.1 s before it was
 tuned (cheaper Rice-parameter search, one residual per predictor family instead of eight, a cached window, batched
 four-byte bit writes, and blocks encoded in parallel). FFmpeg decodes its output bit-exactly (checked on the 3-minute file), and the committed libFLAC fixtures still pass.
