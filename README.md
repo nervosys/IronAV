@@ -51,7 +51,7 @@ A call that carries `_meta.progressToken` gets `notifications/progress`, and `no
 | `levels` | sample peak and RMS (dBFS), clipping |
 | `loudness` | EBU R128 / ITU-R BS.1770: momentary, short-term and integrated loudness (LUFS), loudness range (LU) |
 | `silence` | spans of at least 0.5 s below -50 dBFS |
-| `voice_activity` | spans of speech (energy over the noise floor, zero crossings, syllabic modulation; a steady tone, hum or hiss does not count) |
+| `voice_activity` | spans of speech (energy in the speech band over the noise floor, pitch, syllabic modulation; a steady tone, hum, hiss or noise does not count). On a synthesized voice under pink noise it finds as much speech at 10 dB SNR as when clean, and at 0 dB all of it, with some of the pauses between sentences counted too (it found half before) |
 | `scene` | scene cuts (the measure the H.264 encoder uses for IDR placement) and how much each window changes |
 | `black`, `freeze` | black spans (0.5 s or more) and unchanging pictures (1 s or more) |
 | `thumbnails` | a small picture when the content changes (64-bit perceptual hash, at most every 2 s) or every 10 s |
@@ -244,7 +244,7 @@ take it; padding `pad`, 0 by default, 114 for those), as RGB, BGR or grey bytes.
 (`TapConfig::audio()`) gives mono windows of `window_ms` at `rate` (16 kHz unless asked), starting every `hop_ms` (so
 windows overlap when it is shorter), and at the end of the stream a last, shorter window with what is left; with `features: true` each window comes with its RMS and peak level in dBFS,
 spectral centroid and 85% roll-off in Hz, spectral flatness (near 1 for noise, near 0 for a tone) and the share of its
-20 ms frames that sound like speech: well above an adaptive noise floor, not hiss, and among loud frames that vary as
+20 ms frames that sound like speech: loud in the speech band over an adaptive noise floor, with a pitch (or few zero crossings), and among loud frames that vary as
 syllables do over the last second, as the `voice_activity` analyzer takes them, each frame for itself with no hangover,
 so silence, a steady tone or hum, and hiss read 0 (the spectrum from `ironav_codec::voice::SpectrumMeter`). It takes the stream given as `stream` or the first of its kind, starting its
 decoder if nothing else needed one; if none suits, the first `recv_timeout` says why. The session never waits for a

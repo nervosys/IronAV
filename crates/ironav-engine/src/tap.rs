@@ -9,6 +9,7 @@
 //! sequence number, so a gap is visible, its media time (from the source's timestamps: for RTSP,
 //! the RTP clock from the start of the stream) and the wall-clock time it was decoded.
 
+use ironav_analyze::SpeechFrames;
 use ironav_codec::voice::{SpectrumMeter, StreamResampler};
 use ironav_core::{AudioFrame, Error, ErrorCode, MediaType, Result, VideoFrame};
 use serde::Deserialize;
@@ -167,8 +168,9 @@ pub struct AudioFeatures {
     /// Near 1 for noise, near 0 for a tone.
     pub flatness: f32,
     /// The share of the window's 20 ms frames that sound like speech, from 0 to 1: each well above
-    /// an adaptive noise floor, not hiss, and among loud frames that vary as syllables do (by 3 dB
-    /// or more over the last second), as the `voice_activity` analyzer takes them. Silence, a
+    /// an adaptive noise floor in the speech band (100 Hz to 4 kHz), with a pitch of 70 to 400 Hz
+    /// (or, without one, few zero crossings), and among loud frames that vary as syllables do (by
+    /// 3 dB or more over the last second), as the `voice_activity` analyzer judges them. Silence, a
     /// steady tone or hum, and hiss read 0; each frame counts for itself, with no hangover.
     pub speech: f32,
 }
@@ -294,43 +296,9 @@ pub struct TapFeeder {
     /// with each frame's start time and verdict.
     meter: Option<SpectrumMeter>,
     vad: Option<SpeechFrames>,
-    vad_buf: Vec<f32>,
+    vad_buf: Vec<f64>,
     vad_t: f64,
     flags: VecDeque<(f64, bool)>,
-}
-
-/// Each 20 ms frame's verdict for [`AudioFeatures::speech`].
-struct SpeechFrames {
-    floor: f32,
-    /// The levels of the loud frames among the last 50 (a second), oldest first; `None` for the others.
-    last: VecDeque<Option<f32>>,
-}
-
-impl Default for SpeechFrames {
-    fn default() -> Self {
-        Self { floor: -50.0, last: VecDeque::with_capacity(51) }
-    }
-}
-
-impl SpeechFrames {
-    fn process(&mut self, x: &[f32]) -> bool {
-        let e = 10.0 * (x.iter().map(|v| v * v).sum::<f32>() / x.len().max(1) as f32 + 1e-12).log10();
-        let zcr = x.windows(2).filter(|w| (w[0] >= 0.0) != (w[1] >= 0.0)).count() as f32 / x.len().max(1) as f32;
-        // the floor follows the quietest frames down at once and rises 1 dB a second
-        self.floor = if e < self.floor { e.max(-75.0) } else { self.floor + 0.02 };
-        let loud = e > self.floor + 10.0 && e > -55.0;
-        self.last.push_back(loud.then_some(e));
-        if self.last.len() > 50 {
-            self.last.pop_front();
-        }
-        let levels: Vec<f32> = self.last.iter().flatten().copied().collect();
-        let modulated = levels.len() >= 10 && {
-            let n = levels.len() as f32;
-            let mean = levels.iter().sum::<f32>() / n;
-            (levels.iter().map(|l| (l - mean).powi(2)).sum::<f32>() / n).sqrt() >= 3.0
-        };
-        loud && zcr < 0.35 && modulated
-    }
 }
 
 /// A tap and its feeder, unattached.
@@ -464,9 +432,9 @@ impl TapFeeder {
             let got = r.pull(&mut self.pulled);
             self.pending.extend(&self.pulled[..got]);
             if features {
-                let vad = self.vad.get_or_insert_with(SpeechFrames::default);
+                let vad = self.vad.get_or_insert_with(|| SpeechFrames::new(rate));
                 for &v in &self.pulled[..got] {
-                    self.vad_buf.push(v);
+                    self.vad_buf.push(v as f64);
                     if self.vad_buf.len() == vad_frame {
                         self.flags.push_back((self.vad_t, vad.process(&self.vad_buf)));
                         self.vad_buf.clear();
@@ -535,8 +503,8 @@ mod tests {
 
     /// The share of the 20 ms frames of `x` (16 kHz) after its first second taken for speech.
     fn share(x: &[f32]) -> f32 {
-        let mut d = SpeechFrames::default();
-        let flags: Vec<bool> = x.chunks_exact(320).map(|f| d.process(f)).collect();
+        let mut d = SpeechFrames::new(16_000);
+        let flags: Vec<bool> = x.chunks_exact(320).map(|f| d.process(&f.iter().map(|&v| v as f64).collect::<Vec<f64>>())).collect();
         flags[50..].iter().filter(|&&f| f).count() as f32 / (flags.len() - 50) as f32
     }
 

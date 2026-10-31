@@ -14,7 +14,7 @@ mod video;
 
 pub use ironav_codec::change::LowRes;
 pub use observation::{kind_info, level_of, KindInfo, Level, Observation, Picture, KINDS};
-pub use speech::VoiceActivity;
+pub use speech::{SpeechFrames, VoiceActivity};
 
 use ironav_core::{AudioFrame, MediaType, Packet, StreamInfo, VideoFrame};
 use serde_json::Value;
@@ -123,7 +123,7 @@ pub const ANALYZERS: &[AnalyzerInfo] = &[
     AnalyzerInfo {
         name: "voice_activity",
         consumes: Consumes::Audio,
-        description: "Spans of speech, from energy above the noise floor, zero crossings and syllabic modulation: a cheap gate for a transcription model (steady tones, hum and hiss do not count).",
+        description: "Spans of speech, from energy in the speech band above the noise floor, pitch and syllabic modulation, so speech is found in background noise too: a cheap gate for a transcription model (steady tones, hum, hiss and noise do not count).",
         emits: &["speech_start", "speech_end"],
         make: |_, _| Box::new(speech::VoiceActivity::default()),
     },
