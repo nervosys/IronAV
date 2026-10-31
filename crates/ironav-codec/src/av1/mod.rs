@@ -6,6 +6,8 @@
 pub mod block;
 pub mod cdef;
 pub mod cdf_tables;
+pub mod film_grain;
+pub mod grain_tables;
 pub mod ipred;
 pub mod itx;
 pub mod itx1d;
@@ -49,6 +51,8 @@ struct RefSlot {
     /// The CDFs the frame ended with, for frames that load them (inter frames, later stages).
     #[allow(dead_code)]
     cdfs: Arc<Cdfs>,
+    /// The grain parameters of the frame, which a show_existing_frame of it applies.
+    grain: Option<film_grain::FilmGrain>,
 }
 
 /// The frame whose tile groups are being decoded.
@@ -199,14 +203,14 @@ impl Av1Decoder {
             rgb: f.seq.rgb,
             planes: std::mem::replace(&mut f.planes, [Plane::new(0, 0), Plane::new(0, 0), Plane::new(0, 0)]),
         });
-        let slot = RefSlot { pic: pic.clone(), frame_type: h.frame_type, order_hint: h.order_hint, cdfs: Arc::from(cdfs) };
+        let slot = RefSlot { pic: pic.clone(), frame_type: h.frame_type, order_hint: h.order_hint, cdfs: Arc::from(cdfs), grain: h.grain.clone() };
         for i in 0..8 {
             if h.refresh_frame_flags >> i & 1 == 1 {
                 self.refs[i] = Some(slot.clone());
             }
         }
         if h.show_frame {
-            self.emit(&pic, pts)?;
+            self.emit(&pic, h.grain.as_ref(), pts)?;
         }
         Ok(())
     }
@@ -218,16 +222,24 @@ impl Av1Decoder {
                 *r = Some(slot.clone());
             }
         }
-        self.emit(&slot.pic, pts)
+        self.emit(&slot.pic, slot.grain.as_ref(), pts)
     }
 
-    fn emit(&mut self, p: &Picture, pts: i64) -> Result<()> {
+    fn emit(&mut self, p: &Picture, grain: Option<&film_grain::FilmGrain>, pts: i64) -> Result<()> {
+        let grained;
+        let pix: &[Plane; 3] = match grain {
+            Some(g) => {
+                grained = film_grain::apply(g, &p.planes, p.width, p.height, p.bd, if p.mono { 1 } else { 3 }, p.rgb);
+                &grained
+            }
+            None => &p.planes,
+        };
         if p.rgb && !p.mono {
             if p.bd != 8 || p.ss != [0, 0] {
                 return Err(unsupported("RGB above 8 bits or subsampled has no output format"));
             }
             let mut v = Vec::with_capacity(p.width * p.height * 3);
-            let [g, b, r] = &p.planes;
+            let [g, b, r] = pix;
             for y in 0..p.height {
                 for x in 0..p.width {
                     v.extend([r.at(x, y), g.at(x, y), b.at(x, y)].map(|s| s as u8));
@@ -254,7 +266,7 @@ impl Av1Decoder {
         let mut planes = Vec::with_capacity(3);
         for pl in 0..if p.mono { 1 } else { 3 } {
             let (w, h) = if pl == 0 { (p.width, p.height) } else { ((p.width + p.ss[0]) >> p.ss[0], (p.height + p.ss[1]) >> p.ss[1]) };
-            let src = &p.planes[pl];
+            let src = &pix[pl];
             let mut v = Vec::with_capacity(w * h * if p.bd > 8 { 2 } else { 1 });
             for r in 0..h {
                 let row = &src.data[r * src.stride..r * src.stride + w];

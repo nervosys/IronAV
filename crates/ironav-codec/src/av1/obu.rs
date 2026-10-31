@@ -1,5 +1,6 @@
 //! OBU framing, the sequence header and the frame header of AV1 (spec sections 5.3 to 5.9).
 
+use super::film_grain;
 use ironav_core::{Error, ErrorCode, Result};
 
 pub const OBU_SEQUENCE_HEADER: u8 = 1;
@@ -434,6 +435,7 @@ pub struct FrameHeader {
     pub tx_mode: u8,
     pub reduced_tx_set: bool,
     pub superres_denom: u32,
+    pub grain: Option<film_grain::FilmGrain>,
     /// Where the tile data starts (byte offset into the frame header OBU's payload, when the
     /// header is followed by its tile group in the same OBU), after byte alignment.
     pub header_bytes: usize,
@@ -611,7 +613,7 @@ pub fn parse_frame_header(data: &[u8], seq: &SequenceHeader, refs: &RefInfo, tem
     };
     h.reduced_tx_set = b.flag()?;
     if seq.film_grain_params_present && (h.show_frame || h.showable_frame) {
-        film_grain_params(&mut b)?;
+        h.grain = film_grain::parse(&mut b, seq, h.frame_type == INTER_FRAME)?;
     }
     b.byte_align();
     h.header_bytes = b.byte_pos();
@@ -875,10 +877,3 @@ fn lr_params(b: &mut Bits, seq: &SequenceHeader, h: &mut FrameHeader) -> Result<
     Ok(())
 }
 
-/// film_grain_params: only its apply_grain flag is read; grain synthesis is not implemented.
-fn film_grain_params(b: &mut Bits) -> Result<()> {
-    if b.flag()? {
-        return Err(unsupported("film grain synthesis is not implemented"));
-    }
-    Ok(())
-}

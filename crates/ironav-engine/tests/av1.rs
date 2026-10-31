@@ -146,6 +146,18 @@ fn quantiser_matrices_decode_bit_exactly() {
 }
 
 #[test]
+fn film_grain_decodes_bit_exactly() {
+    need_ffmpeg!();
+    for test in [1, 3, 8, 16] {
+        check(&case(&format!("grain{test}"), "mandelbrot=size=320x180:rate=25", &format!("{DEBLOCK}:film-grain-test={test}"), &["-crf", "30"]));
+    }
+    check(&case("grain-odd", "testsrc2=size=131x75:rate=25", &format!("{DEBLOCK}:film-grain-test=5"), &["-crf", "35"]));
+    check(&Case { pix_fmt: "yuv420p10le", ..case("grain-10bit", "mandelbrot=size=320x180:rate=25", &format!("{DEBLOCK}:film-grain-test=2"), &["-crf", "30"]) });
+    check(&Case { pix_fmt: "yuv444p", ..case("grain-444", TESTSRC, &format!("{DEBLOCK}:film-grain-test=7"), &["-crf", "25"]) });
+    check(&Case { pix_fmt: "gray", ..case("grain-gray", TESTSRC, &format!("{DEBLOCK}:film-grain-test=9"), &["-crf", "25"]) });
+}
+
+#[test]
 fn tiles_decode_bit_exactly() {
     need_ffmpeg!();
     let src = "testsrc2=size=1280x720:rate=25";
