@@ -515,6 +515,7 @@ fn parse_trak(trak: &[u8], index: usize, samples: &mut Vec<Sample>) -> Result<Op
             b"vp09" => CodecId::Vp9,
             b"mp4v" => CodecId::Mpeg4,
             b"jpeg" | b"mjpa" => CodecId::Mjpeg,
+            b"apco" | b"apcs" | b"apcn" | b"apch" | b"ap4h" | b"ap4x" => CodecId::ProRes,
             _ => return Ok(None),
         };
         let (width, height) = (be16(e, 24)? as u32, be16(e, 26)? as u32);
@@ -530,6 +531,12 @@ fn parse_trak(trak: &[u8], index: usize, samples: &mut Vec<Sample>) -> Result<Op
                 av1c_config(c)?
             }
             CodecId::Vp9 => vpcc_config(child(kids, b"vpcC")?),
+            CodecId::ProRes => {
+                // the sample entry's FOURCC names the profile; 4444 is 12-bit 4:4:4, the others 10-bit 4:2:2
+                extradata = fourcc.to_vec();
+                let is444 = matches!(&fourcc, b"ap4h" | b"ap4x");
+                Config { prefix: Vec::new(), nal_length: 0, bits: if is444 { 12 } else { 10 }, chroma: if is444 { 3 } else { 2 } }
+            }
             _ => Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma: 1 },
         };
         let total: i64 = samples[first..].iter().map(|s| s.duration as i64).sum();

@@ -6,7 +6,7 @@ A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so 
 > **Status: foundation (v0.1).** The architecture, agent interface, ontology, hardware model, CLI, MCP server
 > and both GUIs are working and tested. Containers: **WAV, FLAC, Y4M, MP4, QuickTime MOV (read and write), Matroska/WebM (read and write), Ogg, ADTS, MP3, JPEG and MPEG transport streams (read and write).**
 > Audio codecs, each decoded and encoded: **PCM, FLAC, ALAC, AAC-LC (plus HE-AAC v1 decode), MP3, Opus and Vorbis.**
-> Video: **software decoders for H.264, HEVC (including 4:2:2 and 4:4:4), VP8 and VP9; a software H.264 encoder (High profile: CABAC and the 8x8 transform); JPEG/Motion-JPEG decoded and encoded in software.**
+> Video: **software decoders for H.264, HEVC (including 4:2:2 and 4:4:4), VP8 and VP9; a software H.264 encoder (High profile: CABAC and the 8x8 transform); JPEG/Motion-JPEG and Apple ProRes decoded and encoded in software.**
 > NVIDIA GPUs encode H.264 and HEVC (NVENC, preferred for H.264 when usable; HEVC has no software encoder) and decode H.264, HEVC and AV1 (NVDEC).
 > AV1 is decoded on NVIDIA GPUs only (NVDEC); it has no software decoder and no encoder yet. VP9 and AV1 copy between WebM, Matroska and MP4.
 > IronAV is not yet a drop-in replacement for FFmpeg or HandBrake.
@@ -898,6 +898,10 @@ loop restoration and CDEF, superres, and WebM, Matroska and MP4 files. All match
 Baseline, extended-sequential and progressive 8-bit Huffman JPEG (`.jpg`, `.jpeg`, codec `mjpeg`) is decoded and encoded in software. Decoding handles grey, 4:2:0, 4:2:2 and 4:4:4, restart intervals and non-interleaved scans. Arithmetic-coded, 12-bit and lossless files are refused with a clear error, as are progressive pictures over 67 megapixels (all their coefficients are held in memory). The encoder writes baseline JFIF with the standard tables at quality 90; `--qp N` (0-51, as for the other video codecs) sets the quality to 100 minus twice N, so `--qp 5` is 90 and `--qp 23` is 54.
 
 Motion-JPEG can also be written into Matroska (`V_MJPEG`, `-o clip.mkv --vcodec mjpeg`); FFmpeg opens and decodes those files. A `.jpg` holds one picture; `ironav convert -i in.y4m -o out.jpg` picks `mjpeg` by itself. Decoded output differs from FFmpeg's by at most 1 LSB (a different IDCT), checked on 4:2:0, 4:2:2, 4:4:4 and grey images, sequential and progressive (libjpeg's default progressive script, with successive approximation). Encoded files decode in FFmpeg at 40+ dB PSNR. 450 corrupted or truncated files (150 sequential, 300 progressive) made it return errors or pictures, never panic.
+
+## ProRes
+
+Apple ProRes (codec `prores`, in MOV) is decoded and encoded in software: 4:2:2 at 10 bits for Proxy, LT, Standard and HQ, and 4:4:4 at 12 bits for 4444 and 4444 XQ, all progressive (interlaced pictures are refused with an error). The decoder reads the quantisation matrices and skips a 4444 alpha plane. The encoder writes HQ, which `--vcodec prores` selects, converting the picture to 4:2:2 at 10 bits first; it uses a fixed quantiser per profile and flat matrices, and the Rust API takes any profile. Decoding is bit-exact with FFmpeg's in both directions, and HQ encodes at over 45 dB PSNR (`crates/ironav-engine/tests/prores.rs`, skipped without ffmpeg on the PATH).
 
 ## MP3
 

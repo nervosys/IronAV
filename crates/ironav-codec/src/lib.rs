@@ -14,6 +14,7 @@ pub mod jpeg;
 mod filters;
 pub mod mp3;
 pub mod opus;
+pub mod prores;
 pub mod vorbis;
 pub mod vp8;
 mod pcm;
@@ -56,6 +57,9 @@ pub fn implemented() -> Vec<CodecImpl> {
             }
             if c == CodecId::Alac {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-alac" });
+            }
+            if c == CodecId::ProRes {
+                return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-prores" });
             }
             if c == CodecId::Opus {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-opus" });
@@ -167,6 +171,7 @@ pub fn new_decoder_for(s: &ironav_core::StreamInfo) -> Result<Box<dyn Decoder>> 
         CodecId::Hevc => Ok(Box::new(hevc::HevcDecoder::new())),
         CodecId::Vp9 => Ok(Box::new(vp9::Vp9Decoder::new())),
         CodecId::Mjpeg => Ok(Box::new(jpeg::JpegDecoder::new())),
+        CodecId::ProRes => Ok(Box::new(prores::ProResDecoder::new())),
         _ => new_decoder(s.codec, &s.params, s.bits),
     }
 }
@@ -354,6 +359,7 @@ pub fn new_encoder_with_opts(codec: CodecId, params: &StreamParams, bits: Option
         }
         (CodecId::RawVideo, StreamParams::Video { .. }) => Ok(Box::new(rawvideo::RawVideoEncoder)),
         (CodecId::Mjpeg, StreamParams::Video { .. }) => Ok(Box::new(jpeg::JpegEncoder::new(jpeg::JpegEncoder::default_quality()))),
+        (CodecId::ProRes, StreamParams::Video { .. }) => Ok(Box::new(prores::ProResEncoder::new(params, prores::Profile::Hq)?)),
         (CodecId::H264, StreamParams::Video { .. }) => Ok(Box::new(h264::H264Encoder::new(params, None, bitrate_kbps.map(|k| k.saturating_mul(1000)))?)),
         (c, p) if c.media_type() != p.media_type() => Err(Error::invalid_arg(format!(
             "codec {} is {:?} but the stream is {:?}",
@@ -384,6 +390,7 @@ pub fn encoder_extradata(codec: CodecId, params: &StreamParams) -> Vec<u8> {
         (CodecId::Opus, StreamParams::Audio { channels, .. }) => opus::opus_head(*channels as usize),
         (CodecId::Vorbis, StreamParams::Audio { sample_rate, channels }) => vorbis::encoder_headers(*sample_rate, *channels as usize),
         (CodecId::Aac, StreamParams::Audio { sample_rate, channels }) => aac::audio_specific_config(*sample_rate, *channels as usize),
+        (CodecId::ProRes, _) => prores::Profile::Hq.fourcc().to_vec(),
         _ => Vec::new(),
     }
 }

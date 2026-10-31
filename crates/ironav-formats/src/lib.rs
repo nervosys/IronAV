@@ -95,11 +95,11 @@ pub static FORMATS: &[FormatSpec] = &[
     FormatSpec {
         name: "mov",
         extensions: &["mov", "qt"],
-        description: "QuickTime MOV (ISO BMFF with QuickTime sound entries): read as MP4 is, with H.264, HEVC, Motion-JPEG or AAC video and audio, and PCM audio; written with a 'qt  ' brand and the MP4 index layout (fast-start)",
+        description: "QuickTime MOV (ISO BMFF with QuickTime sound entries): read as MP4 is, with H.264, HEVC, ProRes, Motion-JPEG or AAC video and audio, and PCM audio; written with a 'qt  ' brand and the MP4 index layout (fast-start)",
         media: MediaType::Video,
         demux: true,
         mux: true,
-        codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Vp9, CodecId::Av1, CodecId::Mjpeg, CodecId::Aac, CodecId::Flac, CodecId::Alac, CodecId::PcmU8, CodecId::PcmS16Le, CodecId::PcmS24Le, CodecId::PcmS32Le, CodecId::PcmF32Le, CodecId::PcmF64Le],
+        codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Vp9, CodecId::Av1, CodecId::Mjpeg, CodecId::ProRes, CodecId::Aac, CodecId::Flac, CodecId::Alac, CodecId::PcmU8, CodecId::PcmS16Le, CodecId::PcmS24Le, CodecId::PcmS32Le, CodecId::PcmF32Le, CodecId::PcmF64Le],
     },
     FormatSpec {
         name: "mkv",

@@ -21,6 +21,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   ALAC (16 and 24 bits, mono and stereo).
 - **Codecs (voice link):** a playout buffer, a streaming resampler, speech detection with push-to-talk
   trimming, automatic gain control, noise suppression, and Opus packet-loss concealment.
+- **Codecs (ProRes):** Apple ProRes decoder and encoder in MOV: 4:2:2 at 10 bits (Proxy, LT, Standard, HQ) and 4:4:4 at
+  12 bits (4444, 4444 XQ), progressive only. Decoding matches FFmpeg's bit for bit; `--vcodec prores` writes HQ.
 - **Containers:** WAV, FLAC, Y4M, MP4, QuickTime MOV, Matroska and WebM (read and write), Ogg (Opus, Vorbis and FLAC),
   ADTS, MP3, JPEG, and MPEG transport streams (read and write).
 - **Containers (MP4):** fragmented MP4 is read as it arrives; the writer is constant-frame-rate and

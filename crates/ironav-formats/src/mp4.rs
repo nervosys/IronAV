@@ -154,12 +154,14 @@ impl Track {
 
     fn video_entry(&self, width: u32, height: u32) -> Result<Vec<u8>> {
         let missing = |what: &str| Error::new(ErrorCode::Internal, format!("stream has no {what}; the encoder must emit parameter sets with its first frame"));
+        let prores = ironav_codec::prores::Profile::from_fourcc(&self.config).unwrap_or(ironav_codec::prores::Profile::Hq).fourcc();
         let (kind, config) = match self.codec {
             CodecId::Hevc => (b"hvc1", self.hvcc(&missing)?),
             CodecId::Av1 => (b"av01", bx(b"av1C", &self.config)),
             CodecId::Vp9 if self.config.is_empty() => return Err(Error::invalid_input("the VP9 stream has no key frame to describe it to MP4")),
             CodecId::Vp9 => (b"vp09", bx(b"vpcC", &self.config)),
             CodecId::Mjpeg => (b"jpeg", Vec::new()),
+            CodecId::ProRes => (&prores, Vec::new()),
             _ => (b"avc1", self.avcc(&missing)?),
         };
         let mut e = vec![0u8; 6];
@@ -425,7 +427,7 @@ impl Track {
                 Some(x) => Ok(Some(x)),
                 None => Err(Error::invalid_input(format!("an AV1 packet at {} does not parse as OBUs", p.pts))),
             },
-            CodecId::Mjpeg => Ok(Some((p.data.clone(), true))),
+            CodecId::Mjpeg | CodecId::ProRes => Ok(Some((p.data.clone(), true))),
             _ => Ok(annexb_sample(self.is_hevc(), &mut self.params, &p.data)),
         }
     }
@@ -665,7 +667,10 @@ impl Muxer for Mp4Muxer {
                     return Err(Error::new(ErrorCode::UnsupportedFormat, "AV1 needs its av1C configuration record to go into an MP4")
                         .hint("copy it from an MP4, Matroska or WebM file, which carries it"));
                 }
-                (StreamParams::Video { width, height, frame_rate, .. }, CodecId::H264 | CodecId::Hevc | CodecId::Vp9 | CodecId::Av1 | CodecId::Mjpeg) => {
+                (StreamParams::Video { .. }, CodecId::ProRes) if !self.quicktime => {
+                    return Err(Error::new(ErrorCode::UnsupportedFormat, "ProRes is written to QuickTime (.mov) files").hint("write the output as .mov"));
+                }
+                (StreamParams::Video { width, height, frame_rate, .. }, CodecId::H264 | CodecId::Hevc | CodecId::Vp9 | CodecId::Av1 | CodecId::Mjpeg | CodecId::ProRes) => {
                     if frame_rate.num <= 0 || frame_rate.den <= 0 || frame_rate.num > u32::MAX as i64 || frame_rate.den > u32::MAX as i64 {
                         return Err(Error::invalid_arg("MP4 needs a known, constant frame rate"));
                     }

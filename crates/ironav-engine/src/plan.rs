@@ -1,6 +1,6 @@
 use crate::job::{FilterCall, Job};
 use ironav_codec::{audio_bitrate_range, build_filter, encoder_extradata_with_opts, new_encoder_with_opts, FILTERS};
-use ironav_core::{CodecId, Error, ErrorCode, MediaType, Result, SampleFormat, StreamInfo, StreamParams};
+use ironav_core::{CodecId, Error, ErrorCode, MediaType, PixelFormat, Result, SampleFormat, StreamInfo, StreamParams};
 use ironav_formats::{find_format, format_for_path, open_demuxer};
 use crate::job::{Latency, OpusJob, StreamOpts};
 use ironav_hwaccel::{probe_all, provider_codecs, select, Direction, HwPolicy, RateControl, Selection, DEFAULT_QP};
@@ -234,6 +234,15 @@ pub fn plan(job: &Job) -> Result<Plan> {
                 warnings.push(format!("{at}: resampled from {from} Hz to {rate} Hz, a rate {} is coded at", to.name()));
                 chain.push(call);
             }
+        }
+
+        // ProRes is written as 10-bit 4:2:2, so other pictures are converted to it first
+        if media == MediaType::Video && to == CodecId::ProRes && s.codec != CodecId::ProRes && !matches!(&params, StreamParams::Video { pix_fmt: PixelFormat::Yuv422p10, .. }) {
+            let mut args = serde_json::Map::new();
+            args.insert("pix_fmt".into(), "yuv422p10le".into());
+            let call = FilterCall { name: "format".into(), args };
+            params = build_filter(&call.name, &call.args)?.output_params(&params);
+            chain.push(call);
         }
 
         // asking for a bit rate from a codec that has one means re-encoding, not copying, and so
