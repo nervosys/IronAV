@@ -383,7 +383,7 @@ fn cwrsi(mut n: u32, mut k: u32, mut i: u32, y: &mut [i32]) -> u64 {
     let s = -((i >= p) as i32);
     i -= p & s as u32;
     let k0 = k;
-    k = (i + 1) / 2;
+    k = i.div_ceil(2);
     if k != 0 {
         i -= 2 * k - 1;
     }
@@ -432,6 +432,9 @@ impl<R: Coder> Bands<'_, R> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    // Several locals are assigned in different branches further down; hoisting each declaration
+    // to its first assignment would restructure the whole band loop.
+    #[allow(clippy::needless_late_init)]
     fn quant_band(
         &mut self,
         band: usize,
@@ -664,10 +667,10 @@ impl<R: Coder> Bands<'_, R> {
                 xb[1] *= side;
                 let t = xa[0];
                 xa[0] = t - xb[0];
-                xb[0] = t + xb[0];
+                xb[0] += t;
                 let t = xa[1];
                 xa[1] = t - xb[1];
-                xb[1] = t + xb[1];
+                xb[1] += t;
             } else {
                 // "Normal" split code
                 let mut delta = delta;
@@ -945,7 +948,7 @@ impl Celt {
         let (mut diff, mut tf_select, mut tf_changed) = (0usize, 0usize, 0usize);
         let mut bits = if p.transient { 2 } else { 4 };
         let mut consumed = rc.tell();
-        let tf_select_bit = p.size != 0 && consumed + bits + 1 <= p.framebits;
+        let tf_select_bit = p.size != 0 && consumed + bits < p.framebits;
         let t = p.transient as usize;
         let size = p.size as usize;
         for i in p.start_band..p.end_band {
@@ -1061,7 +1064,7 @@ impl Celt {
             let scale = duration + ch - 1;
             // PVQ minimum allocation threshold; below this value the band is skipped
             threshold[i] = ((3 * CELT_FREQ_RANGE[i] as i32) << duration >> 4).max(ch << 3);
-            trim_offset[i] = trim * (band << scale) >> 6;
+            trim_offset[i] = (trim * (band << scale)) >> 6;
             if (CELT_FREQ_RANGE[i] as i32) << size == 1 {
                 trim_offset[i] -= ch << 3;
             }
@@ -1128,7 +1131,7 @@ impl Celt {
             let mut j = end - 1;
             while j >= start {
                 let ju = j as usize;
-                let bandbits = bits1[ju] + (center * bits2[ju] >> ALLOC_STEPS);
+                let bandbits = bits1[ju] + ((center * bits2[ju]) >> ALLOC_STEPS);
                 if bandbits >= threshold[ju] || done {
                     done = true;
                     total += bandbits.min(f.caps[ju]);
@@ -1149,7 +1152,7 @@ impl Celt {
         let mut i = end - 1;
         while i >= start {
             let iu = i as usize;
-            let mut bandbits = bits1[iu] + (low * bits2[iu] >> ALLOC_STEPS);
+            let mut bandbits = bits1[iu] + ((low * bits2[iu]) >> ALLOC_STEPS);
             if bandbits >= threshold[iu] || done {
                 done = true;
             } else {
@@ -1250,7 +1253,7 @@ impl Celt {
                     offset += temp >> 3;
                 }
                 let fine_bits = (f.pulses[i] + offset + (dof << 2)) / (dof << 3);
-                let max_bits = ((f.pulses[i] >> 3) >> (ch - 1)).min(MAX_FINE_BITS).max(0);
+                let max_bits = ((f.pulses[i] >> 3) >> (ch - 1)).clamp(0, MAX_FINE_BITS);
                 f.fine_bits[i] = fine_bits.clamp(0, max_bits);
 
                 // If fine_bits was rounded down or capped, give priority for the final fine energy pass
@@ -1315,7 +1318,7 @@ impl Celt {
                 bands.p.remaining -= consumed;
             }
             bands.p.remaining2 = totalbits - consumed - 1;
-            if (i as i32) <= bands.p.coded_bands - 1 {
+            if (i as i32) < bands.p.coded_bands {
                 let curr_balance = bands.p.remaining / 3.min(bands.p.coded_bands - i as i32);
                 b = (bands.p.remaining2 + 1).min(bands.p.pulses[i] + curr_balance).clamp(0, (1 << 14) - 1);
             }

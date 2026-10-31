@@ -12,6 +12,10 @@ readme = "../../README.md"
 keywords = ["streaming", "video", "audio", "rtsp", "hls"]
 categories = ["multimedia::video", "multimedia::audio", "network-programming"]
 
+
+[lints]
+workspace = true
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true

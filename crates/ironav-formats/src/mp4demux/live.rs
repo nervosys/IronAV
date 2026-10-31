@@ -333,11 +333,10 @@ mod tests {
         let mut s = Mp4Stream::default();
         // a moov with one empty trak and no mvex is not something to read live
         let mut moov = Vec::new();
-        for (kind, body) in [(b"mvhd", vec![0u8; 100])] {
-            moov.extend_from_slice(&(8 + body.len() as u32).to_be_bytes());
-            moov.extend_from_slice(kind);
-            moov.extend_from_slice(&body);
-        }
+        let (kind, body) = (b"mvhd", vec![0u8; 100]);
+        moov.extend_from_slice(&(8 + body.len() as u32).to_be_bytes());
+        moov.extend_from_slice(kind);
+        moov.extend_from_slice(&body);
         let mut d = (8 + moov.len() as u32).to_be_bytes().to_vec();
         d.extend_from_slice(b"moov");
         d.extend_from_slice(&moov);

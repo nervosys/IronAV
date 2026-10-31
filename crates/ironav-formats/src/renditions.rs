@@ -299,7 +299,7 @@ mod tests {
             n += 1;
         }
         assert_eq!(count(2), n);
-        assert_eq!(format!("{}", d.format_name()), "mpegts");
+        assert_eq!(d.format_name().to_string(), "mpegts");
     }
 
     #[test]

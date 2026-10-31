@@ -303,6 +303,8 @@ pub fn open(args: &OpenArgs) -> Result<Arc<Session>> {
 
 /// Opens a live session as [`open`] does, with `taps` attached before its first packet: unlike
 /// [`Session::tap`] on a running session, these see the session's first picture and sound.
+// The `!(x >= 0.0)` checks reject NaN too, which a plain `<` would let through.
+#[allow(clippy::neg_cmp_op_on_partial_ord)]
 pub fn open_with_taps(args: &OpenArgs, taps: Vec<TapConfig>) -> Result<(Arc<Session>, Vec<Tap>)> {
     let (taps, feeders): (Vec<Tap>, Vec<_>) = taps.into_iter().map(crate::tap::tap).collect::<Result<Vec<_>>>()?.into_iter().unzip();
     let url = SourceUrl::parse(&args.source)?;
@@ -771,8 +773,8 @@ impl Session {
                 lock(&self.shared).format = Some(d.format_name());
                 demux = Some(d);
                 head = Vec::new();
-            } else {
-                demux.as_mut().unwrap().feed(bytes)?;
+            } else if let Some(d) = demux.as_mut() {
+                d.feed(bytes)?;
             }
             let d = demux.as_mut().unwrap();
             if ended {

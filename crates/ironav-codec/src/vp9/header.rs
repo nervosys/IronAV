@@ -418,7 +418,7 @@ pub fn parse_uncompressed(data: &[u8], st: &mut HeaderState, refs: &[Option<RefI
                         continue;
                     }
                     h.mvscale[i] = [((r.w << 14) / w) as i32, ((r.h << 14) / ht) as i32];
-                    h.mvstep[i] = [16 * h.mvscale[i][0] >> 14, 16 * h.mvscale[i][1] >> 14];
+                    h.mvstep[i] = [(16 * h.mvscale[i][0]) >> 14, (16 * h.mvscale[i][1]) >> 14];
                 }
                 valid += 1;
             }
@@ -549,7 +549,7 @@ pub fn parse_uncompressed(data: &[u8], st: &mut HeaderState, refs: &[Option<RefI
     while (sb_cols >> max) >= 4 {
         max += 1;
     }
-    let max = (max as i32 - 1).max(0) as u32;
+    let max = (max - 1).max(0) as u32;
     while max > h.log2_tile_cols {
         if b.flag()? {
             h.log2_tile_cols += 1;
@@ -586,20 +586,19 @@ fn inv_recenter_nonneg(v: i32, m: i32) -> i32 {
 }
 
 fn update_prob(c: &mut Rac, p: u8) -> u8 {
-    let d: usize;
-    if !c.bit() {
-        d = c.uint(4) as usize;
+    let d = if !c.bit() {
+        c.uint(4) as usize
     } else if !c.bit() {
-        d = c.uint(4) as usize + 16;
+        c.uint(4) as usize + 16
     } else if !c.bit() {
-        d = c.uint(5) as usize + 32;
+        c.uint(5) as usize + 32
     } else {
         let mut v = c.uint(7) as usize;
         if v >= 65 {
             v = (v << 1) - 65 + c.bit() as usize;
         }
-        d = (v + 64).min(254);
-    }
+        (v + 64).min(254)
+    };
     let p = p as i32;
     let m = INV_MAP_TABLE[d] as i32;
     (if p <= 128 { 1 + inv_recenter_nonneg(m, p - 1) } else { 255 - inv_recenter_nonneg(m, 255 - p) }) as u8

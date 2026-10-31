@@ -95,7 +95,7 @@ impl HalfPel {
             let b = &self.planes[pb][self.offset(ix + bx as i32, iy + by as i32)..];
             for r in 0..h {
                 for c in 0..w {
-                    out[r * w + c] = ((a[r * s + c] as u16 + b[r * s + c] as u16 + 1) >> 1) as u16;
+                    out[r * w + c] = (a[r * s + c] as u16 + b[r * s + c] as u16 + 1) >> 1;
                 }
             }
         }

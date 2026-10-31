@@ -206,7 +206,7 @@ pub fn open_demuxer(path: &Path) -> Result<Box<dyn Demuxer>> {
         Ok(Box::new(ts::TsDemuxer::open(f)?))
     } else if magic.len() >= 12 && &magic[..4] == b"RIFF" && &magic[8..12] == b"WAVE" {
         Ok(Box::new(wav::WavDemuxer::open(f)?))
-    } else if flac::looks_like_flac(magic) && behind_id3.as_ref().map_or(true, |b| b.starts_with(b"fLaC")) {
+    } else if flac::looks_like_flac(magic) && behind_id3.as_ref().is_none_or(|b| b.starts_with(b"fLaC")) {
         Ok(Box::new(flac::FlacDemuxer::open(f)?))
     } else if mp4demux::looks_like_mp4(magic) {
         Ok(Box::new(mp4demux::Mp4Demuxer::open(f)?))
@@ -294,7 +294,7 @@ mod seek_tests {
         let mut f = format!("YUV4MPEG2 W{w} H{h} F10:1 C420jpeg\n").into_bytes();
         for i in 0..n {
             f.extend_from_slice(b"FRAME\n");
-            f.extend(std::iter::repeat(i as u8).take(w * h * 3 / 2));
+            f.extend(std::iter::repeat_n(i as u8, w * h * 3 / 2));
         }
         let mut d = y4m::Y4mDemuxer::open(Cursor::new(f)).unwrap();
         assert_eq!(d.streams()[0].duration, Some(10));

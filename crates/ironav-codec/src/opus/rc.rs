@@ -198,11 +198,11 @@ impl<'a> RangeDecoder<'a> {
         let (k, low, symbol);
         if center < total >> 1 {
             k = (isqrt(8 * center + 1) - 1) >> 1;
-            low = k * (k + 1) >> 1;
+            low = (k * (k + 1)) >> 1;
             symbol = k + 1;
         } else {
             k = (2 * (qn + 1) - isqrt(8 * (total - center - 1) + 1)) >> 1;
-            low = total - ((qn + 1 - k) * (qn + 2 - k) >> 1);
+            low = total - (((qn + 1 - k) * (qn + 2 - k)) >> 1);
             symbol = qn + 1 - k;
         }
         self.update(scale, low, low + symbol, total);
@@ -563,7 +563,7 @@ impl Coder for RangeEncoder {
     }
     fn uint_tri(&mut self, qn: u32, k: u32) -> u32 {
         let total = ((qn >> 1) + 1) * ((qn >> 1) + 1);
-        let (low, symbol) = if k <= qn >> 1 { (k * (k + 1) >> 1, k + 1) } else { (total - ((qn + 1 - k) * (qn + 2 - k) >> 1), qn + 1 - k) };
+        let (low, symbol) = if k <= qn >> 1 { ((k * (k + 1)) >> 1, k + 1) } else { (total - (((qn + 1 - k) * (qn + 2 - k)) >> 1), qn + 1 - k) };
         self.encode(low, low + symbol, total);
         k
     }
@@ -574,7 +574,7 @@ fn tell_frac_of(total_bits: u32, range: u32) -> i32 {
     let mut rcbuffer = log2(range) + 1;
     let mut range = range >> (rcbuffer - 16);
     for _ in 0..3 {
-        range = range * range >> 15;
+        range = (range * range) >> 15;
         let bit = range >> 16;
         rcbuffer = rcbuffer << 1 | bit;
         range >>= bit;

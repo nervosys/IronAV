@@ -758,11 +758,11 @@ impl<R: Read + Seek + Send> Demuxer for Mp4Demuxer<R> {
         let video = |s: &Sample| {
             matches!(self.tracks[s.stream as usize].stream.params, StreamParams::Video { .. }) && !self.discarded[s.stream as usize]
         };
-        let landing = if self.samples.iter().any(|s| video(s)) {
-            self.samples.iter().filter(|s| video(s) && s.sync && at(s) <= t + 1e-9).last().map_or(0.0, at)
+        let landing = if self.samples.iter().any(&video) {
+            self.samples.iter().rfind(|s| video(s) && s.sync && at(s) <= t + 1e-9).map_or(0.0, at)
         } else {
             // No video: start on the packet that contains the requested time.
-            self.samples.iter().filter(|s| !self.discarded[s.stream as usize] && at(s) <= t + 1e-9).last().map_or(t, at)
+            self.samples.iter().rfind(|s| !self.discarded[s.stream as usize] && at(s) <= t + 1e-9).map_or(t, at)
         };
         self.next = self.samples.partition_point(|s| at(s) < landing - 1e-9);
         self.seen.fill(0); // the first video packet after a seek needs its parameter sets again

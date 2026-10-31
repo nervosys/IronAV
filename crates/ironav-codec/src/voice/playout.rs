@@ -67,6 +67,8 @@ fn diff(a: u32, b: u32) -> i64 {
 impl Playout {
     /// A buffer for packets of `frame_ms` of audio, up to `max_bytes` each, aiming to hold
     /// `target_ms` and never more than `max_ms`.
+    // NaN parameters must be rejected, which the negated comparisons below do.
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
     pub fn new(frame_ms: f64, target_ms: f64, max_ms: f64, max_bytes: usize) -> Result<Self> {
         if !(frame_ms > 0.0) || !(target_ms >= 0.0) || !(max_ms >= target_ms) || max_bytes == 0 {
             return Err(Error::invalid_arg("a playout buffer needs a frame length above 0, a target of 0 or more, a maximum of at least the target, and room for a packet"));

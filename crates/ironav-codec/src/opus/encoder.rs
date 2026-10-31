@@ -138,7 +138,7 @@ impl VoiceEst {
 
     /// Takes the next frame of 16 kHz input.
     fn update(&mut self, x: &[f32]) {
-        for block in x.chunks_exact(160) {
+        for block in x.as_chunks::<160>().0.iter() {
             let e = block.iter().map(|&v| (v * v) as f64).sum::<f64>() / 160.0;
             self.db[self.at] = (10.0 * (e + 1e-12).log10()).max(-60.0) as f32;
             self.at = (self.at + 1) % self.db.len();
@@ -1515,7 +1515,7 @@ mod attacks {
         assert_eq!(enc.frame_samples(), 2880);
         let x: Vec<f32> = super::tests::music(2880 * 4, 2).iter().map(|&v| v as f32).collect();
         let mut buf = vec![0u8; enc.packet_bytes()];
-        for f in x.chunks_exact(2880 * 2) {
+        for f in x.as_chunks::<{ 2880 * 2 }>().0.iter() {
             let n = enc.encode_frame_into(f, &mut buf).unwrap();
             assert_eq!((buf[0] >> 3, buf[0] & 3, buf[1] & 63), (31, 3, 3));
             assert!(n <= enc.packet_bytes());

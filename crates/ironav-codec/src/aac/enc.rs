@@ -581,7 +581,7 @@ impl Encoder for AacEncoder {
                 .buf
                 .iter_mut()
                 .map(|b| {
-                    let mut c: Vec<f32> = b.drain(..).collect();
+                    let mut c: Vec<f32> = std::mem::take(b);
                     c.resize(N, 0.0);
                     c
                 })

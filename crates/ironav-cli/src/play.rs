@@ -107,11 +107,9 @@ fn tui(a: PlayArgs) -> Result<()> {
                             return Ok(());
                         }
                     }
-                    Event::Mouse(m) if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) => {
-                        if ui.bar.width > 0 && m.row == ui.bar.y && m.column >= ui.bar.x && m.column < ui.bar.x + ui.bar.width {
-                            if let Some(d) = pl.info().duration {
-                                pl.seek((m.column - ui.bar.x) as f64 / ui.bar.width as f64 * d);
-                            }
+                    Event::Mouse(m) if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) && ui.bar.width > 0 && m.row == ui.bar.y && m.column >= ui.bar.x && m.column < ui.bar.x + ui.bar.width => {
+                        if let Some(d) = pl.info().duration {
+                            pl.seek((m.column - ui.bar.x) as f64 / ui.bar.width as f64 * d);
                         }
                     }
                     _ => {}
@@ -353,7 +351,7 @@ mod tests {
         assert!(text.contains("quit"), "the key help is visible");
 
         assert!(!key(&pl, &mut ui, KeyCode::Char(' '), KeyModifiers::NONE), "space does not quit");
-        assert_eq!(pl.status()["state"] != "paused", true, "space starts playback");
+        assert!(pl.status()["state"] != "paused", "space starts playback");
         assert!(key(&pl, &mut ui, KeyCode::Char('q'), KeyModifiers::NONE), "q quits");
     }
 }

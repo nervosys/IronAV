@@ -137,7 +137,7 @@ fn low_res(v: &VideoFrame) -> LowRes {
             let p = &v.planes[0];
             LowRes::new(w / 4, h / 4, |x, y| {
                 let o = (y * w + x) * 3;
-                (p[o] as i32 * 66 + p[o + 1] as i32 * 129 + p[o + 2] as i32 * 25 + 128 >> 8) + 16
+                ((p[o] as i32 * 66 + p[o + 1] as i32 * 129 + p[o + 2] as i32 * 25 + 128) >> 8) + 16
             })
         }
         f if f.bit_depth() > 8 => LowRes::of_plane(&v.planes[0], w, 2, (f.bit_depth() - 8) as u32, w, h),
@@ -214,6 +214,8 @@ pub struct Reconfigure {
 
 impl Reconfigure {
     /// Checks names and values, so a request learns of a mistake at once.
+    // The `!(x > 0.0)` checks reject NaN too, which a plain `<=` would let through.
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
     pub fn check(&self) -> Result<()> {
         if let Some(l) = &self.level {
             Level::parse(l).ok_or_else(|| Error::invalid_arg(format!("unknown level '{l}'")).alternatives(Level::ALL.iter().map(|l| l.name())))?;
@@ -237,6 +239,8 @@ impl Reconfigure {
 impl Analysis {
     /// Analysis of `infos` (a file's streams, or a live source's) over `from..to` seconds. Sidecars
     /// start once there are streams; a `live` source drops what a slow one cannot take.
+    // The `!(x > 0.0)` checks reject NaN too, which a plain `<=` would let through.
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
     pub fn new(infos: &[StreamInfo], opts: &AnalyzeOptions, from: f64, to: f64, live: bool) -> Result<Analysis> {
         let level = Level::parse(&opts.level)
             .ok_or_else(|| Error::invalid_arg(format!("unknown level '{}'", opts.level)).alternatives(Level::ALL.iter().map(|l| l.name())))?;

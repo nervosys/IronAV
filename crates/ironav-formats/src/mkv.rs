@@ -574,7 +574,7 @@ fn audio_frame_len(t: &MkTrack, codec: CodecId) -> Option<u32> {
     }
     if t.default_ns > 0 {
         let n = (t.default_ns as f64 * t.rate / 1e9).round();
-        if n >= 1.0 && n < 1e6 {
+        if (1.0..1e6).contains(&n) {
             return Some(n as u32);
         }
     }

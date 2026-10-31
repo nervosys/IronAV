@@ -66,7 +66,7 @@ pub fn luma_mc(refp: &[u16], pw: usize, ph: usize, x: i32, y: i32, mx: i32, my: 
 /// Predicts a `w` x `h` chroma block; the vector is in eighth-sample units.
 #[allow(clippy::too_many_arguments)]
 pub fn chroma_mc(refp: &[u16], pw: usize, ph: usize, x: i32, y: i32, mx: i32, my: i32, w: usize, h: usize, out: &mut [u16]) {
-    let (fx, fy) = ((mx & 7) as i32, (my & 7) as i32);
+    let (fx, fy) = (mx & 7, my & 7);
     let (x0, y0) = (x + (mx >> 3), y + (my >> 3));
     let at = |c: i32, r: i32| refp[(r.clamp(0, ph as i32 - 1) as usize) * pw + c.clamp(0, pw as i32 - 1) as usize] as i32;
     for r in 0..h as i32 {

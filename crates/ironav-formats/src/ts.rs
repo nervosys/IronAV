@@ -302,7 +302,7 @@ impl TsParser {
             return;
         }
         let len = (((sec[1] & 0x0F) as usize) << 8) | sec[2] as usize;
-        if len < 9 || len > MAX_SECTION {
+        if !(9..=MAX_SECTION).contains(&len) {
             sec.clear();
             return;
         }
@@ -317,7 +317,7 @@ impl TsParser {
         let body = &s[8..s.len() - 4];
         if pat && s[0] == 0x00 {
             if self.pmt_pid.is_none() {
-                self.pmt_pid = body.chunks_exact(4).find(|e| u16::from_be_bytes([e[0], e[1]]) != 0).map(|e| (((e[2] & 0x1F) as u16) << 8) | e[3] as u16);
+                self.pmt_pid = body.as_chunks::<4>().0.iter().find(|e| u16::from_be_bytes([e[0], e[1]]) != 0).map(|e| (((e[2] & 0x1F) as u16) << 8) | e[3] as u16);
             }
         } else if !pat && s[0] == 0x02 && self.es.is_empty() && body.len() >= 4 {
             let info_len = (((body[2] & 0x0F) as usize) << 8) | body[3] as usize;
@@ -1125,8 +1125,7 @@ mod tests {
         let mut pmt = vec![0x02, 0xB0, 9, 0, 1, 0xC1, 0, 0];
         let crc = crc32(&pmt);
         pmt.extend_from_slice(&crc.to_be_bytes());
-        let mut p = TsParser::default();
-        p.pmt_pid = Some(0x1000);
+        let mut p = TsParser { pmt_pid: Some(0x1000), ..Default::default() };
         p.psi(false, true, &[&[0u8][..], &pmt].concat());
         assert!(p.es.is_empty());
     }

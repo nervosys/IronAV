@@ -338,7 +338,7 @@ impl HevcDecoder {
             }
         };
         let poc = msb + lsb;
-        if tid == 0 && !matches!(nal_type, 6..=9) && !(nal_type <= 14 && nal_type % 2 == 0) {
+        if tid == 0 && !matches!(nal_type, 6..=9) && !(nal_type <= 14 && nal_type.is_multiple_of(2)) {
             self.prev_tid0_poc = poc;
         }
         if irap && self.no_rasl_output && !self.first_picture {

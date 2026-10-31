@@ -85,7 +85,7 @@ fn huffman_lengths(weights: &[f64]) -> Vec<u8> {
     let mut groups: Vec<(u64, Vec<usize>)> = weights.iter().enumerate().map(|(i, &w)| (((w / top) * 1e9).max(1.0) as u64, vec![i])).collect();
     let mut lens = vec![0u8; weights.len()];
     while groups.len() > 1 {
-        groups.sort_by(|a, b| b.0.cmp(&a.0));
+        groups.sort_by_key(|g| std::cmp::Reverse(g.0));
         let (a, b) = (groups.pop().unwrap(), groups.pop().unwrap());
         for &i in a.1.iter().chain(&b.1) {
             lens[i] += 1;

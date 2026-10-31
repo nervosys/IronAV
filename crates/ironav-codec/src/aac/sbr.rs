@@ -458,7 +458,7 @@ impl Sbr {
         }
         if sp.freq_scale == 0 {
             let dk = sp.alter_scale as i32 + 1;
-            self.n_master = (((self.k[2] - self.k[0] + (dk & 2)) >> dk) << 1) as i32;
+            self.n_master = ((self.k[2] - self.k[0] + (dk & 2)) >> dk) << 1;
             self.check_n_master(self.n_master, sp.xover_band as i32)?;
             for k in 1..=self.n_master as usize {
                 self.f_master[k] = dk;

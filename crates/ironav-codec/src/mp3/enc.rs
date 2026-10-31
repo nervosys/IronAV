@@ -855,7 +855,7 @@ impl Mp3Encoder {
         let free = self.slots_end.saturating_sub(self.placed);
         if free > MAX_RESERVOIR as u64 {
             let waste = (free - MAX_RESERVOIR as u64) as usize;
-            self.stream.extend(std::iter::repeat(0u8).take(waste));
+            self.stream.extend(std::iter::repeat_n(0u8, waste));
             self.placed += waste as u64;
         }
         self.release();
@@ -895,7 +895,7 @@ impl Mp3Encoder {
         let chans: Vec<Vec<[f64; 18]>> = pcm.iter().enumerate().map(|(c, p)| self.ana[c].subbands(p)).collect();
         let attack = if self.switching { find_attack(&chans, &mut self.history) } else { None };
         // an attack in the first half of the granule belongs to its block, a later one to the next
-        let short_now = std::mem::replace(&mut self.carry_short, attack.map_or(false, |s| s >= 9)) || attack.map_or(false, |s| s < 9);
+        let short_now = std::mem::replace(&mut self.carry_short, attack.is_some_and(|s| s >= 9)) || attack.is_some_and(|s| s < 9);
         if let Some((prev, prev_short)) = self.held.replace((chans, short_now)) {
             let short = prev_short || (self.prev_short && short_now);
             let kind = if short {
@@ -961,7 +961,7 @@ impl Encoder for Mp3Encoder {
                 .buf
                 .iter_mut()
                 .map(|b| {
-                    let mut c: Vec<f32> = b.drain(..).collect();
+                    let mut c: Vec<f32> = std::mem::take(b);
                     c.resize(GRANULE, 0.0);
                     c
                 })
@@ -971,7 +971,7 @@ impl Encoder for Mp3Encoder {
         // the slots still waiting for data are padded out
         if let Some(last) = self.pending.back() {
             let missing = last.end.saturating_sub(self.placed) as usize;
-            self.stream.extend(std::iter::repeat(0u8).take(missing));
+            self.stream.extend(std::iter::repeat_n(0u8, missing));
             self.placed += missing as u64;
         }
         self.release();
@@ -1009,9 +1009,11 @@ mod tests {
         for g in 0..n {
             let sb = ana.subbands(&input[g * GRANULE..(g + 1) * GRANULE]);
             let xr = ana.granule(sb, kinds[g]);
-            let mut gr = Granule::default();
-            gr.xr = xr.iter().map(|&v| v as f64).collect();
-            gr.block_type = kinds[g].block_type() as u8;
+            let mut gr = Granule {
+                xr: xr.iter().map(|&v| v as f64).collect(),
+                block_type: kinds[g].block_type() as u8,
+                ..Default::default()
+            };
             super::super::antialias(s, &mut gr);
             let mut pcm = [0.0f32; GRANULE];
             granule_pcm(s, &gr, &mut overlap, &mut v, &mut off, &mut pcm);

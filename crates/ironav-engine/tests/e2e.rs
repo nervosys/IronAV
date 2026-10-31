@@ -1,7 +1,7 @@
 use ironav_core::ErrorCode;
 use ironav_engine::{call_tool, ontology, plan, run, FilterCall, Job};
 use serde_json::json;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn scratch(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("ironav-test-{}-{name}", std::process::id()));
@@ -30,7 +30,7 @@ fn write_wav(path: &std::path::Path, samples: &[i16], channels: u16, rate: u32) 
     std::fs::write(path, f).unwrap();
 }
 
-fn job(input: &PathBuf, output: &PathBuf) -> Job {
+fn job(input: &Path, output: &Path) -> Job {
     Job { input: input.display().to_string(), output: output.display().to_string(), hwaccel: "auto".into(), ..Job::default() }
 }
 
@@ -73,7 +73,7 @@ fn copy_is_bit_exact_and_plan_says_copy() {
     let (a, b) = (d.join("a.wav"), d.join("b.wav"));
     write_wav(&a, &(0..9000).map(|i| i as i16).collect::<Vec<_>>(), 1, 16000);
     let p = plan(&job(&a, &b)).unwrap();
-    assert_eq!(serde_json::to_value(&p.steps[0].action).unwrap(), "copy");
+    assert_eq!(serde_json::to_value(p.steps[0].action).unwrap(), "copy");
     run(&job(&a, &b), &mut |_| {}).unwrap();
     assert_eq!(pcm(&a), pcm(&b));
 }
@@ -344,7 +344,7 @@ fn write_y4m(path: &std::path::Path, w: usize, h: usize, frames: usize) {
         f.extend_from_slice(b"FRAME
 ");
         f.extend((0..w * h).map(|i| ((i % w) * 3 + (i / w) + t * 5) as u8));
-        f.extend(std::iter::repeat(128u8).take(w * h / 2));
+        f.extend(std::iter::repeat_n(128u8, w * h / 2));
     }
     std::fs::write(path, f).unwrap();
 }
@@ -658,8 +658,8 @@ fn aac_matches_ffmpeg(scratch_name: &str, file: &str) {
     let mut j = job(&input, &out);
     j.audio.codec = Some("pcm_s16le".into());
     run(&j, &mut |_| {}).unwrap();
-    let got: Vec<i16> = pcm(&out).chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
-    let want: Vec<i16> = std::fs::read(data.join("aac_stereo_tools.ffmpeg.s16")).unwrap().chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
+    let got: Vec<i16> = pcm(&out).as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
+    let want: Vec<i16> = std::fs::read(data.join("aac_stereo_tools.ffmpeg.s16")).unwrap().as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
     assert_eq!(got.len(), want.len());
     let worst = got.iter().zip(&want).map(|(a, b)| (*a as i32 - *b as i32).abs()).max().unwrap();
     assert!(worst <= 2, "largest difference from FFmpeg's decode is {worst} LSB");
@@ -677,7 +677,7 @@ fn opus_vs_ffmpeg(file: &str, ext: &str, late: usize) -> (f64, i32) {
     let mut j = job(&data.join(format!("{file}.{ext}")), &out);
     j.audio.codec = Some("pcm_s16le".into());
     run(&j, &mut |_| {}).unwrap();
-    let s16 = |b: Vec<u8>| -> Vec<i32> { b.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as i32).collect() };
+    let s16 = |b: Vec<u8>| -> Vec<i32> { b.as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes([b[0], b[1]]) as i32).collect() };
     let got = s16(pcm(&out));
     let want = s16(std::fs::read(data.join(format!("{file}.ffmpeg.s16"))).unwrap());
     assert!(got.len() >= want.len() && got.len() < want.len() + 4 * 2000, "{} samples against {}", got.len(), want.len());
@@ -702,7 +702,7 @@ fn mp3_vs_ffmpeg(file: &str, ext: &str, channels: usize) -> (f64, i32) {
     let mut j = job(&data.join(format!("{file}.{ext}")), &out);
     j.audio.codec = Some("pcm_s16le".into());
     run(&j, &mut |_| {}).unwrap();
-    let s16 = |b: Vec<u8>| -> Vec<i32> { b.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as i32).collect() };
+    let s16 = |b: Vec<u8>| -> Vec<i32> { b.as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes([b[0], b[1]]) as i32).collect() };
     let got = s16(pcm(&out));
     let want = s16(std::fs::read(data.join(format!("{file}.ffmpeg.s16"))).unwrap());
     // the .mp3 files carry a LAME tag, so the reader trims them itself; the Matroska copy has none
@@ -817,7 +817,7 @@ fn vorbis_vs_ffmpeg(file: &str, ext: &str, legacy: bool) -> (f64, i32) {
             }
         }
     }
-    let want: Vec<i32> = std::fs::read(data.join(format!("{file}.ffmpeg.s16"))).unwrap().chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as i32).collect();
+    let want: Vec<i32> = std::fs::read(data.join(format!("{file}.ffmpeg.s16"))).unwrap().as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes([b[0], b[1]]) as i32).collect();
     // The length is the last page's granule position (the FFmpeg-encoder fixture's granule is 1024 frames past
     // what its reference holds, so it is not held to it). The mono fixture's reference came out 192
     // samples longer (8192 against its granule of 8000), so it is checked against the granule.
@@ -950,7 +950,7 @@ fn webm_audio_is_opus_or_vorbis() {
 /// The signal-to-noise ratio in dB of `got` against `want` (16-bit little-endian PCM), over the
 /// samples both have.
 fn snr_db(want: &[u8], got: &[u8]) -> f64 {
-    let s = |b: &[u8]| b.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f64).collect::<Vec<_>>();
+    let s = |b: &[u8]| b.as_chunks::<2>().0.iter().map(|c| i16::from_le_bytes([c[0], c[1]]) as f64).collect::<Vec<_>>();
     let (a, b) = (s(want), s(got));
     let (mut sig, mut err) = (0.0, 0.0);
     for (x, y) in a.iter().zip(&b) {

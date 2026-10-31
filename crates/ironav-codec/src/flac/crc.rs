@@ -67,12 +67,12 @@ pub fn crc16_update(crc: u16, byte: u8) -> u16 {
 
 pub fn crc16(data: &[u8]) -> u16 {
     let mut crc = 0u16;
-    let mut chunks = data.chunks_exact(4);
-    for c in &mut chunks {
+    let (chunks, rem) = data.as_chunks::<4>();
+    for c in chunks {
         let x = crc ^ u16::from_be_bytes([c[0], c[1]]);
         crc = T16[3][(x >> 8) as usize] ^ T16[2][(x & 0xFF) as usize] ^ T16[1][c[2] as usize] ^ T16[0][c[3] as usize];
     }
-    chunks.remainder().iter().fold(crc, |c, &b| crc16_update(c, b))
+    rem.iter().fold(crc, |c, &b| crc16_update(c, b))
 }
 
 #[cfg(test)]

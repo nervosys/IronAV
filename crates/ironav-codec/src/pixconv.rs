@@ -59,7 +59,7 @@ fn to_yuv444(v: &VideoFrame, m: Matrix) -> [Vec<u8>; 3] {
         }
         PixelFormat::Rgb24 => {
             let (mut y, mut u, mut vv) = (vec![0u8; w * h], vec![0u8; w * h], vec![0u8; w * h]);
-            for (i, p) in v.planes[0].chunks_exact(3).enumerate() {
+            for (i, p) in v.planes[0].as_chunks::<3>().0.iter().enumerate() {
                 let (r, g, b) = (p[0] as i32, p[1] as i32, p[2] as i32);
                 let (yy, uu, vv_) = match m {
                     Matrix::Bt601 => (66 * r + 129 * g + 25 * b, -38 * r - 74 * g + 112 * b, 112 * r - 94 * g - 18 * b),
@@ -80,7 +80,7 @@ fn redepth(v: VideoFrame, depth: u8) -> VideoFrame {
     let from = v.pix_fmt.bit_depth() as u32;
     let to = depth as u32;
     let pix_fmt = v.pix_fmt.with_depth(depth).expect("a planar YUV layout at 8, 10 or 12 bits");
-    let get: fn(&[u8]) -> Vec<u32> = if from == 8 { |p| p.iter().map(|&b| b as u32).collect() } else { |p| p.chunks_exact(2).map(|w| u16::from_le_bytes([w[0], w[1]]) as u32).collect() };
+    let get: fn(&[u8]) -> Vec<u32> = if from == 8 { |p| p.iter().map(|&b| b as u32).collect() } else { |p| p.as_chunks::<2>().0.iter().map(|w| u16::from_le_bytes([w[0], w[1]]) as u32).collect() };
     let max = (1u32 << to) - 1;
     let planes = v
         .planes
@@ -246,7 +246,7 @@ mod tests {
     #[test]
     fn twelve_bit_changes_depth_and_keeps_its_layout() {
         let bytes = |v: &[u16]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
-        let words = |b: &[u8]| b.chunks_exact(2).map(|w| u16::from_le_bytes([w[0], w[1]])).collect::<Vec<u16>>();
+        let words = |b: &[u8]| b.as_chunks::<2>().0.iter().map(|w| u16::from_le_bytes([w[0], w[1]])).collect::<Vec<u16>>();
         let luma = [0u16, 1, 2, 2047, 2048, 4093, 4094, 4095];
         let f = VideoFrame { width: 4, height: 2, pix_fmt: PixelFormat::Yuv422p12, pts: 0, planes: vec![bytes(&luma), bytes(&[2048; 4]), bytes(&[100, 4095, 0, 1])] };
         // to 10 bits in the same layout: rounded, never past the top

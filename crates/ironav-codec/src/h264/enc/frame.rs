@@ -982,7 +982,7 @@ impl<'a> FrameCoder<'a> {
     fn code_inter_residual(&mut self, mut code: MbCode, mbx: usize, mby: usize, pred: &[u16; 256], cpred: &[[u16; 64]; 2], t8: bool) -> MbCode {
         let (x0, y0, ls) = (mbx * 16, mby * 16, self.ls());
         if t8 {
-            self.code_luma8(&mut code, mbx, mby, &pred);
+            self.code_luma8(&mut code, mbx, mby, pred);
         } else {
             let mut cos = [[0i32; 16]; 16];
             let mut score = [0i32; 4];
@@ -1026,7 +1026,7 @@ impl<'a> FrameCoder<'a> {
                 }
             }
         }
-        self.code_chroma(&mut code, mbx, mby, &cpred, false);
+        self.code_chroma(&mut code, mbx, mby, cpred, false);
         code
     }
 

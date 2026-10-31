@@ -367,8 +367,7 @@ impl Silk {
         // interpolate the first two subframes, then turn both sets of NLSFs into LPC coefficients
         let mut has_leadin = false;
         let mut leadin = [0f32; 16];
-        let body;
-        if self.subframes == 4 {
+        let body = if self.subframes == 4 {
             let mut offset = rc.cdf(&SILK_MODEL_LSF_INTERPOLATION_OFFSET) as i32;
             let frame = &self.frame[ch];
             if offset != 4 && frame.coded {
@@ -386,11 +385,11 @@ impl Silk {
                 offset = 4;
             }
             self.nlsf_interp_factor = offset;
-            body = lsf2lpc(&nlsf, order);
+            lsf2lpc(&nlsf, order)
         } else {
             self.nlsf_interp_factor = 4;
-            body = lsf2lpc(&nlsf, order);
-        }
+            lsf2lpc(&nlsf, order)
+        };
         if !redundant {
             let frame = &mut self.frame[ch];
             frame.nlsf[..order].copy_from_slice(&nlsf[..order]);
@@ -485,7 +484,7 @@ impl Silk {
         // assemble
         for i in 0..shellblocks << 4 {
             let value = excitation[i];
-            let mut e = value * 256 | SILK_QUANT_OFFSET[voiced as usize][qoffset_high] as i32;
+            let mut e = (value * 256) | SILK_QUANT_OFFSET[voiced as usize][qoffset_high] as i32;
             if value < 0 {
                 e += 20;
             } else if value > 0 {
@@ -557,10 +556,10 @@ impl Silk {
             last = log_gain;
 
             // approximate 2**(x/128) with a Q7 input
-            let lg = (log_gain * 0x1D1C71 >> 16) + 2090;
+            let lg = ((log_gain * 0x1D1C71) >> 16) + 2090;
             let ipart = lg >> 7;
             let fpart = lg & 127;
-            let lingain = (1 << ipart) + ((-174 * fpart * (128 - fpart) >> 16) + fpart) * ((1 << ipart) >> 7);
+            let lingain = (1 << ipart) + (((-174 * fpart * (128 - fpart)) >> 16) + fpart) * ((1 << ipart) >> 7);
             gains[i] = lingain as f32 / 65536.0;
         }
         if !redundant {

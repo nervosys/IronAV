@@ -127,7 +127,7 @@ fn frames_of(d: &[u8]) -> Result<Frames> {
         0 => out.push((p, end - p)),
         1 => {
             let n = end - p;
-            if n % 2 != 0 {
+            if !n.is_multiple_of(2) {
                 return Err(bad("odd size for two equal frames"));
             }
             out.push((p, n / 2));
@@ -180,7 +180,7 @@ fn frames_of(d: &[u8]) -> Result<Frames> {
                 }
             } else {
                 let n = end - p;
-                if n % count != 0 {
+                if !n.is_multiple_of(count) {
                     return Err(bad("frames of unequal size in a constant-bitrate packet"));
                 }
                 for i in 0..count {

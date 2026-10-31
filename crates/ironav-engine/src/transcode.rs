@@ -238,7 +238,7 @@ impl Work {
                 self.error = Some(e);
                 self.publish("failed");
             }
-            if self.pictures_in % 25 == 0 {
+            if self.pictures_in.is_multiple_of(25) {
                 self.publish("running");
             }
         }
@@ -273,11 +273,8 @@ impl Work {
             return Ok(());
         }
         let Some(dec) = self.decoder.as_mut() else { return Ok(()) };
-        let frames = match dec.decode(&p) {
-            Ok(f) => f,
-            // a damaged picture is skipped, as the analysis does
-            Err(_) => Vec::new(),
-        };
+        // a damaged picture is skipped, as the analysis does
+        let frames = dec.decode(&p).unwrap_or_default();
         self.encode(frames)
     }
 

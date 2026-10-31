@@ -12,6 +12,10 @@ readme = "../../README.md"
 keywords = ["container", "video", "audio", "mp4", "matroska"]
 categories = ["multimedia::encoding", "multimedia::video", "multimedia::audio"]
 
+
+[lints]
+workspace = true
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true

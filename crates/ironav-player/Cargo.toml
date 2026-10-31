@@ -12,6 +12,10 @@ readme = "../../README.md"
 keywords = ["video", "audio", "player", "playback", "multimedia"]
 categories = ["multimedia::video", "multimedia::audio"]
 
+
+[lints]
+workspace = true
+
 [features]
 default = ["audio"]
 # Real sound output through the operating system (WASAPI, CoreAudio, ALSA...). Without it,

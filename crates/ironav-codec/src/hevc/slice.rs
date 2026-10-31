@@ -284,7 +284,7 @@ impl<'a> Dec<'a> {
             }
             let nrs = self.geo.ts_to_rs[ts];
             let new_tile = self.geo.tile_id[ts] != tile;
-            let new_row = pps.entropy_sync && (nrs % sps.ctb_w == 0 || new_tile);
+            let new_row = pps.entropy_sync && (nrs.is_multiple_of(sps.ctb_w) || new_tile);
             if (pps.tiles && new_tile) || new_row {
                 if self.cab.terminate() != 1 {
                     return Err(bad("missing end_of_subset_one_bit"));
@@ -482,10 +482,8 @@ impl<'a> Dec<'a> {
             } else {
                 merge_2nx2n = self.parse_inter_pus(x0, y0, size)?;
             }
-            if !pcm {
-                if self.cu_pred_mode != PRED_INTRA && !(self.part_mode == PartMode::P2Nx2N && merge_2nx2n) {
-                    rqt_root_cbf = self.cab.decision(NO_RESIDUAL_DATA_FLAG_OFFSET) == 1;
-                }
+            if !pcm && self.cu_pred_mode != PRED_INTRA && !(self.part_mode == PartMode::P2Nx2N && merge_2nx2n) {
+                rqt_root_cbf = self.cab.decision(NO_RESIDUAL_DATA_FLAG_OFFSET) == 1;
             }
         }
         if pcm {
@@ -822,7 +820,7 @@ impl<'a> Dec<'a> {
         // left column, bottom to top
         let mut r = 0;
         while r < 2 * n {
-            let a = ok(self, ((x as i32 - 1) << sx) as i32, ((y + r) << sy) as i32);
+            let a = ok(self, (x as i32 - 1) << sx, ((y + r) << sy) as i32);
             if a {
                 for k in r..(r + uy).min(2 * n) {
                     line[2 * n - 1 - k] = self.pic.frame.planes[plane][(y + k) * stride + x - 1];
@@ -831,13 +829,13 @@ impl<'a> Dec<'a> {
             }
             r += uy;
         }
-        if ok(self, ((x as i32 - 1) << sx) as i32, ((y as i32 - 1) << sy) as i32) {
+        if ok(self, (x as i32 - 1) << sx, (y as i32 - 1) << sy) {
             line[2 * n] = self.pic.frame.planes[plane][(y - 1) * stride + x - 1];
             av[2 * n] = true;
         }
         let mut i = 0;
         while i < 2 * n {
-            if ok(self, ((x + i) << sx) as i32, ((y as i32 - 1) << sy) as i32) {
+            if ok(self, ((x + i) << sx) as i32, (y as i32 - 1) << sy) {
                 for k in i..(i + ux).min(2 * n) {
                     line[2 * n + 1 + k] = self.pic.frame.planes[plane][(y - 1) * stride + x + k];
                     av[2 * n + 1 + k] = true;

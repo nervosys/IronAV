@@ -256,8 +256,8 @@ fn a_video_sidecar_gets_pictures_at_its_interval() {
     let mut f = b"YUV4MPEG2 W64 H48 F25:1 Ip A1:1 C420jpeg\n".to_vec();
     for i in 0..50 {
         f.extend_from_slice(b"FRAME\n");
-        f.extend(std::iter::repeat(if i < 25 { 150u8 } else { 16 }).take(64 * 48));
-        f.extend(std::iter::repeat(128u8).take(64 * 48 / 2));
+        f.extend(std::iter::repeat_n(if i < 25 { 150u8 } else { 16 }, 64 * 48));
+        f.extend(std::iter::repeat_n(128u8, 64 * 48 / 2));
     }
     let y4m = dir.join("v.y4m");
     std::fs::write(&y4m, f).unwrap();
@@ -313,7 +313,7 @@ fn sidecars_are_named_by_the_operator_and_failures_say_why() {
     for _ in 0..5 {
         f.extend_from_slice(b"FRAME
 ");
-        f.extend(std::iter::repeat(128u8).take(16 * 16 * 3 / 2));
+        f.extend(std::iter::repeat_n(128u8, 16 * 16 * 3 / 2));
     }
     let y4m = dir.join("tiny.y4m");
     std::fs::write(&y4m, f).unwrap();

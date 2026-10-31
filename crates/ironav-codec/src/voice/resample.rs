@@ -117,7 +117,7 @@ impl StreamResampler {
         if self.end.is_some() {
             return Err(Error::invalid_arg("the resampler has been flushed"));
         }
-        if n % self.channels != 0 {
+        if !n.is_multiple_of(self.channels) {
             return Err(Error::invalid_arg(format!("{n} samples are not a whole number of {}-channel frames", self.channels)));
         }
         let frames = n / self.channels;

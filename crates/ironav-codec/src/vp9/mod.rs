@@ -119,7 +119,7 @@ impl Vp9Decoder {
             self.segmap_ref = src.as_ref().map(|p| p.segmap.clone());
         }
         let cur = Pic::new(h.width, h.height, h.ss_h, h.ss_v, h.bpp, pts);
-        if src.as_ref().map_or(true, |p| p.w != cur.w || p.h != cur.h) {
+        if src.as_ref().is_none_or(|p| p.w != cur.w || p.h != cur.h) {
             self.segmap_ref = None;
         }
 

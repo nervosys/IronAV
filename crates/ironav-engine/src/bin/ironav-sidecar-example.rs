@@ -60,9 +60,9 @@ fn main() {
             Some("audio") => {
                 let bytes = unbase64(m["data"].as_str().unwrap_or(""));
                 let samples: Vec<f64> = if m["format"] == "f32" {
-                    bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64).collect()
+                    bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64).collect()
                 } else {
-                    bytes.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f64 / 32768.0).collect()
+                    bytes.as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes([b[0], b[1]]) as f64 / 32768.0).collect()
                 };
                 let dur = m["dur"].as_f64().unwrap_or(0.0);
                 chunks += 1;

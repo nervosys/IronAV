@@ -267,7 +267,7 @@ pub(crate) fn y4m_frame(src: &[u8], layout: Layout, w: usize, h: usize, stride: 
             for p in [1, 3] {
                 for r in 0..ch {
                     let (a, b) = (&src[2 * r * stride..], &src[(2 * r + 1) * stride..]);
-                    out.extend((0..cw).map(|i| ((a[i * 4 + p] as u16 + b[i * 4 + p] as u16 + 1) / 2) as u8));
+                    out.extend((0..cw).map(|i| ((a[i * 4 + p] as u16 + b[i * 4 + p] as u16).div_ceil(2)) as u8));
                 }
             }
         }

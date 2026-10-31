@@ -139,12 +139,10 @@ fn the_end_of_the_stream_closes_a_last_short_window() {
 fn a_tap_that_cannot_be_fed_says_why() {
     let s = open();
     let tap = s.tap(TapConfig { stream: Some(1), ..TapConfig::video() }).unwrap();
-    let e = loop {
-        match tap.recv_timeout(Duration::from_secs(10)) {
-            Ok(Some(_)) => panic!("a video tap fed from an audio stream"),
-            Ok(None) => panic!("no answer for 10 s"),
-            Err(e) => break e,
-        }
+    let e = match tap.recv_timeout(Duration::from_secs(10)) {
+        Ok(Some(_)) => panic!("a video tap fed from an audio stream"),
+        Ok(None) => panic!("no answer for 10 s"),
+        Err(e) => e,
     };
     assert!(e.message.contains("stream 1"), "{}", e.message);
     assert!(s.tap(TapConfig { fps: Some(0.0), ..TapConfig::video() }).is_err());

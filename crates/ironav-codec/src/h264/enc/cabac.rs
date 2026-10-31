@@ -261,7 +261,7 @@ mod tests {
                 let kind = [0, 0, 0, 1, 2][rnd(5) as usize];
                 let ctx = rnd(8) as usize * 37;
                 // skewed values so contexts adapt
-                (kind, ctx, rnd(10) < if ctx % 2 == 0 { 2 } else { 8 })
+                (kind, ctx, rnd(10) < if ctx.is_multiple_of(2) { 2 } else { 8 })
             })
             .collect();
         let mut w = BitWriter::new();

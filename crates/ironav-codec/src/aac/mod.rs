@@ -678,7 +678,7 @@ impl AacDecoder {
                 for i in 0..order {
                     let r = -coef[i];
                     lpc[i] = r;
-                    for j in 0..(i + 1) / 2 {
+                    for j in 0..i.div_ceil(2) {
                         let (f, b) = (lpc[j], lpc[i - 1 - j]);
                         lpc[j] = f + r * b;
                         lpc[i - 1 - j] = b + r * f;

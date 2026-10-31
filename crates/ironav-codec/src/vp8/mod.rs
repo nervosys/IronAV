@@ -442,7 +442,7 @@ impl Vp8Decoder {
             let q = |d: i32| (base + d).clamp(0, 127) as usize;
             self.qmat[i] = Quant {
                 y: [DC_QLOOKUP[q(ydc)] as i32, AC_QLOOKUP[q(0)] as i32],
-                y2: [DC_QLOOKUP[q(y2dc)] as i32 * 2, (AC_QLOOKUP[q(y2ac)] as i32 * 101581 >> 16).max(8)],
+                y2: [DC_QLOOKUP[q(y2dc)] as i32 * 2, ((AC_QLOOKUP[q(y2ac)] as i32 * 101581) >> 16).max(8)],
                 uv: [(DC_QLOOKUP[q(uvdc)] as i32).min(132), AC_QLOOKUP[q(uvac)] as i32],
             };
         }

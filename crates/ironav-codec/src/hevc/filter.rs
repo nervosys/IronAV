@@ -181,9 +181,7 @@ fn deblock(pic: &mut CurPic, sps: &Sps, pps: &Pps, geo: &Geometry) {
                 }
                 let bs = if pic.pred_mode[ip] == PRED_INTRA || pic.pred_mode[iq] == PRED_INTRA {
                     2
-                } else if flags & tu_flag != 0 && (pic.nz[ip] != 0 || pic.nz[iq] != 0) {
-                    1
-                } else if motion_differs(&pic.frame.mv[ip], &pic.frame.mv[iq]) {
+                } else if (flags & tu_flag != 0 && (pic.nz[ip] != 0 || pic.nz[iq] != 0)) || motion_differs(&pic.frame.mv[ip], &pic.frame.mv[iq]) {
                     1
                 } else {
                     0

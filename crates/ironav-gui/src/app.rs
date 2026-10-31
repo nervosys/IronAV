@@ -35,6 +35,8 @@ const TABS: [(Tab, &str); 7] = [
     (Tab::Ontology, "Ontology"),
 ];
 
+// Done carries a whole Report; boxing it would touch every use for one message per job.
+#[allow(clippy::large_enum_variant)]
 enum Msg {
     Progress { id: u64, bytes_in: u64 },
     Done { id: u64, result: Result<Report, Error> },

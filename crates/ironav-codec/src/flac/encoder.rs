@@ -84,7 +84,7 @@ fn best_k(sum: u64, n: usize) -> (u32, u64) {
 /// warm-up samples in a block of `n` samples).
 fn plan_residual(res: &[i64], n: usize, order: usize) -> Plan {
     let mut max_p = 0u32;
-    while max_p < MAX_PARTITION_ORDER && n % (1 << (max_p + 1)) == 0 && (n >> (max_p + 1)) >= 8.max(order) {
+    while max_p < MAX_PARTITION_ORDER && n.is_multiple_of(1 << (max_p + 1)) && (n >> (max_p + 1)) >= 8.max(order) {
         max_p += 1;
     }
     // Sums of zigzag residuals at the finest partitioning, then merged pairwise for coarser ones.
@@ -185,9 +185,9 @@ fn with_window<R>(n: usize, f: impl FnOnce(&[f64]) -> R) -> R {
 /// instead of waiting on each other.
 fn dot(a: &[f64], b: &[f64]) -> f64 {
     let mut acc = [0f64; 4];
-    let (ca, cb) = (a.chunks_exact(4), b.chunks_exact(4));
-    let (ra, rb) = (ca.remainder(), cb.remainder());
-    for (x, y) in ca.zip(cb) {
+    let (ca, ra) = a.as_chunks::<4>();
+    let (cb, rb) = b.as_chunks::<4>();
+    for (x, y) in ca.iter().zip(cb) {
         for l in 0..4 {
             acc[l] += x[l] * y[l];
         }
@@ -197,6 +197,8 @@ fn dot(a: &[f64], b: &[f64]) -> f64 {
 }
 
 /// Levinson-Durbin on a Tukey-windowed autocorrelation; returns coefficients for each order 1..=max.
+// NaN must take the bail-out path, so the negated comparison in the loop is kept as written.
+#[allow(clippy::neg_cmp_op_on_partial_ord)]
 fn lpc_coefficients(s: &[i64], max_order: usize) -> Option<Vec<(Vec<f64>, f64)>> {
     let n = s.len();
     let x: Vec<f64> = with_window(n, |w| s.iter().zip(w).map(|(&v, &w)| v as f64 * w).collect());

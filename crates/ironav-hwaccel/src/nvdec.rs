@@ -343,22 +343,22 @@ impl State {
         }
         let surfaces = (f.min_num_decode_surfaces as u32).max(1);
         let mut info = CreateInfo {
-            width: f.coded_width.into(),
-            height: f.coded_height.into(),
-            num_decode_surfaces: surfaces.into(),
+            width: f.coded_width,
+            height: f.coded_height,
+            num_decode_surfaces: surfaces,
             codec: f.codec,
             chroma_format: f.chroma_format,
-            creation_flags: CREATE_PREFER_CUVID.into(),
+            creation_flags: CREATE_PREFER_CUVID,
             bit_depth_minus8: (self.bits - 8).into(),
             intra_decode_only: 0,
-            max_width: f.coded_width.into(),
-            max_height: f.coded_height.into(),
+            max_width: f.coded_width,
+            max_height: f.coded_height,
             reserved1: 0,
             display_area: [0; 4],
             output_format: if self.bits == 10 { SURFACE_P016 } else { SURFACE_NV12 },
             deinterlace: DEINTERLACE_WEAVE,
-            target_width: f.coded_width.into(),
-            target_height: f.coded_height.into(),
+            target_width: f.coded_width,
+            target_height: f.coded_height,
             num_output_surfaces: 2,
             vid_lock: ptr::null_mut(),
             target_rect: [0; 4],
@@ -438,16 +438,16 @@ impl State {
         let (planes, pix_fmt) = if self.bits == 10 {
             // P016 keeps the 10 bits in the top of each 16-bit word; yuv420p10le wants them at the bottom.
             let low = |p: &[u8]| (u16::from_le_bytes([p[0], p[1]]) >> 6).to_le_bytes();
-            let y: Vec<u8> = y.chunks_exact(2).flat_map(low).collect();
+            let y: Vec<u8> = y.as_chunks::<2>().0.iter().flat_map(|c| low(c)).collect();
             let (mut u, mut v) = (Vec::with_capacity(cw * ch * 2), Vec::with_capacity(cw * ch * 2));
-            for p in uv.chunks_exact(4) {
+            for p in uv.as_chunks::<4>().0 {
                 u.extend_from_slice(&low(&p[0..2]));
                 v.extend_from_slice(&low(&p[2..4]));
             }
             (vec![y, u, v], PixelFormat::Yuv420p10)
         } else {
             let (mut u, mut v) = (vec![0u8; cw * ch], vec![0u8; cw * ch]);
-            for ((u, v), p) in u.iter_mut().zip(v.iter_mut()).zip(uv.chunks_exact(2)) {
+            for ((u, v), p) in u.iter_mut().zip(v.iter_mut()).zip(uv.as_chunks::<2>().0) {
                 *u = p[0];
                 *v = p[1];
             }
@@ -646,7 +646,7 @@ impl NvdecDecoder {
     fn feed(&mut self, data: &[u8], pts: i64, flags: u32) -> Result<Vec<Frame>> {
         // SAFETY: binds the context we retained to this thread.
         unsafe { (self.set_ctx)(self.ctx) };
-        let mut pkt = SourcePacket { flags: flags.into(), payload_size: data.len() as u32 as c_ulong, payload: if data.is_empty() { ptr::null() } else { data.as_ptr() }, timestamp: pts };
+        let mut pkt = SourcePacket { flags, payload_size: data.len() as u32 as c_ulong, payload: if data.is_empty() { ptr::null() } else { data.as_ptr() }, timestamp: pts };
         // SAFETY: the parser calls back into `self.state` synchronously before returning.
         let r = unsafe { (self.state().api.parse)(self.parser, &mut pkt) };
         if let Some(e) = self.state().error.take() {
@@ -698,7 +698,7 @@ impl Drop for NvdecDecoder {
 /// True if `params` describe a stream this provider can decode.
 pub fn accepts(params: &StreamParams) -> std::result::Result<(), String> {
     match params {
-        StreamParams::Video { pix_fmt, .. } if matches!(pix_fmt, PixelFormat::Yuv420p | PixelFormat::Yuv420p10) => Ok(()),
+        StreamParams::Video { pix_fmt: PixelFormat::Yuv420p | PixelFormat::Yuv420p10, .. } => Ok(()),
         StreamParams::Video { pix_fmt, .. } => Err(format!("NVDEC provider decodes yuv420p and yuv420p10le only, the stream is {}", pix_fmt.name())),
         _ => Err("NVDEC only decodes video".to_string()),
     }

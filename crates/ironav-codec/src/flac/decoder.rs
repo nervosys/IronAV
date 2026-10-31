@@ -146,7 +146,7 @@ fn read_residual(br: &mut BitReader, n: usize, order: usize, out: &mut [i64]) ->
     let escape = (1u32 << param_bits) - 1;
     let porder = br.read(4)?;
     let parts = 1usize << porder;
-    if n % parts != 0 || (n >> porder) < order {
+    if !n.is_multiple_of(parts) || (n >> porder) < order {
         return Err(bad("invalid residual partition order"));
     }
     let psize = n >> porder;

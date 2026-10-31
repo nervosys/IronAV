@@ -237,6 +237,8 @@ fn add_residual(buf: &mut [u16], stride: usize, w: usize, h: usize, r: &[i32], m
     }
 }
 
+// The CABAC state is held inline on purpose: boxing it would add an indirection to every bin read.
+#[allow(clippy::large_enum_variant)]
 enum Reader<'a> {
     Cavlc(BitReader<'a>),
     Cabac(Cabac<'a>),
@@ -326,8 +328,6 @@ impl<'a> SliceDec<'a> {
 
     pub fn decode(&mut self) -> Result<()> {
         let inter_slice = self.hdr.slice_type != SliceType::I;
-        if inter_slice {
-        }
         let mut addr = self.hdr.first_mb;
         loop {
             let mut more = true;
@@ -1282,7 +1282,7 @@ impl<'a> SliceDec<'a> {
             let idx = t - 4;
             let masks: [(u8, u8); 9] = [(1, 1), (2, 2), (1, 2), (2, 1), (1, 3), (2, 3), (3, 1), (3, 2), (3, 3)];
             let (m0, m1) = masks[(idx / 2) as usize];
-            if idx % 2 == 0 {
+            if idx.is_multiple_of(2) {
                 ref_parts.extend([(0, 0, 4, 2, m0), (0, 2, 4, 2, m1)]);
                 mv_parts.extend([(0, 0, 4, 2, m0, 1, false), (0, 2, 4, 2, m1, 1, false)]);
             } else {
@@ -1432,7 +1432,7 @@ impl<'a> SliceDec<'a> {
             if c444 {
                 // 4:4:4 chroma is interpolated exactly like luma
                 for c in 0..2usize {
-                    inter::luma_mc(&entry.pic.planes[1 + c], cpw, cph, cx as i32, cy, mv[0] as i32, mv[1] as i32, cw, ch, &mut chroma[l][c], self.maxv);
+                    inter::luma_mc(&entry.pic.planes[1 + c], cpw, cph, cx, cy, mv[0] as i32, mv[1] as i32, cw, ch, &mut chroma[l][c], self.maxv);
                 }
             } else if self.pic.cf != 0 {
                 // 4:2:2 chroma has full vertical resolution, so its vertical vector is in quarter samples

@@ -42,7 +42,7 @@ pub fn predict(
 ) {
     assert!(log2m4 <= 3 && (8..=12).contains(&bd));
     let n = 4usize << log2m4;
-    assert!(top.len() >= 2 * n + 1 && left.len() >= n);
+    assert!(top.len() > 2 * n && left.len() >= n);
 
     // tb[0] = top-left, tb[1 + i] = above sample i.
     let mut tb = [0i32; 2 * MAX_N + 1];

@@ -374,7 +374,7 @@ impl MkvStream {
                         }
                     }
                     _ => {
-                        if d.len() % count != 0 {
+                        if !d.len().is_multiple_of(count) {
                             return Err(bad("a fixed lace does not divide its block"));
                         }
                         sizes = vec![d.len() / count; count - 1];

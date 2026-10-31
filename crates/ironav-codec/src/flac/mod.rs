@@ -86,7 +86,7 @@ mod tests {
         let mut bad = pk[0].clone();
         let mid = bad.data.len() / 2;
         bad.data[mid] ^= 0x10;
-        let e = FlacDecoder::new(44_100, 1, Some(16)).decode(&bad).err().expect("must fail");
+        let e = FlacDecoder::new(44_100, 1, Some(16)).decode(&bad).expect_err("must fail");
         assert!(e.message.contains("CRC"), "{}", e.message);
     }
 }

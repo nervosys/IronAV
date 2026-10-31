@@ -495,7 +495,7 @@ impl StreamDemuxer for Id3Stream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     fn fixture(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../ironav-engine/tests/data").join(name)
@@ -517,7 +517,7 @@ mod tests {
         (d.streams().to_vec(), out)
     }
 
-    fn from_file(path: &PathBuf) -> (StreamInfo, Vec<(i64, Vec<u8>)>) {
+    fn from_file(path: &Path) -> (StreamInfo, Vec<(i64, Vec<u8>)>) {
         let mut d = crate::open_demuxer(path).unwrap();
         let s = d.streams()[0].clone();
         let mut out = Vec::new();
@@ -659,7 +659,7 @@ mod tests {
             let (want_info, want) = from_file(&path);
             // the file reader keeps a LAME trim; a stream has none
             let mut tagged = b"ID3\x04\x00\x00\x00\x00\x07\x68".to_vec();
-            tagged.extend(std::iter::repeat(0xFFu8).take(1000));
+            tagged.extend(std::iter::repeat_n(0xFFu8, 1000));
             tagged.extend_from_slice(&bytes);
             for (input, step) in [(&bytes, 1), (&bytes, 4096), (&tagged, 97), (&tagged, tagged.len())] {
                 let d = crate::stream::stream_demuxer(&input[..200], &Default::default()).unwrap();
@@ -675,7 +675,7 @@ mod tests {
     fn adts_behind_a_tag_is_still_adts() {
         let bytes = std::fs::read(fixture("aac_stereo_tools.aac")).unwrap();
         let mut tagged = b"ID3\x03\x00\x00\x00\x00\x01\x00".to_vec();
-        tagged.extend(std::iter::repeat(0u8).take(128));
+        tagged.extend(std::iter::repeat_n(0u8, 128));
         tagged.extend_from_slice(&bytes);
         let d = crate::stream::stream_demuxer(&tagged[..200], &Default::default()).unwrap();
         let (info, got) = streamed(d, &tagged, 333);

@@ -126,7 +126,7 @@ impl PixelFormat {
     }
     /// `(width, height, bytes_per_pixel)` of each plane for a frame of the given size.
     pub fn planes(self, w: usize, h: usize) -> Vec<(usize, usize, usize)> {
-        let (cw, ch) = ((w + 1) / 2, (h + 1) / 2);
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
         match self {
             Self::Gray8 => vec![(w, h, 1)],
             Self::Yuv420p => vec![(w, h, 1), (cw, ch, 1), (cw, ch, 1)],

@@ -10,9 +10,9 @@ pub fn sha1(data: &[u8]) -> [u8; 20] {
     }
     msg.extend_from_slice(&((data.len() as u64).wrapping_mul(8)).to_be_bytes());
     let mut h = [0x67452301u32, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
-    for block in msg.chunks_exact(64) {
+    for block in msg.as_chunks::<64>().0 {
         let mut w = [0u32; 80];
-        for (i, c) in block.chunks_exact(4).enumerate() {
+        for (i, c) in block.as_chunks::<4>().0.iter().enumerate() {
             w[i] = u32::from_be_bytes([c[0], c[1], c[2], c[3]]);
         }
         for i in 16..80 {
@@ -34,7 +34,7 @@ pub fn sha1(data: &[u8]) -> [u8; 20] {
         }
     }
     let mut out = [0u8; 20];
-    for (o, x) in out.chunks_exact_mut(4).zip(h) {
+    for (o, x) in out.as_chunks_mut::<4>().0.iter_mut().zip(h) {
         o.copy_from_slice(&x.to_be_bytes());
     }
     out

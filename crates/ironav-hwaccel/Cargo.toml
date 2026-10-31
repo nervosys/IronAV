@@ -12,6 +12,10 @@ readme = "../../README.md"
 keywords = ["video", "gpu", "nvenc", "nvdec", "multimedia"]
 categories = ["multimedia::video", "multimedia::encoding"]
 
+
+[lints]
+workspace = true
+
 [dependencies]
 serde.workspace = true
 ironav-core.workspace = true

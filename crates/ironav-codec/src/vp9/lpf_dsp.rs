@@ -38,7 +38,7 @@ fn wide_smooth(s: &[i32], out: &mut [i32; 16]) {
     let shift = if n == 8 { 3 } else { 4 };
     let get = |t: isize| s[t.clamp(0, n as isize - 1) as usize];
     // Window sum over taps c-r..=c+r with edge samples replicated.
-    let mut win: i32 = (1 - r..=1 + r).map(|t| get(t)).sum();
+    let mut win: i32 = (1 - r..=1 + r).map(&get).sum();
     for c in 1..n - 1 {
         out[c] = (win + s[c] + (1 << (shift - 1))) >> shift;
         let ci = c as isize;

@@ -62,7 +62,7 @@ fn cut_and_black(path: &Path) {
         }
         f.extend_from_slice(b"FRAME\n");
         f.extend_from_slice(&y);
-        f.extend(std::iter::repeat(128u8).take(w * h / 2));
+        f.extend(std::iter::repeat_n(128u8, w * h / 2));
     }
     std::fs::write(path, f).unwrap();
 }

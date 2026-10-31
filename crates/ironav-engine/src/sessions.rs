@@ -105,7 +105,7 @@ mod tests {
         let id = s["session"].as_str().unwrap().to_string();
         let r = control(&json!({ "session": id, "cmd": "seek", "fraction": 0.5 })).unwrap();
         assert_eq!(r["position"], 1.0);
-        assert_eq!(status(&json!({ "session": id })).unwrap()["state"].as_str().is_some(), true);
+        assert!(status(&json!({ "session": id })).unwrap()["state"].as_str().is_some());
         close(&json!({ "session": id })).unwrap();
         let e = status(&json!({ "session": id })).unwrap_err();
         assert_eq!(e.code, ErrorCode::NotFound);

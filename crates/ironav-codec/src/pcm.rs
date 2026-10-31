@@ -16,7 +16,7 @@ impl Decoder for PcmDecoder {
     fn decode(&mut self, packet: &Packet) -> Result<Vec<Frame>> {
         let d = &packet.data;
         let width = self.fmt.bytes() * self.channels as usize;
-        if width == 0 || d.len() % width != 0 {
+        if width == 0 || !d.len().is_multiple_of(width) {
             return Err(Error::invalid_input(format!(
                 "PCM packet of {} bytes is not a whole number of {}-channel {} frames",
                 d.len(),
@@ -26,17 +26,17 @@ impl Decoder for PcmDecoder {
         }
         let samples: Vec<f64> = match self.fmt {
             SampleFormat::U8 => d.iter().map(|&b| (b as f64 - 128.0) / 128.0).collect(),
-            SampleFormat::S16 => d.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f64 / 32768.0).collect(),
+            SampleFormat::S16 => d.as_chunks::<2>().0.iter().map(|c| i16::from_le_bytes([c[0], c[1]]) as f64 / 32768.0).collect(),
             SampleFormat::S24 => d
-                .chunks_exact(3)
+                .as_chunks::<3>().0.iter()
                 .map(|c| (((i32::from_le_bytes([0, c[0], c[1], c[2]])) >> 8) as f64) / 8388608.0)
                 .collect(),
             SampleFormat::S32 => {
-                d.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64 / 2147483648.0).collect()
+                d.as_chunks::<4>().0.iter().map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64 / 2147483648.0).collect()
             }
-            SampleFormat::F32 => d.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64).collect(),
+            SampleFormat::F32 => d.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64).collect(),
             SampleFormat::F64 => d
-                .chunks_exact(8)
+                .as_chunks::<8>().0.iter()
                 .map(|c| f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
                 .collect(),
         };

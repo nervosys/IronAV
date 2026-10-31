@@ -133,10 +133,8 @@ pub fn open<R: Read>(mut r: R) -> Result<Mp4Demuxer<Cursor<Vec<u8>>>> {
         last_granule = (granule != u64::MAX).then_some(granule);
 
         let mut p = 27 + nseg;
-        if flags & 0x01 == 0 {
-            if start != data.len() {
-                data.truncate(start); // a packet lost its tail: drop it
-            }
+        if flags & 0x01 == 0 && start != data.len() {
+            data.truncate(start); // a packet lost its tail: drop it
         }
         for &s in table {
             data.extend_from_slice(&page[p..p + s as usize]);
@@ -169,8 +167,7 @@ pub fn open<R: Read>(mut r: R) -> Result<Mp4Demuxer<Cursor<Vec<u8>>>> {
     };
     let mut samples = Vec::with_capacity(packets.len());
     let mut pts = 0i64;
-    let stream;
-    if flac {
+    let stream = if flac {
         let hd = hdr(0)?;
         // 0x7F "FLAC", version (2), header count (2), "fLaC", a metadata block header (4), STREAMINFO (34)
         if hd.len() < 51 || &hd[9..13] != b"fLaC" || hd[5] != 1 {
@@ -189,7 +186,7 @@ pub fn open<R: Read>(mut r: R) -> Result<Mp4Demuxer<Cursor<Vec<u8>>>> {
             samples.push(Sample { stream: 0, sync: true, offset: off, size: size as u32, dts: pts, cts_offset: 0, duration: len });
             pts += len as i64;
         }
-        stream = StreamInfo {
+        StreamInfo {
             index: 0,
             codec: CodecId::Flac,
             time_base: Rational::new(1, rate as i64),
@@ -198,7 +195,7 @@ pub fn open<R: Read>(mut r: R) -> Result<Mp4Demuxer<Cursor<Vec<u8>>>> {
             extradata: Vec::new(),
             lead_in: 0,
             params: StreamParams::Audio { sample_rate: rate, channels },
-        };
+        }
     } else if vorbis {
         let extradata = ironav_codec::vorbis::join_headers([hdr(0)?, hdr(1)?, hdr(2)?]);
         let (channels, rate) = ironav_codec::vorbis::PacketTimer::channels_and_rate(&extradata)?;
@@ -209,7 +206,7 @@ pub fn open<R: Read>(mut r: R) -> Result<Mp4Demuxer<Cursor<Vec<u8>>>> {
             pts += len as i64;
         }
         trim_end(&mut samples, &mut pts, last_granule);
-        stream = StreamInfo {
+        StreamInfo {
             index: 0,
             codec: CodecId::Vorbis,
             time_base: Rational::new(1, rate as i64),
@@ -218,7 +215,7 @@ pub fn open<R: Read>(mut r: R) -> Result<Mp4Demuxer<Cursor<Vec<u8>>>> {
             extradata,
             lead_in: 0,
             params: StreamParams::Audio { sample_rate: rate, channels },
-        };
+        }
     } else {
         let hd = hdr(0)?;
         if hd.len() < 19 || hd[8] >> 4 != 0 {
@@ -233,7 +230,7 @@ pub fn open<R: Read>(mut r: R) -> Result<Mp4Demuxer<Cursor<Vec<u8>>>> {
             pts += len as i64;
         }
         trim_end(&mut samples, &mut pts, last_granule);
-        stream = StreamInfo {
+        StreamInfo {
             index: 0,
             codec: CodecId::Opus,
             time_base: Rational::new(1, 48_000),
@@ -242,8 +239,8 @@ pub fn open<R: Read>(mut r: R) -> Result<Mp4Demuxer<Cursor<Vec<u8>>>> {
             extradata,
             lead_in: 0,
             params: StreamParams::Audio { sample_rate: 48_000, channels },
-        };
-    }
+        }
+    };
     let track = TrackInfo { stream, config: Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma: 1 }, convert: false };
     Ok(Mp4Demuxer::from_parts(Cursor::new(data), "ogg", vec![track], samples))
 }

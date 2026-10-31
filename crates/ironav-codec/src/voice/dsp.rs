@@ -146,6 +146,8 @@ impl Gate {
     }
 
     /// The next frame to send after a [`push`](Self::push), oldest first.
+    // A lending iterator: the item borrows from `self`, which `Iterator::next` cannot express.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<&[f32]> {
         if self.taken >= self.ready {
             return None;
@@ -237,7 +239,7 @@ impl Denoiser {
         let n = 2 * hop;
         let mut rest = n;
         for p in [2, 3, 5] {
-            while rest > 1 && rest % p == 0 {
+            while rest > 1 && rest.is_multiple_of(p) {
                 rest /= p;
             }
         }
@@ -272,7 +274,7 @@ impl Denoiser {
     /// Suppresses noise in `frame` (a whole number of hops) in place; what comes out is `hop`
     /// samples late.
     pub fn process(&mut self, frame: &mut [f32]) -> Result<()> {
-        if frame.len() % self.hop != 0 {
+        if !frame.len().is_multiple_of(self.hop) {
             return Err(Error::invalid_arg(format!("the suppressor takes whole hops of {} samples, not {}", self.hop, frame.len())));
         }
         let h = self.hop;

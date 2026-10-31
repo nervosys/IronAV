@@ -223,7 +223,7 @@ impl NvencEncoder {
         if bits != 8 && !(bits == 10 && codec == CodecId::Hevc) {
             return Err(Error::invalid_arg(format!("NVENC provider encodes {} at 8 bits{}, not {bits}", codec.name(), if codec == CodecId::Hevc { " or 10 bits" } else { "" })));
         }
-        if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
+        if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             return Err(Error::invalid_arg(format!("NVENC needs even, non-zero dimensions, got {width}x{height}"))
                 .hint("crop or scale the video to even dimensions first"));
         }
@@ -385,7 +385,7 @@ impl NvencEncoder {
             let f: FnPtr = this.func(F_INITIALIZE)?;
             let st = f(this.enc, init.0.as_mut_ptr().cast());
             this.check(st, "initialize encoder")?;
-            debug_assert!(PRESET_CFG + SZ_CONFIG <= SZ_PRESET_CONFIG);
+            const _: () = assert!(PRESET_CFG + SZ_CONFIG <= SZ_PRESET_CONFIG);
 
             // A small ring: enough that a driver which holds a few frames never stalls us.
             let aligned_w = (width + 31) & !31;
@@ -503,9 +503,9 @@ impl Encoder for NvencEncoder {
         // interleaved. Build that layout on the host, then copy it row by row like 8-bit input.
         let staged: Option<(Vec<u8>, Vec<u8>)> = (bps == 2).then(|| {
             let top = |p: &[u8]| (u16::from_le_bytes([p[0], p[1]]) << 6).to_le_bytes();
-            let ys: Vec<u8> = y[..w * h * 2].chunks_exact(2).flat_map(top).collect();
+            let ys: Vec<u8> = y[..w * h * 2].as_chunks::<2>().0.iter().flat_map(|c| top(c)).collect();
             let mut uv = Vec::with_capacity(cw * ch * 4);
-            for (a, b) in u[..cw * ch * 2].chunks_exact(2).zip(vv[..cw * ch * 2].chunks_exact(2)) {
+            for (a, b) in u[..cw * ch * 2].as_chunks::<2>().0.iter().zip(vv[..cw * ch * 2].as_chunks::<2>().0) {
                 uv.extend_from_slice(&top(a));
                 uv.extend_from_slice(&top(b));
             }
@@ -654,7 +654,7 @@ mod tests {
     fn layout_constants_match_the_header() {
         assert_eq!(std::mem::size_of::<Blob<SZ_PRESET_CONFIG>>(), 5128);
         assert_eq!(std::mem::size_of::<Blob<SZ_FUNCTION_LIST>>(), 2552);
-        assert!(PRESET_CFG + SZ_CONFIG <= SZ_PRESET_CONFIG);
+        const _: () = assert!(PRESET_CFG + SZ_CONFIG <= SZ_PRESET_CONFIG);
         assert_eq!(FUNCTION_LIST_VER, 1895956493);
         assert_eq!(CREATE_INPUT_VER, 1895956493);
         assert_eq!(OPEN_SESSION_VER, 1895890957);

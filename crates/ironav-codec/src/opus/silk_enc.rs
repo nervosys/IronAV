@@ -1282,7 +1282,7 @@ pub(super) mod tests {
             let target = bitrate * fl as f64 / 16_000.0;
             let used = enc.encode(&mut rc, &buf[f * fl..f * fl + PAST + fl + LOOKAHEAD], 1, subframes, target, 1275 * 8, false);
             rc.finish_in_place().unwrap();
-            let nb = (used as usize + 7) / 8;
+            let nb = (used as usize).div_ceil(8);
             assert!(rc.bytes()[nb..].iter().all(|&b| b == 0), "frame {f}: bytes past the length");
             total += nb;
             let mut rd = RangeDecoder::new(&rc.bytes()[..nb]);

@@ -213,7 +213,7 @@ fn base64(s: &str) -> Option<Vec<u8>> {
 
 fn hex(s: &str) -> Option<Vec<u8>> {
     let s = s.trim();
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len()).step_by(2).map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok()).collect()
@@ -506,7 +506,7 @@ impl RtpStream {
                 self.emit(ti, ts, 0, pcm, true);
             }
             Payload::L16 => {
-                let pcm = data.chunks_exact(2).flat_map(|s| [s[1], s[0]]).collect();
+                let pcm = data.as_chunks::<2>().0.iter().flat_map(|s| [s[1], s[0]]).collect();
                 self.emit(ti, ts, 0, pcm, true);
             }
         }

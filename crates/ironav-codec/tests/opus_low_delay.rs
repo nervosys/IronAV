@@ -145,7 +145,7 @@ fn a_16_khz_link_allocates_nothing_per_frame() {
     let mut pending = Vec::with_capacity(2 * 480);
     let mut packet = vec![0u8; enc.packet_bytes()];
     let mut packets = 0;
-    for (k, f) in input.chunks_exact(160).enumerate() {
+    for (k, f) in input.as_chunks::<160>().0.iter().enumerate() {
         if k == 2 {
             ALLOCS.with(|a| a.set(0));
             COUNTING.with(|c| c.set(true));
@@ -171,7 +171,7 @@ fn a_16_khz_link_allocates_nothing_per_frame() {
 fn packets(input: &[f32]) -> Vec<Vec<u8>> {
     let mut enc = OpusEncoder::new(48_000, 1, 32_000).unwrap().with_frame_ms(10.0).unwrap();
     let mut buf = vec![0u8; enc.packet_bytes()];
-    input.chunks_exact(480).map(|f| { let n = enc.encode_frame_into(f, &mut buf).unwrap(); buf[..n].to_vec() }).collect()
+    input.as_chunks::<480>().0.iter().map(|f| { let n = enc.encode_frame_into(f, &mut buf).unwrap(); buf[..n].to_vec() }).collect()
 }
 
 fn rms(x: &[f32]) -> f64 {

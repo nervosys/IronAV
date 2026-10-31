@@ -39,6 +39,15 @@ ironav-engine = { path = "crates/ironav-engine", version = "0.1.0" }
 ironav-webui = { path = "crates/ironav-webui", version = "0.1.0" }
 ironav-gui = { path = "crates/ironav-gui", version = "0.1.0" }
 
+# Codec code follows its specifications: tables keep their published digits, loops index several
+# arrays at once, and the decoding functions take what the syntax hands them.
+[workspace.lints.clippy]
+approx_constant = "allow"
+excessive_precision = "allow"
+needless_range_loop = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

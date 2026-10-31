@@ -429,7 +429,7 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps> {
     let log2_ctb = log2_min_cb + r.ue()?;
     let log2_min_tb = r.ue()? + 2;
     let log2_max_tb = log2_min_tb + r.ue()?;
-    if log2_ctb > 6 || log2_ctb < 4 || log2_max_tb > 5 || log2_min_tb >= log2_min_cb {
+    if !(4..=6).contains(&log2_ctb) || log2_max_tb > 5 || log2_min_tb >= log2_min_cb {
         return Err(bad("block size limits are out of range"));
     }
     let max_th_depth_inter = r.ue()?;
@@ -1034,36 +1034,36 @@ mod tests {
         // no chroma location; three zero flags; no display window; timing (1/25) with HRD (NAL, one CPB,
         // fixed rate); bitstream restriction with five zero codes; then a marker bit
         let mut bits = String::new();
-        bits.push_str("1");
+        bits.push('1');
         bits.push_str("00000001");
-        bits.push_str("0");
-        bits.push_str("1");
+        bits.push('0');
+        bits.push('1');
         bits.push_str("1010");
-        bits.push_str("1");
+        bits.push('1');
         bits.push_str("000000010000000100000001");
-        bits.push_str("0");
+        bits.push('0');
         bits.push_str("000");
-        bits.push_str("0");
-        bits.push_str("1");
+        bits.push('0');
+        bits.push('1');
         bits.push_str(&format!("{:032b}{:032b}", 1, 25));
-        bits.push_str("0");
-        bits.push_str("1");
+        bits.push('0');
+        bits.push('1');
         bits.push_str("10"); // nal_hrd_parameters_present, vcl absent
-        bits.push_str("0"); // sub_pic_hrd_params_present_flag
+        bits.push('0'); // sub_pic_hrd_params_present_flag
         bits.push_str("00000000"); // bit_rate_scale, cpb_size_scale
         bits.push_str("000000000000000"); // delay lengths
-        bits.push_str("1"); // fixed_pic_rate_general_flag
-        bits.push_str("1"); // elemental_duration_in_tc_minus1 = 0
-        bits.push_str("1"); // cpb_cnt_minus1 = 0
-        bits.push_str("1"); // bit_rate_value_minus1
-        bits.push_str("1"); // cpb_size_value_minus1
-        bits.push_str("0"); // cbr_flag
-        bits.push_str("1");
+        bits.push('1'); // fixed_pic_rate_general_flag
+        bits.push('1'); // elemental_duration_in_tc_minus1 = 0
+        bits.push('1'); // cpb_cnt_minus1 = 0
+        bits.push('1'); // bit_rate_value_minus1
+        bits.push('1'); // cpb_size_value_minus1
+        bits.push('0'); // cbr_flag
+        bits.push('1');
         bits.push_str("000");
         bits.push_str("11111");
         let at = bits.len();
-        bits.push_str("1");
-        while bits.len() % 8 != 0 {
+        bits.push('1');
+        while !bits.len().is_multiple_of(8) {
             bits.push('0');
         }
         let bytes: Vec<u8> = bits.as_bytes().chunks(8).map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap(), 2).unwrap()).collect();

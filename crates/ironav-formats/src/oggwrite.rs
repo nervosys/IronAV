@@ -149,7 +149,7 @@ impl Muxer for OggWriter {
         tags.extend((vendor.len() as u32).to_le_bytes());
         tags.extend(vendor);
         tags.extend(0u32.to_le_bytes());
-        self.page(HEADER_BOS, 0, &[s.extradata.clone()])?;
+        self.page(HEADER_BOS, 0, std::slice::from_ref(&s.extradata))?;
         self.page(0, 0, &[tags])?;
         self.started = true;
         Ok(())

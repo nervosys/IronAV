@@ -21,7 +21,7 @@ impl Fft {
         let mut factors = Vec::new();
         let mut rest = m;
         for p in [5, 3, 2] {
-            while rest % p == 0 {
+            while rest.is_multiple_of(p) {
                 factors.push(p);
                 rest /= p;
             }

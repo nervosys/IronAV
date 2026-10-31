@@ -178,7 +178,7 @@ mod tests {
     /// An AAC-LC, 44.1 kHz, stereo frame of `body` payload bytes.
     fn frame(body: usize, crc: bool) -> Vec<u8> {
         let n = 7 + if crc { 2 } else { 0 } + body;
-        let mut f = vec![0xFF, 0xF0 | 1 - crc as u8, 0x50, 0x80, (n >> 3) as u8, ((n & 7) << 5) as u8 | 0x1F, 0xFC];
+        let mut f = vec![0xFF, 0xF0 | (1 - crc as u8), 0x50, 0x80, (n >> 3) as u8, ((n & 7) << 5) as u8 | 0x1F, 0xFC];
         f.resize(n, 0xAA);
         f
     }

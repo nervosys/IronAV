@@ -125,8 +125,8 @@ pub fn build_filter(name: &str, args: &Map<String, Value>) -> Result<Box<dyn Fil
             })?;
             let matrix = match num("matrix")? {
                 None => crate::pixconv::Matrix::Bt601,
-                Some(m) if m == 601.0 => crate::pixconv::Matrix::Bt601,
-                Some(m) if m == 709.0 => crate::pixconv::Matrix::Bt709,
+                Some(601.0) => crate::pixconv::Matrix::Bt601,
+                Some(709.0) => crate::pixconv::Matrix::Bt709,
                 Some(m) => return Err(Error::invalid_arg(format!("format.matrix must be 601 or 709, got {m}")).alternatives(["601", "709"])),
             };
             Box::new(crate::pixconv::Format { to, matrix })
@@ -135,7 +135,7 @@ pub fn build_filter(name: &str, args: &Map<String, Value>) -> Result<Box<dyn Fil
             let dim = |key: &str| -> Result<Option<u32>> {
                 match num(key)? {
                     None => Ok(None),
-                    Some(v) if v == 0.0 => Ok(None),
+                    Some(0.0) => Ok(None),
                     Some(v) if v.fract() == 0.0 && v > 0.0 && v <= u32::MAX as f64 => Ok(Some(v as u32)),
                     Some(v) => Err(Error::invalid_arg(format!("scale.{key} must be a whole number of pixels, got {v}"))),
                 }
@@ -185,7 +185,7 @@ impl Filter for Gray {
         let plane = match v.pix_fmt {
             PixelFormat::Rgb24 => v
                 .planes[0]
-                .chunks_exact(3)
+                .as_chunks::<3>().0.iter()
                 .map(|p| ((p[0] as u32 * 299 + p[1] as u32 * 587 + p[2] as u32 * 114 + 500) / 1000) as u8)
                 .collect(),
             _ => v.planes.into_iter().next().unwrap_or_default(),

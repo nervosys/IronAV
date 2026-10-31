@@ -379,12 +379,12 @@ impl TapFeeder {
         let pixels = match c.layout {
             PixelLayout::Rgb => px,
             PixelLayout::Bgr => {
-                for p in px.chunks_exact_mut(3) {
+                for p in px.as_chunks_mut::<3>().0 {
                     p.swap(0, 2);
                 }
                 px
             }
-            PixelLayout::Gray => px.chunks_exact(3).map(|p| ((p[0] as u32 * 77 + p[1] as u32 * 150 + p[2] as u32 * 29 + 128) >> 8) as u8).collect(),
+            PixelLayout::Gray => px.as_chunks::<3>().0.iter().map(|p| ((p[0] as u32 * 77 + p[1] as u32 * 150 + p[2] as u32 * 29 + 128) >> 8) as u8).collect(),
         };
         let layout = c.layout;
         self.give(t, clock, TapData::Video { width: w, height: h, layout, pixels });
@@ -504,7 +504,7 @@ mod tests {
     /// The share of the 20 ms frames of `x` (16 kHz) after its first second taken for speech.
     fn share(x: &[f32]) -> f32 {
         let mut d = SpeechFrames::new(16_000);
-        let flags: Vec<bool> = x.chunks_exact(320).map(|f| d.process(&f.iter().map(|&v| v as f64).collect::<Vec<f64>>())).collect();
+        let flags: Vec<bool> = x.as_chunks::<320>().0.iter().map(|f| d.process(&f.iter().map(|&v| v as f64).collect::<Vec<f64>>())).collect();
         flags[50..].iter().filter(|&&f| f).count() as f32 / (flags.len() - 50) as f32
     }
 

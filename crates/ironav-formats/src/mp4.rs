@@ -1006,7 +1006,7 @@ mod tests {
         let offs = |c: &[u8]| -> Vec<u64> { c[8..].chunks(8).map(|b| u64::from_be_bytes(b.try_into().unwrap())).collect() };
         let (v, a) = (offs(video_co), offs(audio_co));
         assert_eq!((v.len(), a.len()), (2, 2));
-        let mut all = vec![(v[0], 'v'), (v[1], 'v'), (a[0], 'a'), (a[1], 'a')];
+        let mut all = [(v[0], 'v'), (v[1], 'v'), (a[0], 'a'), (a[1], 'a')];
         all.sort();
         // Audio fills its second chunk just before video fills its own, so the order is a v a v.
         assert_eq!(all.iter().map(|x| x.1).collect::<String>(), "avav", "tracks should interleave");

@@ -12,6 +12,10 @@ readme = "../../README.md"
 keywords = ["video", "audio", "gui", "egui", "multimedia"]
 categories = ["multimedia::video", "multimedia::audio"]
 
+
+[lints]
+workspace = true
+
 [dependencies]
 serde_json.workspace = true
 ironav-core.workspace = true

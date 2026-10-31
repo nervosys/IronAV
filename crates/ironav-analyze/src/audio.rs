@@ -192,7 +192,7 @@ impl Loudness {
         if n >= 30 {
             self.short_term.push(mean(&self.blocks[n - 30..]));
         }
-        if n % 10 == 0 {
+        if n.is_multiple_of(10) {
             out.push(Observation::new("loudness", "loudness", t, json!({
                 "momentary_lufs": lufs_value(*self.momentary.last().unwrap_or(&0.0)),
                 "short_term_lufs": lufs_value(*self.short_term.last().unwrap_or(&0.0)),

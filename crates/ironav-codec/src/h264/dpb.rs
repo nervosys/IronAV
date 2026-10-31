@@ -216,6 +216,8 @@ impl Dpb {
             let mut pred = h.frame_num as i64;
             let max_pic_num = max_frame_num as i64;
             let mut idx = 0usize;
+            // idx is also read after the insert and bumped mid-body, so it stays a separate counter.
+            #[allow(clippy::explicit_counter_loop)]
             for &(idc, v) in &h.ref_mod.ops[l] {
                 if idx >= n {
                     break;
