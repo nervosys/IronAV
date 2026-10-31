@@ -13,6 +13,7 @@ pub mod vp9;
 pub mod jpeg;
 mod filters;
 pub mod mp3;
+pub mod mpeg4;
 pub mod opus;
 pub mod prores;
 pub mod vorbis;
@@ -57,6 +58,9 @@ pub fn implemented() -> Vec<CodecImpl> {
             }
             if c == CodecId::Alac {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-alac" });
+            }
+            if c == CodecId::Mpeg4 {
+                return Some(CodecImpl { codec: c, decode: true, encode: false, implementation: "ironav-mpeg4" });
             }
             if c == CodecId::ProRes {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-prores" });
@@ -172,6 +176,7 @@ pub fn new_decoder_for(s: &ironav_core::StreamInfo) -> Result<Box<dyn Decoder>> 
         CodecId::Vp9 => Ok(Box::new(vp9::Vp9Decoder::new())),
         CodecId::Mjpeg => Ok(Box::new(jpeg::JpegDecoder::new())),
         CodecId::ProRes => Ok(Box::new(prores::ProResDecoder::new())),
+        CodecId::Mpeg4 => Ok(Box::new(mpeg4::Mpeg4Decoder::new(&s.extradata))),
         _ => new_decoder(s.codec, &s.params, s.bits),
     }
 }

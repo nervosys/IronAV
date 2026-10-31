@@ -537,6 +537,11 @@ fn parse_trak(trak: &[u8], index: usize, samples: &mut Vec<Sample>) -> Result<Op
                 let is444 = matches!(&fourcc, b"ap4h" | b"ap4x");
                 Config { prefix: Vec::new(), nal_length: 0, bits: if is444 { 12 } else { 10 }, chroma: if is444 { 3 } else { 2 } }
             }
+            CodecId::Mpeg4 => {
+                // the decoder-specific info of the esds box holds the visual object and layer headers
+                extradata = esds_config(need(kids, b"esds", "the mp4v entry")?)?.1;
+                Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma: 1 }
+            }
             _ => Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma: 1 },
         };
         let total: i64 = samples[first..].iter().map(|s| s.duration as i64).sum();
@@ -679,9 +684,17 @@ fn sound_child<'a>(kids: &'a [u8], kind: &[u8; 4], within: &str) -> Result<&'a [
     }
 }
 
-/// The AudioSpecificConfig inside an `esds` box: ES descriptor (0x03) > decoder config (0x04,
-/// object type 0x40 = MPEG-4 AAC) > decoder specific info (0x05).
+/// The AudioSpecificConfig inside an `esds` box, which must be MPEG-4 AAC (object type 0x40).
 fn aac_config(esds: &[u8]) -> Result<Vec<u8>> {
+    match esds_config(esds)? {
+        (0x40, dsi) => Ok(dsi),
+        _ => Err(Error::new(ErrorCode::UnsupportedCodec, "the mp4a track is not MPEG-4 AAC (object type is not 0x40)")),
+    }
+}
+
+/// The object type and the decoder specific info of an `esds` box: ES descriptor (0x03) > decoder
+/// config (0x04) > decoder specific info (0x05). For MPEG-4 Visual the info is the VOS and VOL headers.
+fn esds_config(esds: &[u8]) -> Result<(u8, Vec<u8>)> {
     fn descriptor(d: &[u8], at: &mut usize) -> Result<(u8, usize)> {
         let tag = *d.get(*at).ok_or_else(|| corrupt("esds is cut short"))?;
         *at += 1;
@@ -717,15 +730,14 @@ fn aac_config(esds: &[u8]) -> Result<Vec<u8>> {
     if tag != 4 {
         return Err(corrupt("esds has no decoder configuration"));
     }
-    if d.get(at) != Some(&0x40) {
-        return Err(Error::new(ErrorCode::UnsupportedCodec, "the mp4a track is not MPEG-4 AAC (object type is not 0x40)"));
-    }
+    let object = *d.get(at).ok_or_else(|| corrupt("esds is cut short"))?;
     at += 13; // object type, stream type, buffer size, max and average bit rate
     let (tag, len) = descriptor(d, &mut at)?;
     if tag != 5 {
-        return Err(corrupt("esds has no AudioSpecificConfig"));
+        return Err(corrupt("esds has no decoder specific info"));
     }
-    d.get(at..at + len).map(<[u8]>::to_vec).ok_or_else(|| corrupt("AudioSpecificConfig runs past the esds box"))
+    let info = d.get(at..at + len).map(<[u8]>::to_vec).ok_or_else(|| corrupt("decoder specific info runs past the esds box"))?;
+    Ok((object, info))
 }
 
 fn push_start_coded(out: &mut Vec<u8>, nal: &[u8]) {

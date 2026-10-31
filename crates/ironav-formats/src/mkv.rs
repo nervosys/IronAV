@@ -619,6 +619,10 @@ fn build_track(t: &MkTrack, index: usize, frames: &[&Frame], scale: u64, samples
                 let (bits, chroma) = vp9.unwrap_or((8, 1));
                 Config { prefix: Vec::new(), nal_length: 0, bits, chroma }
             }
+            CodecId::Mpeg4 => {
+                extradata = t.private.clone();
+                Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma: 1 }
+            }
             CodecId::Av1 if !t.private.is_empty() => {
                 extradata = t.private.clone();
                 av1c_config(&t.private)?

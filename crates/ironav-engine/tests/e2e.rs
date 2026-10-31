@@ -434,7 +434,7 @@ fn schema_and_ontology_know_hardware_codecs() {
     let o = ontology();
     let h264 = o.get("codec/h264").expect("h264 entity");
     assert_eq!(h264.status, ironav_ontology::Status::Implemented);
-    assert!(o.get("codec/mpeg4").is_some_and(|e| e.status == ironav_ontology::Status::Planned));
+    assert!(o.get("codec/mpeg4").is_some_and(|e| e.status == ironav_ontology::Status::Implemented));
     // AV1 has no software codec; it is usable only where the NVDEC provider is compiled in.
     let av1 = o.get("codec/av1").expect("av1 entity");
     let gpu = cfg!(any(windows, target_os = "linux"));
