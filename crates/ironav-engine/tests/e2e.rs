@@ -1581,7 +1581,7 @@ fn luma_psnr(a: &[u8], b: &[u8], w: usize, h: usize) -> f64 {
     10.0 * (255.0f64 * 255.0 / mse.max(1e-9)).log10()
 }
 
-/// Encodes `src` to `out` with the VP9 encoder (key frames only) at `qp` and returns the size of the file.
+/// Encodes `src` to `out` with the VP9 encoder at `qp` (key frames, then inter frames) and returns the size of the file.
 fn vp9_encode(src: &Path, out: &Path, qp: u8) -> u64 {
     let mut j = job(src, out);
     j.hwaccel = "off".into();
@@ -1589,6 +1589,28 @@ fn vp9_encode(src: &Path, out: &Path, qp: u8) -> u64 {
     j.video.qp = Some(qp);
     run(&j, &mut |_| {}).unwrap();
     std::fs::metadata(out).unwrap().len()
+}
+
+/// Inter frames make the VP9 stream smaller than the same frames coded alone (all key frames).
+#[test]
+fn vp9_inter_frames_make_the_stream_smaller_than_key_frames_alone() {
+    if !ffmpeg_available() {
+        eprintln!("skipped: ffmpeg is not on PATH");
+        return;
+    }
+    let dir = scratch("vp9-inter-size");
+    let (w, h, n) = (176, 144, 10);
+    let frames = moving_pattern(w, h, n);
+    let all = dir.join("all.y4m");
+    write_y4m_frames(&all, w, h, &frames);
+    let together = vp9_encode(&all, &dir.join("all.webm"), 30);
+    let mut alone = 0;
+    for (t, fr) in frames.iter().enumerate() {
+        let one = dir.join(format!("one{t}.y4m"));
+        write_y4m_frames(&one, w, h, std::slice::from_ref(fr));
+        alone += vp9_encode(&one, &dir.join(format!("one{t}.webm")), 30);
+    }
+    assert!(together * 10 < alone * 8, "{together} bytes with inter frames, {alone} as key frames only");
 }
 
 /// VP9 written by IronAV, in WebM, Matroska and MP4, decodes to the same pictures in IronAV and in
@@ -1600,7 +1622,7 @@ fn vp9_encoded_files_decode_to_what_ffmpeg_decodes() {
         return;
     }
     let dir = scratch("vp9-enc");
-    let (w, h, n) = (177, 99, 6);
+    let (w, h, n) = (177, 99, 12);
     let frames = moving_pattern(w, h, n);
     let src = dir.join("src.y4m");
     write_y4m_frames(&src, w, h, &frames);

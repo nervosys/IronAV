@@ -287,7 +287,7 @@ impl Dec {
         }
     }
 
-    fn mc_l(&mut self, r: &Pic, avg: bool, x: usize, y: usize, mv: Mv, bw: usize, bh: usize) {
+    pub(super) fn mc_l(&mut self, r: &Pic, avg: bool, x: usize, y: usize, mv: Mv, bw: usize, bh: usize) {
         let f = self.b.filter as usize;
         self.mc_block(0, r, x, y, mv.x as i32 * 2, mv.y as i32 * 2, bw, bh, r.w as i32, r.h as i32, f, avg);
     }
@@ -304,7 +304,7 @@ impl Dec {
         }
     }
 
-    fn inter_pred(&mut self) {
+    pub(super) fn inter_pred(&mut self) {
         let (row, col) = (self.row, self.col);
         let b = self.b;
         let bs = b.bs;

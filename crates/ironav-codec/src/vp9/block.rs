@@ -865,7 +865,6 @@ impl Dec {
         self.row = row;
         self.col = col;
         let row7 = row & 7;
-        let col7 = col & 7;
 
         self.min_mv = Mv32 { x: -(128 + col as i32 * 64), y: -(128 + row as i32 * 64) };
         self.max_mv = Mv32 { x: 128 + (self.cols as i32 - col as i32 - w4 as i32) * 64, y: 128 + (self.rows as i32 - row as i32 - h4 as i32) * 64 };
@@ -909,7 +908,18 @@ impl Dec {
             self.inter_recon()?;
         }
 
+        self.lf_masks();
+        Ok(())
+    }
+
+    /// Records the loop filter level and edge masks of the block at `self.row` and `self.col`, which
+    /// has its size, modes, skip flag and transform size set.
+    pub(super) fn lf_masks(&mut self) {
         let b = self.b;
+        let (row, col) = (self.row, self.col);
+        let (row7, col7) = (row & 7, col & 7);
+        let w4 = BWH_TAB[1][b.bs][0] as usize;
+        let h4 = BWH_TAB[1][b.bs][1] as usize;
         let lvl = if self.h.lf_level != 0 {
             self.h.seg.feat[b.seg_id].lflvl[if b.intra { 0 } else { b.refs[0] + 1 }][(b.mode[3] != ZEROMV) as usize]
         } else {
@@ -945,7 +955,6 @@ impl Dec {
                 );
             }
         }
-        Ok(())
     }
 }
 

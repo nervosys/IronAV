@@ -15,7 +15,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   Motion-JPEG, AAC-LC with HE-AAC v1, MP3 (MPEG-1/2/2.5 Layer III), Vorbis, Opus (SILK, CELT and hybrid)
   FLAC (4 to 32 bits) and ALAC (16 to 24 bits, mono and stereo).
 - **Codecs (encoders):** software HEVC (Main profile, 8-bit 4:2:0: 32x32 coding tree units, CABAC, intra and P pictures with merge and skip, AMVP motion, quarter-sample search, deblocking, rate control by QP or bit rate; MP4 and Matroska), software H.264 (Constrained Baseline, then Main with CABAC and High with the 8x8
-  transform, B pictures, rate-distortion mode decisions), VP8 (key and inter frames, quarter-pixel motion, rate control), VP9 (key frames only, profile 0, WebM, Matroska and MP4), AAC-LC with an ADTS writer, MP3 Layer III with
+  transform, B pictures, rate-distortion mode decisions), VP8 (key and inter frames, quarter-pixel motion, rate control), VP9 (key and inter frames, profile 0, WebM, Matroska and MP4), AAC-LC with an ADTS writer, MP3 Layer III with
   an MP3 writer, Vorbis, Opus (CELT, wideband SILK, hybrid, DTX, in-band FEC, automatic mode switching,
   2.5 to 60 ms frames; the CLI and job JSON select the mode, signal, frame size, FEC and DTX), JPEG and Motion-JPEG, FLAC, and
   ALAC (16 and 24 bits, mono and stereo).

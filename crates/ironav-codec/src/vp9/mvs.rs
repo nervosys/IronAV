@@ -200,6 +200,25 @@ impl Dec {
         if sign { -(n + 1) } else { n + 1 }
     }
 
+    /// The candidate motion of `mode` (NEARESTMV, NEARMV or NEWMV) for reference `k`, and whether high
+    /// precision applies: the base that a coded NEWMV difference is added to.
+    pub(super) fn base_mv(&self, mode: u8, k: usize, sb: i32) -> (Mv, bool) {
+        let mut mv = self.find_ref_mvs(self.b.refs[k] as i8, k, mode == NEARMV, if mode == NEWMV { -1 } else { sb });
+        let mut hp = false;
+        if mode == NEWMV || sb == -1 {
+            hp = self.h.highprecisionmvs && mv.x.abs() < 64 && mv.y.abs() < 64;
+            if !hp {
+                if mv.y & 1 != 0 {
+                    mv.y += if mv.y < 0 { 1 } else { -1 };
+                }
+                if mv.x & 1 != 0 {
+                    mv.x += if mv.x < 0 { 1 } else { -1 };
+                }
+            }
+        }
+        (mv, hp)
+    }
+
     /// Motion vector(s) of a block (or sub-block `sb`, or -1 for the whole block) coded as `mode`.
     pub fn fill_mv(&mut self, mode: u8, sb: i32) -> [Mv; 2] {
         let mut out = [Mv::default(); 2];
@@ -208,19 +227,7 @@ impl Dec {
         }
         let nref = if self.b.comp { 2 } else { 1 };
         for k in 0..nref {
-            let mut mv = self.find_ref_mvs(self.b.refs[k] as i8, k, mode == NEARMV, if mode == NEWMV { -1 } else { sb });
-            let mut hp = false;
-            if mode == NEWMV || sb == -1 {
-                hp = self.h.highprecisionmvs && mv.x.abs() < 64 && mv.y.abs() < 64;
-                if !hp {
-                    if mv.y & 1 != 0 {
-                        mv.y += if mv.y < 0 { 1 } else { -1 };
-                    }
-                    if mv.x & 1 != 0 {
-                        mv.x += if mv.x < 0 { 1 } else { -1 };
-                    }
-                }
-            }
+            let (mut mv, hp) = self.base_mv(mode, k, sb);
             if mode == NEWMV {
                 let j = self.c.tree(&MV_JOINT_TREE, &self.p.mv_joint);
                 self.counts.mv_joint[j] += 1;
