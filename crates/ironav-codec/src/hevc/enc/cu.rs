@@ -40,6 +40,9 @@ pub struct Cu {
     pub chroma_mode: u32,
     pub mvp: usize,
     pub mvd: [i32; 2],
+    /// A skipped unit (merge, no residual), or a merged unit with its candidate index.
+    pub skip: bool,
+    pub merge_idx: Option<u32>,
     pub luma: Vec<Blk>,
     pub cb: Blk,
     pub cr: Blk,
@@ -71,6 +74,9 @@ struct Saved {
 /// A rate term: the bits a candidate costs, weighted by lambda into the distortion's units.
 const SIDE_INTRA: f64 = 10.0;
 const SIDE_INTER: f64 = 6.0;
+/// Scales HM's lambda (for squared error) up: the decisions measure absolute differences, and the
+/// bits are estimates, so a stronger rate weight measures smaller at equal PSNR.
+const LAMBDA_SCALE: f64 = 2.0;
 
 /// Chroma quantisation parameter for a luma one (Table 8-10, 8-bit 4:2:0).
 pub fn chroma_qp(qp: i32) -> i32 {
@@ -88,30 +94,26 @@ pub fn chroma_qp(qp: i32) -> i32 {
 fn forward(r: &[f32], log2: u32, dst: bool) -> Vec<f32> {
     let n = 1usize << log2;
     let step = 32 >> log2;
-    let m = |j: usize, i: usize| -> f32 {
-        if dst {
-            DST4[j][i] as f32
-        } else {
-            TRANSFORM[j * step][i] as f32
+    // m[j][i]: basis function j at sample i
+    let mut m = [0f32; 1024];
+    for j in 0..n {
+        for i in 0..n {
+            m[j * n + i] = if dst { DST4[j][i] as f32 } else { TRANSFORM[j * step][i] as f32 };
         }
-    };
-    let mut tmp = vec![0f32; n * n];
+    }
+    let mut tmp = [0f32; 1024];
     for k in 0..n {
-        for x in 0..n {
-            let mut s = 0f32;
-            for y in 0..n {
-                s += m(k, y) * r[y * n + x];
+        for y in 0..n {
+            let a = m[k * n + y];
+            for x in 0..n {
+                tmp[k * n + x] += a * r[y * n + x];
             }
-            tmp[k * n + x] = s;
         }
     }
     let mut out = vec![0f32; n * n];
     for k in 0..n {
         for l in 0..n {
-            let mut s = 0f32;
-            for x in 0..n {
-                s += m(l, x) * tmp[k * n + x];
-            }
+            let s: f32 = (0..n).map(|x| m[l * n + x] * tmp[k * n + x]).sum();
             out[k * n + l] = s;
         }
     }
@@ -164,7 +166,7 @@ impl<'a> SliceCoder<'a> {
             ref_poc,
             pic: CurPic::new(sps, 0, poc),
             qp,
-            lambda: 0.57 * 2f64.powf((qp as f64 - 12.0) / 3.0),
+            lambda: LAMBDA_SCALE * 0.57 * 2f64.powf((qp as f64 - 12.0) / 3.0),
             slice_addr,
             slice_idx,
             p_slice: refp.is_some(),
@@ -274,7 +276,7 @@ impl<'a> SliceCoder<'a> {
     /// Records a coding unit's state over its area: prediction mode, intra modes, motion, depth,
     /// the luma coefficient flags of its transform blocks and their edges.
     #[allow(clippy::too_many_arguments)]
-    fn set_meta(&mut self, x: usize, y: usize, log2: u32, depth: u32, intra: bool, mode: u32, mv: MvField, tus: &[(usize, usize, u32, bool)]) {
+    fn set_meta(&mut self, x: usize, y: usize, log2: u32, depth: u32, intra: bool, mode: u32, mv: MvField, tus: &[(usize, usize, u32, bool)], skip: bool) {
         let n = 1usize << log2;
         let (pred, ipm) = if intra { (PRED_INTRA, mode as u8) } else { (PRED_INTER, 1) };
         for yy in (y >> 2)..((y + n) >> 2) {
@@ -282,7 +284,7 @@ impl<'a> SliceCoder<'a> {
                 let i = yy * self.w4 + xx;
                 let p = &mut self.pic;
                 p.pred_mode[i] = pred;
-                p.skip[i] = 0;
+                p.skip[i] = skip as u8;
                 p.ct_depth[i] = depth as u8;
                 p.ipm[i] = ipm;
                 p.qp[i] = self.qp as i8;
@@ -465,7 +467,8 @@ impl<'a> SliceCoder<'a> {
         let qp = if c == 0 { self.qp } else { chroma_qp(self.qp) };
         let step = 16.0 * LEVEL_SCALE[(qp % 6) as usize] as f32 * (1u32 << (qp / 6)) as f32 / (1u32 << (log2 + 3)) as f32;
         let scale = 1.0 / (32.0 * (n * n) as f32);
-        let off = if intra { 0.4 } else { 0.3 };
+        // HM's rounding offsets: a dead zone for intra (1/3) and inter (1/6) residuals
+        let off = if intra { 1.0 / 3.0 } else { 1.0 / 6.0 };
         let lv: Vec<i32> = f
             .iter()
             .map(|&v| {
@@ -514,6 +517,10 @@ impl<'a> SliceCoder<'a> {
         if !can_split {
             return (lc, Node::Leaf(Box::new(leaf)));
         }
+        // a skipped unit is not split further
+        if matches!(&leaf, Cu { skip: true, .. }) {
+            return (lc, Node::Leaf(Box::new(leaf)));
+        }
         let after_leaf = self.save(x, y, n);
         self.restore(&before, x, y, n);
         let (sc, node) = self.split(x, y, log2, depth, self.lambda);
@@ -549,7 +556,10 @@ impl<'a> SliceCoder<'a> {
         let after_intra = self.save(x, y, n);
         self.restore(&before, x, y, n);
         match self.eval_inter(x, y, log2, depth) {
-            Some((cp, cu_p)) if cp < ci => (cp, cu_p),
+            Some((cp, cu_p, after)) if cp < ci => {
+                self.restore(&after, x, y, n);
+                (cp, cu_p)
+            }
             _ => {
                 self.restore(&after_intra, x, y, n);
                 (ci, cu_i)
@@ -557,8 +567,26 @@ impl<'a> SliceCoder<'a> {
         }
     }
 
+    /// An intra unit, unsplit or (for 8x8 units) with four 4x4 luma transforms, whichever costs less.
     fn eval_intra(&mut self, x: usize, y: usize, log2: u32, depth: u32) -> (f64, Cu) {
-        let split = log2 == LOG2_MIN_CB;
+        if log2 > LOG2_MIN_CB {
+            return self.intra_cu(x, y, log2, depth, false);
+        }
+        let n = 1usize << log2;
+        let before = self.save(x, y, n);
+        let (c0, cu0) = self.intra_cu(x, y, log2, depth, false);
+        let after = self.save(x, y, n);
+        self.restore(&before, x, y, n);
+        let (c1, cu1) = self.intra_cu(x, y, log2, depth, true);
+        if c0 <= c1 {
+            self.restore(&after, x, y, n);
+            (c0, cu0)
+        } else {
+            (c1, cu1)
+        }
+    }
+
+    fn intra_cu(&mut self, x: usize, y: usize, log2: u32, depth: u32, split: bool) -> (f64, Cu) {
         let mode = self.pick_luma(x, y, log2);
         let cl = if split { 2 } else { log2 - 1 };
         let (cidc, cmode) = self.pick_chroma(x / 2, y / 2, cl, mode);
@@ -584,13 +612,13 @@ impl<'a> SliceCoder<'a> {
         }
         let (prev_flag, mpm_idx, rem) = self.mpm(x, y, mode);
         let rects: Vec<(usize, usize, u32, bool)> = tus.iter().zip(&luma).map(|(&(tx, ty, tl), b)| (tx, ty, tl, b.cbf)).collect();
-        self.set_meta(x, y, log2, depth, true, mode, MvField::default(), &rects);
+        self.set_meta(x, y, log2, depth, true, mode, MvField::default(), &rects, false);
         let cost = dist + self.lambda * (bits + SIDE_INTRA);
         let cr = chroma.pop().unwrap_or_default();
         let cb = chroma.pop().unwrap_or_default();
         (
             cost,
-            Cu { log2, intra: true, split_tu: split, prev_flag, mpm_idx, rem, luma_mode: mode, chroma_idc: cidc, chroma_mode: cmode, mvp: 0, mvd: [0, 0], luma, cb, cr },
+            Cu { log2, intra: true, split_tu: split, prev_flag, mpm_idx, rem, luma_mode: mode, chroma_idc: cidc, chroma_mode: cmode, mvp: 0, mvd: [0, 0], skip: false, merge_idx: None, luma, cb, cr },
         )
     }
 
@@ -684,15 +712,15 @@ impl<'a> SliceCoder<'a> {
                 *best = mv;
             }
         };
-        for dy in -4i16..=4 {
-            for dx in -4i16..=4 {
-                try_mv([dx * 4, dy * 4], &mut best, &mut bc);
-            }
-        }
         for c in cands {
             try_mv([(c[0] >> 2) << 2, (c[1] >> 2) << 2], &mut best, &mut bc);
         }
-        for _ in 0..8 {
+        for dy in -2i16..=2 {
+            for dx in -2i16..=2 {
+                try_mv([dx * 4, dy * 4], &mut best, &mut bc);
+            }
+        }
+        for _ in 0..16 {
             let centre = best;
             for (dx, dy) in [(4i16, 0i16), (-4, 0), (0, 4), (0, -4)] {
                 try_mv([centre[0] + dx, centre[1] + dy], &mut best, &mut bc);
@@ -730,15 +758,46 @@ impl<'a> SliceCoder<'a> {
         }
     }
 
-    fn eval_inter(&mut self, x: usize, y: usize, log2: u32, depth: u32) -> Option<(f64, Cu)> {
-        self.refp?;
+    /// The merge candidates' motion vectors for the `n` square at (`x`, `y`): for a P slice of one
+    /// reference, the spatial candidates (8.5.3.2.3 to 8.5.3.2.5) then zero candidates, five in all.
+    fn merge_mvs(&self, x: usize, y: usize, n: usize) -> Vec<[i16; 2]> {
+        let (xi, yi, ni) = (x as i32, y as i32, n as i32);
+        let get = |xn: i32, yn: i32| -> Option<[i16; 2]> {
+            if self.avail(x, y, xn, yn) && self.pic.pred_mode[self.i4(xn as usize, yn as usize)] == PRED_INTER {
+                Some(self.pic.frame.mv[self.i4(xn as usize, yn as usize)].mv[0])
+            } else {
+                None
+            }
+        };
+        let a1 = get(xi - 1, yi + ni - 1);
+        let b1 = get(xi + ni - 1, yi - 1);
+        let b0 = get(xi + ni, yi - 1);
+        let a0 = get(xi - 1, yi + ni);
+        let b2 = get(xi - 1, yi - 1);
+        let mut list: Vec<[i16; 2]> = Vec::with_capacity(5);
+        list.extend(a1);
+        if let Some(c) = b1.filter(|&c| a1 != Some(c)) {
+            list.push(c);
+        }
+        if let Some(c) = b0.filter(|&c| b1 != Some(c)) {
+            list.push(c);
+        }
+        if let Some(c) = a0.filter(|&c| a1 != Some(c)) {
+            list.push(c);
+        }
+        if let Some(c) = b2.filter(|&c| list.len() < 4 && a1 != Some(c) && b1 != Some(c)) {
+            list.push(c);
+        }
+        list.resize(5, [0, 0]);
+        list
+    }
+
+    /// Motion-compensated prediction and residual of a unit with motion `mvf`, costed. `merge` is the
+    /// merge index; otherwise the AMVP predictor index `mvp`, difference `mvd` and their `mvbits`.
+    #[allow(clippy::too_many_arguments)]
+    fn code_inter(&mut self, x: usize, y: usize, log2: u32, depth: u32, mvf: MvField, merge: Option<u32>, mvp: usize, mvd: [i32; 2], mvbits: f64) -> (f64, Cu) {
         let n = 1usize << log2;
-        let cands = self.amvp(x, y, n);
-        let mv = self.motion_search(x, y, n, &cands);
-        let dist_to = |c: [i16; 2]| (mv[0] as i32 - c[0] as i32).abs() + (mv[1] as i32 - c[1] as i32).abs();
-        let mvp = if dist_to(cands[0]) <= dist_to(cands[1]) { 0 } else { 1 };
-        let mvd = [mv[0] as i32 - cands[mvp][0] as i32, mv[1] as i32 - cands[mvp][1] as i32];
-        self.inter_pred(x, y, n, mv);
+        self.inter_pred(x, y, n, mvf.mv[0]);
         let (mut dist, mut bits) = (0.0, 0.0);
         let (lb, d, r) = self.residual_block(0, x, y, log2, false);
         dist += d;
@@ -752,12 +811,48 @@ impl<'a> SliceCoder<'a> {
         }
         let cr = chroma.pop().unwrap_or_default();
         let cb = chroma.pop().unwrap_or_default();
-        let mvbits: f64 = mvd.iter().map(|&v| if v == 0 { 1.0 } else { 2.0 + 2.0 * (v.unsigned_abs() as f64).log2() }).sum();
+        let skip = merge.is_some() && !(lb.cbf || cb.cbf || cr.cbf);
         let tus = [(x, y, log2, lb.cbf)];
-        let mvf = MvField { mv: [mv, [0, 0]], ref_idx: [0, -1], ref_poc: [self.ref_poc, 0], pred: 1 };
-        self.set_meta(x, y, log2, depth, false, 1, mvf, &tus);
+        self.set_meta(x, y, log2, depth, false, 1, mvf, &tus, skip);
         let cost = dist + self.lambda * (bits + mvbits + SIDE_INTER);
-        Some((cost, Cu { log2, intra: false, split_tu: false, prev_flag: false, mpm_idx: 0, rem: 0, luma_mode: 1, chroma_idc: 4, chroma_mode: 1, mvp, mvd, luma: vec![lb], cb, cr }))
+        (cost, Cu { log2, intra: false, split_tu: false, prev_flag: false, mpm_idx: 0, rem: 0, luma_mode: 1, chroma_idc: 4, chroma_mode: 1, mvp, mvd, skip, merge_idx: merge, luma: vec![lb], cb, cr })
+    }
+
+    /// The best inter unit at (`x`, `y`) among the merge candidates and the AMVP motion search, with
+    /// its reconstruction saved.
+    fn eval_inter(&mut self, x: usize, y: usize, log2: u32, depth: u32) -> Option<(f64, Cu, Saved)> {
+        self.refp?;
+        let n = 1usize << log2;
+        let mut best: Option<(f64, Cu, Saved)> = None;
+        let mut tried: Vec<[i16; 2]> = Vec::with_capacity(5);
+        for (k, mv) in self.merge_mvs(x, y, n).into_iter().enumerate() {
+            if tried.contains(&mv) {
+                continue;
+            }
+            tried.push(mv);
+            let mvf = MvField { mv: [mv, [0, 0]], ref_idx: [0, -1], ref_poc: [self.ref_poc, 0], pred: 1 };
+            let mvbits = if k == 0 { 1.0 } else { k as f64 + 1.0 };
+            let (c, cu) = self.code_inter(x, y, log2, depth, mvf, Some(k as u32), 0, [0, 0], mvbits);
+            if best.as_ref().is_none_or(|b| c < b.0) {
+                best = Some((c, cu, self.save(x, y, n)));
+            }
+        }
+        // early out: a skipped merge candidate is the cheapest unit to code, so no motion search
+        if best.as_ref().is_some_and(|b| b.1.skip) {
+            return best;
+        }
+        let cands = self.amvp(x, y, n);
+        let mv = self.motion_search(x, y, n, &cands);
+        let dist_to = |c: [i16; 2]| (mv[0] as i32 - c[0] as i32).abs() + (mv[1] as i32 - c[1] as i32).abs();
+        let mvp = if dist_to(cands[0]) <= dist_to(cands[1]) { 0 } else { 1 };
+        let mvd = [mv[0] as i32 - cands[mvp][0] as i32, mv[1] as i32 - cands[mvp][1] as i32];
+        let mvbits: f64 = mvd.iter().map(|&v| if v == 0 { 1.0 } else { 2.0 + 2.0 * (v.unsigned_abs() as f64).log2() }).sum();
+        let mvf = MvField { mv: [mv, [0, 0]], ref_idx: [0, -1], ref_poc: [self.ref_poc, 0], pred: 1 };
+        let (c, cu) = self.code_inter(x, y, log2, depth, mvf, None, mvp, mvd, mvbits);
+        if best.as_ref().is_none_or(|b| c < b.0) {
+            best = Some((c, cu, self.save(x, y, n)));
+        }
+        best
     }
 
     // ------------------------------------------------------------ syntax
@@ -785,7 +880,7 @@ impl<'a> SliceCoder<'a> {
                 if coded {
                     e.decision(SPLIT_CODING_UNIT_FLAG_OFFSET + self.split_inc(x, y, depth), 0);
                 }
-                self.write_cu(e, cu);
+                self.write_cu(e, cu, x, y);
             }
         }
     }
@@ -801,9 +896,39 @@ impl<'a> SliceCoder<'a> {
         inc
     }
 
-    fn write_cu(&self, e: &mut CabacEnc, cu: &Cu) {
+    /// The merge index: truncated unary over five candidates, the first bin in its own context.
+    fn write_merge_idx(&self, e: &mut CabacEnc, idx: u32) {
+        if idx == 0 {
+            e.decision(MERGE_IDX_OFFSET, 0);
+            return;
+        }
+        e.decision(MERGE_IDX_OFFSET, 1);
+        for _ in 1..idx {
+            e.bypass(1);
+        }
+        if idx < 4 {
+            e.bypass(0);
+        }
+    }
+
+    fn skip_inc(&self, x: usize, y: usize) -> usize {
+        let mut inc = 0;
+        if self.avail(x, y, x as i32 - 1, y as i32) && self.pic.skip[self.i4(x - 1, y)] != 0 {
+            inc += 1;
+        }
+        if self.avail(x, y, x as i32, y as i32 - 1) && self.pic.skip[self.i4(x, y - 1)] != 0 {
+            inc += 1;
+        }
+        inc
+    }
+
+    fn write_cu(&self, e: &mut CabacEnc, cu: &Cu, x: usize, y: usize) {
         if self.p_slice {
-            e.decision(SKIP_FLAG_OFFSET, 0);
+            e.decision(SKIP_FLAG_OFFSET + self.skip_inc(x, y), cu.skip as u32);
+            if cu.skip {
+                self.write_merge_idx(e, cu.merge_idx.unwrap_or(0));
+                return;
+            }
             e.decision(PRED_MODE_FLAG_OFFSET, cu.intra as u32);
         }
         if !cu.intra || cu.log2 == LOG2_MIN_CB {
@@ -832,6 +957,10 @@ impl<'a> SliceCoder<'a> {
                 e.decision(INTRA_CHROMA_PRED_MODE_OFFSET, 1);
                 e.bypass_bits(cu.chroma_idc, 2);
             }
+        } else if let Some(idx) = cu.merge_idx {
+            // a merged 2Nx2N unit with a residual: rqt_root_cbf is inferred to be 1
+            e.decision(MERGE_FLAG_OFFSET, 1);
+            self.write_merge_idx(e, idx);
         } else {
             e.decision(MERGE_FLAG_OFFSET, 0);
             self.write_mvd(e, cu.mvd);

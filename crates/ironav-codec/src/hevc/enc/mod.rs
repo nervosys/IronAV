@@ -2,9 +2,11 @@
 //! IDR pictures and P pictures that each refer to the one before, so the stream is low-delay and
 //! needs no reordering. Coding tree units are 32x32, split into coding units of 8x8 to 32x32 by a
 //! rate-distortion decision on the actual reconstruction. Intra units choose one of the 35 modes
-//! (a coarse search then refinement) and a chroma mode; inter units use one motion vector per unit
-//! with quarter-sample refinement, coded with AMVP (merge is not used). Residuals are transformed,
-//! quantised flat by QP and coded with CABAC. The loop filter is the deblocking filter; SAO is off.
+//! (a coarse search then refinement) and a chroma mode, and 8x8 units choose one transform or four.
+//! Inter units are merged (spatial candidates; a merged unit without residual is skipped) or use one
+//! motion vector per unit with quarter-sample refinement, coded with AMVP. Residuals are transformed,
+//! quantised with a dead zone by QP and coded with CABAC. The loop filter is the deblocking filter;
+//! SAO is off.
 //! Slices (rows of CTBs) are coded on threads. Output is Annex B with VPS, SPS and PPS ahead of
 //! every IDR picture; the sample-entry configuration is in-band, as for H.264.
 //!
@@ -118,8 +120,8 @@ impl HevcEncoder {
             refs: None,
             count: 0,
             idr_at: 0,
-            // a slice per eight CTB rows or so: more slices lose too much prediction across their edges
-            slices: std::thread::available_parallelism().map_or(1, |n| n.get()).min(((ph / (1 << LOG2_CTB)) / 8).max(1)),
+            // a slice per four CTB rows or so: more slices lose too much prediction across their edges
+            slices: std::thread::available_parallelism().map_or(1, |n| n.get()).min(((ph / (1 << LOG2_CTB)) / 4).max(1)),
             #[cfg(test)]
             recon: Vec::new(),
         })

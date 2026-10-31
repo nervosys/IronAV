@@ -161,7 +161,7 @@ pub fn slice_header(first: bool, addr: usize, nctb: usize, idr: bool, poc: u32, 
         w.put(8, poc & 255); // slice_pic_order_cnt_lsb
         w.flag(true); // short_term_ref_pic_set_sps_flag; the one set takes no index bits
         w.flag(false); // num_ref_idx_active_override_flag
-        w.ue(4); // five_minus_max_num_merge_cand
+        w.ue(0); // five_minus_max_num_merge_cand
     }
     w.se(qp - 26); // slice_qp_delta
     w.flag(true); // slice_loop_filter_across_slices_enabled_flag

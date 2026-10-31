@@ -532,7 +532,8 @@ impl<'a> Dec<'a> {
 fn interpolate<const T: usize>(src: &[u16], pw: usize, ph: usize, ix: i32, iy: i32, cx: Option<&[i8; T]>, cy: Option<&[i8; T]>, bw: usize, bh: usize, bd: u32, out: &mut [i16]) {
     let before = (T / 2 - 1) as i32;
     let (pwid, phgt) = (bw + T - 1, bh + T - 1);
-    let mut pad = [0u16; 71 * 71];
+    // buffers sized to the block: zeroing a fixed 71x71 array per call dominates small blocks
+    let mut pad = vec![0u16; pwid * phgt];
     let (x0, y0) = (ix - before, iy - before);
     let inside_x = x0 >= 0 && x0 as usize + pwid <= pw;
     for r in 0..phgt {
@@ -582,7 +583,7 @@ fn interpolate<const T: usize>(src: &[u16], pw: usize, ph: usize, ix: i32, iy: i
             }
         }
         (Some(cx), Some(cy)) => {
-            let mut tmp = [0i32; 71 * 64];
+            let mut tmp = vec![0i32; phgt * bw];
             for y in 0..phgt {
                 let row = &pad[y * pwid..(y + 1) * pwid];
                 for x in 0..bw {
