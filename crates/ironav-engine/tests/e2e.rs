@@ -227,6 +227,10 @@ fn ontology_is_consistent_with_registries() {
     for c in ironav_core::CodecId::ALL {
         assert!(o.get(&format!("codec/{}", c.name())).is_some());
     }
+    for f in ironav_formats::FORMATS {
+        let e = o.get(&format!("container/{}", f.name)).expect("a registered container is in the ontology");
+        assert_eq!(serde_json::to_value(e.status).unwrap(), "implemented", "{}", f.name);
+    }
     for r in o.relations() {
         assert!(o.get(&r.subject).is_some(), "dangling subject {}", r.subject);
         assert!(o.get(&r.object).is_some(), "dangling object {}", r.object);
