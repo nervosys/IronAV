@@ -104,12 +104,14 @@ transmitters and lists those that answer, with their device service URLs and the
 `onvif_profiles` (`ironav onvif URL --user U --password P`) asks one camera for its maker, model and firmware and for
 each media profile (Media service version 1, or version 2 when that is all the camera offers): the encoding, size,
 frame rate and bitrate, the RTSP URI for `stream_open` (add the credentials to it) and a JPEG snapshot URI. Credentials
-go as a WS-Security password digest dated by the camera's own clock, which it is asked for first; a camera that wants
-HTTP digest authentication instead is not supported yet. Its connections go through the same allow-list as a source's.
+go as a WS-Security password digest dated by the camera's own clock, which it is asked for first. Its connections go
+through the same allow-list as a source's.
 `http://host[:port]/path` plays HLS when it names a playlist (the highest-bandwidth variant of those whose `CODECS` IronAV
 decodes, no taller than `?height=` when given; TS or fMP4 segments with
 `EXT-X-MAP` and byte ranges; a live playlist is followed from three segments before its end), and downloads anything
-else as it arrives. A variant whose audio is a separate rendition (`EXT-X-MEDIA` with `TYPE=AUDIO`) plays with it: the
+else as it arrives. Credentials in the URL (`http://user:password@host/...`) answer a Basic or Digest challenge (Digest
+is preferred, and its password is never sent; the answer is reused for the host's later requests). SHA-256 Digest is
+not supported. A variant whose audio is a separate rendition (`EXT-X-MEDIA` with `TYPE=AUDIO`) plays with it: the
 default one, or the one `?audio=` names by language or name (`?audio=fr`). The two playlists are fetched side by side
 and their packets merged in time order; packed AAC with Apple's ID3 timestamp lines up with the video. Encrypted
 playlists are not supported. A variant with WebVTT subtitles (`TYPE=SUBTITLES`) has them followed as well: the default

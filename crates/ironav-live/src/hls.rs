@@ -640,6 +640,7 @@ impl Read for HlsReader {
 mod tests {
     use super::*;
     use crate::source::Chunk;
+    use crate::md5::md5_hex;
     use std::collections::HashMap;
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
@@ -675,10 +676,14 @@ mod tests {
                         range = Some((a.parse::<usize>().unwrap(), b.parse::<usize>().unwrap()));
                     }
                 }
-                on_get(&path, &routes);
-                // everything under /r/ needs credentials
-                let body = if path.starts_with("/r/") && !authorized { None } else { routes.lock().unwrap().get(&path).cloned() };
                 let mut c = c;
+                // everything under /r/ needs credentials, asked for by a challenge
+                if path.starts_with("/r/") && !authorized {
+                    let _ = write!(c, "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"r\"\r\nContent-Length: 0\r\n\r\n");
+                    continue;
+                }
+                on_get(&path, &routes);
+                let body = routes.lock().unwrap().get(&path).cloned();
                 match body {
                     Some(b) if b.starts_with(b">") => {
                         let _ = write!(c, "HTTP/1.1 302 Found\r\nLocation: {}\r\nContent-Length: 0\r\n\r\n", String::from_utf8_lossy(&b[1..]));
@@ -974,6 +979,122 @@ s1.vtt
         });
         let got = drain(&format!("http://u:p@127.0.0.1:{port}/r/index.m3u8"), Duration::from_secs(20)).unwrap();
         assert_eq!(String::from_utf8_lossy(&got), "[100][101][102][103][0][1][2]");
+    }
+
+    /// A Digest server for user "u" (realm "r", MD5, qop auth) with password `pass`, serving `routes`.
+    /// The request for `rotate`, if any, first moves it to nonce "n2", which makes the client's nonce
+    /// stale. Each request is logged as "path status nonce nc", status being challenge, stale, ok or bad.
+    fn digest_server(routes: Routes, pass: &'static str, rotate: Option<&'static str>) -> (u16, Arc<Mutex<Vec<String>>>) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let log: Arc<Mutex<Vec<String>>> = Default::default();
+        let seen = log.clone();
+        std::thread::spawn(move || {
+            let mut nonce = "n1";
+            for c in l.incoming() {
+                let Ok(mut c) = c else { return };
+                let mut r = BufReader::new(c.try_clone().unwrap());
+                let mut first = String::new();
+                if r.read_line(&mut first).is_err() {
+                    continue;
+                }
+                let path = first.split_whitespace().nth(1).unwrap_or("/").to_string();
+                if rotate == Some(path.as_str()) {
+                    nonce = "n2";
+                }
+                let mut auth = String::new();
+                loop {
+                    let mut h = String::new();
+                    if r.read_line(&mut h).unwrap_or(0) == 0 || h.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(v) = h.trim().strip_prefix("Authorization: Digest ") {
+                        auth = v.to_string();
+                    }
+                }
+                let p: HashMap<String, String> = auth.split(", ").filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_string(), v.trim_matches('"').to_string())).collect();
+                let get = |k: &str| p.get(k).cloned().unwrap_or_default();
+                let (client_nonce, nc, cnonce) = (get("nonce"), get("nc"), get("cnonce"));
+                let ha1 = md5_hex(format!("u:r:{pass}").as_bytes());
+                let ha2 = md5_hex(format!("GET:{path}").as_bytes());
+                let want = md5_hex(format!("{ha1}:{client_nonce}:{nc}:{cnonce}:auth:{ha2}").as_bytes());
+                let status = if auth.is_empty() {
+                    "challenge"
+                } else if client_nonce != nonce {
+                    "stale"
+                } else if get("username") == "u" && get("response") == want && get("uri") == path {
+                    "ok"
+                } else {
+                    "bad"
+                };
+                seen.lock().unwrap().push(format!("{path} {status} {client_nonce} {nc}"));
+                let challenge = |extra: &str| format!("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Digest realm=\"r\", qop=\"auth\", algorithm=MD5, opaque=\"o\", nonce=\"{nonce}\"{extra}\r\nContent-Length: 0\r\n\r\n");
+                let _ = match status {
+                    "ok" => match routes.lock().unwrap().get(&path).cloned() {
+                        Some(b) => {
+                            let mut resp = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", b.len()).into_bytes();
+                            resp.extend(b);
+                            c.write_all(&resp)
+                        }
+                        None => c.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"),
+                    },
+                    "stale" => c.write_all(challenge(", stale=true").as_bytes()),
+                    _ => c.write_all(challenge("").as_bytes()),
+                };
+            }
+        });
+        (port, log)
+    }
+
+    #[test]
+    fn digest_is_answered_once_and_the_nonce_is_reused() {
+        let routes: Routes = Default::default();
+        {
+            let mut r = routes.lock().unwrap();
+            r.insert("/d/index.m3u8".into(), b"#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\ns0.ts\n#EXTINF:1,\ns1.ts\n#EXT-X-ENDLIST\n".to_vec());
+            r.insert("/d/s0.ts".into(), b"A".to_vec());
+            r.insert("/d/s1.ts".into(), b"B".to_vec());
+        }
+        let (port, log) = digest_server(routes, "p", None);
+        let got = drain(&format!("http://u:p@127.0.0.1:{port}/d/index.m3u8"), Duration::from_secs(10)).unwrap();
+        assert_eq!(got, b"AB");
+        let log = log.lock().unwrap().clone();
+        assert_eq!(log.iter().filter(|l| l.contains(" challenge ")).count(), 1, "{log:?}");
+        // the requests after the challenge all carry its nonce, with the count going up by one each time
+        let oks: Vec<Vec<&str>> = log.iter().map(|l| l.split_whitespace().collect::<Vec<&str>>()).filter(|f| f[1] == "ok").collect();
+        assert!(oks.len() >= 3, "{log:?}");
+        assert!(oks.iter().all(|f| f[2] == "n1"), "{log:?}");
+        let ncs: Vec<String> = oks.iter().map(|f| f[3].to_string()).collect();
+        assert_eq!(ncs, (1..=ncs.len()).map(|k| format!("{k:08x}")).collect::<Vec<_>>(), "{log:?}");
+    }
+
+    #[test]
+    fn a_stale_nonce_is_answered_with_the_new_one() {
+        let routes: Routes = Default::default();
+        {
+            let mut r = routes.lock().unwrap();
+            r.insert("/d/index.m3u8".into(), b"#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\ns0.ts\n#EXTINF:1,\ns1.ts\n#EXT-X-ENDLIST\n".to_vec());
+            r.insert("/d/s0.ts".into(), b"A".to_vec());
+            r.insert("/d/s1.ts".into(), b"B".to_vec());
+        }
+        let (port, log) = digest_server(routes, "p", Some("/d/s1.ts"));
+        let got = drain(&format!("http://u:p@127.0.0.1:{port}/d/index.m3u8"), Duration::from_secs(10)).unwrap();
+        assert_eq!(got, b"AB");
+        let log = log.lock().unwrap().clone();
+        assert_eq!(log.iter().filter(|l| l.starts_with("/d/s1.ts stale n1 ")).count(), 1, "{log:?}");
+        assert!(log.iter().any(|l| l.starts_with("/d/s1.ts ok n2 00000001")), "{log:?}");
+    }
+
+    #[test]
+    fn a_wrong_password_is_refused_without_showing_it() {
+        let routes: Routes = Default::default();
+        routes.lock().unwrap().insert("/d/index.m3u8".into(), b"#EXTM3U\n#EXT-X-ENDLIST\n".to_vec());
+        let (port, log) = digest_server(routes, "secret-pass", None);
+        let e = drain(&format!("http://u:wrong-pass@127.0.0.1:{port}/d/index.m3u8"), Duration::from_secs(10)).unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("refused the username and password"), "{msg}");
+        assert!(!msg.contains("wrong-pass") && !msg.contains("secret-pass"), "{msg}");
+        assert!(log.lock().unwrap().iter().all(|l| !l.contains(" ok ")));
     }
 
     #[test]

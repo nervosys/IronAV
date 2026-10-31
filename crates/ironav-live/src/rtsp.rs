@@ -11,7 +11,7 @@
 //! frame as it arrived. RTSP replies on the same connection are taken out. While playing it sends
 //! a keepalive at half the session timeout, and TEARDOWN when it is dropped.
 
-use crate::md5::md5_hex;
+use crate::auth::{choose, Auth};
 use crate::net::{self, Allow};
 use crate::source::{Chunk, Source, SourceInfo};
 use crate::url::{percent_decode, split_authority, SourceUrl};
@@ -105,97 +105,6 @@ enum Message {
     Response(Response),
     /// A request from the server (ANNOUNCE, GET_PARAMETER, ...), which needs no answer here.
     Request,
-}
-
-enum Auth {
-    Basic(String),
-    Digest { user: String, pass: String, realm: String, nonce: String, opaque: Option<String>, qop: bool, nc: u32 },
-}
-
-impl Auth {
-    /// The credentials answering `challenge` (a `WWW-Authenticate` value), if it is one we speak.
-    fn answer(challenge: &str, user: &str, pass: &str) -> Option<Auth> {
-        let (scheme, params) = challenge.trim().split_once(' ').unwrap_or((challenge.trim(), ""));
-        if scheme.eq_ignore_ascii_case("basic") {
-            return Some(Auth::Basic(format!("Basic {}", base64(format!("{user}:{pass}").as_bytes()))));
-        }
-        if !scheme.eq_ignore_ascii_case("digest") {
-            return None;
-        }
-        let p = auth_params(params);
-        let get = |k: &str| p.iter().find(|(n, _)| n.eq_ignore_ascii_case(k)).map(|(_, v)| v.clone());
-        if get("algorithm").is_some_and(|a| !a.eq_ignore_ascii_case("md5")) {
-            return None;
-        }
-        Some(Auth::Digest {
-            user: user.into(),
-            pass: pass.into(),
-            realm: get("realm")?,
-            nonce: get("nonce")?,
-            opaque: get("opaque"),
-            qop: get("qop").is_some_and(|q| q.split(',').any(|o| o.trim().eq_ignore_ascii_case("auth"))),
-            nc: 0,
-        })
-    }
-
-    fn header(&mut self, method: &str, uri: &str) -> String {
-        match self {
-            Auth::Basic(h) => h.clone(),
-            Auth::Digest { user, pass, realm, nonce, opaque, qop, nc } => {
-                let ha1 = md5_hex(format!("{user}:{realm}:{pass}").as_bytes());
-                let ha2 = md5_hex(format!("{method}:{uri}").as_bytes());
-                let mut h = format!("Digest username=\"{user}\", realm=\"{realm}\", nonce=\"{nonce}\", uri=\"{uri}\"");
-                if *qop {
-                    *nc += 1;
-                    let cnonce = md5_hex(format!("{nonce}{nc}{:?}", Instant::now()).as_bytes())[..16].to_string();
-                    let response = md5_hex(format!("{ha1}:{nonce}:{nc:08x}:{cnonce}:auth:{ha2}").as_bytes());
-                    h += &format!(", response=\"{response}\", qop=auth, nc={nc:08x}, cnonce=\"{cnonce}\"");
-                } else {
-                    h += &format!(", response=\"{}\"", md5_hex(format!("{ha1}:{nonce}:{ha2}").as_bytes()));
-                }
-                if let Some(o) = opaque {
-                    h += &format!(", opaque=\"{o}\"");
-                }
-                h
-            }
-        }
-    }
-}
-
-/// `name=value` pairs of an authentication challenge; values may be quoted and hold commas.
-fn auth_params(s: &str) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    let mut rest = s.trim();
-    while !rest.is_empty() {
-        let Some((name, after)) = rest.split_once('=') else { break };
-        let after = after.trim_start();
-        let (value, tail) = if let Some(q) = after.strip_prefix('"') {
-            match q.find('"') {
-                Some(e) => (&q[..e], &q[e + 1..]),
-                None => (q, ""),
-            }
-        } else {
-            match after.find(',') {
-                Some(e) => (&after[..e], &after[e..]),
-                None => (after, ""),
-            }
-        };
-        out.push((name.trim().trim_start_matches(',').trim().to_string(), value.to_string()));
-        rest = tail.trim_start().trim_start_matches(',').trim_start();
-    }
-    out
-}
-
-fn base64(d: &[u8]) -> String {
-    const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut s = String::new();
-    for c in d.chunks(3) {
-        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
-        for i in 0..4 {
-            s.push(if i <= c.len() { A[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
-        }
-    }
-    s
 }
 
 /// A track's URL: its control attribute against the base.
@@ -464,7 +373,7 @@ impl RtspSource {
                 return Err(Error::new(ErrorCode::InvalidArgument, format!("{shown} asks for credentials")).hint("put them in the URL: rtsp://user:password@host/path"));
             };
             let challenges: Vec<String> = r.all("www-authenticate").map(str::to_string).collect();
-            self.auth = Some(choose_auth(&challenges, &user, &pass).map_err(|why| Error::new(ErrorCode::UnsupportedFormat, format!("{shown} {why}")))?);
+            self.auth = Some(choose(&challenges, &user, &pass).map_err(|why| Error::new(ErrorCode::UnsupportedFormat, format!("{shown} {why}")))?);
             answered = true;
         }
     }
@@ -563,17 +472,6 @@ fn param<'a>(value: &'a str, name: &str) -> Option<&'a str> {
         let (k, v) = p.trim().split_once('=')?;
         k.trim().eq_ignore_ascii_case(name).then_some(v.trim())
     })
-}
-
-/// The answer to a 401's challenges. Digest is preferred, since it does not send the password; if
-/// the server offers Digest only in a form IronAV does not speak, the password is not sent in the
-/// clear instead, even if Basic is offered too.
-fn choose_auth(challenges: &[String], user: &str, pass: &str) -> std::result::Result<Auth, String> {
-    let digest: Vec<&String> = challenges.iter().filter(|c| c.trim_start().to_ascii_lowercase().starts_with("digest")).collect();
-    if !digest.is_empty() {
-        return digest.iter().find_map(|c| Auth::answer(c, user, pass)).ok_or_else(|| format!("asks for Digest authentication in a form IronAV does not speak ({}), and the password is not sent in the clear instead", digest.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("; ")));
-    }
-    challenges.iter().find_map(|c| Auth::answer(c, user, pass)).ok_or_else(|| format!("asks for an authentication scheme IronAV does not speak: {}", challenges.join("; ")))
 }
 
 fn status_error(r: &Response, method: &str, shown: &str) -> Error {
@@ -693,6 +591,7 @@ impl Drop for RtspSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::md5::md5_hex;
     use std::net::TcpListener;
     use std::sync::mpsc;
 
@@ -717,11 +616,11 @@ mod tests {
         let want = md5_hex(format!("{}:n:{}", md5_hex(b"u:r:p"), md5_hex(b"DESCRIBE:rtsp://h/s")).as_bytes());
         assert!(a.header("DESCRIBE", "rtsp://h/s").contains(&format!("response=\"{want}\"")));
         assert_eq!(Auth::answer("Basic realm=\"x\"", "Aladdin", "open sesame").unwrap().header("X", "y"), "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==");
-        assert!(Auth::answer("Digest realm=\"r\", nonce=\"n\", algorithm=SHA-256", "u", "p").is_none());
+        assert!(Auth::answer("Digest realm=\"r\", nonce=\"n\", algorithm=SHA-256", "u", "p").is_err());
         // Digest in a form we do not speak does not fall back to Basic
         let offered = ["Digest realm=\"r\", nonce=\"n\", algorithm=SHA-256".to_string(), "Basic realm=\"r\"".to_string()];
-        assert!(choose_auth(&offered, "u", "p").is_err());
-        assert!(matches!(choose_auth(&offered[1..], "u", "p"), Ok(Auth::Basic(_))));
+        assert!(choose(&offered, "u", "p").is_err());
+        assert!(matches!(choose(&offered[1..], "u", "p"), Ok(Auth::Basic(_))));
         assert_eq!(param("RTP/AVP/TCP;unicast;Interleaved=4-5", "interleaved"), Some("4-5"));
 
         // a password with an unescaped '/' is taken whole, and redirects keep credentials only on the same server

@@ -3,11 +3,14 @@
 //! the connection closes, byte ranges, and timeouts on every read and write. HTTPS goes through
 //! [`tls`](crate::tls), and a redirect from it to plain HTTP is refused.
 
+use crate::auth::{choose, Auth};
 use crate::net::{self, Allow};
 use crate::tls::{self, Conn};
 use crate::url::{percent_decode, redact, split_authority};
 use ironav_core::{Error, ErrorCode, Result};
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -238,56 +241,91 @@ pub(crate) fn post(url: &str, content_type: &str, body: &[u8], allow: &Allow, ma
     Ok((status, r.bytes(max)?))
 }
 
+/// A host, the scheme it was reached by, and the credentials: the answer to its last challenge.
+type Key = (bool, String, u16, String, String);
+
+/// The answers to challenges, kept for the rest of the process so that each request after the first
+/// to a host is sent with them, and needs no round trip (a Digest nonce's count goes up each time).
+static ANSWERS: Mutex<BTreeMap<Key, Auth>> = Mutex::new(BTreeMap::new());
+
+fn key(u: &HttpUrl) -> Option<Key> {
+    u.user.as_ref().map(|(user, pass)| (u.tls, u.host.to_ascii_lowercase(), u.port, user.clone(), pass.clone()))
+}
+
+fn answers() -> MutexGuard<'static, BTreeMap<Key, Auth>> {
+    ANSWERS.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// One connection's request, sent with `authz` as its `Authorization`, and the answer's head.
+fn exchange(u: &HttpUrl, shown: &str, method: &str, payload: Option<(&str, &[u8])>, range: Option<(u64, u64)>, authz: Option<&str>, allow: &Allow) -> Result<(u16, Vec<(String, String)>, BufReader<Conn>)> {
+    let tcp = net::connect(&u.host, u.port, CONNECT_TIMEOUT, allow, shown)?;
+    let mut conn = if u.tls { tls::connect(tcp, &u.host, Some(b"http/1.1"), shown)? } else { Conn::Plain(tcp) };
+    conn.tcp().set_read_timeout(Some(IO_TIMEOUT))?;
+    conn.tcp().set_write_timeout(Some(IO_TIMEOUT))?;
+    let mut req = format!("{method} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {USER_AGENT}\r\nAccept: */*\r\nConnection: close\r\n", u.path, u.authority);
+    if let Some((ct, body)) = payload {
+        req += &format!("Content-Type: {ct}\r\nContent-Length: {}\r\n", body.len());
+    }
+    if let Some(a) = authz {
+        req += &format!("Authorization: {a}\r\n");
+    }
+    if let Some((first, last)) = range {
+        req += &format!("Range: bytes={first}-{last}\r\n");
+    }
+    req += "\r\n";
+    conn.write_all(req.as_bytes())?;
+    if let Some((_, body)) = payload {
+        conn.write_all(body)?;
+    }
+    let mut conn = BufReader::new(conn);
+    let mut size = 0;
+    // interim answers (100 Continue, 103 Early Hints) come before the real one
+    loop {
+        let mut status_line = String::new();
+        (&mut conn).take(8192).read_line(&mut status_line)?;
+        let status: u16 = status_line.split_whitespace().nth(1).and_then(|s| s.parse().ok()).filter(|_| status_line.starts_with("HTTP/1.")).ok_or_else(|| Error::new(ErrorCode::Io, format!("{shown} did not answer in HTTP/1.x")))?;
+        let mut headers = Vec::new();
+        size += status_line.len();
+        loop {
+            let mut line = String::new();
+            let n = (&mut conn).take(8192).read_line(&mut line)?;
+            size += n;
+            if n == 0 || line.trim().is_empty() {
+                break;
+            }
+            if size > MAX_HEADER {
+                return Err(Error::invalid_input(format!("{shown} sent more than {} KiB of headers", MAX_HEADER >> 10)));
+            }
+            if let Some((k, v)) = line.split_once(':') {
+                headers.push((k.trim().to_string(), v.trim().to_string()));
+            }
+        }
+        if !(100..200).contains(&status) {
+            return Ok((status, headers, conn));
+        }
+    }
+}
+
 fn request(url: &str, method: &str, payload: Option<(&str, &[u8])>, range: Option<(u64, u64)>, allow: &Allow, errors: bool) -> Result<(u16, Response)> {
     let mut u = HttpUrl::parse(url)?;
     for _ in 0..=MAX_REDIRECTS {
         let shown = redact(&u.plain());
-        let tcp = net::connect(&u.host, u.port, CONNECT_TIMEOUT, allow, &shown)?;
-        let mut conn = if u.tls { tls::connect(tcp, &u.host, Some(b"http/1.1"), &shown)? } else { Conn::Plain(tcp) };
-        conn.tcp().set_read_timeout(Some(IO_TIMEOUT))?;
-        conn.tcp().set_write_timeout(Some(IO_TIMEOUT))?;
-        let mut req = format!("{method} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {USER_AGENT}\r\nAccept: */*\r\nConnection: close\r\n", u.path, u.authority);
-        if let Some((ct, body)) = payload {
-            req += &format!("Content-Type: {ct}\r\nContent-Length: {}\r\n", body.len());
-        }
-        if let Some((user, pass)) = &u.user {
-            req += &format!("Authorization: Basic {}\r\n", base64(format!("{user}:{pass}").as_bytes()));
-        }
-        if let Some((first, last)) = range {
-            req += &format!("Range: bytes={first}-{last}\r\n");
-        }
-        req += "\r\n";
-        conn.write_all(req.as_bytes())?;
-        if let Some((_, body)) = payload {
-            conn.write_all(body)?;
-        }
-        let mut conn = BufReader::new(conn);
-        let mut size = 0;
-        // interim answers (100 Continue, 103 Early Hints) come before the real one
-        let (status, headers) = loop {
-            let mut status_line = String::new();
-            (&mut conn).take(8192).read_line(&mut status_line)?;
-            let status: u16 = status_line.split_whitespace().nth(1).and_then(|s| s.parse().ok()).filter(|_| status_line.starts_with("HTTP/1.")).ok_or_else(|| Error::new(ErrorCode::Io, format!("{shown} did not answer in HTTP/1.x")))?;
-            let mut headers = Vec::new();
-            size += status_line.len();
-            loop {
-                let mut line = String::new();
-                let n = (&mut conn).take(8192).read_line(&mut line)?;
-                size += n;
-                if n == 0 || line.trim().is_empty() {
-                    break;
-                }
-                if size > MAX_HEADER {
-                    return Err(Error::invalid_input(format!("{shown} sent more than {} KiB of headers", MAX_HEADER >> 10)));
-                }
-                if let Some((k, v)) = line.split_once(':') {
-                    headers.push((k.trim().to_string(), v.trim().to_string()));
-                }
+        let key = key(&u);
+        let authz = key.as_ref().and_then(|k| answers().get_mut(k).map(|a| a.header(method, &u.path)));
+        let (mut status, mut headers, mut conn) = exchange(&u, &shown, method, payload, range, authz.as_deref(), allow)?;
+        // one retry, answering the challenge (Digest preferred to Basic)
+        if let (401, Some(k), Some((user, pass))) = (status, &key, &u.user) {
+            let challenges: Vec<String> = headers.iter().filter(|(n, _)| n.eq_ignore_ascii_case("www-authenticate")).map(|(_, v)| v.clone()).collect();
+            if !challenges.is_empty() {
+                let mut auth = choose(&challenges, user, pass).map_err(|why| Error::new(ErrorCode::Io, format!("{shown} {why}")))?;
+                let authz = auth.header(method, &u.path);
+                answers().insert(k.clone(), auth);
+                (status, headers, conn) = exchange(&u, &shown, method, payload, range, Some(&authz), allow)?;
             }
-            if !(100..200).contains(&status) {
-                break (status, headers);
-            }
-        };
+        }
+        if status == 401 && key.is_some() && errors {
+            return Err(Error::new(ErrorCode::Io, format!("{shown} refused the username and password")));
+        }
         let header = |n: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.clone());
         if matches!(status, 301 | 302 | 303 | 307 | 308) {
             // only 307 and 308 keep the method and body
