@@ -7,42 +7,50 @@ fn clip1(v: i32, bd: u32) -> u16 {
     v.clamp(0, (1 << bd) - 1) as u16
 }
 
-/// Filters `lines` sample lines across one edge. `pos` is the first q0 sample, `xs` the step
-/// across the edge and `ys` the step along it.
+/// Filters the sample lines across one edge: four segments of `per_bs` lines, each with its own
+/// boundary strength in `bs`. `pos` is the first q0 sample, `xs` the step across the edge and `ys`
+/// the step along it.
 #[allow(clippy::too_many_arguments)]
-fn filter_edge(pl: &mut [u16], pos: usize, xs: usize, ys: usize, lines: usize, bs: &[u8; 4], per_bs: usize, alpha: i32, beta: i32, index_a: usize, chroma: bool, bd: u32, keep: (bool, bool)) {
+fn filter_edge(pl: &mut [u16], pos: usize, xs: usize, ys: usize, per_bs: usize, bs: &[u8; 4], alpha: i32, beta: i32, index_a: usize, chroma: bool, bd: u32, keep: (bool, bool)) {
     if alpha == 0 || beta == 0 {
         return;
     }
-    for k in 0..lines {
-        let b = bs[k / per_bs];
+    let n = if chroma { 1 } else { 3 };
+    // I_PCM and lossless samples are put back after filtering; only then are they read out
+    let restore = keep.0 || keep.1;
+    for (s, &b) in bs.iter().enumerate() {
         if b == 0 {
             continue;
         }
-        let q = pos + k * ys;
-        let n = if chroma { 1 } else { 3 };
-        let (mut sp, mut sq) = ([0u16; 3], [0u16; 3]);
-        if keep.0 || keep.1 {
-            for i in 0..n {
-                sp[i] = pl[q - (i + 1) * xs];
-                sq[i] = pl[q + i * xs];
+        let tc0 = if b < 4 { (TC0[index_a][b as usize].max(0) as i32) << (bd - 8) } else { 0 };
+        for k in s * per_bs..(s + 1) * per_bs {
+            let q = pos + k * ys;
+            let (mut sp, mut sq) = ([0u16; 3], [0u16; 3]);
+            if restore {
+                for i in 0..n {
+                    sp[i] = pl[q - (i + 1) * xs];
+                    sq[i] = pl[q + i * xs];
+                }
             }
-        }
-        filter_line(pl, q, xs, b, alpha, beta, index_a, chroma, bd);
-        for i in 0..n {
-            if keep.0 {
-                pl[q - (i + 1) * xs] = sp[i];
-            }
-            if keep.1 {
-                pl[q + i * xs] = sq[i];
+            filter_line(pl, q, xs, b, tc0, alpha, beta, chroma, bd);
+            if restore {
+                for i in 0..n {
+                    if keep.0 {
+                        pl[q - (i + 1) * xs] = sp[i];
+                    }
+                    if keep.1 {
+                        pl[q + i * xs] = sq[i];
+                    }
+                }
             }
         }
     }
 }
 
-/// Filters the sample line through `q`, the first sample past the edge, with boundary strength `b`.
+/// Filters the sample line through `q`, the first sample past the edge, with boundary strength `b`;
+/// `tc0` is the clipping threshold for `b` below 4.
 #[allow(clippy::too_many_arguments)]
-fn filter_line(pl: &mut [u16], q: usize, xs: usize, b: u8, alpha: i32, beta: i32, index_a: usize, chroma: bool, bd: u32) {
+fn filter_line(pl: &mut [u16], q: usize, xs: usize, b: u8, tc0: i32, alpha: i32, beta: i32, chroma: bool, bd: u32) {
     let p0 = pl[q - xs] as i32;
     let q0 = pl[q] as i32;
     let p1 = pl[q - 2 * xs] as i32;
@@ -52,7 +60,7 @@ fn filter_line(pl: &mut [u16], q: usize, xs: usize, b: u8, alpha: i32, beta: i32
     }
     if chroma {
         if b < 4 {
-            let tc = ((TC0[index_a][b as usize].max(0) as i32) << (bd - 8)) + 1;
+            let tc = tc0 + 1;
             let delta = ((((q0 - p0) << 2) + (p1 - q1) + 4) >> 3).clamp(-tc, tc);
             pl[q - xs] = clip1(p0 + delta, bd);
             pl[q] = clip1(q0 - delta, bd);
@@ -67,7 +75,6 @@ fn filter_line(pl: &mut [u16], q: usize, xs: usize, b: u8, alpha: i32, beta: i32
     let ap = (p2 - p0).abs();
     let aq = (q2 - q0).abs();
     if b < 4 {
-        let tc0 = (TC0[index_a][b as usize].max(0) as i32) << (bd - 8);
         let tc = tc0 + (ap < beta) as i32 + (aq < beta) as i32;
         let delta = ((((q0 - p0) << 2) + (p1 - q1) + 4) >> 3).clamp(-tc, tc);
         pl[q - xs] = clip1(p0 + delta, bd);
@@ -172,7 +179,7 @@ pub fn deblock_picture(pic: &mut Picture, bd: u32) {
     for mby in 0..h {
         for mbx in 0..w {
             let idx = mby * w + mbx;
-            let m = pic.mbs[idx];
+            let m = &pic.mbs[idx];
             if m.slice == 0 {
                 continue;
             }
@@ -183,41 +190,40 @@ pub fn deblock_picture(pic: &mut Picture, bd: u32) {
             let usable = |o: &MbInfo| o.slice != 0 && (sp.disable_deblocking == 0 || o.slice == m.slice);
             let left_ok = mbx > 0 && usable(&pic.mbs[idx - 1]);
             let top_ok = mby > 0 && usable(&pic.mbs[idx - w]);
-            let left = if mbx > 0 { pic.mbs[idx - 1] } else { m };
-            let top = if mby > 0 { pic.mbs[idx - w] } else { m };
-            // luma, and Cb and Cr filtered the same way in 4:4:4
-            for pl in 0..if pic.cf == 3 { 3 } else { 1 } {
-            let off = if pl > 0 { pic.slices[m.slice as usize - 1].chroma_qp_offset[pl - 1] } else { 0 };
+            // the macroblocks on the far side of the left and top edges (`m` itself at the picture edge)
+            let edge_mb = [if mbx > 0 { &pic.mbs[idx - 1] } else { m }, if mby > 0 { &pic.mbs[idx - w] } else { m }];
+            // boundary strengths depend on the macroblocks only, so all planes and chroma share them
+            let mut bs = [[[0u8; 4]; 4]; 2];
             for dir in 0..2 {
                 for e in 0..4usize {
-                    if e == 0 && !(if dir == 0 { left_ok } else { top_ok }) {
-                        continue;
-                    }
-                    if m.t8x8 && e & 1 == 1 {
-                        continue;
-                    }
-                    let other = if e == 0 {
-                        if dir == 0 {
-                            &left
-                        } else {
-                            &top
-                        }
-                    } else {
-                        &m
-                    };
-                    let bs = strength(&m, other, dir, e);
-                    let qpav = if pl == 0 { (other.qp as i32 + m.qp as i32 + 1) >> 1 } else { (chroma_qp(other.qp as i32, off, bd) + chroma_qp(m.qp as i32, off, bd) + 1) >> 1 };
-                    let ia = (qpav + sp.alpha_offset).clamp(0, 51) as usize;
-                    let ib = (qpav + sp.beta_offset).clamp(0, 51) as usize;
-                    let (alpha, beta) = ((ALPHA[ia] as i32) << (bd - 8), (BETA[ib] as i32) << (bd - 8));
-                    let (x0, y0) = (mbx * 16, mby * 16);
-                    if dir == 0 {
-                        filter_edge(&mut pic.planes[pl], y0 * ls + x0 + e * 4, 1, ls, 16, &bs, 4, alpha, beta, ia, false, bd, (other.keep, m.keep));
-                    } else {
-                        filter_edge(&mut pic.planes[pl], (y0 + e * 4) * ls + x0, ls, 1, 16, &bs, 4, alpha, beta, ia, false, bd, (other.keep, m.keep));
-                    }
+                    let other = if e == 0 { edge_mb[dir] } else { m };
+                    bs[dir][e] = strength(m, other, dir, e);
                 }
             }
+            // luma, and Cb and Cr filtered the same way in 4:4:4
+            for pl in 0..if pic.cf == 3 { 3 } else { 1 } {
+                let off = if pl > 0 { sp.chroma_qp_offset[pl - 1] } else { 0 };
+                for dir in 0..2 {
+                    for e in 0..4usize {
+                        if e == 0 && !(if dir == 0 { left_ok } else { top_ok }) {
+                            continue;
+                        }
+                        if m.t8x8 && e & 1 == 1 {
+                            continue;
+                        }
+                        let other = if e == 0 { edge_mb[dir] } else { m };
+                        let qpav = if pl == 0 { (other.qp as i32 + m.qp as i32 + 1) >> 1 } else { (chroma_qp(other.qp as i32, off, bd) + chroma_qp(m.qp as i32, off, bd) + 1) >> 1 };
+                        let ia = (qpav + sp.alpha_offset).clamp(0, 51) as usize;
+                        let ib = (qpav + sp.beta_offset).clamp(0, 51) as usize;
+                        let (alpha, beta) = ((ALPHA[ia] as i32) << (bd - 8), (BETA[ib] as i32) << (bd - 8));
+                        let (x0, y0) = (mbx * 16, mby * 16);
+                        if dir == 0 {
+                            filter_edge(&mut pic.planes[pl], y0 * ls + x0 + e * 4, 1, ls, 4, &bs[dir][e], alpha, beta, ia, false, bd, (other.keep, m.keep));
+                        } else {
+                            filter_edge(&mut pic.planes[pl], (y0 + e * 4) * ls + x0, ls, 1, 4, &bs[dir][e], alpha, beta, ia, false, bd, (other.keep, m.keep));
+                        }
+                    }
+                }
             }
             // chroma: vertical edges at 0 and 4, horizontal edges every 4 rows (every 4 chroma rows of
             // 4:2:2, every 8 luma rows of 4:2:0); each takes the strength of the luma edge it lines up with
@@ -226,34 +232,25 @@ pub fn deblock_picture(pic: &mut Picture, bd: u32) {
             }
             let chh = pic.ch;
             for comp in 0..2usize {
-                let off = pic.slices[m.slice as usize - 1].chroma_qp_offset[comp];
+                let off = sp.chroma_qp_offset[comp];
                 for dir in 0..2 {
                     let edges: &[usize] = if dir == 1 && chh == 16 { &[0, 1, 2, 3] } else { &[0, 2] };
                     for &e in edges {
                         if e == 0 && !(if dir == 0 { left_ok } else { top_ok }) {
                             continue;
                         }
-                        let other = if e == 0 {
-                            if dir == 0 {
-                                &left
-                            } else {
-                                &top
-                            }
-                        } else {
-                            &m
-                        };
-                        let bs = strength(&m, other, dir, e);
+                        let other = if e == 0 { edge_mb[dir] } else { m };
                         let qpav = (chroma_qp(other.qp as i32, off, bd) + chroma_qp(m.qp as i32, off, bd) + 1) >> 1;
                         let ia = (qpav + sp.alpha_offset).clamp(0, 51) as usize;
                         let ib = (qpav + sp.beta_offset).clamp(0, 51) as usize;
                         let (alpha, beta) = ((ALPHA[ia] as i32) << (bd - 8), (BETA[ib] as i32) << (bd - 8));
                         let (x0, y0) = (mbx * 8, mby * chh);
                         if dir == 0 {
-                            filter_edge(&mut pic.planes[1 + comp], y0 * cs + x0 + e * 2, 1, cs, chh, &bs, chh / 4, alpha, beta, ia, true, bd, (other.keep, m.keep));
+                            filter_edge(&mut pic.planes[1 + comp], y0 * cs + x0 + e * 2, 1, cs, chh / 4, &bs[dir][e], alpha, beta, ia, true, bd, (other.keep, m.keep));
                         } else if chh == 16 {
-                            filter_edge(&mut pic.planes[1 + comp], (y0 + e * 4) * cs + x0, cs, 1, 8, &bs, 2, alpha, beta, ia, true, bd, (other.keep, m.keep));
+                            filter_edge(&mut pic.planes[1 + comp], (y0 + e * 4) * cs + x0, cs, 1, 2, &bs[dir][e], alpha, beta, ia, true, bd, (other.keep, m.keep));
                         } else {
-                            filter_edge(&mut pic.planes[1 + comp], (y0 + e * 2) * cs + x0, cs, 1, 8, &bs, 2, alpha, beta, ia, true, bd, (other.keep, m.keep));
+                            filter_edge(&mut pic.planes[1 + comp], (y0 + e * 2) * cs + x0, cs, 1, 2, &bs[dir][e], alpha, beta, ia, true, bd, (other.keep, m.keep));
                         }
                     }
                 }
