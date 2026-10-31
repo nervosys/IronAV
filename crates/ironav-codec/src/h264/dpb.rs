@@ -1,7 +1,7 @@
 //! Picture order count, reference picture marking and reference list construction
 //! (ITU-T H.264 8.2.1, 8.2.4 and 8.2.5), for frame pictures.
 
-use super::mb::MbInfo;
+use super::mb::{MbInfo, Spare};
 use super::ps::{Marking, SliceHeader, SliceType, Sps};
 use ironav_core::{Error, Result};
 use std::sync::Arc;
@@ -64,6 +64,8 @@ pub struct Dpb {
     last_out: Option<i32>,
     /// Pictures dropped from the output in low-delay mode because they came after a later one.
     pub late: u64,
+    /// Buffers of finished pictures, for the next pictures to reuse.
+    pub spare: Vec<Spare>,
 }
 
 /// MaxDpbMbs for a level_idc (Table A-1).
@@ -279,7 +281,7 @@ impl Dpb {
             // everything before an IDR picture goes out first
             out.extend(self.drain_all());
             self.last_out = None;
-            self.refs.clear();
+            self.clear_refs();
             self.max_long_idx = None;
         }
         if h.nal_ref_idc != 0 {
@@ -350,13 +352,30 @@ impl Dpb {
                 .filter(|(_, s)| s.long_idx.is_none())
                 .min_by_key(|(_, s)| self.frame_num_wrap(s.frame_num, cur_frame_num, max_frame_num))
                 .map(|(i, _)| i);
-            match victim {
-                Some(i) => {
-                    self.refs.remove(i);
-                }
-                None => {
-                    self.refs.remove(0);
-                }
+            self.unref(victim.unwrap_or(0));
+        }
+    }
+
+    fn unref(&mut self, i: usize) {
+        let s = self.refs.remove(i);
+        self.release(s.pic);
+    }
+
+    fn clear_refs(&mut self) {
+        for s in std::mem::take(&mut self.refs) {
+            self.release(s.pic);
+        }
+    }
+
+    /// Keeps the buffers of a picture that nothing refers to any more. Only a complete picture is
+    /// kept: an incomplete one may hold samples and macroblocks that a new picture must not inherit.
+    pub fn release(&mut self, pic: Arc<DecodedPic>) {
+        if self.spare.len() >= 4 {
+            return;
+        }
+        if let Ok(p) = Arc::try_unwrap(pic) {
+            if p.mbs.iter().all(|m| m.slice != 0) {
+                self.spare.push((p.planes, p.mbs));
             }
         }
     }
@@ -371,18 +390,18 @@ impl Dpb {
                 1 => {
                     let pic_num = cur_frame_num as i64 - (a as i64 + 1);
                     if let Some(i) = self.refs.iter().position(|s| s.long_idx.is_none() && self.frame_num_wrap(s.frame_num, cur_frame_num, max_frame_num) == pic_num) {
-                        self.refs.remove(i);
+                        self.unref(i);
                     }
                 }
                 2 => {
                     if let Some(i) = self.refs.iter().position(|s| s.long_idx == Some(a)) {
-                        self.refs.remove(i);
+                        self.unref(i);
                     }
                 }
                 3 => {
                     let pic_num = cur_frame_num as i64 - (a as i64 + 1);
                     if let Some(i) = self.refs.iter().position(|s| s.long_idx == Some(b)) {
-                        self.refs.remove(i);
+                        self.unref(i);
                     }
                     if let Some(s) = self.refs.iter_mut().find(|s| s.long_idx.is_none() && (if s.frame_num > cur_frame_num { s.frame_num as i64 - max_frame_num as i64 } else { s.frame_num as i64 }) == pic_num) {
                         s.long_idx = Some(b);
@@ -391,16 +410,18 @@ impl Dpb {
                 4 => {
                     self.max_long_idx = if a == 0 { None } else { Some(a - 1) };
                     let lim = a;
-                    self.refs.retain(|s| s.long_idx.is_none_or(|i| i < lim));
+                    while let Some(i) = self.refs.iter().position(|s| s.long_idx.is_some_and(|i| i >= lim)) {
+                        self.unref(i);
+                    }
                 }
                 5 => {
-                    self.refs.clear();
+                    self.clear_refs();
                     self.max_long_idx = None;
                     m5 = true;
                 }
                 6 => {
                     if let Some(i) = self.refs.iter().position(|s| s.long_idx == Some(b)) {
-                        self.refs.remove(i);
+                        self.unref(i);
                     }
                     cur_long = Some(b);
                 }

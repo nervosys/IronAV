@@ -43,6 +43,23 @@ struct Current {
     mbs_done: usize,
 }
 
+/// The `w` x `h` samples at (x0, y0) of a plane `stride` samples wide, as bytes for 8-bit video and
+/// little-endian 16-bit words otherwise.
+fn window(src: &[u16], stride: usize, (x0, y0): (usize, usize), (w, h): (usize, usize), wide: bool) -> Vec<u8> {
+    let mut v = Vec::with_capacity(w * h * if wide { 2 } else { 1 });
+    for r in 0..h {
+        let row = &src[(y0 + r) * stride + x0..][..w];
+        if wide {
+            for s in row {
+                v.extend_from_slice(&s.to_le_bytes());
+            }
+        } else {
+            v.extend(row.iter().map(|&s| s as u8));
+        }
+    }
+    v
+}
+
 fn unsupported(msg: &str) -> Error {
     Error::new(ErrorCode::UnsupportedCodec, msg.to_string())
 }
@@ -86,32 +103,12 @@ impl H264Decoder {
         let c444 = pic.cf == 3;
         let (cw, ch) = (if c444 { w } else { w.div_ceil(2) }, if c422 || c444 { h } else { h.div_ceil(2) });
         let wide = pic.bit_depth > 8;
-        // 8-bit samples go out as bytes, deeper ones as little-endian 16-bit words
-        let put = |v: &mut Vec<u8>, src: &[u16]| {
-            if wide {
-                for s in src {
-                    v.extend_from_slice(&s.to_le_bytes());
-                }
-            } else {
-                v.extend(src.iter().map(|&s| s as u8));
-            }
-        };
         let gray = pic.cf == 0 && !wide;
-        let mut planes = Vec::with_capacity(3);
-        let ys = pic.mb_w * 16;
-        let mut y = Vec::with_capacity(w * h);
-        for r in 0..h {
-            put(&mut y, &pic.planes[0][(ct + r) * ys + cl..(ct + r) * ys + cl + w]);
-        }
-        planes.push(y);
+        let mut planes = vec![window(&pic.planes[0], pic.mb_w * 16, (cl, ct), (w, h), wide)];
         let cs = pic.mb_w * pic.cw;
+        let (cx, cy) = (if c444 { cl } else { cl / 2 }, if c422 || c444 { ct } else { ct / 2 });
         for pl in 1..if gray { 1 } else { 3 } {
-            let mut v = Vec::with_capacity(cw * ch);
-            for r in 0..ch {
-                let o = ((if c422 || c444 { ct } else { ct / 2 }) + r) * cs + if c444 { cl } else { cl / 2 };
-                put(&mut v, &pic.planes[pl][o..o + cw]);
-            }
-            planes.push(v);
+            planes.push(window(&pic.planes[pl], cs, (cx, cy), (cw, ch), wide));
         }
         let pix_fmt = match (c422, wide) {
             _ if gray => PixelFormat::Gray8,
@@ -122,7 +119,9 @@ impl H264Decoder {
             (false, true) => PixelFormat::Yuv420p10,
             (false, false) => PixelFormat::Yuv420p,
         };
-        self.out.push(Frame::Video(VideoFrame { width: w as u32, height: h as u32, pix_fmt, pts: p.pts, planes }));
+        let pts = p.pts;
+        self.dpb.release(p.pic);
+        self.out.push(Frame::Video(VideoFrame { width: w as u32, height: h as u32, pix_fmt, pts, planes }));
     }
 
     fn finish_picture(&mut self) {
@@ -169,7 +168,8 @@ impl H264Decoder {
             self.finish_picture();
             let sps = self.sps[sps_id].as_ref().unwrap();
             let poc = self.dpb.compute_poc(sps, &hdr);
-            self.cur = Some(Current { pic: Picture::new(sps.mb_width, sps.mb_height, sps.chroma_format_idc as u8, sps.bit_depth_luma), sps_id, hdr: hdr.clone(), pts, poc, mbs_done: 0 });
+            let pic = Picture::with_spare(sps.mb_width, sps.mb_height, sps.chroma_format_idc as u8, sps.bit_depth_luma, self.dpb.spare.pop());
+            self.cur = Some(Current { pic, sps_id, hdr: hdr.clone(), pts, poc, mbs_done: 0 });
         }
         let cur = self.cur.as_mut().unwrap();
         let sps = self.sps[sps_id].as_ref().unwrap();

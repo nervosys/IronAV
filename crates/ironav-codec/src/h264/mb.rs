@@ -82,6 +82,9 @@ impl Default for MbInfo {
     }
 }
 
+/// The planes and macroblock info of a picture that is no longer used, for reuse.
+pub type Spare = ([Vec<u16>; 3], Vec<MbInfo>);
+
 pub struct Picture {
     pub mb_w: usize,
     pub mb_h: usize,
@@ -106,20 +109,31 @@ pub struct SliceParams {
 
 impl Picture {
     pub fn new(mb_w: usize, mb_h: usize, cf: u8, bd: u32) -> Self {
+        Self::with_spare(mb_w, mb_h, cf, bd, None)
+    }
+
+    /// A new picture, in the buffers of a finished one when they fit. Decoding writes every sample of
+    /// a picture whose macroblocks were all decoded, so only the macroblock slice marks are reset.
+    pub fn with_spare(mb_w: usize, mb_h: usize, cf: u8, bd: u32, spare: Option<Spare>) -> Self {
         let ch = if cf >= 2 { 16 } else { 8 };
         let cw = if cf == 3 { 16 } else { 8 };
         // a monochrome picture keeps chroma planes at mid-grey, as other decoders output it
         let grey = 1u16 << (bd - 1);
-        Picture {
-            mb_w,
-            mb_h,
-            cf,
-            cw,
-            ch,
-            planes: [vec![0; mb_w * mb_h * 256], vec![grey; mb_w * mb_h * cw * ch], vec![grey; mb_w * mb_h * cw * ch]],
-            mbs: vec![MbInfo::default(); mb_w * mb_h],
-            slices: Vec::new(),
-        }
+        let (ylen, clen) = (mb_w * mb_h * 256, mb_w * mb_h * cw * ch);
+        let (planes, mbs) = match spare {
+            Some((mut p, mut m)) if p[0].len() == ylen && p[1].len() == clen && m.len() == mb_w * mb_h => {
+                for x in m.iter_mut() {
+                    x.slice = 0;
+                }
+                if cf == 0 {
+                    p[1].fill(grey);
+                    p[2].fill(grey);
+                }
+                (p, m)
+            }
+            _ => ([vec![0; ylen], vec![grey; clen], vec![grey; clen]], vec![MbInfo::default(); mb_w * mb_h]),
+        };
+        Picture { mb_w, mb_h, cf, cw, ch, planes, mbs, slices: Vec::new() }
     }
 }
 
@@ -205,10 +219,13 @@ struct Res {
 }
 
 impl Res {
-    fn new() -> Self {
+    const fn new() -> Self {
         Res { luma: [[0; 256]; 3], dc: [[0; 16]; 3], cdc: [[0; 8]; 2], cac: [[0; 16]; 16] }
     }
 }
+
+/// The residual of a macroblock without coded coefficients.
+static NO_RES: Res = Res::new();
 
 /// Intra residual DPCM of lossless coding (8.5.15): residuals accumulate along the prediction direction.
 fn dpcm(r: &mut [i32], w: usize, h: usize, hor: bool) {
@@ -265,7 +282,13 @@ pub struct SliceDec<'a> {
     bd: u32,
     maxv: i32,
     qp_off: i32,
+    /// Inter prediction scratch: luma per list, and chroma per list and component.
+    mcl: [[u16; 256]; 2],
+    mcc: [[[u16; 256]; 2]; 2],
 }
+
+/// A motion partition: (x, y, width, height) in 4x4 units, list mask, prediction direction, direct.
+type MvPart = (usize, usize, usize, usize, u8, u8, bool);
 
 /// Motion derived by direct prediction for a whole macroblock.
 struct Direct {
@@ -273,9 +296,32 @@ struct Direct {
     mv: [[[i16; 2]; 16]; 2],
 }
 
+/// Motion partitions of a macroblock, kept inline: at most `N` of them.
+struct Parts<T: Copy, const N: usize> {
+    n: usize,
+    v: [T; N],
+}
+
+impl<T: Copy, const N: usize> Parts<T, N> {
+    fn new(fill: T) -> Self {
+        Parts { n: 0, v: [fill; N] }
+    }
+    fn push(&mut self, t: T) {
+        self.v[self.n] = t;
+        self.n += 1;
+    }
+    fn extend(&mut self, ts: impl IntoIterator<Item = T>) {
+        for t in ts {
+            self.push(t);
+        }
+    }
+    fn list(&self) -> &[T] {
+        &self.v[..self.n]
+    }
+}
+
 /// Appends the motion partitions of the 8x8 block at (x0, y0): shape 0 = 8x8, 1 = 8x4, 2 = 4x8, 3 = 4x4.
-#[allow(clippy::type_complexity)]
-fn sub_parts(v: &mut Vec<(usize, usize, usize, usize, u8, u8, bool)>, x0: usize, y0: usize, mask: u8, shape: usize) {
+fn sub_parts(v: &mut Parts<MvPart, 16>, x0: usize, y0: usize, mask: u8, shape: usize) {
     match shape {
         0 => v.push((x0, y0, 2, 2, mask, 0, false)),
         1 => v.extend([(x0, y0, 2, 1, mask, 0, false), (x0, y0 + 1, 2, 1, mask, 0, false)]),
@@ -306,7 +352,7 @@ impl<'a> SliceDec<'a> {
             r.skip(hdr.data_pos);
             Reader::Cavlc(r)
         };
-        Ok(SliceDec { sps, pps, hdr, pic, scale, slice_id, qp: hdr.qp, last_dqp: false, mbx: 0, mby: 0, cur: MbInfo::default(), rd, refs, done: [0; 2], cur_poc, bd: sps.bit_depth_luma, maxv: (1 << sps.bit_depth_luma) - 1, qp_off: 6 * (sps.bit_depth_luma as i32 - 8) })
+        Ok(SliceDec { sps, pps, hdr, pic, scale, slice_id, qp: hdr.qp, last_dqp: false, mbx: 0, mby: 0, cur: MbInfo::default(), rd, refs, done: [0; 2], cur_poc, bd: sps.bit_depth_luma, maxv: (1 << sps.bit_depth_luma) - 1, qp_off: 6 * (sps.bit_depth_luma as i32 - 8), mcl: [[0; 256]; 2], mcc: [[[0; 256]; 2]; 2] })
     }
 
     fn start_mb(&mut self, addr: usize) -> Result<()> {
@@ -1238,9 +1284,9 @@ impl<'a> SliceDec<'a> {
         let b = self.hdr.slice_type == SliceType::B;
         let maxr = [self.hdr.num_ref_idx_active[0].saturating_sub(1), self.hdr.num_ref_idx_active[1].saturating_sub(1)];
         // (bx, by, w, h, list mask) where bit 0 is list 0 and bit 1 list 1
-        let mut ref_parts: Vec<(usize, usize, usize, usize, u8)> = Vec::new();
+        let mut ref_parts: Parts<(usize, usize, usize, usize, u8), 4> = Parts::new((0, 0, 0, 0, 0));
         // (bx, by, w, h, list mask, prediction direction, direct)
-        let mut mv_parts: Vec<(usize, usize, usize, usize, u8, u8, bool)> = Vec::new();
+        let mut mv_parts: Parts<MvPart, 16> = Parts::new((0, 0, 0, 0, 0, 0, false));
         let mut direct_mask = 0u8;
         let mut sub8_ok = true;
         let mut ref0 = false;
@@ -1328,7 +1374,7 @@ impl<'a> SliceDec<'a> {
             self.put_direct(&d, direct_mask);
         }
         for l in 0..2usize {
-            for &(bx, by, w, h, mask) in &ref_parts {
+            for &(bx, by, w, h, mask) in ref_parts.list() {
                 if mask & (1 << l) == 0 {
                     continue;
                 }
@@ -1338,7 +1384,7 @@ impl<'a> SliceDec<'a> {
         }
         for l in 0..2usize {
             self.done[l] = 0;
-            for &(bx, by, w, h, mask, dir, direct) in &mv_parts {
+            for &(bx, by, w, h, mask, dir, direct) in mv_parts.list() {
                 if direct {
                     self.mark_done(l, bx, by, w, h);
                 } else if mask & (1 << l) != 0 {
@@ -1364,18 +1410,18 @@ impl<'a> SliceDec<'a> {
         if cbp & 15 != 0 && self.pps.transform_8x8 && sub8_ok && direct_ok {
             self.cur.t8x8 = self.read_t8x8_flag()?;
         }
-        let mut res = Res::new();
         if cbp > 0 {
             let dqp = self.read_qp_delta()?;
             self.qp = (self.qp + dqp + 52 + 2 * self.qp_off).rem_euclid(52 + self.qp_off) - self.qp_off;
             self.last_dqp = dqp != 0;
+            let mut res = Res::new();
             self.read_residual(&mut res, cbp, false)?;
-        } else {
-            self.last_dqp = false;
+            self.mc_mb()?;
+            return self.add_inter_residual(&res);
         }
+        self.last_dqp = false;
         self.mc_mb()?;
-        self.add_inter_residual(&res)?;
-        Ok(())
+        self.add_inter_residual(&NO_RES)
     }
 
     /// Motion-compensated prediction of the whole macroblock, written into the picture.
@@ -1414,42 +1460,40 @@ impl<'a> SliceDec<'a> {
         let (cw, ch) = (if c444 { bw } else { bw / 2 }, if c422 || c444 { bh } else { bh / 2 });
         let (cpw, cph) = (if c444 { pw } else { pw / 2 }, if c422 || c444 { ph } else { ph / 2 });
         let (cx, cy) = (if c444 { x } else { x / 2 }, if c422 || c444 { y } else { y / 2 });
-        let mut luma = [[0u16; 256]; 2];
-        let mut chroma = [[[0u16; 256]; 2]; 2];
-        let mut used = [false; 2];
-        let mut pics: [Option<(std::sync::Arc<super::dpb::DecodedPic>, bool)>; 2] = [None, None];
+        // (order count, long-term) of the picture each list predicts from
+        let mut pics: [Option<(i32, bool)>; 2] = [None, None];
+        let refs = self.refs;
         for l in 0..2usize {
             let r = self.cur.ref_idx[l][b8];
             if r < 0 {
                 continue;
             }
-            let entry = match self.refs[l].get(r as usize) {
-                Some(Some(e)) => e.clone(),
+            let entry = match refs[l].get(r as usize) {
+                Some(Some(e)) => e,
                 _ => return Err(Error::invalid_input("H.264 macroblock refers to a reference picture that is not available")),
             };
             let mv = self.cur.mv[l][by * 4 + bx];
-            inter::luma_mc(&entry.pic.planes[0], pw, ph, x, y, mv[0] as i32, mv[1] as i32, bw, bh, &mut luma[l], self.maxv);
+            inter::luma_mc(&entry.pic.planes[0], pw, ph, x, y, mv[0] as i32, mv[1] as i32, bw, bh, &mut self.mcl[l], self.maxv);
             if c444 {
                 // 4:4:4 chroma is interpolated exactly like luma
                 for c in 0..2usize {
-                    inter::luma_mc(&entry.pic.planes[1 + c], cpw, cph, cx, cy, mv[0] as i32, mv[1] as i32, cw, ch, &mut chroma[l][c], self.maxv);
+                    inter::luma_mc(&entry.pic.planes[1 + c], cpw, cph, cx, cy, mv[0] as i32, mv[1] as i32, cw, ch, &mut self.mcc[l][c], self.maxv);
                 }
             } else if self.pic.cf != 0 {
                 // 4:2:2 chroma has full vertical resolution, so its vertical vector is in quarter samples
                 let my = if c422 { mv[1] as i32 * 2 } else { mv[1] as i32 };
                 for c in 0..2usize {
-                    inter::chroma_mc(&entry.pic.planes[1 + c], cpw, cph, x / 2, cy, mv[0] as i32, my, cw, ch, &mut chroma[l][c]);
+                    inter::chroma_mc(&entry.pic.planes[1 + c], cpw, cph, x / 2, cy, mv[0] as i32, my, cw, ch, &mut self.mcc[l][c]);
                 }
             }
-            used[l] = true;
-            pics[l] = Some((entry.pic.clone(), entry.long));
+            pics[l] = Some((entry.pic.poc, entry.long));
         }
-        if !used[0] && !used[1] {
+        if pics[0].is_none() && pics[1].is_none() {
             return Err(Error::invalid_input("H.264 inter macroblock uses no reference picture"));
         }
         let (r0, r1) = (self.cur.ref_idx[0][b8].max(0) as usize, self.cur.ref_idx[1][b8].max(0) as usize);
         let explicit = self.hdr.weights.as_ref();
-        if used[0] && used[1] {
+        if pics[0].is_some() && pics[1].is_some() {
             // weights as (log2 denominator, w0, w1, offset) for luma and each chroma plane
             let mut wts: Option<[(u32, i32, i32, i32); 3]> = None;
             if let Some(wt) = explicit {
@@ -1462,8 +1506,8 @@ impl<'a> SliceDec<'a> {
                     ]);
                 }
             } else if self.pps.weighted_bipred_idc == 2 {
-                let (p0, l0) = pics[0].as_ref().map(|p| (p.0.poc, p.1)).unwrap();
-                let (p1, l1) = pics[1].as_ref().map(|p| (p.0.poc, p.1)).unwrap();
+                let (p0, l0) = pics[0].unwrap();
+                let (p1, l1) = pics[1].unwrap();
                 let (mut w0, mut w1) = (32, 32);
                 let tb = (self.cur_poc - p0).clamp(-128, 127);
                 let td = (p1 - p0).clamp(-128, 127);
@@ -1477,14 +1521,14 @@ impl<'a> SliceDec<'a> {
                 }
                 wts = Some([(5, w0, w1, 0); 3]);
             }
-            let (l0, l1) = luma.split_at_mut(1);
+            let (l0, l1) = self.mcl.split_at_mut(1);
             let (a, bb) = (&mut l0[0][..bw * bh], &l1[0][..bw * bh]);
             match wts {
                 Some(wt) => inter::weight_bi(a, bb, wt[0].0, wt[0].1, wt[0].2, wt[0].3, self.maxv),
                 None => inter::average(a, bb),
             }
             for c in 0..if self.pic.cf != 0 { 2usize } else { 0 } {
-                let (c0, c1) = chroma.split_at_mut(1);
+                let (c0, c1) = self.mcc.split_at_mut(1);
                 let (a, bb) = (&mut c0[0][c][..cw * ch], &c1[0][c][..cw * ch]);
                 match wts {
                     Some(wt) => inter::weight_bi(a, bb, wt[1 + c].0, wt[1 + c].1, wt[1 + c].2, wt[1 + c].3, self.maxv),
@@ -1492,29 +1536,27 @@ impl<'a> SliceDec<'a> {
                 }
             }
         } else {
-            let l = if used[0] { 0 } else { 1 };
+            let l = if pics[0].is_some() { 0 } else { 1 };
             let r = if l == 0 { r0 } else { r1 };
             if let Some(wt) = explicit {
                 if let Some(e) = wt.entries[l].get(r) {
-                    inter::weight_uni(&mut luma[l][..bw * bh], wt.luma_log2_denom, e[0], e[1] << (self.bd - 8), self.maxv);
+                    inter::weight_uni(&mut self.mcl[l][..bw * bh], wt.luma_log2_denom, e[0], e[1] << (self.bd - 8), self.maxv);
                     for c in 0..if self.pic.cf != 0 { 2usize } else { 0 } {
-                        inter::weight_uni(&mut chroma[l][c][..cw * ch], wt.chroma_log2_denom, e[2 + 2 * c], e[3 + 2 * c] << (self.bd - 8), self.maxv);
+                        inter::weight_uni(&mut self.mcc[l][c][..cw * ch], wt.chroma_log2_denom, e[2 + 2 * c], e[3 + 2 * c] << (self.bd - 8), self.maxv);
                     }
                 }
             }
-            if l == 1 {
-                luma[0] = luma[1];
-                chroma[0] = chroma[1];
-            }
         }
+        // the prediction is in list 0's scratch, or in list 1's when only list 1 is used
+        let o = usize::from(pics[0].is_none());
         for row in 0..bh {
-            let o = (y as usize + row) * pw + x as usize;
-            self.pic.planes[0][o..o + bw].copy_from_slice(&luma[0][row * bw..row * bw + bw]);
+            let d = (y as usize + row) * pw + x as usize;
+            self.pic.planes[0][d..d + bw].copy_from_slice(&self.mcl[o][row * bw..row * bw + bw]);
         }
         for c in 0..if self.pic.cf != 0 { 2usize } else { 0 } {
             for row in 0..ch {
-                let o = (cy as usize + row) * cpw + cx as usize;
-                self.pic.planes[1 + c][o..o + cw].copy_from_slice(&chroma[0][c][row * cw..row * cw + cw]);
+                let d = (cy as usize + row) * cpw + cx as usize;
+                self.pic.planes[1 + c][d..d + cw].copy_from_slice(&self.mcc[o][c][row * cw..row * cw + cw]);
             }
         }
         Ok(())
