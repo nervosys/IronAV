@@ -178,6 +178,8 @@ pub struct SequenceHeader {
     pub subsampling_y: bool,
     pub color_range: bool,
     pub separate_uv_delta_q: bool,
+    /// matrix_coefficients is identity: the planes are G, B and R.
+    pub rgb: bool,
     pub film_grain_params_present: bool,
 }
 
@@ -319,6 +321,7 @@ fn parse_color_config(b: &mut Bits, s: &mut SequenceHeader) -> Result<()> {
         s.subsampling_y = true;
         return Ok(());
     }
+    s.rgb = mc == 0;
     if cp == 1 && tc == 13 && mc == 0 {
         s.color_range = true;
         s.subsampling_x = false;
@@ -466,7 +469,7 @@ pub struct RefInfo {
 pub fn parse_frame_header(data: &[u8], seq: &SequenceHeader, refs: &RefInfo, temporal_id: u32, spatial_id: u32) -> Result<FrameHeader> {
     let mut b = Bits::new(data);
     let mut h = FrameHeader::default();
-    let id_len = if seq.frame_id_numbers_present { seq.additional_frame_id_length + seq.delta_frame_id_length + 1 } else { 0 };
+    let id_len = if seq.frame_id_numbers_present { seq.additional_frame_id_length + seq.delta_frame_id_length } else { 0 };
     if seq.reduced_still_picture_header {
         h.frame_type = KEY_FRAME;
         h.show_frame = true;
@@ -724,16 +727,15 @@ fn quantization_params(b: &mut Bits, seq: &SequenceHeader, h: &mut FrameHeader) 
 fn segmentation_params(b: &mut Bits, h: &mut FrameHeader) -> Result<()> {
     h.seg_enabled = b.flag()?;
     if h.seg_enabled {
-        let update_data;
-        if h.primary_ref_frame == 7 {
+        let update_data = if h.primary_ref_frame == 7 {
             h.seg_update_map = true;
             h.seg_temporal_update = false;
-            update_data = true;
+            true
         } else {
             h.seg_update_map = b.flag()?;
             h.seg_temporal_update = if h.seg_update_map { b.flag()? } else { false };
-            update_data = b.flag()?;
-        }
+            b.flag()?
+        };
         if update_data {
             for i in 0..8 {
                 for j in 0..8 {

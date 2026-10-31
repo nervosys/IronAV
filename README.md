@@ -8,7 +8,7 @@ A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so 
 > Audio codecs, each decoded and encoded: **PCM, FLAC, ALAC, AAC-LC (plus HE-AAC v1 decode), MP3, Opus and Vorbis.**
 > Video: **software decoders for H.264, HEVC (including 4:2:2 and 4:4:4), VP8 and VP9; a software H.264 encoder (High profile: CABAC and the 8x8 transform), a software HEVC encoder (Main profile, 8-bit 4:2:0, merge and skip, SAO), a software VP8 encoder, and a software VP9 encoder (key and inter frames); JPEG/Motion-JPEG and Apple ProRes decoded and encoded in software; MPEG-4 Part 2 (Simple and Advanced Simple profiles) decoded in software.**
 > NVIDIA GPUs encode H.264 and HEVC (NVENC, preferred when usable) and decode H.264, HEVC and AV1 (NVDEC).
-> AV1 is decoded on NVIDIA GPUs only (NVDEC); it has no software decoder and no encoder yet. VP9 and AV1 copy between WebM, Matroska and MP4.
+> AV1 is decoded on NVIDIA GPUs (NVDEC); the software decoder handles key and intra-only frames so far, and there is no encoder yet. VP9 and AV1 copy between WebM, Matroska and MP4.
 > IronAV is not yet a drop-in replacement for FFmpeg or HandBrake.
 
 ## Interfaces
@@ -889,15 +889,19 @@ Threaded output was checked against FFmpeg in both modes on 22 clips: sizes from
 tile rows, 4:2:2, 4:4:4, lossless, loop-filter sharpness 2, 3 and 7, strong filtering (crf 55-60), adaptive quantisation, error-resilient and frame-parallel
 streams. All match on every frame. 90 corrupted copies caused no panic (and 120 more before the loop filter was threaded). `IRONAV_VP9_THREADS=1` turns the threading off.
 
-## AV1 (GPU only)
+## AV1
 
 AV1 video in `.webm`, `.mkv` and `.mp4` files is decoded on NVIDIA GPUs through NVDEC (the same provider as H.264 and HEVC). The demuxers read the bit depth and chroma
 layout from the `av1C` configuration record, and its configuration OBUs (the sequence header) are handed to the driver's parser before the first packet, as FFmpeg's
 `cuviddec` does. 8-bit and 10-bit 4:2:0 come out as `yuv420p` and `yuv420p10le`; anything else is refused before the GPU is touched. The GPU says which sizes it
 takes, and IronAV checks them: the RTX 3090 Ti used here decodes 128x128 to 8192x8192, and a smaller stream is refused with that range in the message.
 
-There is **no software AV1 decoder**, so with `--hwaccel off`, or on a machine without a usable NVIDIA GPU, an AV1 job is refused at planning time with
-`hardware-unavailable`, and nothing is written. (FFmpeg itself has no AV1 decoder of its own either; it uses libdav1d or libaom, or the GPU.) AV1 is not encoded
+Without a usable GPU, or with `--hwaccel off`, the software AV1 decoder takes over. It is at its first stage: key frames and intra-only frames, with
+every intra tool (partitions to 128x128, directional, smooth, Paeth, CFL, palette and filter-intra prediction, all transforms, lossless), tiles, the deblocking
+filter, 8, 10 and 12 bits, 4:2:0, 4:2:2, 4:4:4 (RGB as `rgb24`) and monochrome. Inter frames, CDEF, loop restoration, superres, film grain, intra block copy
+and quantiser matrices are refused with an error naming the tool, so a typical AV1 file (inter frames, CDEF) is still GPU only. On libaom's intra-only output
+(`ffmpeg -c:v libaom-av1 -g 1 -aom-params enable-cdef=0`) the pictures equal libaom's bit for bit: 128x72 to 1280x720, odd sizes, crf 0 to 63, 4x2 tiles,
+the bit depths and samplings above, palettes and lossless coding, in WebM, Matroska and MP4 (tests/av1.rs). About 30 frames a second at 720p. AV1 is not encoded
 (consumer NVENC before the RTX 40 series cannot encode it), but it can be copied between WebM, Matroska and MP4 with no GPU (see "Matroska output").
 
 Checked bit for bit against FFmpeg's libdav1d (through PyAV) on SVT-AV1 output: 27 clips from 128x128 to 3840x2160, including odd sizes, 10-bit, film grain

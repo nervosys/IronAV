@@ -202,9 +202,6 @@ pub fn predict_intra(p: &mut Plane, x: usize, y: usize, log2w: u32, log2h: u32, 
     left[OFF - 1] = corner;
 
     let mut pred = vec![0i32; w * h];
-    if let (0, Some(fmode)) = (0, filter) {
-        let _ = fmode;
-    }
     if let Some(fmode) = filter {
         filter_intra(&mut pred, &mut above, &mut left, w, h, fmode, bd);
     } else if (1..=8).contains(&mode) {

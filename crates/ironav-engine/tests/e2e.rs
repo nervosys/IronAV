@@ -1971,8 +1971,9 @@ fn vp9_and_av1_copy_between_webm_matroska_and_mp4() {
 
 // ---- AV1 -------------------------------------------------------------------------------
 
-/// AV1 is decoded only on the GPU. Without one (or with hardware off) the job must refuse
-/// precisely; with one, the pictures must equal libdav1d's (AV1 decoding is exact).
+/// AV1 is decoded on the GPU when there is one, else in software, which decodes key and
+/// intra-only frames without CDEF only (tests/av1.rs) and refuses these streams precisely. On
+/// the GPU the pictures must equal libdav1d's (AV1 decoding is exact).
 #[test]
 fn av1_decodes_on_the_gpu_to_what_dav1d_decodes_or_refuses_precisely() {
     let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
@@ -1984,13 +1985,15 @@ fn av1_decodes_on_the_gpu_to_what_dav1d_decodes_or_refuses_precisely() {
 
         let mut off = j.clone();
         off.hwaccel = "off".into();
-        assert_eq!(plan(&off).unwrap_err().code, ErrorCode::HardwareUnavailable, "{name}: no software AV1 decoder");
+        assert!(plan(&off).is_ok(), "{name}: AV1 is planned for the software decoder");
+        let e = run(&off, &mut |_| {}).unwrap_err();
+        assert_eq!(e.code, ErrorCode::UnsupportedFormat, "{name}: {}", e.message);
+        assert!(e.message.contains("not decoded yet"), "{name}: {}", e.message);
 
         let report = match run(&j, &mut |_| {}) {
             Ok(r) => r,
             Err(e) => {
-                assert_eq!(e.code, ErrorCode::HardwareUnavailable, "{name}: {}", e.message);
-                assert!(!out.exists(), "{name}: nothing is written when decoding is refused");
+                assert!(e.message.contains("not decoded yet"), "{name}: {}", e.message);
                 continue;
             }
         };

@@ -331,7 +331,7 @@ impl State {
                     ),
                 )
                 .hint(if self.codec == CodecId::Av1 {
-                    "AV1 has no software decoder in this build, so this stream cannot be decoded here"
+                    "set hwaccel to \"off\" to use the software decoder, which decodes AV1 key and intra-only frames only"
                 } else {
                     "set hwaccel to \"off\" to use the software decoder"
                 }),

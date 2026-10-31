@@ -13,6 +13,8 @@ pub struct SymbolDecoder<'a> {
     value: u32,
     range: u32,
     max_bits: i64,
+    /// Whether CDFs adapt (disable_cdf_update is 0).
+    pub adapt: bool,
 }
 
 impl<'a> SymbolDecoder<'a> {
@@ -20,7 +22,7 @@ impl<'a> SymbolDecoder<'a> {
     pub fn new(data: &'a [u8]) -> Self {
         let sz = data.len();
         let num_bits = (sz * 8).min(15) as u32;
-        let mut d = SymbolDecoder { data, bit_pos: 0, value: 0, range: 1 << 15, max_bits: 8 * sz as i64 - 15 };
+        let mut d = SymbolDecoder { data, bit_pos: 0, value: 0, range: 1 << 15, max_bits: 8 * sz as i64 - 15, adapt: true };
         let buf = d.bits(num_bits);
         let padded = buf << (15 - num_bits);
         d.value = ((1 << 15) - 1) ^ padded;
@@ -71,7 +73,9 @@ impl<'a> SymbolDecoder<'a> {
     /// read_symbol with adaptation of the CDF.
     pub fn symbol(&mut self, cdf: &mut [u16]) -> usize {
         let sym = self.decode(cdf);
-        update_cdf(cdf, sym);
+        if self.adapt {
+            update_cdf(cdf, sym);
+        }
         sym
     }
 
@@ -233,5 +237,38 @@ impl Cdfs {
             coeff_base: av1_default_coeff_base_multi_cdfs[q],
             coeff_br: av1_default_coeff_lps_multi_cdfs[q],
         })
+    }
+
+    /// Zeroes every adaptation counter, as a frame's saved CDFs are stored.
+    pub fn clear_counts(&mut self) {
+        macro_rules! clear {
+            ($($f:ident),*) => { $(self.$f.clear_counts();)* };
+        }
+        clear!(kf_y_mode, angle_delta, uv_mode, uv_mode_cfl, partition_w8, partition, partition_w128, intra_tx_1, intra_tx_2, cfl_sign, cfl_alpha);
+        clear!(palette_y_size, palette_uv_size, palette_y_mode, palette_uv_mode, intrabc, filter_intra_mode, filter_intra, skip, delta_q, delta_lf_multi);
+        clear!(delta_lf, seg_tree, spatial_seg, tx_size_8x8, tx_size, switchable_restore, wiener, sgrproj, dc_sign, txb_skip, eob_extra, eob16, eob32);
+        clear!(eob64, eob128, eob256, eob512, eob1024, coeff_base_eob, coeff_base, coeff_br);
+        // a palette colour CDF of n symbols keeps its counter at n - 1
+        for (i, (y, uv)) in self.palette_y_color.iter_mut().zip(self.palette_uv_color.iter_mut()).enumerate() {
+            for c in y.iter_mut().chain(uv.iter_mut()) {
+                c[i + 1] = 0;
+            }
+        }
+    }
+}
+
+trait Counted {
+    fn clear_counts(&mut self);
+}
+
+impl<const N: usize> Counted for [u16; N] {
+    fn clear_counts(&mut self) {
+        self[N - 1] = 0;
+    }
+}
+
+impl<T: Counted, const M: usize> Counted for [T; M] {
+    fn clear_counts(&mut self) {
+        self.iter_mut().for_each(Counted::clear_counts);
     }
 }

@@ -44,7 +44,7 @@ pub struct CodecImpl {
 /// Whether a GPU decoder, when one is usable, should be chosen over the software decoder.
 /// NVDEC cannot decode 10-bit H.264, so those streams go to the software decoder.
 pub fn prefers_hardware_decode(c: CodecId, params: &ironav_core::StreamParams) -> bool {
-    c == CodecId::Hevc || c == CodecId::H264 && !matches!(params, ironav_core::StreamParams::Video { pix_fmt: ironav_core::PixelFormat::Yuv420p10 | ironav_core::PixelFormat::Yuv422p10 | ironav_core::PixelFormat::Yuv444p10, .. })
+    c == CodecId::Hevc || c == CodecId::Av1 || c == CodecId::H264 && !matches!(params, ironav_core::StreamParams::Video { pix_fmt: ironav_core::PixelFormat::Yuv420p10 | ironav_core::PixelFormat::Yuv422p10 | ironav_core::PixelFormat::Yuv444p10, .. })
 }
 
 pub fn implemented() -> Vec<CodecImpl> {
@@ -80,6 +80,9 @@ pub fn implemented() -> Vec<CodecImpl> {
             }
             if c == CodecId::Hevc {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-hevc" });
+            }
+            if c == CodecId::Av1 {
+                return Some(CodecImpl { codec: c, decode: true, encode: false, implementation: "ironav-av1" });
             }
             if c == CodecId::Vp8 {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-vp8" });
@@ -178,6 +181,7 @@ pub fn new_decoder_for(s: &ironav_core::StreamInfo) -> Result<Box<dyn Decoder>> 
         CodecId::Mjpeg => Ok(Box::new(jpeg::JpegDecoder::new())),
         CodecId::ProRes => Ok(Box::new(prores::ProResDecoder::new())),
         CodecId::Mpeg4 => Ok(Box::new(mpeg4::Mpeg4Decoder::new(&s.extradata))),
+        CodecId::Av1 => Ok(Box::new(av1::Av1Decoder::new(&s.extradata))),
         _ => new_decoder(s.codec, &s.params, s.bits),
     }
 }

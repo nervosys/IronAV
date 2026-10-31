@@ -532,7 +532,7 @@ pub static default_cfl_alpha_cdf: [[u16; CFL_ALPHABET_SIZE];
 ]);
 
 pub static default_palette_y_size_cdf: [[u16;
-  PALETTE_SIZES as usize];
+  PALETTE_SIZES];
   PALETTE_BSIZE_CTXS] = cdf_2d([
   [7952, 13000, 18149, 21478, 25527, 29241],
   [7139, 11421, 16195, 19544, 23666, 28073],
@@ -544,7 +544,7 @@ pub static default_palette_y_size_cdf: [[u16;
 ]);
 
 pub static default_palette_uv_size_cdf: [[u16;
-  PALETTE_SIZES as usize];
+  PALETTE_SIZES];
   PALETTE_BSIZE_CTXS] = cdf_2d([
   [8713, 19979, 27128, 29609, 31331, 32272],
   [5839, 15573, 23581, 26947, 29848, 31700],
@@ -570,9 +570,9 @@ pub static default_palette_uv_mode_cdfs: [[u16; 2]; PALETTE_UV_MODE_CONTEXTS] =
   cdf_2d([[32461], [21488]]);
 
 pub static default_palette_y_color_index_cdf: [[[u16;
-  PALETTE_COLORS as usize];
+  PALETTE_COLORS];
   PALETTE_COLOR_INDEX_CONTEXTS];
-  PALETTE_SIZES as usize] = [
+  PALETTE_SIZES] = [
   cdf_2d([[28710], [16384], [10553], [27036], [31603]]),
   cdf_2d([
     [27877, 30490],
@@ -619,9 +619,9 @@ pub static default_palette_y_color_index_cdf: [[[u16;
 ];
 
 pub static default_palette_uv_color_index_cdf: [[[u16;
-  PALETTE_COLORS as usize];
+  PALETTE_COLORS];
   PALETTE_COLOR_INDEX_CONTEXTS];
-  PALETTE_SIZES as usize] = [
+  PALETTE_SIZES] = [
   cdf_2d([[29089], [16384], [8713], [29257], [31610]]),
   cdf_2d([
     [25257, 29145],
@@ -670,7 +670,7 @@ pub static default_palette_uv_color_index_cdf: [[[u16;
 pub static default_intrabc_cdf: [u16; 2] = cdf([30531]);
 
 pub static default_filter_intra_mode_cdf: [u16;
-  FILTER_INTRA_MODES as usize] =
+  FILTER_INTRA_MODES] =
   cdf([8949, 12776, 17211, 29558]);
 
 pub static default_filter_intra_cdfs: [[u16; 2]; BLOCK_SIZES_ALL] =
