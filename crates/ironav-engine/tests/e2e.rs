@@ -2088,10 +2088,6 @@ fn stream_data(packets: &[Packet], stream: usize) -> Vec<&[u8]> {
     packets.iter().filter(|p| p.stream == stream).map(|p| p.data.as_slice()).collect()
 }
 
-fn ffmpeg_available() -> bool {
-    std::process::Command::new("ffmpeg").arg("-version").output().is_ok_and(|o| o.status.success())
-}
-
 /// FFmpeg's (hash, size) for each packet of one stream, copied without re-encoding. Timestamps are
 /// left out: they are in each container's own time base.
 fn ffmpeg_packets(path: &Path, map: &str) -> Vec<(String, String)> {
