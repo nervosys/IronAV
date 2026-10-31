@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "Engine for IronAV: job specs, planning, threaded execution and the agent tool registry."
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+keywords = ["video", "audio", "transcode", "streaming", "multimedia"]
+categories = ["multimedia::encoding", "multimedia::video", "multimedia::audio"]
 
 [dependencies]
 serde.workspace = true

@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Live input for IronAV: byte sources (growing files, pipes, TCP, UDP, RTSP) read as they arrive."
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+keywords = ["streaming", "video", "audio", "rtsp", "hls"]
+categories = ["multimedia::video", "multimedia::audio", "network-programming"]
 
 [dependencies]
 serde.workspace = true

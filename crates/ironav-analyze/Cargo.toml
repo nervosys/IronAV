@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Media understanding for IronAV: analyzers that turn packets and decoded frames into typed observations and digests."
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+keywords = ["video", "audio", "analysis", "multimedia", "agent"]
+categories = ["multimedia", "multimedia::video", "multimedia::audio"]
 
 [dependencies]
 serde.workspace = true

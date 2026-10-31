@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Audio and video playback engine for IronAV: pipelined decoding, an audio-driven clock, and a JSON command interface."
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+keywords = ["video", "audio", "player", "playback", "multimedia"]
+categories = ["multimedia::video", "multimedia::audio"]
 
 [features]
 default = ["audio"]

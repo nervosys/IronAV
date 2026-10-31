@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "Local browser GUI for IronAV, served by a dependency-free loopback HTTP server over the shared tool registry."
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+keywords = ["video", "audio", "web", "gui", "multimedia"]
+categories = ["multimedia::video", "network-programming"]
 
 [dependencies]
 serde_json.workspace = true

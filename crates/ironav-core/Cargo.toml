@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "Core types for IronAV: errors, rationals, media descriptions and the traits that codecs, containers and filters implement."
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+keywords = ["video", "audio", "multimedia", "codec", "media"]
+categories = ["multimedia", "multimedia::encoding"]
 
 [dependencies]
 serde.workspace = true

@@ -63,7 +63,8 @@ fn a_sidecar_is_added_to_a_running_session_and_removed() {
     configure();
     let dir = scratch("added");
     let wav = dir.join("late-keys.wav");
-    dtmf_wav_at(&wav, 2.0, 4.0);
+    // the keys come late enough for the sidecar to join first, even on a loaded machine
+    dtmf_wav_at(&wav, 4.0, 6.0);
     let s = call_tool("stream_open", &json!({ "source": format!("{}?pace=realtime", wav.display()), "analyzers": ["levels"] })).unwrap();
     let id = s["session"].as_str().unwrap().to_string();
     let e = call_tool("stream_configure", &json!({ "session": id, "add": ["nope"] })).unwrap_err();

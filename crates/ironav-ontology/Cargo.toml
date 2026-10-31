@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "Typed knowledge graph for IronAV describing its codecs, containers, filters, hardware backends and operations."
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+keywords = ["video", "audio", "ontology", "codec", "multimedia"]
+categories = ["multimedia", "multimedia::encoding"]
 
 [dependencies]
 serde.workspace = true

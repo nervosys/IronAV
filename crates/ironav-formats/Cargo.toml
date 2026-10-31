@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "Container demuxers and muxers for IronAV, and the format registry."
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+keywords = ["container", "video", "audio", "mp4", "matroska"]
+categories = ["multimedia::encoding", "multimedia::video", "multimedia::audio"]
 
 [dependencies]
 serde.workspace = true

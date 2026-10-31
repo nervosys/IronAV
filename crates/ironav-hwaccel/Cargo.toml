@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "Cross-platform hardware acceleration model for IronAV: backend matrix, driver detection and policy-based selection."
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+keywords = ["video", "gpu", "nvenc", "nvdec", "multimedia"]
+categories = ["multimedia::video", "multimedia::encoding"]
 
 [dependencies]
 serde.workspace = true
