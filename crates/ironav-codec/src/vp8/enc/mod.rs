@@ -5,7 +5,7 @@
 //! predicts from is exactly what a decoder will have. The boolean coder is RFC 6386 section 7.3; the
 //! forward transforms follow the libvpx encoder's DCT and Walsh-Hadamard (`vp8/encoder/dct.c`).
 
-mod boolenc;
+pub(crate) mod boolenc;
 mod mb;
 mod syntax;
 

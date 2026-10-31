@@ -80,7 +80,7 @@ pub fn implemented() -> Vec<CodecImpl> {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-vp8" });
             }
             if c == CodecId::Vp9 {
-                return Some(CodecImpl { codec: c, decode: true, encode: false, implementation: "ironav-vp9" });
+                return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-vp9" });
             }
             let implementation = if c.sample_format().is_some() {
                 "ironav-pcm"
@@ -363,6 +363,7 @@ pub fn new_encoder_with_opts(codec: CodecId, params: &StreamParams, bits: Option
         (CodecId::H264, StreamParams::Video { .. }) => Ok(Box::new(h264::H264Encoder::new(params, None, bitrate_kbps.map(|k| k.saturating_mul(1000)))?)),
         (CodecId::Hevc, StreamParams::Video { .. }) => Ok(Box::new(hevc::HevcEncoder::new(params, None, bitrate_kbps.map(|k| k.saturating_mul(1000)))?)),
         (CodecId::Vp8, StreamParams::Video { .. }) => Ok(Box::new(vp8::Vp8Encoder::new(params, None, bitrate_kbps.map(|k| k.saturating_mul(1000)))?)),
+        (CodecId::Vp9, StreamParams::Video { .. }) => Ok(Box::new(vp9::Vp9Encoder::new(params, None)?)),
         (c, p) if c.media_type() != p.media_type() => Err(Error::invalid_arg(format!(
             "codec {} is {:?} but the stream is {:?}",
             c.name(),

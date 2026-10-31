@@ -9,6 +9,7 @@
 mod adapt;
 mod block;
 mod dec;
+mod enc;
 mod header;
 mod intrapred;
 mod itx;
@@ -18,6 +19,8 @@ mod mvs;
 mod rac;
 mod recon;
 mod tables;
+
+pub use enc::Vp9Encoder;
 
 use std::sync::Arc;
 

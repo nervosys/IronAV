@@ -4,6 +4,7 @@ use ironav_codec::h264::H264Encoder;
 use ironav_codec::hevc::HevcEncoder;
 use ironav_codec::jpeg::JpegEncoder;
 use ironav_codec::vp8::Vp8Encoder;
+use ironav_codec::vp9::Vp9Encoder;
 use ironav_codec::{build_filter, new_encoder_with_opts};
 use ironav_core::{CodecId, Decoder, Encoder, Error, ErrorCode, Filter, Frame, MediaType, Packet, Rational, Result};
 use ironav_hwaccel::{new_video_decoder, new_video_encoder, Direction, RateControl};
@@ -195,6 +196,12 @@ fn execute(
                     };
                     let e = H264Encoder::new(&dst.params, qp, bitrate)?;
                     Box::new(if st.low_latency { e.low_latency() } else { e })
+                }
+                _ if dst.codec == CodecId::Vp9 && dst.params.media_type() == MediaType::Video => {
+                    let RateControl::ConstQp(q) = rate else {
+                        return Err(Error::invalid_arg("the software VP9 encoder is constant quality: set qp, not a bit rate").hint("qp 18-28 is the usual range"));
+                    };
+                    Box::new(Vp9Encoder::new(&dst.params, Some(q))?)
                 }
                 _ if dst.codec == CodecId::Vp8 && dst.params.media_type() == MediaType::Video => {
                     let (qp, bitrate) = match rate {

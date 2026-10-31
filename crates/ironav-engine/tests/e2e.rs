@@ -1581,6 +1581,50 @@ fn luma_psnr(a: &[u8], b: &[u8], w: usize, h: usize) -> f64 {
     10.0 * (255.0f64 * 255.0 / mse.max(1e-9)).log10()
 }
 
+/// Encodes `src` to `out` with the VP9 encoder (key frames only) at `qp` and returns the size of the file.
+fn vp9_encode(src: &Path, out: &Path, qp: u8) -> u64 {
+    let mut j = job(src, out);
+    j.hwaccel = "off".into();
+    j.video.codec = Some("vp9".into());
+    j.video.qp = Some(qp);
+    run(&j, &mut |_| {}).unwrap();
+    std::fs::metadata(out).unwrap().len()
+}
+
+/// VP9 written by IronAV, in WebM, Matroska and MP4, decodes to the same pictures in IronAV and in
+/// FFmpeg, and those pictures are close to the source (odd dimensions included).
+#[test]
+fn vp9_encoded_files_decode_to_what_ffmpeg_decodes() {
+    if !ffmpeg_available() {
+        eprintln!("skipped: ffmpeg is not on PATH");
+        return;
+    }
+    let dir = scratch("vp9-enc");
+    let (w, h, n) = (177, 99, 6);
+    let frames = moving_pattern(w, h, n);
+    let src = dir.join("src.y4m");
+    write_y4m_frames(&src, w, h, &frames);
+    for ext in ["webm", "mkv", "mp4"] {
+        let enc = dir.join(format!("out.{ext}"));
+        vp9_encode(&src, &enc, 28);
+        let ours = dir.join(format!("ours-{ext}.y4m"));
+        let mut d = job(&enc, &ours);
+        d.hwaccel = "off".into();
+        d.video.codec = Some("rawvideo".into());
+        run(&d, &mut |_| {}).unwrap();
+        let theirs = dir.join(format!("ffmpeg-{ext}.yuv"));
+        let st = std::process::Command::new("ffmpeg").args(["-v", "error", "-y", "-i"]).arg(&enc).args(["-f", "rawvideo", "-pix_fmt", "yuv420p"]).arg(&theirs).status().unwrap();
+        assert!(st.success(), "ffmpeg could not decode {ext}");
+        let got = y4m_frames_any(&ours);
+        assert_eq!(got.len(), n, "{ext}: frame count");
+        assert!(got.concat() == std::fs::read(&theirs).unwrap(), "{ext}: IronAV's decode differs from FFmpeg's");
+        for (t, (g, s)) in got.iter().zip(&frames).enumerate() {
+            let p = luma_psnr(g, s, w, h);
+            assert!(p > 30.0, "{ext} frame {t}: PSNR {p:.1} dB");
+        }
+    }
+}
+
 /// Encodes `src` to `out` with the VP8 encoder at `qp` and returns the size of the file.
 fn vp8_encode(src: &Path, out: &Path, qp: u8) -> u64 {
     let mut j = job(src, out);

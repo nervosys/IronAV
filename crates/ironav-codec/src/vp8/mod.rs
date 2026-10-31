@@ -5,7 +5,7 @@
 //! reads unfiltered pixels, while later frames reference the filtered ones.
 
 mod dsp;
-mod enc;
+pub(crate) mod enc;
 mod pred;
 mod tables;
 

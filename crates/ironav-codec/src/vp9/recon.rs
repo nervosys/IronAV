@@ -53,7 +53,7 @@ impl Dec {
     /// Builds the prediction edges for a transform block at 4x4 unit (x4, y4) of the block and
     /// returns the mode to use after fallbacks for missing neighbours.
     #[allow(clippy::too_many_arguments)]
-    fn intra_edges(&self, pl: usize, mode: u8, px: usize, py: usize, tx: usize, x4: usize, y4: usize, w4: usize, top: &mut [u16; 65], left: &mut [u16; 32]) -> u8 {
+    pub(super) fn intra_edges(&self, pl: usize, mode: u8, px: usize, py: usize, tx: usize, x4: usize, y4: usize, w4: usize, top: &mut [u16; 65], left: &mut [u16; 32]) -> u8 {
         let (ss_h, ss_v) = if pl == 0 { (0, 0) } else { (self.ss_h, self.ss_v) };
         let have_top = self.row > 0 || y4 > 0;
         let have_left = self.col > self.tile_col_start || x4 > 0;
