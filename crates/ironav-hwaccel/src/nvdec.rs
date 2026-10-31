@@ -11,6 +11,9 @@
 //! n13.x) with `clang -fdump-record-layouts`; the tests pin their sizes. Only 8-bit 4:2:0 is
 //! accepted, and the GPU is asked first whether it can decode the stream.
 
+// `c_ulong` is 32 bits on Windows and 64 on Linux: conversions into it are needed on one only
+#![allow(clippy::useless_conversion)]
+
 use ironav_core::{CodecId, Decoder, Error, ErrorCode, Frame, Packet, PixelFormat, Result, StreamParams, VideoFrame};
 use libloading::Library;
 use std::collections::VecDeque;
@@ -343,22 +346,22 @@ impl State {
         }
         let surfaces = (f.min_num_decode_surfaces as u32).max(1);
         let mut info = CreateInfo {
-            width: f.coded_width,
-            height: f.coded_height,
-            num_decode_surfaces: surfaces,
+            width: f.coded_width.into(),
+            height: f.coded_height.into(),
+            num_decode_surfaces: surfaces.into(),
             codec: f.codec,
             chroma_format: f.chroma_format,
-            creation_flags: CREATE_PREFER_CUVID,
+            creation_flags: CREATE_PREFER_CUVID.into(),
             bit_depth_minus8: (self.bits - 8).into(),
             intra_decode_only: 0,
-            max_width: f.coded_width,
-            max_height: f.coded_height,
+            max_width: f.coded_width.into(),
+            max_height: f.coded_height.into(),
             reserved1: 0,
             display_area: [0; 4],
             output_format: if self.bits == 10 { SURFACE_P016 } else { SURFACE_NV12 },
             deinterlace: DEINTERLACE_WEAVE,
-            target_width: f.coded_width,
-            target_height: f.coded_height,
+            target_width: f.coded_width.into(),
+            target_height: f.coded_height.into(),
             num_output_surfaces: 2,
             vid_lock: ptr::null_mut(),
             target_rect: [0; 4],
@@ -646,7 +649,7 @@ impl NvdecDecoder {
     fn feed(&mut self, data: &[u8], pts: i64, flags: u32) -> Result<Vec<Frame>> {
         // SAFETY: binds the context we retained to this thread.
         unsafe { (self.set_ctx)(self.ctx) };
-        let mut pkt = SourcePacket { flags, payload_size: data.len() as u32 as c_ulong, payload: if data.is_empty() { ptr::null() } else { data.as_ptr() }, timestamp: pts };
+        let mut pkt = SourcePacket { flags: flags.into(), payload_size: data.len() as u32 as c_ulong, payload: if data.is_empty() { ptr::null() } else { data.as_ptr() }, timestamp: pts };
         // SAFETY: the parser calls back into `self.state` synchronously before returning.
         let r = unsafe { (self.state().api.parse)(self.parser, &mut pkt) };
         if let Some(e) = self.state().error.take() {
