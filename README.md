@@ -610,6 +610,22 @@ SNR instead of 2.9 concealed (20 ms SILK), 5.3 instead of 2.7 (10 ms), 10.1 inst
 of 3.1 (20 ms hybrid, below 8 kHz), and stereo SILK at 3.8 instead of 2.7; the whole stream without losses decodes at
 15.2 dB against 20.4 without FEC (20 ms SILK). libopus decodes all of these streams, at 22 to 27.5 dB for mono.
 
+Automatic mode (`OpusMode::Auto`) picks SILK, hybrid or CELT for each packet as libopus does: SILK below 16 kb/s
+(24 for stereo), hybrid above that, and CELT above a threshold that runs from 16 kb/s for music to 64 kb/s for speech
+(44 for stereo), with hysteresis, and a mode kept for three packets at least. Whether the input is speech comes from
+`with_signal(OpusSignal::Voice)` or `Music`, or is guessed from how its level moves (the spread of its 10 ms levels
+over two seconds: speech dips between syllables and words, music mostly holds its level), which takes a second or two to
+settle and is a far simpler guess than libopus's analysis. `set_bitrate` changes the rate between packets (a link
+adapting to the network), and the mode follows. A change between CELT and the others carries a redundant 5 ms CELT
+frame, as libopus sends: a change to CELT waits a packet, which ends with one that the CELT frames after it carry on
+from; a change from CELT starts with one, coded from CELT's state, and SILK starts again. Our decoder now follows
+libopus's rules at a change of mode (CELT starts again unless a redundant frame came before, the tail of a hybrid
+frame's last window is played out into a SILK frame, and a SILK frame's redundancy size counts the position bit).
+Speech, music and speech at 40 kb/s goes hybrid, CELT, hybrid, and speech at 12, 24, 80 and 12 kb/s goes SILK, hybrid,
+CELT, SILK; every 20 ms around a change decodes above 5 dB, most at the SNR of the speech around it, and the worst is
+the first frame after a change from CELT to hybrid, where SILK starts from nothing (7 to 10 dB against 18). libopus
+decodes such a stream (10, 20 and 60 ms) at 18.6, 21.6 and 22.3 dB.
+
 Discontinuous transmission (`with_dtx(true)`): after 200 ms without activity (a frame's level against a background level
 that follows the quietest frames down at once and rises 3 dB a second, never above -45 dBFS), frames are coded but only
 their TOC byte is sent, with one real frame every 400 ms. A decoder conceals the empty frames as lost ones (ours does,
@@ -626,8 +642,8 @@ share (3 kb/s and a quarter of the rate above 16), SILK the rest, and the frame 
 side's delay, so the two meet in step and the stream has SILK's pre-skip. Mono or stereo, like SILK mode (configurations 14 and
 15: full band, 10 or 20 ms). On the speech-like test with hiss added from 10 to 14 kHz, hybrid gives back 73 % of the
 energy above 9 kHz, which SILK alone drops entirely. libopus decodes the hybrid streams at 28.5 dB (20 ms, 24 kb/s) and
-26.3 dB (10 ms), FFmpeg's decoder at 31.9 and 26.4. Not yet: NLSF interpolation, switching
-modes mid-stream, and libopus's rate-distortion pulse search, so silence still costs about 15 bytes a frame without DTX.
+26.3 dB (10 ms), FFmpeg's decoder at 31.9 and 26.4. Not yet: NLSF interpolation, SILK's narrow and medium bands
+in the encoder, and libopus's rate-distortion pulse search, so silence still costs about 15 bytes a frame without DTX.
 
 ### Voice link
 

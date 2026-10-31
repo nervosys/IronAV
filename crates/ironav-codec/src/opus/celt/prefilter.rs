@@ -42,6 +42,28 @@ impl Default for Prefilter {
     }
 }
 
+impl Prefilter {
+    /// Starts again from no filtering, as a decoder's post-filter does after a reset, keeping
+    /// the input's history.
+    pub fn restart(&mut self) {
+        (self.period, self.gain, self.tapset) = (MIN_PERIOD, 0.0, 0);
+    }
+
+    /// Keeps the input's history up to date over a frame of `n` samples (each slice as
+    /// [`run`](Self::run) takes it) that is coded without the pre-filter.
+    pub fn skip(&mut self, sig: &[&[f32]], n: usize) {
+        for (h, s) in self.hist.iter_mut().zip(sig) {
+            let x = &s[OVERLAP..OVERLAP + n];
+            if n >= MAX_PERIOD {
+                h.copy_from_slice(&x[n - MAX_PERIOD..]);
+            } else {
+                h.copy_within(n.., 0);
+                h[MAX_PERIOD - n..].copy_from_slice(x);
+            }
+        }
+    }
+}
+
 /// `x . y` and the energies of both.
 fn corr(x: &[f32], y: &[f32]) -> (f32, f32, f32) {
     let (mut xy, mut xx, mut yy) = (0f32, 0f32, 0f32);

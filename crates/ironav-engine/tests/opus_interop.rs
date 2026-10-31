@@ -3,9 +3,10 @@
 //! opus_interop -- --ignored`. Each file is one second of a speech-like signal, which is also
 //! written as `input.wav` to compare against: CELT at six frame lengths, SILK and hybrid at four (packets of 40
 //! and 60 ms hold two or three frames), each mode with DTX across a pause, against `pause.wav`, and each mode
-//! in stereo, against `stereo.wav`; SILK and hybrid also with in-band FEC (`_fec`).
+//! in stereo, against `stereo.wav`; SILK and hybrid also with in-band FEC (`_fec`); and automatic mode
+//! switching between all three, against `switch.wav`.
 
-use ironav_codec::opus::{opus_head, OpusEncoder, OpusMode};
+use ironav_codec::opus::{opus_head, OpusEncoder, OpusMode, OpusSignal};
 use ironav_core::{CodecId, Packet, Rational, StreamInfo, StreamParams};
 use std::path::PathBuf;
 
@@ -104,6 +105,29 @@ fn short_frame_streams_for_another_decoder() {
         m.write_header(&[info]).unwrap();
         let mut buf = vec![0u8; enc.packet_bytes()];
         for (k, f) in stereo.chunks_exact(2 * n).enumerate() {
+            let len = enc.encode_frame_into(f, &mut buf).unwrap();
+            m.write_packet(&Packet { stream: 0, pts: (k * n) as i64, duration: n as i64, data: buf[..len].to_vec() }).unwrap();
+        }
+        m.finish().unwrap();
+    }
+    // automatic mode, the bit rate changing every half second (SILK, hybrid, CELT, SILK, ...),
+    // over two seconds of the signal, as `switch.wav`
+    let long: Vec<f32> = input.iter().chain(&input).copied().collect();
+    let mut wav = ironav_formats::create_muxer(&dir.join("switch.wav"), "wav").unwrap();
+    wav.write_header(std::slice::from_ref(&pcm)).unwrap();
+    let data = long.iter().flat_map(|v| ((v * 32767.0).round() as i16).to_le_bytes()).collect();
+    wav.write_packet(&Packet { stream: 0, pts: 0, duration: long.len() as i64, data }).unwrap();
+    wav.finish().unwrap();
+    for ms in [10.0, 20.0, 60.0] {
+        let rates = [12_000, 24_000, 80_000, 12_000];
+        let mut enc = OpusEncoder::new(48_000, 1, rates[0]).unwrap().with_mode(OpusMode::Auto).unwrap().with_frame_ms(ms).unwrap().with_signal(OpusSignal::Voice);
+        let n = enc.frame_samples();
+        let info = StreamInfo { codec: CodecId::Opus, extradata: enc.head(), bits: None, ..pcm.clone() };
+        let mut m = ironav_formats::create_muxer(&dir.join(format!("voice_auto_{ms}ms.opus")), "ogg").unwrap();
+        m.write_header(&[info]).unwrap();
+        for (k, f) in long.chunks_exact(n).enumerate() {
+            enc.set_bitrate(rates[(k * n / 24_000).min(3)]).unwrap();
+            let mut buf = vec![0u8; enc.packet_bytes()];
             let len = enc.encode_frame_into(f, &mut buf).unwrap();
             m.write_packet(&Packet { stream: 0, pts: (k * n) as i64, duration: n as i64, data: buf[..len].to_vec() }).unwrap();
         }

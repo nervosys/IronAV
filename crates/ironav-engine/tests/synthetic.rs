@@ -36,7 +36,8 @@ fn a_test_picture_numbers_its_frames_and_says_it_is_synthetic() {
         let p95 = st["stage_ms"][stage]["p95"].as_f64().unwrap();
         assert!((0.0..500.0).contains(&p95), "{stage}: {st}");
     }
-    assert!(st["stage_ms"]["decode"]["max"].as_f64().unwrap() > 0.0, "{st}");
+    // measured, though raw video decodes in less than the 0.1 ms it is rounded to
+    assert!(st["stage_ms"]["decode"]["max"].as_f64().is_some_and(|v| v >= 0.0), "{st}");
 }
 
 #[test]

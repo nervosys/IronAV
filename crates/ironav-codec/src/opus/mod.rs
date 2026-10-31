@@ -17,7 +17,7 @@ mod tables;
 
 use ironav_core::{AudioFrame, Decoder, Error, ErrorCode, Frame, Packet, Result, StreamParams};
 use rc::RangeDecoder;
-pub use encoder::{opus_head, OpusEncoder, OpusMode, SILK_PRE_SKIP};
+pub use encoder::{opus_head, OpusEncoder, OpusMode, OpusSignal, SILK_PRE_SKIP};
 use std::f64::consts::PI;
 use tables::CELT_WINDOW2;
 
@@ -281,6 +281,10 @@ pub struct OpusDecoder {
     red_out: [Vec<f32>; 2],
     /// The last frame decoded: its length and whether it was CELT only, for concealment.
     last: Option<(usize, bool)>,
+    /// The mode of the last frame decoded, and whether it had a redundant CELT frame: CELT
+    /// starts again at a change of mode unless it did.
+    prev_mode: Option<Mode>,
+    prev_red: bool,
     plc: plc::Plc,
 }
 
@@ -324,6 +328,8 @@ impl OpusDecoder {
             celt_out: [vec![0.0; 960], vec![0.0; 960]],
             red_out: [vec![0.0; 240], vec![0.0; 240]],
             last: None,
+            prev_mode: None,
+            prev_red: false,
             plc: plc::Plc::new(ch),
         })
     }
@@ -535,7 +541,7 @@ impl OpusDecoder {
         let (mut red_pos, mut red_size) = (false, 0usize);
         if redundancy {
             red_pos = rc.log(1) != 0;
-            red_size = if t.mode == Mode::Hybrid { rc.uint(256) as usize + 2 } else { size.saturating_sub(((consumed + 7) / 8) as usize) };
+            red_size = if t.mode == Mode::Hybrid { rc.uint(256) as usize + 2 } else { size.saturating_sub(((rc.tell() + 7) / 8) as usize) };
             if red_size > size {
                 return Err(bad("invalid redundancy frame size"));
             }
@@ -546,7 +552,12 @@ impl OpusDecoder {
             }
         }
 
+        let changed = self.prev_mode.is_some_and(|m| m != t.mode);
         if t.mode != Mode::Silk {
+            // CELT starts again at a change of mode, but carries on from a redundant frame
+            if changed && !self.prev_red {
+                self.celt.flush();
+            }
             rc.set_raw(size, size);
             let start = if t.mode == Mode::Hybrid { 17 } else { 0 };
             self.celt.decode_frame(&mut rc, celt_out, t.stereo as usize + 1, n, start, BAND_END[t.bandwidth])?;
@@ -556,8 +567,19 @@ impl OpusDecoder {
                 }
             }
         } else {
+            // after a hybrid frame, the end of its high band's last window
+            if self.prev_mode == Some(Mode::Hybrid) && !(redundancy && red_pos && self.prev_red) {
+                let mut silence = RangeDecoder::new(&[0xff, 0xff]);
+                self.celt.decode_frame(&mut silence, celt_out, t.stereo as usize + 1, 120, 0, BAND_END[t.bandwidth])?;
+                for c in 0..self.channels {
+                    for (o, v) in out[c][..120].iter_mut().zip(&celt_out[c][..120]) {
+                        *o += *v;
+                    }
+                }
+            }
             self.celt.flush();
         }
+        (self.prev_mode, self.prev_red) = (Some(t.mode), redundancy);
 
         if redundancy {
             if !red_pos {

@@ -250,6 +250,13 @@ impl Celt {
     /// frame. Bands from `start` up are coded: 0 alone, 17 (8 kHz) after SILK in a hybrid frame,
     /// where there is no post-filter.
     pub fn encode_frame(&mut self, rc: &mut RangeEncoder, sig: &[&[f32]], size: i32, silent: bool, intra: bool, pitch: Option<super::prefilter::PitchParams>, start: usize) {
+        self.encode_bands(rc, sig, size, silent, intra, pitch, start, END);
+    }
+
+    /// [`encode_frame`](Self::encode_frame) for the bands from `start` to `end` (17 for a
+    /// wideband frame, 21 for full band).
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_bands(&mut self, rc: &mut RangeEncoder, sig: &[&[f32]], size: i32, silent: bool, intra: bool, pitch: Option<super::prefilter::PitchParams>, start: usize, end: usize) {
         let channels = sig.len();
         let n = OVERLAP << size;
         self.flushed = false;
@@ -257,7 +264,7 @@ impl Celt {
             let p = &mut self.p;
             p.coded_channels = channels as i32;
             p.start_band = start;
-            p.end_band = END;
+            p.end_band = end;
             p.framebits = rc.frame_bits();
             p.size = size;
             p.apply_phase_inv = self.apply_phase_inv;

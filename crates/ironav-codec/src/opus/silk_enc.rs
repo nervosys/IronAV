@@ -351,6 +351,13 @@ impl SilkEncoder {
         self.sent.clone_from(&self.st);
     }
 
+    /// Starts again as a decoder does after CELT frames: from no history, with no copies.
+    pub fn restart(&mut self) {
+        self.st = State::new();
+        self.sent = State::new();
+        self.lbrr = Default::default();
+    }
+
     /// Goes back to the state after the last packet sent, as a decoder that was sent nothing
     /// since (it conceals, and keeps its state) has it; with no copies for the next packet.
     pub fn rewind(&mut self) {
@@ -740,6 +747,13 @@ impl SilkStereo {
     pub fn mark_sent(&mut self) {
         self.side.mark_sent();
         self.sent = self.prev;
+    }
+
+    /// [`SilkEncoder::restart`] for the side and the weights.
+    pub fn restart(&mut self) {
+        self.side.restart();
+        (self.prev, self.sent) = ([0.0; 2], [0.0; 2]);
+        self.res.fill(0.0);
     }
 
     /// [`SilkEncoder::rewind`] for the side and the weights.
