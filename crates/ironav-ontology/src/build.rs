@@ -32,8 +32,6 @@ fn codec_meta(c: CodecId) -> (&'static str, &'static str) {
 
 /// Containers IronAV does not implement yet, with the codecs they hold.
 const PLANNED_CONTAINERS: &[(&str, &str, &str, &[CodecId])] = &[
-    ("mov", "QuickTime MOV", "Apple QuickTime container; common for ProRes editing masters.",
-        &[CodecId::H264, CodecId::Hevc, CodecId::ProRes, CodecId::Mjpeg, CodecId::Aac, CodecId::Alac, CodecId::PcmS16Le, CodecId::PcmS32Le]),
 ];
 
 /// Build the ontology from the live registries.

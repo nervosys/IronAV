@@ -702,7 +702,7 @@ fn build_track(t: &MkTrack, index: usize, frames: &[&Frame], scale: u64, samples
     }
     let duration: i64 = samples[first..].iter().map(|s| s.duration as i64).sum();
     let stream = StreamInfo { index, codec, time_base, duration: Some(duration), bits, extradata, lead_in: 0, params };
-    Ok(Some(TrackInfo { stream, config, convert }))
+    Ok(Some(TrackInfo { stream, config, convert, swap: 0 }))
 }
 
 /// Open a Matroska or WebM file for reading.

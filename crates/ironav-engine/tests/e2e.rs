@@ -1948,3 +1948,174 @@ fn low_latency_re_encodes_without_reordering() {
     c.video.latency = Some(ironav_engine::Latency::Low);
     assert_eq!(plan(&c).unwrap_err().code, ErrorCode::InvalidArgument);
 }
+
+// QuickTime MOV: ffmpeg-made fixtures under tests/data, and files IronAV writes that ffmpeg reads back.
+
+use ironav_core::{CodecId, Packet, StreamInfo};
+
+/// Demuxes a file: its format name, its streams, and every packet in order.
+fn demux_all(path: &Path) -> (&'static str, Vec<StreamInfo>, Vec<Packet>) {
+    let mut d = ironav_formats::open_demuxer(path).unwrap();
+    let streams = d.streams().to_vec();
+    let mut packets = Vec::new();
+    while let Some(p) = d.read_packet().unwrap() {
+        packets.push(p);
+    }
+    (d.format_name(), streams, packets)
+}
+
+/// The payloads of one stream's packets.
+fn stream_data(packets: &[Packet], stream: usize) -> Vec<&[u8]> {
+    packets.iter().filter(|p| p.stream == stream).map(|p| p.data.as_slice()).collect()
+}
+
+fn ffmpeg_available() -> bool {
+    std::process::Command::new("ffmpeg").arg("-version").output().is_ok_and(|o| o.status.success())
+}
+
+/// FFmpeg's (hash, size) for each packet of one stream, copied without re-encoding. Timestamps are
+/// left out: they are in each container's own time base.
+fn ffmpeg_packets(path: &Path, map: &str) -> Vec<(String, String)> {
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-i"])
+        .arg(path)
+        .args(["-map", map, "-c", "copy", "-f", "framemd5", "-"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "ffmpeg could not read {}", path.display());
+    String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .map(|l| {
+            let f: Vec<&str> = l.split(',').map(str::trim).collect();
+            (f[4].to_string(), f[5].to_string())
+        })
+        .collect()
+}
+
+/// The raw sample bytes of a WAV file.
+fn wav_pcm(path: &Path) -> Vec<u8> {
+    let (_, _, packets) = demux_all(path);
+    packets.iter().flat_map(|p| p.data.iter().copied()).collect()
+}
+
+#[test]
+fn quicktime_video_and_aac_are_the_packets_of_the_mp4_copy() {
+    let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    let (mov_name, mov_streams, mov) = demux_all(&data.join("quicktime_h264_aac.mov"));
+    let (mp4_name, _, mp4) = demux_all(&data.join("quicktime_h264_aac.mp4"));
+    assert_eq!((mov_name, mp4_name), ("mov", "mp4"));
+    assert_eq!(mov_streams.iter().map(|s| s.codec).collect::<Vec<_>>(), vec![CodecId::H264, CodecId::Aac]);
+    for stream in 0..2 {
+        let a: Vec<(i64, &[u8])> = mov.iter().filter(|p| p.stream == stream).map(|p| (p.pts, p.data.as_slice())).collect();
+        let b: Vec<(i64, &[u8])> = mp4.iter().filter(|p| p.stream == stream).map(|p| (p.pts, p.data.as_slice())).collect();
+        assert!(!a.is_empty());
+        assert!(a == b, "stream {stream} differs from the MP4 copy");
+    }
+}
+
+#[test]
+fn quicktime_pcm_is_bit_exact_with_the_wav_it_was_made_from() {
+    let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    let (want16, want24) = (wav_pcm(&data.join("quicktime_src_s16.wav")), wav_pcm(&data.join("quicktime_src_s24.wav")));
+    // big-endian 'twos', little-endian 'sowt' (16 bits) and 'in24' with its 'enda' atom (24 bits)
+    for (file, want, codec, bits) in [
+        ("quicktime_h264_s16le.mov", &want16, CodecId::PcmS16Le, 16),
+        ("quicktime_h264_s16be.mov", &want16, CodecId::PcmS16Le, 16),
+        ("quicktime_h264_s24le.mov", &want24, CodecId::PcmS24Le, 24),
+    ] {
+        let (name, streams, packets) = demux_all(&data.join(file));
+        assert_eq!(name, "mov");
+        assert_eq!((streams[1].codec, streams[1].bits), (codec, Some(bits)), "{file}");
+        let got: Vec<u8> = stream_data(&packets, 1).concat();
+        assert!(got == *want, "{file}: {} bytes, the WAV has {}", got.len(), want.len());
+    }
+}
+
+#[test]
+fn quicktime_motion_jpeg_frames_are_the_matroska_copy_frames() {
+    let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    let (name, streams, mov) = demux_all(&data.join("quicktime_mjpeg_s16le.mov"));
+    let (_, _, mkv) = demux_all(&data.join("quicktime_mjpeg_s16le.mkv"));
+    assert_eq!(name, "mov");
+    assert_eq!((streams[0].codec, streams[1].codec), (CodecId::Mjpeg, CodecId::PcmS16Le));
+    assert_eq!(stream_data(&mov, 0), stream_data(&mkv, 0));
+}
+
+#[test]
+fn mp4_copies_into_mov_and_ffmpeg_reads_the_same_packets() {
+    if !ffmpeg_available() {
+        eprintln!("skipped: ffmpeg is not on PATH");
+        return;
+    }
+    let dir = scratch("mp4-to-mov");
+    let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    let (src, out) = (data.join("quicktime_h264_aac.mp4"), dir.join("out.mov"));
+    let report = run(&job(&src, &out), &mut |_| {}).unwrap();
+    assert_eq!(report.format, "mov");
+    for map in ["0:v", "0:a"] {
+        assert!(!ffmpeg_packets(&src, map).is_empty(), "{map}");
+        assert_eq!(ffmpeg_packets(&out, map), ffmpeg_packets(&src, map), "{map}");
+    }
+    let (name, _, packets) = demux_all(&out);
+    let (_, _, src_packets) = demux_all(&src);
+    assert_eq!(name, "mov");
+    assert_eq!(stream_data(&packets, 0), stream_data(&src_packets, 0));
+}
+
+#[test]
+fn pcm_written_to_mov_decodes_bit_exact_in_ffmpeg() {
+    if !ffmpeg_available() {
+        eprintln!("skipped: ffmpeg is not on PATH");
+        return;
+    }
+    let dir = scratch("pcm-to-mov");
+    let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    for (wav, fmt, codec) in [("quicktime_src_s16.wav", "s16le", CodecId::PcmS16Le), ("quicktime_src_s24.wav", "s24le", CodecId::PcmS24Le)] {
+        let (src, out) = (data.join(wav), dir.join(format!("{fmt}.mov")));
+        run(&job(&src, &out), &mut |_| {}).unwrap();
+        let want = wav_pcm(&src);
+        assert!(!want.is_empty());
+        let decoded = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-i"])
+            .arg(&out)
+            .args(["-map", "0:a", "-f", fmt, "-"])
+            .output()
+            .unwrap();
+        assert!(decoded.status.success());
+        assert!(decoded.stdout == want, "{wav}: ffmpeg's decode differs from the source");
+        let (name, streams, packets) = demux_all(&out);
+        assert_eq!((name, streams[0].codec), ("mov", codec));
+        assert!(stream_data(&packets, 0).concat() == want, "{wav}: IronAV reads its own MOV differently");
+    }
+}
+
+#[test]
+fn motion_jpeg_written_to_mov_reads_back_in_ffmpeg() {
+    if !ffmpeg_available() {
+        eprintln!("skipped: ffmpeg is not on PATH");
+        return;
+    }
+    let dir = scratch("mjpeg-to-mov");
+    let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    let (src, out) = (data.join("quicktime_mjpeg_s16le.mov"), dir.join("out.mov"));
+    run(&job(&src, &out), &mut |_| {}).unwrap();
+    assert!(!ffmpeg_packets(&src, "0:v").is_empty());
+    assert_eq!(ffmpeg_packets(&out, "0:v"), ffmpeg_packets(&src, "0:v"));
+}
+
+#[test]
+fn quicktime_converts_back_to_mp4_with_the_same_packets() {
+    let dir = scratch("mov-to-mp4");
+    let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    let (src, out) = (data.join("quicktime_h264_aac.mov"), dir.join("out.mp4"));
+    let report = run(&job(&src, &out), &mut |_| {}).unwrap();
+    assert_eq!(report.format, "mp4");
+    let (name, _, packets) = demux_all(&out);
+    let (_, _, src_packets) = demux_all(&src);
+    assert_eq!(name, "mp4");
+    for stream in 0..2 {
+        assert_eq!(stream_data(&packets, stream), stream_data(&src_packets, stream), "stream {stream}");
+    }
+}

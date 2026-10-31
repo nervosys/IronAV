@@ -27,6 +27,12 @@ pub fn looks_like_mp4(magic: &[u8]) -> bool {
     magic.len() >= 12 && matches!(&magic[4..8], b"ftyp" | b"moov" | b"mdat" | b"free" | b"skip" | b"wide")
 }
 
+/// Whether `magic` (the first bytes of a file) is QuickTime: a `qt  ` major brand, or an index,
+/// media or padding box with no `ftyp` in front, which old QuickTime writers leave.
+pub fn looks_like_mov(magic: &[u8]) -> bool {
+    magic.len() >= 12 && (matches!(&magic[4..8], b"moov" | b"mdat" | b"wide" | b"free") || (&magic[4..8] == b"ftyp" && &magic[8..12] == b"qt  "))
+}
+
 struct Boxes<'a> {
     data: &'a [u8],
 }
@@ -129,6 +135,8 @@ pub(crate) struct TrackInfo {
     pub config: Config,
     /// Whether samples are length-prefixed NAL units to be rewritten as Annex B (H.264 and HEVC).
     pub convert: bool,
+    /// Byte width of each big-endian sample to reverse (QuickTime PCM), or 0.
+    pub swap: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -165,12 +173,16 @@ impl<R: Read + Seek + Send> Mp4Demuxer<R> {
         let mut at = 0u64;
         let mut moov = None;
         let mut moofs: Vec<(u64, u64, u64)> = Vec::new(); // (box start, body start, body length)
+        let mut quicktime = false;
         while at + 8 <= len {
             r.seek(SeekFrom::Start(at))?;
             let mut h = [0u8; 16];
             let n = r.read(&mut h)?.min(16);
             if n < 8 {
                 break;
+            }
+            if at == 0 {
+                quicktime = looks_like_mov(&h[..n]);
             }
             let size = u32::from_be_bytes(h[..4].try_into().unwrap()) as u64;
             let (hdr, total) = match size {
@@ -258,7 +270,7 @@ impl<R: Read + Seek + Send> Mp4Demuxer<R> {
         if tracks.is_empty() {
             return Err(Error::new(ErrorCode::UnsupportedCodec, "the MP4 has no audio or video track IronAV recognises"));
         }
-        Ok(Self::from_parts(r, "mp4", tracks, samples))
+        Ok(Self::from_parts(r, if quicktime { "mov" } else { "mp4" }, tracks, samples))
     }
 
     /// A demuxer over samples some other container reader has found: `samples` index into `tracks`
@@ -494,6 +506,7 @@ fn parse_trak(trak: &[u8], index: usize, samples: &mut Vec<Sample>) -> Result<Op
 
     let time_base = Rational::new(1, timescale as i64);
     let mut extradata = Vec::new();
+    let mut swap = 0usize;
     let (codec, params, bits, config, convert) = if is_video {
         let codec = match &fourcc {
             b"avc1" | b"avc3" => CodecId::H264,
@@ -505,7 +518,9 @@ fn parse_trak(trak: &[u8], index: usize, samples: &mut Vec<Sample>) -> Result<Op
             _ => return Ok(None),
         };
         let (width, height) = (be16(e, 24)? as u32, be16(e, 26)? as u32);
-        let kids = e.get(78..).unwrap_or(&[]);
+        // a version 1 QuickTime video entry has 16 more bytes before its child boxes
+        let kids_at = if be16(e, 8)? == 1 { 94 } else { 78 };
+        let kids = e.get(kids_at..).unwrap_or(&[]);
         let config = match codec {
             CodecId::H264 => parse_avcc(need(kids, b"avcC", "the avc1 entry")?)?,
             CodecId::Hevc => parse_hvcc(need(kids, b"hvcC", "the hvc1 entry")?)?,
@@ -529,14 +544,6 @@ fn parse_trak(trak: &[u8], index: usize, samples: &mut Vec<Sample>) -> Result<Op
         let params = StreamParams::Video { width, height, pix_fmt, frame_rate };
         (codec, params, None, config, matches!(codec, CodecId::H264 | CodecId::Hevc))
     } else {
-        let codec = match &fourcc {
-            b"fLaC" => CodecId::Flac,
-            b"mp4a" => CodecId::Aac,
-            b"Opus" => CodecId::Opus,
-            b"alac" => CodecId::Alac,
-            b".mp3" => CodecId::Mp3,
-            _ => return Ok(None),
-        };
         // QuickTime sound entries of version 1 and 2 carry extra fields before the child boxes.
         let version = be16(e, 8)?;
         let kids_at = match version {
@@ -544,9 +551,27 @@ fn parse_trak(trak: &[u8], index: usize, samples: &mut Vec<Sample>) -> Result<Op
             2 => 28 + 36,
             _ => 28,
         };
-        let mut channels = be16(e, 16)?;
-        let mut rate = be32(e, 24)? >> 16;
+        let kids = e.get(kids_at..).unwrap_or(&[]);
+        let pcm = quicktime_pcm(&fourcc, e, kids)?;
+        let codec = match (&pcm, &fourcc) {
+            (Some(p), _) => p.codec,
+            (None, b"fLaC") => CodecId::Flac,
+            (None, b"mp4a") => CodecId::Aac,
+            (None, b"Opus") => CodecId::Opus,
+            (None, b"alac") => CodecId::Alac,
+            (None, b".mp3") => CodecId::Mp3,
+            _ => return Ok(None),
+        };
+        // version 2 states the rate and channel count in its own fields, as doubles and words
+        let (mut channels, mut rate) = if version == 2 {
+            (be32(e, 40)? as u16, e.get(32..40).map_or(0.0, |b| f64::from_be_bytes(b.try_into().unwrap())).round() as u32)
+        } else {
+            (be16(e, 16)?, be32(e, 24)? >> 16)
+        };
         let mut bits = Some(be16(e, 18)? as u8).filter(|&b| b > 0);
+        if let Some(p) = &pcm {
+            bits = Some(p.bits);
+        }
         if codec == CodecId::Flac {
             let dfla = need(e.get(kids_at..).unwrap_or(&[]), b"dfLa", "the fLaC entry")?;
             let si = dfla.get(4..).filter(|b| b.len() >= 4 + 34 && b[0] & 0x7F == 0).ok_or_else(|| corrupt("dfLa has no STREAMINFO block"))?;
@@ -556,7 +581,7 @@ fn parse_trak(trak: &[u8], index: usize, samples: &mut Vec<Sample>) -> Result<Op
             bits = Some(((packed >> 36) & 31) as u8 + 1);
         }
         if codec == CodecId::Aac {
-            extradata = aac_config(need(e.get(kids_at..).unwrap_or(&[]), b"esds", "the mp4a entry")?)?;
+            extradata = aac_config(sound_child(kids, b"esds", "the mp4a entry")?)?;
         }
         if codec == CodecId::Alac {
             // the box holds a version and flags, then the 24-byte ALACSpecificConfig, which has the true rate, channels and depth
@@ -571,13 +596,14 @@ fn parse_trak(trak: &[u8], index: usize, samples: &mut Vec<Sample>) -> Result<Op
             channels = cfg[9] as u16;
             rate = u32::from_be_bytes([cfg[20], cfg[21], cfg[22], cfg[23]]);
         }
+        swap = pcm.as_ref().filter(|p| p.big && p.bits > 8).map_or(0, |p| p.bits as usize / 8);
         let params = StreamParams::Audio { sample_rate: rate, channels };
         (codec, params, bits, Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma: 1 }, false)
     };
     let duration: i64 = samples[first..].iter().map(|s| s.duration as i64).sum();
     let lead_in = edit_lead_in(trak)?;
     let stream = StreamInfo { index, codec, time_base, duration: Some(duration), bits, extradata, lead_in, params };
-    Ok(Some(TrackInfo { stream, config, convert }))
+    Ok(Some(TrackInfo { stream, config, convert, swap }))
 }
 
 /// Media time at which the track's first non-empty edit starts, from `edts/elst`; 0 without one.
@@ -595,6 +621,55 @@ fn edit_lead_in(trak: &[u8]) -> Result<i64> {
         }
     }
     Ok(0)
+}
+
+/// A QuickTime PCM sample entry: its codec, sample size in bits, and whether its samples are big-endian.
+struct Pcm {
+    codec: CodecId,
+    bits: u8,
+    big: bool,
+}
+
+/// The PCM format of a sound entry by its four-character code (`None` for other codecs).
+fn quicktime_pcm(fourcc: &[u8; 4], e: &[u8], kids: &[u8]) -> Result<Option<Pcm>> {
+    // a `wave` box's `enda` says whether the samples are little-endian (1) or big-endian (0)
+    let enda = match child(kids, b"wave")? {
+        Some(wave) => child(wave, b"enda")?.map(|b| be16(b, 0)).transpose()?,
+        None => None,
+    };
+    let (codec, bits, big) = match fourcc {
+        b"twos" => (CodecId::PcmS16Le, 16, true),
+        b"sowt" => (CodecId::PcmS16Le, 16, false),
+        b"in24" => (CodecId::PcmS24Le, 24, true),
+        b"in32" => (CodecId::PcmS32Le, 32, true),
+        b"fl32" => (CodecId::PcmF32Le, 32, true),
+        b"fl64" => (CodecId::PcmF64Le, 64, true),
+        b"raw " => (CodecId::PcmU8, 8, false),
+        b"lpcm" => {
+            // version 2: the format is in the flags (1 float, 2 big-endian, 4 signed)
+            let (flags, bits) = (be32(e, 52)?, be32(e, 48)? as u8);
+            let codec = match (flags & 1 != 0, flags & 4 != 0, bits) {
+                (true, _, 32) => CodecId::PcmF32Le,
+                (true, _, 64) => CodecId::PcmF64Le,
+                (false, true, 16) => CodecId::PcmS16Le,
+                (false, true, 24) => CodecId::PcmS24Le,
+                (false, true, 32) => CodecId::PcmS32Le,
+                (false, false, 8) => CodecId::PcmU8,
+                _ => return Err(Error::new(ErrorCode::UnsupportedCodec, format!("lpcm of {bits} bits (flags {flags:#x}) is not supported"))),
+            };
+            (codec, bits, flags & 2 != 0)
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(Pcm { codec, bits, big: enda.map_or(big, |v| v == 0) }))
+}
+
+/// A child box of a sound entry, which QuickTime may keep inside its `wave` box.
+fn sound_child<'a>(kids: &'a [u8], kind: &[u8; 4], within: &str) -> Result<&'a [u8]> {
+    match child(kids, b"wave")? {
+        Some(wave) => need(wave, kind, within).or_else(|_| need(kids, kind, within)),
+        None => need(kids, kind, within),
+    }
 }
 
 /// The AudioSpecificConfig inside an `esds` box: ES descriptor (0x03) > decoder config (0x04,
@@ -813,6 +888,9 @@ impl<R: Read + Seek + Send> Demuxer for Mp4Demuxer<R> {
                 }
                 out
             } else {
+                if t.swap > 0 {
+                    raw.chunks_exact_mut(t.swap).for_each(<[u8]>::reverse);
+                }
                 raw
             };
             self.seen[st] += 1;
@@ -1035,5 +1113,43 @@ mod tests {
         let landed = a.seek(0.09).unwrap();
         assert!((landed - 4096.0 / 48000.0).abs() < 1e-9, "audio frame 2 starts at {landed}");
         assert_eq!(a.read_packet().unwrap().unwrap().pts, 4096);
+    }
+
+    #[test]
+    fn recognises_quicktime_by_brand_or_by_a_leading_index_or_padding_box() {
+        assert!(looks_like_mov(b"\0\0\0\x14ftypqt  \0\0\x02\0"));
+        assert!(looks_like_mov(b"\0\0\0\x08wide\0\0\0\x08mdat"));
+        assert!(looks_like_mov(b"\0\0\x01\0moov\0\0\0\0\0\0\0\0"));
+        assert!(!looks_like_mov(b"\0\0\0\x14ftypisom\0\0\x02\0"));
+    }
+
+    #[test]
+    fn quicktime_pcm_round_trips_in_every_sample_format() {
+        for (codec, bits) in [(CodecId::PcmU8, 8u8), (CodecId::PcmS16Le, 16), (CodecId::PcmS24Le, 24), (CodecId::PcmS32Le, 32), (CodecId::PcmF32Le, 32), (CodecId::PcmF64Le, 64)] {
+            let sink = Arc::new(Mutex::new(Cursor::new(Vec::new())));
+            let mut m = crate::mp4::Mp4Muxer::quicktime(Box::new(Shared(sink.clone())), None);
+            let info = StreamInfo {
+                index: 0,
+                codec,
+                time_base: Rational::new(1, 8000),
+                duration: None,
+                bits: Some(bits),
+                extradata: Vec::new(),
+                lead_in: 0,
+                params: StreamParams::Audio { sample_rate: 8000, channels: 2 },
+            };
+            m.write_header(&[info]).unwrap();
+            let data: Vec<u8> = (0..40 * 2 * bits as usize / 8).map(|i| (i * 37) as u8).collect();
+            m.write_packet(&Packet { stream: 0, pts: 0, duration: 40, data: data.clone() }).unwrap();
+            m.finish().unwrap();
+            let file = sink.lock().unwrap().get_ref().clone();
+            assert_eq!(&file[8..12], b"qt  ", "a QuickTime brand");
+            let mut d = Mp4Demuxer::open(Cursor::new(file)).unwrap();
+            assert_eq!(d.format_name(), "mov");
+            let s = &d.streams()[0];
+            assert_eq!((s.codec, s.bits), (codec, Some(bits)), "{codec:?}");
+            assert!(matches!(s.params, StreamParams::Audio { sample_rate: 8000, channels: 2 }));
+            assert_eq!(d.read_packet().unwrap().unwrap().data, data, "{codec:?}");
+        }
     }
 }

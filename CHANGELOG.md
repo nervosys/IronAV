@@ -21,11 +21,15 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   ALAC (16 and 24 bits, mono and stereo).
 - **Codecs (voice link):** a playout buffer, a streaming resampler, speech detection with push-to-talk
   trimming, automatic gain control, noise suppression, and Opus packet-loss concealment.
-- **Containers:** WAV, FLAC, Y4M, MP4, Matroska and WebM (read and write), Ogg (Opus, Vorbis and FLAC),
+- **Containers:** WAV, FLAC, Y4M, MP4, QuickTime MOV, Matroska and WebM (read and write), Ogg (Opus, Vorbis and FLAC),
   ADTS, MP3, JPEG, and MPEG transport streams (read and write).
 - **Containers (MP4):** fragmented MP4 is read as it arrives; the writer is constant-frame-rate and
   writes fast-start files; B-frames are copied with `ctts` and an edit list; ALAC audio is read and written
   in the `alac` sample entry.
+- **Containers (QuickTime):** MOV is read as MP4 is, including QuickTime sound entries (versions 1 and 2, `wave`
+  atoms, and PCM in `twos`, `sowt`, `in24`, `in32`, `fl32`, `fl64`, `raw ` and `lpcm` form) and files with no `ftyp`;
+  written with a `qt  ` brand, H.264, HEVC, AAC, Motion-JPEG and PCM. FFmpeg decodes the PCM bit-exact and reads the copied
+  packets the same as IronAV does.
 - **Containers (copy):** VP9 and AV1 are copied between WebM, Matroska and MP4; AAC keeps its encoder
   delay in MP4; Opus ends where the source did in Matroska (DiscardPadding) and Ogg.
 - **Live input and streaming (HTTP authentication):** Digest (MD5 and MD5-sess, RFC 7616 and RFC 2069 forms) and

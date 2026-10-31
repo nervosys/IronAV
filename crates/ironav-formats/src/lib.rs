@@ -93,6 +93,15 @@ pub static FORMATS: &[FormatSpec] = &[
         codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Vp9, CodecId::Av1, CodecId::Aac, CodecId::Flac, CodecId::Alac],
     },
     FormatSpec {
+        name: "mov",
+        extensions: &["mov", "qt"],
+        description: "QuickTime MOV (ISO BMFF with QuickTime sound entries): read as MP4 is, with H.264, HEVC, Motion-JPEG or AAC video and audio, and PCM audio; written with a 'qt  ' brand and the MP4 index layout (fast-start)",
+        media: MediaType::Video,
+        demux: true,
+        mux: true,
+        codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Vp9, CodecId::Av1, CodecId::Mjpeg, CodecId::Aac, CodecId::Flac, CodecId::Alac, CodecId::PcmU8, CodecId::PcmS16Le, CodecId::PcmS24Le, CodecId::PcmS32Le, CodecId::PcmF32Le, CodecId::PcmF64Le],
+    },
+    FormatSpec {
         name: "mkv",
         extensions: &["mkv", "mka"],
         description: "Matroska: read (also WebM, with any codec the file holds) and written with H.264, HEVC, VP8, VP9, AV1 or Motion-JPEG video (copied; VP8 and MJPEG also encoded by IronAV where it has the codec) and AAC, FLAC, MP3, Opus or Vorbis audio copied or encoded; one stream of each kind; no SeekHead",
@@ -243,6 +252,7 @@ pub fn create_muxer(path: &Path, format: &str) -> Result<Box<dyn Muxer>> {
         "jpeg" => Ok(Box::new(jpeg::JpegMuxer::new(out))),
         "flac" => Ok(Box::new(flac::FlacMuxer::new(out))),
         "mp4" => Ok(Box::new(mp4::Mp4Muxer::with_faststart(out, path))),
+        "mov" => Ok(Box::new(mp4::Mp4Muxer::quicktime(out, Some(path)))),
         "aac" => Ok(Box::new(adts::AdtsMuxer::new(out))),
         "mp3" => Ok(Box::new(mp3::Mp3Muxer::new(out))),
         "mkv" => Ok(Box::new(mkvwrite::MatroskaWriter::new(out))),

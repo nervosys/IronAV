@@ -147,6 +147,7 @@ impl Track {
             Kind::Video { width, height } => self.video_entry(width, height),
             Kind::Audio { rate, channels, bits } if self.codec == CodecId::Aac => Ok(self.aac_entry(rate, channels, bits)),
             Kind::Audio { rate, channels, bits } if self.codec == CodecId::Alac => Ok(self.alac_entry(rate, channels, bits)),
+            Kind::Audio { rate, channels, bits } if self.codec.sample_format().is_some() => Ok(self.lpcm_entry(rate, channels, bits)),
             Kind::Audio { rate, channels, bits } => Ok(self.audio_entry(rate, channels, bits)),
         }
     }
@@ -158,6 +159,7 @@ impl Track {
             CodecId::Av1 => (b"av01", bx(b"av1C", &self.config)),
             CodecId::Vp9 if self.config.is_empty() => return Err(Error::invalid_input("the VP9 stream has no key frame to describe it to MP4")),
             CodecId::Vp9 => (b"vp09", bx(b"vpcC", &self.config)),
+            CodecId::Mjpeg => (b"jpeg", Vec::new()),
             _ => (b"avc1", self.avcc(&missing)?),
         };
         let mut e = vec![0u8; 6];
@@ -198,6 +200,32 @@ impl Track {
         esds.extend_from_slice(&es);
         e.extend_from_slice(&full(b"esds", 0, 0, &esds));
         bx(b"mp4a", &e)
+    }
+
+    /// QuickTime `lpcm` sample entry, version 2: little-endian samples, the format in its flags.
+    fn lpcm_entry(&self, rate: u32, channels: u16, bits: u8) -> Vec<u8> {
+        let flags: u32 = match self.codec {
+            CodecId::PcmF32Le | CodecId::PcmF64Le => 1 | 8,
+            CodecId::PcmU8 => 8,
+            _ => 4 | 8,
+        };
+        let mut e = vec![0u8; 6];
+        e.extend_from_slice(&1u16.to_be_bytes()); // data reference index
+        e.extend_from_slice(&2u16.to_be_bytes()); // version
+        e.extend_from_slice(&[0u8; 6]); // revision, vendor
+        e.extend_from_slice(&3u16.to_be_bytes()); // channels, as version 2 always states them
+        e.extend_from_slice(&16u16.to_be_bytes());
+        e.extend_from_slice(&[0xFF, 0xFE, 0, 0]); // compression id -2, packet size
+        e.extend_from_slice(&0x0001_0000u32.to_be_bytes()); // unused in version 2
+        e.extend_from_slice(&72u32.to_be_bytes()); // size of the version 2 fields
+        e.extend_from_slice(&(rate as f64).to_be_bytes());
+        e.extend_from_slice(&(channels as u32).to_be_bytes());
+        e.extend_from_slice(&0x7F00_0000u32.to_be_bytes());
+        e.extend_from_slice(&(bits as u32).to_be_bytes());
+        e.extend_from_slice(&flags.to_be_bytes());
+        e.extend_from_slice(&(channels as u32 * bits as u32 / 8).to_be_bytes()); // bytes per frame
+        e.extend_from_slice(&1u32.to_be_bytes()); // frames per packet
+        bx(b"lpcm", &e)
     }
 
     /// `fLaC` sample entry with a `dfLa` box holding the STREAMINFO metadata block (FLAC in ISO BMFF).
@@ -397,6 +425,7 @@ impl Track {
                 Some(x) => Ok(Some(x)),
                 None => Err(Error::invalid_input(format!("an AV1 packet at {} does not parse as OBUs", p.pts))),
             },
+            CodecId::Mjpeg => Ok(Some((p.data.clone(), true))),
             _ => Ok(annexb_sample(self.is_hevc(), &mut self.params, &p.data)),
         }
     }
@@ -487,6 +516,19 @@ pub struct Mp4Muxer {
     data_len: u64,
     /// When set, `finish` rewrites this file with the movie box in front of the media data.
     faststart: Option<std::path::PathBuf>,
+    /// QuickTime (MOV): a `qt  ` brand, and PCM and Motion-JPEG tracks as well.
+    quicktime: bool,
+}
+
+/// Sample size in bits of a PCM codec.
+fn pcm_bits(c: CodecId) -> u8 {
+    match c {
+        CodecId::PcmU8 => 8,
+        CodecId::PcmS16Le => 16,
+        CodecId::PcmS24Le => 24,
+        CodecId::PcmS32Le | CodecId::PcmF32Le => 32,
+        _ => 64,
+    }
 }
 
 /// Luma and chroma bit depth (minus 8) from an unescaped HEVC SPS, for a stream with a single
@@ -534,13 +576,18 @@ fn hevc_bit_depths(sps: &[u8]) -> Option<(u8, u8)> {
 
 impl Mp4Muxer {
     pub fn new(out: Box<dyn WriteSeek>) -> Self {
-        Self { out, tracks: Vec::new(), mdat_start: 0, data_len: 0, faststart: None }
+        Self { out, tracks: Vec::new(), mdat_start: 0, data_len: 0, faststart: None, quicktime: false }
     }
 
     /// Like `new`, but once the file is complete it is rewritten so that the index comes first and
     /// playback can begin before the download ends. `path` must be the file `out` writes to.
     pub fn with_faststart(out: Box<dyn WriteSeek>, path: &std::path::Path) -> Self {
         Self { faststart: Some(path.to_path_buf()), ..Self::new(out) }
+    }
+
+    /// The QuickTime (MOV) writer; `path`, the file `out` writes to, enables the fast-start rewrite.
+    pub fn quicktime(out: Box<dyn WriteSeek>, path: Option<&std::path::Path>) -> Self {
+        Self { quicktime: true, faststart: path.map(std::path::Path::to_path_buf), ..Self::new(out) }
     }
 
     fn moov(&self, shift: u64) -> Result<Vec<u8>> {
@@ -618,7 +665,7 @@ impl Muxer for Mp4Muxer {
                     return Err(Error::new(ErrorCode::UnsupportedFormat, "AV1 needs its av1C configuration record to go into an MP4")
                         .hint("copy it from an MP4, Matroska or WebM file, which carries it"));
                 }
-                (StreamParams::Video { width, height, frame_rate, .. }, CodecId::H264 | CodecId::Hevc | CodecId::Vp9 | CodecId::Av1) => {
+                (StreamParams::Video { width, height, frame_rate, .. }, CodecId::H264 | CodecId::Hevc | CodecId::Vp9 | CodecId::Av1 | CodecId::Mjpeg) => {
                     if frame_rate.num <= 0 || frame_rate.den <= 0 || frame_rate.num > u32::MAX as i64 || frame_rate.den > u32::MAX as i64 {
                         return Err(Error::invalid_arg("MP4 needs a known, constant frame rate"));
                     }
@@ -633,6 +680,9 @@ impl Muxer for Mp4Muxer {
                             .hint("copy the AAC from an MP4 or M4A file, which carries it"));
                     }
                     (Kind::Audio { rate: *sample_rate, channels: *channels, bits: 16 }, *sample_rate, 0)
+                }
+                (StreamParams::Audio { sample_rate, channels }, c) if self.quicktime && c.sample_format().is_some() => {
+                    (Kind::Audio { rate: *sample_rate, channels: *channels, bits: pcm_bits(c) }, *sample_rate, 0)
                 }
                 (StreamParams::Audio { .. }, CodecId::Flac) => {
                     let (rate, channels, bits) = flac_audio_params(s)?;
@@ -695,7 +745,14 @@ impl Muxer for Mp4Muxer {
         for b in brands {
             ftyp.extend_from_slice(b);
         }
-        let ftyp = bx(b"ftyp", &ftyp);
+        let ftyp = if self.quicktime {
+            let mut qt = b"qt  ".to_vec();
+            qt.extend_from_slice(&0x2005_0300u32.to_be_bytes()); // minor version, as QuickTime writes it
+            qt.extend_from_slice(b"qt  ");
+            bx(b"ftyp", &qt)
+        } else {
+            bx(b"ftyp", &ftyp)
+        };
         self.out.write_all(&ftyp)?;
         self.mdat_start = ftyp.len() as u64;
         // 64-bit mdat header: size field 1, then the real size, patched in finish().
