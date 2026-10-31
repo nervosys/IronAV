@@ -967,7 +967,7 @@ fn splat_arr<const N: usize>(a: &mut [u8; N], off: usize, n: usize, v: u8) {
 }
 
 /// Folds the per-4x4 non-zero flags of each transform block into its first entry.
-fn merge(la: &mut [u8; 20], end: usize, step: usize) {
+pub(super) fn merge(la: &mut [u8; 20], end: usize, step: usize) {
     let mut n = 0;
     while n < end {
         let any = la[n..(n + step).min(20)].iter().any(|&v| v != 0);
@@ -977,7 +977,7 @@ fn merge(la: &mut [u8; 20], end: usize, step: usize) {
 }
 
 /// Spreads each transform block's flag over its 4x4 columns (or rows).
-fn splat_ctx(la: &mut [u8; 20], end: usize, step: usize, full: bool) {
+pub(super) fn splat_ctx(la: &mut [u8; 20], end: usize, step: usize, full: bool) {
     if step == 2 {
         let mut n = 1;
         while n < end {

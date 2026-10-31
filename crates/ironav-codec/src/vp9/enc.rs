@@ -1,15 +1,18 @@
 //! A software VP9 encoder for profile 0 (8-bit 4:2:0).
 //!
 //! A key frame every `keyint` frames (250 by default), and inter frames between them. An inter frame predicts
-//! from the frame before (LAST) and refreshes only that reference. One tile, 4x4 transforms, the regular 8-tap
-//! filter, single reference, no probability updates and quarter-pixel motion vectors. An open-loop search on
-//! the source splits each 64x64 superblock down to 8x8 blocks; each block then takes the cheapest of intra
-//! (8x8 only), ZEROMV, NEARESTMV, NEARMV and NEWMV by a rate-distortion cost. The encoder reconstructs with the
-//! decoder's own prediction, transform and loop filter code, so its pictures are the decoder's.
+//! from the frame before (LAST) and refreshes only that reference. One tile, the regular 8-tap filter, single
+//! reference and quarter-pixel motion vectors. An open-loop search on the source splits each 64x64 superblock
+//! down to 8x8 blocks; each block then takes the cheapest of intra (8x8 only), ZEROMV, NEARESTMV, NEARMV and
+//! NEWMV by a rate-distortion cost. Inter frames code their coefficient probabilities as updates from their own
+//! counts, in a first pass that decides the blocks and a second that writes them. Transforms are 4x4 unless
+//! `with_large_tx` lets inter blocks take up to 32x32. The encoder reconstructs with the decoder's own
+//! prediction, transform and loop filter code, so its pictures are the decoder's.
 
 use std::sync::Arc;
 
 use super::bad;
+use super::block::{merge, splat_ctx};
 use super::dec::*;
 use super::header::*;
 use super::intrapred;
@@ -47,6 +50,8 @@ struct Input {
     planes: [Vec<i32>; 3],
     stride: [usize; 3],
     dq: [i32; 2],
+    /// Whether inter blocks may use transforms larger than 4x4 (TX_MODE_SELECT).
+    large_tx: bool,
 }
 
 pub struct Vp9Encoder {
@@ -61,6 +66,8 @@ pub struct Vp9Encoder {
     /// The last reconstruction (the LAST reference) and the last key frame (GOLDEN and ALTREF).
     last: Option<Arc<Pic>>,
     key: Option<Arc<Pic>>,
+    /// Whether inter blocks may use transforms larger than 4x4.
+    large_tx: bool,
 }
 
 impl Vp9Encoder {
@@ -78,12 +85,19 @@ impl Vp9Encoder {
             return Err(Error::invalid_arg(format!("{width}x{height} is not a VP9 picture size")));
         }
         let q = base_q(qp.unwrap_or(DEFAULT_QP));
-        Ok(Self { width: width as usize, height: height as usize, q, keyint: DEFAULT_KEYINT, since_key: 0, prev_src: None, last: None, key: None })
+        Ok(Self { width: width as usize, height: height as usize, q, keyint: DEFAULT_KEYINT, since_key: 0, prev_src: None, last: None, key: None, large_tx: false })
     }
 
     /// Key frames every `n` frames (1 makes every frame a key frame).
     pub fn with_keyint(mut self, n: u64) -> Self {
         self.keyint = n.max(1);
+        self
+    }
+
+    /// Lets inter blocks take transforms up to 32x32, chosen by cost. Off by default: on the test pictures the
+    /// larger transforms cost about as many bits as the 4x4 ones save.
+    pub fn with_large_tx(mut self, on: bool) -> Self {
+        self.large_tx = on;
         self
     }
 
@@ -109,7 +123,7 @@ impl Vp9Encoder {
         let planes = [pad(&v.planes[0], w, h, bw, bh), pad(&v.planes[1], cw, ch, bw / 2, bh / 2), pad(&v.planes[2], cw, ch, bw / 2, bh / 2)];
         let q = self.q as usize;
         let dq = [DC_QLOOKUP[0][q] as i32, AC_QLOOKUP[0][q] as i32];
-        Ok(Input { planes, stride: [bw, bw / 2, bw / 2], dq })
+        Ok(Input { planes, stride: [bw, bw / 2, bw / 2], dq, large_tx: self.large_tx })
     }
 
     /// The loop filter level: a function of the quantiser, sharpness 0.
@@ -145,7 +159,7 @@ impl Vp9Encoder {
         let (w, h) = (self.width, self.height);
         let lf = self.lf_level();
         let mut hdr = self.header(true);
-        let comp = compressed(true);
+        let comp = compressed(true, &[], false);
         let (probs, coef) = parse_compressed(&comp, &mut hdr, &HeaderState::new()).map_err(bad)?;
 
         let mut d = Dec::new(hdr, probs, coef, Pic::new(w, h, true, true, 8, 0));
@@ -171,21 +185,28 @@ impl Vp9Encoder {
         Ok((data, d.cur))
     }
 
-    /// Codes one inter frame from the last reconstruction. Returns the frame and its reconstruction.
+    /// The decoder state for an inter frame with compressed header `comp` and the given references.
+    fn inter_dec(&self, comp: &[u8], last: Arc<Pic>, key: Arc<Pic>) -> Result<Dec> {
+        let mut hdr = self.header(false);
+        let (probs, coef) = parse_compressed(comp, &mut hdr, &HeaderState::new()).map_err(bad)?;
+        let mut d = Dec::new(hdr, probs, coef, Pic::new(self.width, self.height, true, true, 8, 0));
+        d.refs = [Some(last.clone()), Some(key.clone()), Some(key)];
+        d.prev = Some(last);
+        d.above_mode.fill(NEARESTMV);
+        Ok(d)
+    }
+
+    /// Codes one inter frame from the last reconstruction. Returns the frame and its reconstruction. The first
+    /// pass decides the blocks and counts their tokens; the updates that pay go in the compressed header, and
+    /// the second pass writes the same blocks with the updated probabilities.
     fn code_inter(&self, inp: &Input) -> Result<(Vec<u8>, Pic)> {
         let (Some(prev), Some(last), Some(key)) = (self.prev_src.as_ref(), self.last.clone(), self.key.clone()) else {
             return Err(Error::invalid_input("the VP9 encoder has no reference for an inter frame"));
         };
         let (w, h) = (self.width, self.height);
         let lf = self.lf_level();
-        let mut hdr = self.header(false);
-        let comp = compressed(false);
-        let (probs, coef) = parse_compressed(&comp, &mut hdr, &HeaderState::new()).map_err(bad)?;
 
-        let mut d = Dec::new(hdr, probs, coef, Pic::new(w, h, true, true, 8, 0));
-        d.refs = [Some(last.clone()), Some(key.clone()), Some(key)];
-        d.prev = Some(last);
-        d.above_mode.fill(NEARESTMV);
+        let mut d = self.inter_dec(&compressed(false, &[], inp.large_tx), last.clone(), key.clone())?;
         let o = Open { cur: inp, prev, w, h, cols: d.cols, rows: d.rows };
         let mut plan = Plan::new(d.cols, d.rows);
         for row in (0..d.rows).step_by(8) {
@@ -193,21 +214,15 @@ impl Vp9Encoder {
                 plan_node(&o, row, col, 0, (0, 0), &mut plan);
             }
         }
+        let mut first = Pass::default();
+        encode_tile_inter(&mut d, &mut BoolEncoder::default(), inp, &plan, &mut first);
 
+        let comp = compressed(false, &coef_updates(&first.cnt), inp.large_tx);
+        let mut d = self.inter_dec(&comp, last, key)?;
+        let mut second = Pass { replay: Some(first.out.into_iter()), ..Default::default() };
         let mut e = BoolEncoder::default();
         e.put(128, false);
-        let mut row = 0;
-        while row < d.rows {
-            d.left_partition = [0; 8];
-            d.left_skip = [0; 8];
-            d.left_mode = [NEARESTMV; 16];
-            d.left_y_nnz = [0; 16];
-            d.left_uv_nnz = [[0; 16]; 2];
-            for col in (0..d.cols).step_by(8) {
-                encode_sb_inter(&mut d, &mut e, inp, &plan, row, col, 0);
-            }
-            row += 8;
-        }
+        encode_tile_inter(&mut d, &mut e, inp, &plan, &mut second);
         if lf > 0 {
             d.loopfilter(0);
         }
@@ -313,13 +328,50 @@ fn uncompressed(key: bool, w: usize, h: usize, q: i32, lf: u8, comp_len: usize) 
     b.into_bytes()
 }
 
-/// The compressed header: the transform mode and the coefficient update flags, then (inter frames) the update
-/// flags of the mode, reference, partition and motion vector probabilities. No probability is updated.
-fn compressed(key: bool) -> Vec<u8> {
+/// The compressed header: the transform mode (ONLY_4X4 for key frames, ALLOW_32X32 for inter frames), the
+/// coefficient updates (`deltas`, by `coef_pos`; none when empty), then (inter frames) the update flags of the
+/// mode, reference, partition and motion vector probabilities.
+fn compressed(key: bool, deltas: &[Option<u8>], large_tx: bool) -> Vec<u8> {
     let mut ce = BoolEncoder::default();
     ce.put(128, false);
-    ce.literal(0, 2); // tx_mode ONLY_4X4
-    ce.put(128, false); // no coefficient updates for 4x4
+    let select = !key && large_tx;
+    if select {
+        ce.literal(3, 2); // TX_MODE_SELECT
+        ce.put(128, true);
+        for _ in 0..12 {
+            ce.put(252, false); // no transform size probability updates
+        }
+    } else {
+        ce.literal(0, 2); // tx_mode ONLY_4X4
+    }
+    for tx in 0..(if select { 4 } else { 1 }) {
+        let ds = deltas.get(tx * 432..(tx + 1) * 432).unwrap_or(&[]);
+        let any = ds.iter().any(Option::is_some);
+        ce.put(128, any); // coefficient updates for this transform size
+        if !any {
+            continue;
+        }
+        for pl in 0..2 {
+            for rf in 0..2 {
+                for band in 0..6 {
+                    for ctx in 0..6 {
+                        if band == 0 && ctx >= 3 {
+                            continue;
+                        }
+                        for node in 0..3 {
+                            match ds[coef_pos(0, pl, rf, band, ctx, node)] {
+                                Some(d) => {
+                                    ce.put(252, true);
+                                    write_subexp(&mut ce, d);
+                                }
+                                None => ce.put(252, false),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     for _ in 0..3 {
         ce.put(252, false); // no skip probability updates
     }
@@ -421,7 +473,7 @@ fn encode_block(d: &mut Dec, e: &mut BoolEncoder, inp: &Input, row: usize, col: 
     for n in 0..4 {
         let (x, y) = (n & 1, n >> 1);
         let nnz = (a[x] + l[y]) as usize;
-        write_tokens(e, &lv[n], eobs[n], nnz, SCANS[0][txtp], SCANS_NB[0][txtp], &d.coef[0][0][0]);
+        write_tokens(e, &mut CoefCnt::default(), &lv[n], eobs[n], nnz, SCANS[0][txtp], SCANS_NB[0][txtp], &BAND_COUNTS[0], &d.coef[0][0][0]);
         a[x] = (eobs[n] > 0) as u8;
         l[y] = a[x];
     }
@@ -434,7 +486,7 @@ fn encode_block(d: &mut Dec, e: &mut BoolEncoder, inp: &Input, row: usize, col: 
         a[..16].copy_from_slice(&d.above_uv_nnz[pl][col..col + 16]);
         l[..16 - row7].copy_from_slice(&d.left_uv_nnz[pl][row7..16]);
         let nnz = (a[0] + l[0]) as usize;
-        write_tokens(e, &uv[pl].0, uv[pl].1, nnz, SCANS[0][0], SCANS_NB[0][0], &d.coef[0][1][0]);
+        write_tokens(e, &mut CoefCnt::default(), &uv[pl].0, uv[pl].1, nnz, SCANS[0][0], SCANS_NB[0][0], &BAND_COUNTS[0], &d.coef[0][1][0]);
         a[0] = (uv[pl].1 > 0) as u8;
         l[0] = a[0];
         d.above_uv_nnz[pl][col..col + 16].copy_from_slice(&a[..16]);
@@ -570,32 +622,31 @@ fn dequant(lv: &[i32; 16], dq: [i32; 2]) -> [i32; 16] {
 
 /// Writes the tokens of one 4x4 block with levels `lv` and end of block `eob`: the inverse of the
 /// decoder's `coeffs_b`, with the same scan, neighbour contexts, bands and token tree.
-fn write_tokens(e: &mut BoolEncoder, lv: &[i32; 16], eob: usize, mut nnz: usize, scan: &[i16], nb: &[[i16; 2]], p: &[[[u8; 11]; 6]; 6]) {
+fn write_tokens(e: &mut BoolEncoder, cnt: &mut CoefCnt, lv: &[i32], eob: usize, mut nnz: usize, scan: &[i16], nb: &[[i16; 2]], bc: &[i16; 8], p: &[[[u8; 11]; 6]; 6]) {
     if eob == 0 {
-        e.put(p[0][nnz][0], false);
+        put_count(e, cnt, 0, nnz, 0, p[0][nnz][0], false);
         return;
     }
-    let bc = &BAND_COUNTS[0];
-    let ctx = |cache: &[u8; 16], i: usize| (1 + cache[nb[i][0] as usize] as usize + cache[nb[i][1] as usize] as usize) >> 1;
-    let mut cache = [0u8; 16];
+    let ctx = |cache: &[u8], i: usize| (1 + cache[nb[i][0] as usize] as usize + cache[nb[i][1] as usize] as usize) >> 1;
+    let mut cache = [0u8; 1024];
     let (mut band, mut band_left) = (0usize, bc[0] as i32);
     let mut i = 0usize;
     loop {
         let mut tp = p[band][nnz];
-        e.put(tp[0], true);
+        put_count(e, cnt, band, nnz, 0, tp[0], true);
         while lv[scan[i] as usize] == 0 {
-            e.put(tp[1], false);
+            put_count(e, cnt, band, nnz, 1, tp[1], false);
             band_left -= 1;
             if band_left == 0 {
                 band += 1;
                 band_left = bc[band] as i32;
             }
             cache[scan[i] as usize] = 0;
-            nnz = ctx(&cache, i);
+            nnz = ctx(&cache[..], i);
             i += 1;
             tp = p[band][nnz];
         }
-        e.put(tp[1], true);
+        put_count(e, cnt, band, nnz, 1, tp[1], true);
         let rc = scan[i] as usize;
         cache[rc] = write_magnitude(e, &tp, lv[rc].unsigned_abs());
         e.put(128, lv[rc] < 0);
@@ -604,14 +655,121 @@ fn write_tokens(e: &mut BoolEncoder, lv: &[i32; 16], eob: usize, mut nnz: usize,
             band += 1;
             band_left = bc[band] as i32;
         }
-        nnz = ctx(&cache, i);
+        nnz = ctx(&cache[..], i);
         i += 1;
-        if i == 16 {
+        if i == lv.len() {
             break;
         }
         if i == eob {
-            e.put(p[band][nnz][0], false);
+            put_count(e, cnt, band, nnz, 0, p[band][nnz][0], false);
             break;
+        }
+    }
+}
+
+/// Counts of the coefficient token bits: [band][context][node][bit], for the first three nodes.
+type CoefCnt = [[[[u32; 2]; 3]; 6]; 6];
+
+/// The counts of a frame's tokens by [transform size][plane (luma, chroma)][reference (intra, inter)].
+type TokCounts = [[[CoefCnt; 2]; 2]; 4];
+
+/// Writes a bit with probability `prob` and counts it at `node` of `band` and context `ctx`.
+fn put_count(e: &mut BoolEncoder, cnt: &mut CoefCnt, band: usize, ctx: usize, node: usize, prob: u8, bit: bool) {
+    cnt[band][ctx][node][bit as usize] += 1;
+    e.put(prob, bit);
+}
+
+/// The coefficient probability updates of a frame, by position: the delta index of each updated probability.
+/// Positions are [transform size][plane][reference][band][context][node], flattened.
+const COEF_POS: usize = 4 * 2 * 2 * 6 * 6 * 3;
+
+fn coef_pos(tx: usize, pl: usize, rf: usize, band: usize, ctx: usize, node: usize) -> usize {
+    ((((tx * 2 + pl) * 2 + rf) * 6 + band) * 6 + ctx) * 3 + node
+}
+
+/// The bits of `c` (counts of 0 and 1) coded with probability `p` of a 0.
+fn bits_at(c: [u32; 2], p: u8) -> f64 {
+    static COST: std::sync::OnceLock<[[f64; 2]; 256]> = std::sync::OnceLock::new();
+    let cost = COST.get_or_init(|| std::array::from_fn(|p| [-((p.max(1) as f64) / 256.0).log2(), -((256.0 - p.min(255) as f64) / 256.0).log2()]));
+    c[0] as f64 * cost[p as usize][0] + c[1] as f64 * cost[p as usize][1]
+}
+
+/// The probability the decoder makes of delta index `d` applied to `p` (its update_prob).
+fn remap(d: u8, p: u8) -> u8 {
+    fn recenter(v: i32, m: i32) -> i32 {
+        if v > 2 * m {
+            v
+        } else if v & 1 != 0 {
+            m - ((v + 1) >> 1)
+        } else {
+            m + (v >> 1)
+        }
+    }
+    let m = INV_MAP_TABLE[d as usize] as i32;
+    let p = p as i32;
+    (if p <= 128 { 1 + recenter(m, p - 1) } else { 255 - recenter(m, 255 - p) }) as u8
+}
+
+/// The bits of delta index `d` as the decoder's term subexponential code reads it.
+fn subexp_bits(d: u8) -> f64 {
+    match d {
+        0..=15 => 5.0,
+        16..=31 => 6.0,
+        32..=63 => 8.0,
+        _ if d - 64 >= 65 => 11.0,
+        _ => 10.0,
+    }
+}
+
+/// The updates that pay: for each position, the delta index that codes its probability in fewest bits, where
+/// that saves more than the update costs (about 6 bits for the flag and the index's bits).
+fn coef_updates(cnt: &TokCounts) -> Vec<Option<u8>> {
+    let mut out = vec![None; COEF_POS];
+    for tx in 0..4 {
+        for pl in 0..2 {
+            for rf in 0..2 {
+                for band in 0..6 {
+                    for ctx in 0..6 {
+                        for node in 0..3 {
+                            let c = cnt[tx][pl][rf][band][ctx][node];
+                            if c == [0, 0] || (band == 0 && ctx >= 3) {
+                                continue;
+                            }
+                            let old = DEFAULT_COEF_PROBS[tx][pl][rf][band][ctx][node];
+                            let keep = bits_at(c, old);
+                            let best = (0..=253u8).map(|d| (bits_at(c, remap(d, old)) + 6.0 + subexp_bits(d), d)).min_by(|a, b| a.0.total_cmp(&b.0));
+                            if let Some((_, d)) = best.filter(|b| b.0 < keep) {
+                                out[coef_pos(tx, pl, rf, band, ctx, node)] = Some(d);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Writes delta index `d` as the decoder's term subexponential code.
+fn write_subexp(e: &mut BoolEncoder, d: u8) {
+    let d = d as u32;
+    if d < 16 {
+        e.put(128, false);
+        e.literal(d, 4);
+    } else if d < 32 {
+        e.literal(0b10, 2);
+        e.literal(d - 16, 4);
+    } else if d < 64 {
+        e.literal(0b110, 3);
+        e.literal(d - 32, 5);
+    } else {
+        e.literal(0b111, 3);
+        let v = d - 64;
+        if v < 65 {
+            e.literal(v, 7);
+        } else {
+            e.literal((v + 65) >> 1, 7);
+            e.put(128, (v + 65) & 1 == 1);
         }
     }
 }
@@ -844,15 +1002,17 @@ struct Cand {
     mode: u8,
     uvmode: u8,
     mv: Mv,
-    ly: Vec<[i32; 16]>,
+    /// The transform size of the luma (chroma's follows).
+    tx: usize,
+    ly: Vec<Vec<i32>>,
     ey: Vec<usize>,
-    lc: [Vec<[i32; 16]>; 2],
+    lc: [Vec<Vec<i32>>; 2],
     ec: [Vec<usize>; 2],
     rec: [Vec<u16>; 3],
 }
 
-/// The bits a block's tokens take, roughly: a count per coded 4x4 block and per coefficient.
-fn est_bits(lv: &[[i32; 16]], eob: &[usize]) -> f64 {
+/// The bits a block's tokens take, roughly: a count per coded transform block and per coefficient.
+fn est_bits(lv: &[Vec<i32>], eob: &[usize]) -> f64 {
     lv.iter()
         .zip(eob)
         .map(|(l, &e)| if e == 0 { 0.5 } else { 4.0 + l.iter().map(|&v| if v == 0 { 0.6 } else { 3.0 + 2.0 * (v.unsigned_abs() as f64).log2() }).sum::<f64>() })
@@ -879,19 +1039,75 @@ fn rd_cost(d: &Dec, inp: &Input, c: &Cand) -> f64 {
     dist as f64 + lambda * bits
 }
 
-/// The residuals of the luma 4x4 blocks inside the frame of the current inter block, whose prediction is in
-/// place: their levels and ends, in the decoder's order, after adding them to the picture.
-fn inter_luma(d: &mut Dec, inp: &Input) -> (Vec<[i32; 16]>, Vec<usize>) {
-    let (ex, ey) = ends(d, d.b.bs);
-    let (row, col) = (d.row, d.col);
-    let mut lv = Vec::with_capacity(ex * ey);
-    let mut eobs = Vec::with_capacity(ex * ey);
-    for y in 0..ey {
-        for x in 0..ex {
-            let (px, py) = (col * 8 + x * 4, row * 8 + y * 4);
-            let (l, eob) = residual4(d, inp, 0, px, py, 0);
+/// The largest transform of the block of size `bs`: the largest that fits, up to 32x32.
+fn max_tx(bs: usize) -> usize {
+    (BWH_TAB[0][bs][0].min(BWH_TAB[0][bs][1]) as usize).ilog2().min(3) as usize
+}
+
+/// Sets the transform size of the current block to `tx`, and its chroma's as the decoder derives it.
+fn set_tx(d: &mut Dec, tx: usize) {
+    let (w8, h8) = (BWH_TAB[1][d.b.bs][0] as usize, BWH_TAB[1][d.b.bs][1] as usize);
+    d.b.tx = tx;
+    d.b.uvtx = tx - ((w8 * 2 == 1 << tx || h8 * 2 == 1 << tx) as usize);
+}
+
+/// The transform size syntax of a block of size `bs` at (`row`, `col`) with largest transform `max` (as the
+/// decoder reads it: the context from the neighbours' skip flags and transform sizes).
+fn write_tx(d: &Dec, e: &mut BoolEncoder, row: usize, col: usize, max: usize, tx: usize) {
+    let (row7, have_a, have_l) = (row & 7, row > 0, col > 0);
+    let (as_, ls) = (d.above_skip[col] != 0, d.left_skip[row7] != 0);
+    let (at, lt) = (d.above_txfm[col] as usize, d.left_txfm[row7] as usize);
+    let c = if have_a {
+        if have_l {
+            ((if as_ { max } else { at }) + (if ls { max } else { lt }) > max) as usize
+        } else if as_ {
+            1
+        } else {
+            (at * 2 > max) as usize
+        }
+    } else if have_l {
+        if ls { 1 } else { (lt * 2 > max) as usize }
+    } else {
+        1
+    };
+    let p = &d.p;
+    match max {
+        3 => {
+            e.put(p.tx32p[c][0], tx > 0);
+            if tx > 0 {
+                e.put(p.tx32p[c][1], tx >= 2);
+                if tx >= 2 {
+                    e.put(p.tx32p[c][2], tx == 3);
+                }
+            }
+        }
+        2 => {
+            e.put(p.tx16p[c][0], tx > 0);
+            if tx > 0 {
+                e.put(p.tx16p[c][1], tx == 2);
+            }
+        }
+        1 => e.put(p.tx8p[c], tx == 1),
+        _ => {}
+    }
+}
+
+/// The transform blocks of plane `pl` of the current inter block, of size `1 << tx` 4x4 units, in raster order over
+/// the `ex` by `ey` 4x4 units inside the frame, as the decoder reads them. The prediction is in place: each
+/// reconstruction is added to the picture. Returns their levels and ends.
+fn inter_plane(d: &mut Dec, inp: &Input, pl: usize, ex: usize, ey: usize, tx: usize) -> (Vec<Vec<i32>>, Vec<usize>) {
+    let (x0, y0) = if pl == 0 { (d.col * 8, d.row * 8) } else { (d.col * 4, d.row * 4) };
+    let step = 1usize << tx;
+    let mut lv = Vec::new();
+    let mut eobs = Vec::new();
+    for y in (0..ey).step_by(step) {
+        for x in (0..ex).step_by(step) {
+            let (px, py) = (x0 + x * 4, y0 + y * 4);
+            let (l, eob) = residual_n(d, inp, pl, px, py, tx);
             if eob > 0 {
-                add4(d, inp, 0, px, py, &l, eob, 0);
+                let mut coef = dequant_n(&l, inp.dq, tx);
+                let stride = d.cur.stride[pl];
+                itx::inverse_add(tx, 0, &mut coef, &mut d.cur.planes[pl][py * stride + px..], stride, eob, 8);
             }
             lv.push(l);
             eobs.push(eob);
@@ -900,64 +1116,146 @@ fn inter_luma(d: &mut Dec, inp: &Input) -> (Vec<[i32; 16]>, Vec<usize>) {
     (lv, eobs)
 }
 
-/// The chroma residuals of the current inter block, as `inter_luma` makes them for both planes.
-fn inter_chroma(d: &mut Dec, inp: &Input) -> ([Vec<[i32; 16]>; 2], [Vec<usize>; 2]) {
-    let (ex, ey) = ends(d, d.b.bs);
-    let (ex, ey) = (ex / 2, ey / 2);
-    let (row, col) = (d.row, d.col);
-    let mut lc: [Vec<[i32; 16]>; 2] = Default::default();
-    let mut ec: [Vec<usize>; 2] = Default::default();
-    for pl in 0..2 {
-        for y in 0..ey {
-            for x in 0..ex {
-                let (px, py) = (col * 4 + x * 4, row * 4 + y * 4);
-                let (l, eob) = residual4(d, inp, 1 + pl, px, py, 0);
-                if eob > 0 {
-                    add4(d, inp, 1 + pl, px, py, &l, eob, 0);
-                }
-                lc[pl].push(l);
-                ec[pl].push(eob);
-            }
+/// The quantised residual of the `4 << tx` square at (`px`, `py`) of plane `pl` against the picture's prediction.
+fn residual_n(d: &Dec, inp: &Input, pl: usize, px: usize, py: usize, tx: usize) -> (Vec<i32>, usize) {
+    if tx == 0 {
+        let (l, eob) = residual4(d, inp, pl, px, py, 0);
+        return (l.to_vec(), eob);
+    }
+    let n = 4 << tx;
+    let stride = d.cur.stride[pl];
+    let mut r = vec![0f64; n * n];
+    for j in 0..n {
+        for i in 0..n {
+            let s = inp.planes[pl][(py + j) * inp.stride[pl] + px + i];
+            r[j * n + i] = (s - d.cur.planes[pl][(py + j) * stride + px + i] as i32) as f64;
         }
     }
-    (lc, ec)
+    quantize_n(&fdct_n(&r, n), inp.dq, SCANS[tx][0])
+}
+
+/// The orthonormal DCT basis of the `n` square, [frequency][sample], for n = 4, 8, 16 and 32.
+fn dct_basis(n: usize) -> &'static [f64] {
+    static BASES: std::sync::OnceLock<[Vec<f64>; 4]> = std::sync::OnceLock::new();
+    let all = BASES.get_or_init(|| {
+        std::array::from_fn(|t| {
+            let n = 4usize << t;
+            (0..n * n)
+                .map(|i| {
+                    let (k, y) = (i / n, i % n);
+                    let s = if k == 0 { (1.0 / n as f64).sqrt() } else { (2.0 / n as f64).sqrt() };
+                    s * (PI * ((2 * y + 1) * k) as f64 / (2 * n) as f64).cos()
+                })
+                .collect()
+        })
+    });
+    &all[n.trailing_zeros() as usize - 2]
+}
+
+/// The forward DCT of the `n` square `r` (raster order), scaled as `fdct4` is.
+fn fdct_n(r: &[f64], n: usize) -> Vec<f64> {
+    let b = dct_basis(n);
+    let mut t = vec![0.0; n * n];
+    for kr in 0..n {
+        for y in 0..n {
+            t[kr * n + y] = (0..n).map(|x| b[kr * n + x] * r[y * n + x]).sum();
+        }
+    }
+    let mut c = vec![0.0; n * n];
+    for kr in 0..n {
+        for kc in 0..n {
+            c[kr * n + kc] = 8.0 * (0..n).map(|y| b[kc * n + y] * t[kr * n + y]).sum::<f64>();
+        }
+    }
+    c
+}
+
+/// Quantises `c` (raster order) with the dequantisers `dq`: as `quantize`, for any size.
+fn quantize_n(c: &[f64], dq: [i32; 2], scan: &[i16]) -> (Vec<i32>, usize) {
+    let lv: Vec<i32> = c.iter().enumerate().map(|(rc, &v)| ((v / dq[(rc != 0) as usize] as f64).round() as i32).clamp(-MAX_LEVEL, MAX_LEVEL)).collect();
+    let eob = scan.iter().rposition(|&rc| lv[rc as usize] != 0).map_or(0, |i| i + 1);
+    (lv, eob)
+}
+
+/// The dequantised coefficients of `lv` for transform size `tx`: halved for 32x32, as the decoder does.
+fn dequant_n(lv: &[i32], dq: [i32; 2], tx: usize) -> Vec<i32> {
+    lv.iter()
+        .enumerate()
+        .map(|(rc, &v)| {
+            let p = v * dq[(rc != 0) as usize];
+            if tx == 3 { p / 2 } else { p }
+        })
+        .collect()
+}
+
+/// Writes the tokens of one plane of an inter block, as the decoder's `y_tokens` and `uv_tokens`: the transform
+/// blocks `lv` and `eobs` in raster order, their size and type `(tx, txtp)`, the above and left contexts `a` and
+/// `l`, the block's extent `end` in 4x4 units inside the frame, and `full` where the block is whole inside it.
+#[allow(clippy::too_many_arguments)]
+fn write_plane(e: &mut BoolEncoder, cnt: &mut CoefCnt, p: &[[[u8; 11]; 6]; 6], lv: &[Vec<i32>], eobs: &[usize], (tx, txtp): (usize, usize), a: &mut [u8; 20], l: &mut [u8; 20], end: (usize, usize), full: (bool, bool)) {
+    let step = 1usize << tx;
+    if tx > 0 {
+        merge(l, end.1, step);
+        merge(a, end.0, step);
+    }
+    let mut n = 0;
+    for y in (0..end.1).step_by(step) {
+        for x in (0..end.0).step_by(step) {
+            let nnz = (a[x] + l[y]) as usize;
+            write_tokens(e, cnt, &lv[n], eobs[n], nnz, SCANS[tx][txtp], SCANS_NB[tx][txtp], &BAND_COUNTS[tx], p);
+            a[x] = (eobs[n] > 0) as u8;
+            l[y] = a[x];
+            n += 1;
+        }
+    }
+    if tx > 0 {
+        splat_ctx(a, end.0, step, full.0);
+        splat_ctx(l, end.1, step, full.1);
+    }
 }
 
 /// Predicts the current block from LAST with `mode` and `mv`, codes its residual, and returns the candidate.
 /// `near` is the nearest candidate, which NEWMV codes its difference from.
-fn eval_inter(d: &mut Dec, inp: &Input, mode: u8, mv: Mv, near: Mv) -> Cand {
+fn eval_inter(d: &mut Dec, inp: &Input, mode: u8, mv: Mv, near: Mv, tx: usize) -> Cand {
     d.b.intra = false;
     d.b.mode = [mode; 4];
     d.b.mv = [[mv, Mv::default()]; 4];
+    set_tx(d, tx);
     d.inter_pred();
-    let (ly, ey) = inter_luma(d, inp);
-    let (lc, ec) = inter_chroma(d, inp);
+    let (ex, ny) = ends(d, d.b.bs);
+    let uvtx = d.b.uvtx;
+    let (ly, ey) = inter_plane(d, inp, 0, ex, ny, tx);
+    let (lu, eu) = inter_plane(d, inp, 1, ex / 2, ny / 2, uvtx);
+    let (lv, ev) = inter_plane(d, inp, 2, ex / 2, ny / 2, uvtx);
     let side = match mode {
         ZEROMV => 1.0,
         NEARESTMV => 2.0,
         NEARMV => 3.0,
         _ => 5.0 + mv_bits(mv, near),
     };
-    let mut c = Cand { cost: 0.0, side, intra: false, mode, uvmode: DC_PRED, mv, ly, ey, lc, ec, rec: save(d, d.b.bs) };
+    let mut c = Cand { cost: 0.0, side, intra: false, mode, uvmode: DC_PRED, mv, tx, ly, ey, lc: [lu, lv], ec: [eu, ev], rec: save(d, d.b.bs) };
     c.cost = rd_cost(d, inp, &c);
     c
 }
 
-/// Predicts the current block (8x8) with intra `mode` and DC chroma, codes its residual, and returns the candidate.
+/// Predicts the current block (8x8) with intra `mode` and DC chroma, with 4x4 transforms, codes its residual, and
+/// returns the candidate.
 fn eval_intra(d: &mut Dec, inp: &Input, mode: u8) -> Cand {
     d.b.intra = true;
     d.b.mode = [mode; 4];
     d.b.uvmode = DC_PRED;
     d.b.mv = [[Mv::default(); 2]; 4];
+    set_tx(d, 0);
     let (lv, eobs, _) = code_luma(d, inp, mode);
-    let mut lc: [Vec<[i32; 16]>; 2] = Default::default();
+    let mut lc: [Vec<Vec<i32>>; 2] = Default::default();
     let mut ec: [Vec<usize>; 2] = Default::default();
     for pl in 0..2 {
         let (l, e) = code_chroma(d, inp, pl);
-        lc[pl].push(l);
+        lc[pl].push(l.to_vec());
         ec[pl].push(e);
     }
-    let mut c = Cand { cost: 0.0, side: 6.0, intra: true, mode, uvmode: DC_PRED, mv: Mv::default(), ly: lv.to_vec(), ey: eobs.to_vec(), lc, ec, rec: save(d, d.b.bs) };
+    let ly = lv.iter().map(|l| l.to_vec()).collect();
+    let mut c = Cand { cost: 0.0, side: 6.0, intra: true, mode, uvmode: DC_PRED, mv: Mv::default(), tx: 0, ly, ey: eobs.to_vec(), lc, ec, rec: save(d, d.b.bs) };
     c.cost = rd_cost(d, inp, &c);
     c
 }
@@ -998,9 +1296,11 @@ fn search_mv(d: &mut Dec, inp: &Input, starts: [Mv; 2]) -> Mv {
         }
     }
     for step in [8i32, 4, 2] {
+        // whole pixels try all eight neighbours, the fractions only the four across
+        let pattern: &[(i32, i32)] = if step == 8 { &NEIGHBOURS } else { &NEIGHBOURS[..4] };
         for _ in 0..8 {
             let mut moved = false;
-            for (dx, dy) in NEIGHBOURS {
+            for &(dx, dy) in pattern {
                 let m = Mv { x: (best.x as i32 + dx * step) as i16, y: (best.y as i32 + dy * step) as i16 };
                 let c = mv_sad(d, inp, &r, reg, m);
                 if c < bc {
@@ -1079,7 +1379,7 @@ fn write_comp(e: &mut BoolEncoder, p: &MvCompProbs, v: i32) {
 
 /// Writes the mode information, the tokens and the contexts of the candidate `c` for the block at `d`'s
 /// position, and records it for the later blocks and the loop filter.
-fn write_block(d: &mut Dec, e: &mut BoolEncoder, c: &Cand, bs: usize) {
+fn write_block(d: &mut Dec, e: &mut BoolEncoder, c: &Cand, bs: usize, cnt: &mut TokCounts, large_tx: bool) {
     let (row, col) = (d.row, d.col);
     let row7 = row & 7;
     let (nw, nh) = (BWH_TAB[1][bs][0] as usize, BWH_TAB[1][bs][1] as usize);
@@ -1104,6 +1404,13 @@ fn write_block(d: &mut Dec, e: &mut BoolEncoder, c: &Cand, bs: usize) {
         0
     };
     e.put(d.p.intra[ic], !c.intra);
+    // a skipped inter block takes the largest transform, which is not coded
+    let max = if large_tx { max_tx(bs) } else { 0 };
+    let tx = if skip && !c.intra { max } else { c.tx };
+    set_tx(d, tx);
+    if large_tx && (c.intra || !skip) {
+        write_tx(d, e, row, col, max, tx);
+    }
     if c.intra {
         e.tree(&INTRAMODE_TREE, &d.p.y_mode[SIZE_GROUP[bs] as usize], c.mode);
         e.tree(&INTRAMODE_TREE, &d.p.uv_mode[c.mode as usize], c.uvmode);
@@ -1120,6 +1427,8 @@ fn write_block(d: &mut Dec, e: &mut BoolEncoder, c: &Cand, bs: usize) {
 
     splat(&mut d.above_skip, col, nw, skip as u8);
     splat(&mut d.left_skip, row7, nh, skip as u8);
+    splat(&mut d.above_txfm, col, nw, tx as u8);
+    splat(&mut d.left_txfm, row7, nh, tx as u8);
     splat(&mut d.above_partition, col, nw, ABOVE_CTX[bs]);
     splat(&mut d.left_partition, row7, nh, LEFT_CTX[bs]);
     splat(&mut d.above_intra, col, nw, c.intra as u8);
@@ -1154,23 +1463,16 @@ fn write_block(d: &mut Dec, e: &mut BoolEncoder, c: &Cand, bs: usize) {
         }
     } else {
         let refi = (!c.intra) as usize;
-        let txtp = if c.intra { INTRA_TXFM_TYPE[c.mode as usize] as usize } else { 0 };
+        let (tx, uvtx) = (d.b.tx, d.b.uvtx);
         let (ex, ey) = ends(d, bs);
+        let (w4, h4) = (2 * BWH_TAB[1][bs][0] as usize, 2 * BWH_TAB[1][bs][1] as usize);
         let ly = row7 * 2;
         let mut a = [0u8; 20];
         let mut l = [0u8; 20];
         a[..16].copy_from_slice(&d.above_y_nnz[col * 2..col * 2 + 16]);
         l[..16 - ly].copy_from_slice(&d.left_y_nnz[ly..16]);
-        let mut n = 0;
-        for y in 0..ey {
-            for x in 0..ex {
-                let nnz = (a[x] + l[y]) as usize;
-                write_tokens(e, &c.ly[n], c.ey[n], nnz, SCANS[0][txtp], SCANS_NB[0][txtp], &d.coef[0][0][refi]);
-                a[x] = (c.ey[n] > 0) as u8;
-                l[y] = a[x];
-                n += 1;
-            }
-        }
+        let txtp = if c.intra { INTRA_TXFM_TYPE[c.mode as usize] as usize } else { 0 };
+        write_plane(e, &mut cnt[tx][0][refi], &d.coef[tx][0][refi], &c.ly, &c.ey, (tx, txtp), &mut a, &mut l, (ex, ey), (ex == w4, ey == h4));
         d.above_y_nnz[col * 2..col * 2 + 16].copy_from_slice(&a[..16]);
         d.left_y_nnz[ly..16].copy_from_slice(&l[..16 - ly]);
 
@@ -1179,16 +1481,8 @@ fn write_block(d: &mut Dec, e: &mut BoolEncoder, c: &Cand, bs: usize) {
             let mut l = [0u8; 20];
             a[..16].copy_from_slice(&d.above_uv_nnz[pl][col..col + 16]);
             l[..16 - row7].copy_from_slice(&d.left_uv_nnz[pl][row7..16]);
-            let mut n = 0;
-            for y in 0..ey / 2 {
-                for x in 0..ex / 2 {
-                    let nnz = (a[x] + l[y]) as usize;
-                    write_tokens(e, &c.lc[pl][n], c.ec[pl][n], nnz, SCANS[0][0], SCANS_NB[0][0], &d.coef[0][1][refi]);
-                    a[x] = (c.ec[pl][n] > 0) as u8;
-                    l[y] = a[x];
-                    n += 1;
-                }
-            }
+            let (cx, cy) = (ex / 2, ey / 2);
+            write_plane(e, &mut cnt[uvtx][1][refi], &d.coef[uvtx][1][refi], &c.lc[pl], &c.ec[pl], (uvtx, 0), &mut a, &mut l, (cx, cy), (cx == w4 / 2, cy == h4 / 2));
             d.above_uv_nnz[pl][col..col + 16].copy_from_slice(&a[..16]);
             d.left_uv_nnz[pl][row7..16].copy_from_slice(&l[..16 - row7]);
         }
@@ -1196,34 +1490,64 @@ fn write_block(d: &mut Dec, e: &mut BoolEncoder, c: &Cand, bs: usize) {
     d.lf_masks();
 }
 
+/// The state of one pass over an inter frame. The first pass decides every block and counts its tokens; the
+/// second writes the decided blocks (`replay`) with the frame's own probabilities.
+#[derive(Default)]
+struct Pass {
+    cnt: TokCounts,
+    out: Vec<Cand>,
+    replay: Option<std::vec::IntoIter<Cand>>,
+}
+
 /// Codes the inter-frame block at (`row`, `col`) of level `bl` (8x8 or larger, whole): the candidates are
 /// tried in turn and the cheapest is written. `pm` is the open-loop motion, a starting point for the search.
-fn encode_block_inter(d: &mut Dec, e: &mut BoolEncoder, inp: &Input, row: usize, col: usize, bl: usize, pm: Mv) {
+/// On the second pass the decided candidate is written instead (decisions do not depend on probabilities).
+fn encode_block_inter(d: &mut Dec, e: &mut BoolEncoder, inp: &Input, row: usize, col: usize, bl: usize, pm: Mv, pass: &mut Pass) {
     let bs = bl * 3;
     set_block(d, row, col, bs);
-    let near = [d.base_mv(NEARESTMV, 0, -1).0, d.base_mv(NEARMV, 0, -1).0];
-    let nm = search_mv(d, inp, [near[0], pm]);
-    // a vector already tried under a cheaper mode is not tried again
-    let mut cands = vec![eval_inter(d, inp, ZEROMV, Mv::default(), near[0])];
-    for (mode, mv) in [(NEARESTMV, near[0]), (NEARMV, near[1]), (NEWMV, nm)] {
-        if cands.iter().all(|c| c.mv != mv) {
-            cands.push(eval_inter(d, inp, mode, mv, near[0]));
+    let best = match pass.replay.as_mut() {
+        Some(it) => it.next().expect("a decision per block"),
+        None => {
+            let near = [d.base_mv(NEARESTMV, 0, -1).0, d.base_mv(NEARMV, 0, -1).0];
+            let top = if inp.large_tx { max_tx(bs) } else { 0 };
+            // a vector already tried under a cheaper mode is not tried again
+            let mut cands = vec![eval_inter(d, inp, ZEROMV, Mv::default(), near[0], top)];
+            for (mode, mv) in [(NEARESTMV, near[0]), (NEARMV, near[1])] {
+                if cands.iter().all(|c| c.mv != mv) {
+                    cands.push(eval_inter(d, inp, mode, mv, near[0], top));
+                }
+            }
+            let nm = search_mv(d, inp, [near[0], pm]);
+            if cands.iter().all(|c| c.mv != nm) {
+                cands.push(eval_inter(d, inp, NEWMV, nm, near[0], top));
+            }
+            if bl == 3 {
+                for mode in [intrapred::VERT_PRED, intrapred::HOR_PRED, DC_PRED, intrapred::TM_VP8_PRED] {
+                    cands.push(eval_intra(d, inp, mode));
+                }
+            }
+            let mut best = cands.into_iter().min_by(|a, b| a.cost.total_cmp(&b.cost)).expect("candidates were tried");
+            // the chosen motion again, with smaller transforms
+            for t in (0..if best.intra { 0 } else { top }).rev() {
+                let c = eval_inter(d, inp, best.mode, best.mv, near[0], t);
+                if c.cost < best.cost {
+                    best = c;
+                }
+            }
+            best
         }
-    }
-    if bl == 3 {
-        for mode in [intrapred::VERT_PRED, intrapred::HOR_PRED, DC_PRED, intrapred::TM_VP8_PRED] {
-            cands.push(eval_intra(d, inp, mode));
-        }
-    }
-    let best = cands.into_iter().min_by(|a, b| a.cost.total_cmp(&b.cost)).expect("candidates were tried");
+    };
     restore(d, bs, &best.rec);
-    write_block(d, e, &best, bs);
+    write_block(d, e, &best, bs, &mut pass.cnt, inp.large_tx);
+    if pass.replay.is_none() {
+        pass.out.push(best);
+    }
 }
 
 /// Codes the superblock or node at (`row`, `col`) of level `bl` for an inter frame, as the decoder's
 /// `decode_sb`, with the block sizes of `plan`. Nodes that reach past the frame's edge are split, as the
 /// decoder's partition reading requires.
-fn encode_sb_inter(d: &mut Dec, e: &mut BoolEncoder, inp: &Input, plan: &Plan, row: usize, col: usize, bl: usize) {
+fn encode_sb_inter(d: &mut Dec, e: &mut BoolEncoder, inp: &Input, plan: &Plan, row: usize, col: usize, bl: usize, pass: &mut Pass) {
     let c = (((d.above_partition[col] >> (3 - bl)) & 1) as usize) | ((((d.left_partition[row & 7] >> (3 - bl)) & 1) as usize) << 1);
     let p = d.p.partition[bl][c];
     let hbs = 4usize >> bl;
@@ -1232,23 +1556,39 @@ fn encode_sb_inter(d: &mut Dec, e: &mut BoolEncoder, inp: &Input, plan: &Plan, r
         if plan.lvl[idx] as usize == bl {
             e.tree(&PARTITION_TREE, &p, 0);
             let (x, y) = plan.mv[idx];
-            encode_block_inter(d, e, inp, row, col, bl, Mv { x: (x * 8) as i16, y: (y * 8) as i16 });
+            encode_block_inter(d, e, inp, row, col, bl, Mv { x: (x * 8) as i16, y: (y * 8) as i16 }, pass);
         } else {
             e.tree(&PARTITION_TREE, &p, 3);
             for (r, cc) in [(row, col), (row, col + hbs), (row + hbs, col), (row + hbs, col + hbs)] {
-                encode_sb_inter(d, e, inp, plan, r, cc, bl + 1);
+                encode_sb_inter(d, e, inp, plan, r, cc, bl + 1, pass);
             }
         }
     } else if col + hbs < d.cols {
         e.put(p[1], true);
-        encode_sb_inter(d, e, inp, plan, row, col, bl + 1);
-        encode_sb_inter(d, e, inp, plan, row, col + hbs, bl + 1);
+        encode_sb_inter(d, e, inp, plan, row, col, bl + 1, pass);
+        encode_sb_inter(d, e, inp, plan, row, col + hbs, bl + 1, pass);
     } else if row + hbs < d.rows {
         e.put(p[2], true);
-        encode_sb_inter(d, e, inp, plan, row, col, bl + 1);
-        encode_sb_inter(d, e, inp, plan, row + hbs, col, bl + 1);
+        encode_sb_inter(d, e, inp, plan, row, col, bl + 1, pass);
+        encode_sb_inter(d, e, inp, plan, row + hbs, col, bl + 1, pass);
     } else {
-        encode_sb_inter(d, e, inp, plan, row, col, bl + 1);
+        encode_sb_inter(d, e, inp, plan, row, col, bl + 1, pass);
+    }
+}
+
+/// Codes every superblock of an inter frame with `plan` (see `encode_sb_inter`).
+fn encode_tile_inter(d: &mut Dec, e: &mut BoolEncoder, inp: &Input, plan: &Plan, pass: &mut Pass) {
+    let mut row = 0;
+    while row < d.rows {
+        d.left_partition = [0; 8];
+        d.left_skip = [0; 8];
+        d.left_mode = [NEARESTMV; 16];
+        d.left_y_nnz = [0; 16];
+        d.left_uv_nnz = [[0; 16]; 2];
+        for col in (0..d.cols).step_by(8) {
+            encode_sb_inter(d, e, inp, plan, row, col, 0, pass);
+        }
+        row += 8;
     }
 }
 
@@ -1303,8 +1643,8 @@ mod tests {
     /// Encodes `n` frames at `qp` (key frames every `keyint`), decodes them, and checks that every decoded
     /// frame is the encoder's reconstruction. Returns the decoded frames as bytes of the picture planes, and
     /// the size of each packet.
-    fn round_trip_keyint(w: usize, h: usize, n: usize, qp: u8, keyint: u64) -> (Vec<Vec<u8>>, Vec<usize>) {
-        let mut enc = Vp9Encoder::new(&params(w, h), Some(qp)).unwrap().with_keyint(keyint);
+    fn round_trip_keyint(w: usize, h: usize, n: usize, qp: u8, keyint: u64, large: bool) -> (Vec<Vec<u8>>, Vec<usize>) {
+        let mut enc = Vp9Encoder::new(&params(w, h), Some(qp)).unwrap().with_keyint(keyint).with_large_tx(large);
         let mut dec = Vp9Decoder::new();
         let mut out = Vec::new();
         let mut sizes = Vec::new();
@@ -1322,7 +1662,13 @@ mod tests {
     }
 
     fn round_trip(w: usize, h: usize, n: usize, qp: u8) -> Vec<Vec<u8>> {
-        round_trip_keyint(w, h, n, qp, DEFAULT_KEYINT).0
+        round_trip_keyint(w, h, n, qp, DEFAULT_KEYINT, false).0
+    }
+
+    #[test]
+    fn large_transforms_reconstruct_like_the_decoder() {
+        round_trip_keyint(64, 64, 8, 28, DEFAULT_KEYINT, true);
+        round_trip_keyint(177, 99, 8, 28, DEFAULT_KEYINT, true);
     }
 
     #[test]
@@ -1353,8 +1699,8 @@ mod tests {
 
     #[test]
     fn inter_frames_are_smaller_than_key_frames() {
-        let (_, inter) = round_trip_keyint(177, 99, 10, 28, DEFAULT_KEYINT);
-        let (_, key) = round_trip_keyint(177, 99, 10, 28, 1);
+        let (_, inter) = round_trip_keyint(177, 99, 10, 28, DEFAULT_KEYINT, false);
+        let (_, key) = round_trip_keyint(177, 99, 10, 28, 1, false);
         let (i, k): (usize, usize) = (inter.iter().sum(), key.iter().sum());
         assert!(i < k * 3 / 4, "inter frames took {i} bytes, key frames only {k}");
     }
