@@ -309,8 +309,11 @@ QP deltas, constrained intra, the deblocking filter and sample adaptive offset. 
 B pictures used as references, intra refresh, weighted prediction, 4:4:4, ultra-low-latency and lossless tuning). Scaling lists sent in
 the SPS (an x265 matrix file, at 8 and 10 bits and 4:4:4) match as well, and so does joining an open-GOP stream at a CRA picture: its
 RASL pictures are dropped and the rest are the pictures the whole stream gives from there (the `hevc_joined_at_a_cra_picture_drops_its_rasl_pictures`
-test, checked against NVDEC too). Written from the specification but **not yet checked against a reference stream** because neither
-encoder here produces them: tiles, PCM and long-term reference pictures. 12-bit 4:2:0, 4:2:2, 4:4:4 and monochrome x265 streams
+test, checked against NVDEC too). The JCT-VC conformance suite (the HEVC_v1 bitstreams) was decoded too: 146 of its 147 streams
+decode to the official MD5 of every picture, covering tiles, PCM, long-term reference pictures, wavefronts with dependent slices,
+entry points, bumping and `no_output_of_prior_pics_flag`, RASL pictures after an end of sequence, parameter set changes and conformance
+windows (that run found and fixed long-term pictures without an MSB, a wavefront row start in a one-CTU-wide picture, and end of sequence
+NAL units being skipped). The one left, `TSUNEQBD_A_MAIN10_Technicolor_2`, has 10-bit luma with 9-bit chroma, which is refused. 12-bit 4:2:0, 4:2:2, 4:4:4 and monochrome x265 streams
 (with B pictures, weighted prediction and scaling lists) match FFmpeg too; checking them found SAO offsets scaled by the first
 edition's `bitDepth - 10` rule, which the range extensions (the only profiles with 12 bits) replaced, and that is fixed.
 4:2:2 and 4:4:4 (the range extension profiles' chroma formats) were checked the same way: 60 x265 streams, 4:2:2 and 4:4:4 at 8 and 10 bits,

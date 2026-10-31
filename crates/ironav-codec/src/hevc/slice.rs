@@ -256,12 +256,12 @@ impl<'a> Dec<'a> {
                 // wavefront: continue from the contexts after the second CTB of the row above, when it exists
                 let (x0, y0) = (self.ctb_x << sps.log2_ctb, self.ctb_y << sps.log2_ctb);
                 let ctb = 1i32 << sps.log2_ctb;
-                if self.avail(x0, y0, x0 as i32 + ctb, y0 as i32 - ctb) {
-                    if let Some(c) = carry.wpp_ctx {
-                        self.cab.set_contexts(&c);
-                    }
-                } else if ts != first_ts || !self.hdr.dependent {
-                    self.cab.init_contexts(self.init, self.slice_qp);
+                // (9.3.1: this comes before a dependent slice segment's carrying on from the one
+                // before it, so a row start with no CTB above right, as in a picture one CTB wide,
+                // starts from the initial contexts)
+                match carry.wpp_ctx {
+                    Some(c) if self.avail(x0, y0, x0 as i32 + ctb, y0 as i32 - ctb) => self.cab.set_contexts(&c),
+                    _ => self.cab.init_contexts(self.init, self.slice_qp),
                 }
                 self.last_qp_y = self.slice_qp;
             }

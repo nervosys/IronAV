@@ -221,7 +221,7 @@ impl HevcDecoder {
                 let full = if msb { v + (poc & !(max_lsb - 1)) } else { v };
                 keep_long.push((full, msb));
                 if used {
-                    lt_curr.push(full);
+                    lt_curr.push((full, msb));
                 }
             }
         }
@@ -242,7 +242,7 @@ impl HevcDecoder {
         }
         let lt_full: Vec<i32> = lt_curr
             .iter()
-            .map(|&v| self.dpb.iter().find(|e| e.marking == Marking::Long && (e.frame.poc == v || (e.frame.poc & (max_lsb - 1)) == v)).map_or(v, |e| e.frame.poc))
+            .map(|&(v, msb)| self.dpb.iter().find(|e| e.marking == Marking::Long && if msb { e.frame.poc == v } else { (e.frame.poc & (max_lsb - 1)) == v }).map_or(v, |e| e.frame.poc))
             .collect();
         (before, after, lt_full)
     }
@@ -342,8 +342,13 @@ impl HevcDecoder {
             self.prev_tid0_poc = poc;
         }
         if irap && self.no_rasl_output && !self.first_picture {
-            // a new coded video sequence: everything still waiting goes out first
-            while self.bump() {}
+            // a new coded video sequence (C.5.2.2): what is still waiting goes out first, unless
+            // the picture says to drop it (no_output_of_prior_pics_flag, taken as set for a CRA
+            // after an end of sequence, as the HM and FFmpeg take it)
+            let drop = hdr.no_output_of_prior_pics || (nal_type == 21 && self.after_eos);
+            if !drop {
+                while self.bump() {}
+            }
             self.dpb.clear();
         }
         self.first_picture = false;
@@ -423,7 +428,8 @@ impl Decoder for HevcDecoder {
     fn decode(&mut self, packet: &Packet) -> Result<Vec<OutFrame>> {
         let mut err = None;
         for nal in split_annexb(&packet.data) {
-            if nal.len() < 3 {
+            // an end of sequence or of bitstream is the 2-byte header alone
+            if nal.len() < 2 {
                 continue;
             }
             let ty = (nal[0] >> 1) & 63;

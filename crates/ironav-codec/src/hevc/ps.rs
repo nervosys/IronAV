@@ -899,8 +899,9 @@ pub fn parse_slice_header(rbsp: &[u8], nal_type: u8, temporal_id: u8, sps_tab: &
                         cycle += prev_msb;
                     }
                     prev_msb = cycle;
-                    // with the MSB known the entry is the POC relative to the current picture's MSB part
-                    let poc = lsb as i32 - (cycle << sps.log2_max_poc_lsb);
+                    // with the MSB known the entry is the POC relative to the current picture's MSB part;
+                    // without, the LSB alone (the cycle still accumulates for the entries after it)
+                    let poc = if msb_present { lsb as i32 - (cycle << sps.log2_max_poc_lsb) } else { lsb as i32 };
                     h.lt.push((poc, msb_present, used));
                 }
             }
