@@ -4,6 +4,7 @@
 use super::ipred::{predict_cfl, predict_intra, Edges, Plane};
 use super::itx::inverse_transform;
 use super::obu::{seg_qidx, FrameHeader, SequenceHeader, TX_MODE_SELECT};
+use super::qm_tables::weights;
 use super::quant_tables::*;
 use super::scan_tables::*;
 use super::symbol::{Cdfs, SymbolDecoder};
@@ -1156,6 +1157,8 @@ impl FrameDec {
                 _ => 2,
             };
             let (dcq, acq) = self.plane_quant(plane);
+            let qm_level = if self.h.using_qmatrix && !self.b.lossless && tt < IDTX { [self.h.qm_y, self.h.qm_u, self.h.qm_v][plane] } else { 15 };
+            let qm = (qm_level < 15).then(|| weights(qm_level, plane, tx, 1 << log2w.min(5), 1 << log2h.min(5)));
             let dq_shift = (1usize << (log2w + log2h) > 256) as u32 + (1usize << (log2w + log2h) > 1024) as u32;
             let lim = 1i64 << (7 + self.bd);
             self.dq[..n].fill(0);
@@ -1188,7 +1191,10 @@ impl FrameDec {
                 }
                 level &= 0xFFFFF;
                 cul += level;
-                let q = if ci == 0 { dcq } else { acq };
+                let mut q = if ci == 0 { dcq } else { acq };
+                if let Some(w) = qm {
+                    q = (q * w[pos] as u32 + 16) >> 5;
+                }
                 let d = (((level as u64 * q as u64) & 0xFFFFFF) >> dq_shift) as i64;
                 self.dq[pos] = (if sign { -d } else { d }).clamp(-lim, lim - 1) as i32;
             }

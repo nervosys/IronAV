@@ -136,6 +136,16 @@ fn cdef_decodes_bit_exactly() {
 }
 
 #[test]
+fn quantiser_matrices_decode_bit_exactly() {
+    need_ffmpeg!();
+    let qm = "enable-qm=1:qm-min=0:qm-max=8";
+    check(&case("qm", TESTSRC, &format!("{DEBLOCK}:{qm}"), &["-crf", "30"]));
+    check(&case("qm-all", "mandelbrot=size=320x180:rate=25", &format!("{CDEF}:enable-qm=1:qm-min=0:qm-max=14"), &["-crf", "20"]));
+    check(&Case { pix_fmt: "yuv420p10le", ..case("qm-10bit", "mandelbrot=size=320x180:rate=25", &format!("{CDEF}:{qm}"), &["-crf", "40"]) });
+    check(&Case { pix_fmt: "yuv444p", ..case("qm-444", TESTSRC, &format!("{CDEF}:{qm}"), &["-crf", "25"]) });
+}
+
+#[test]
 fn tiles_decode_bit_exactly() {
     need_ffmpeg!();
     let src = "testsrc2=size=1280x720:rate=25";

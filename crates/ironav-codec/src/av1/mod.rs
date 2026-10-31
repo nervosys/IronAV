@@ -11,6 +11,7 @@ pub mod itx;
 pub mod itx1d;
 pub mod lf;
 pub mod obu;
+pub mod qm_tables;
 pub mod quant_tables;
 pub mod scan_tables;
 pub mod symbol;
@@ -277,9 +278,6 @@ fn check_supported(h: &FrameHeader) -> Result<()> {
     }
     if h.uses_lr {
         return Err(unsupported("loop restoration is not decoded yet"));
-    }
-    if h.using_qmatrix && (h.qm_y < 15 || h.qm_u < 15 || h.qm_v < 15) {
-        return Err(unsupported("quantiser matrices are not decoded yet"));
     }
     Ok(())
 }
