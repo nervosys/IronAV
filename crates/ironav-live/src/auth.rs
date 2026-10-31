@@ -1,8 +1,10 @@
-//! The credentials answer for HTTP and RTSP: Basic, and Digest (RFC 7616 with MD5 and MD5-sess and
-//! qop=auth, or RFC 2069's form without qop). SHA-256 is not implemented. The MD5 is for Digest only.
+//! The credentials answer for HTTP and RTSP: Basic, and Digest (RFC 7616 with MD5, MD5-sess, SHA-256
+//! and SHA-256-sess and qop=auth, or RFC 2069's form without qop). SHA-512-256 is not implemented.
+//! The hashes are for Digest only.
 
 use crate::http::base64;
 use crate::md5::md5_hex;
+use crate::sha256::sha256_hex;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
 
@@ -13,6 +15,22 @@ pub(crate) enum Auth {
     Digest(Digest),
 }
 
+/// The hash a Digest answer is computed with.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Hash {
+    Md5,
+    Sha256,
+}
+
+impl Hash {
+    fn hex(self, data: &[u8]) -> String {
+        match self {
+            Hash::Md5 => md5_hex(data),
+            Hash::Sha256 => sha256_hex(data),
+        }
+    }
+}
+
 pub(crate) struct Digest {
     user: String,
     pass: String,
@@ -21,6 +39,7 @@ pub(crate) struct Digest {
     opaque: Option<String>,
     /// As the challenge named it, and echoed.
     algorithm: Option<String>,
+    hash: Hash,
     sess: bool,
     qop: bool,
     nc: u32,
@@ -40,9 +59,11 @@ impl Auth {
         let get = |k: &str| p.iter().find(|(n, _)| n.eq_ignore_ascii_case(k)).map(|(_, v)| v.clone());
         let algorithm = get("algorithm");
         let name = algorithm.clone().unwrap_or_else(|| "MD5".into());
-        let sess = match name.to_ascii_lowercase().as_str() {
-            "md5" => false,
-            "md5-sess" => true,
+        let (hash, sess) = match name.to_ascii_lowercase().as_str() {
+            "md5" => (Hash::Md5, false),
+            "md5-sess" => (Hash::Md5, true),
+            "sha-256" => (Hash::Sha256, false),
+            "sha-256-sess" => (Hash::Sha256, true),
             _ => return Err(format!("the {name} algorithm")),
         };
         let qop = match get("qop") {
@@ -51,10 +72,14 @@ impl Auth {
             Some(q) => return Err(format!("the qop {q}")),
         };
         if sess && !qop {
-            return Err("MD5-sess without qop auth".into());
+            return Err(format!("{name} without qop auth"));
         }
         let need = |k: &str| get(k).ok_or_else(|| format!("a challenge without a {k}"));
-        Ok(Auth::Digest(Digest { user: user.into(), pass: pass.into(), realm: need("realm")?, nonce: need("nonce")?, opaque: get("opaque"), algorithm, sess, qop, nc: 0 }))
+        Ok(Auth::Digest(Digest { user: user.into(), pass: pass.into(), realm: need("realm")?, nonce: need("nonce")?, opaque: get("opaque"), algorithm, hash, sess, qop, nc: 0 }))
+    }
+
+    fn is_sha256(&self) -> bool {
+        matches!(self, Auth::Digest(d) if d.hash == Hash::Sha256)
     }
 
     /// The `Authorization` value for a request with `method` and request target `uri`.
@@ -87,36 +112,39 @@ impl Digest {
         h
     }
 
-    /// The request digest: `MD5(HA1:nonce:nc:cnonce:qop:HA2)`, or `MD5(HA1:nonce:HA2)` without qop.
+    /// The request digest: `H(HA1:nonce:nc:cnonce:qop:HA2)`, or `H(HA1:nonce:HA2)` without qop, for
+    /// the hash `H` the challenge named.
     fn response(&self, method: &str, uri: &str, nc: u32, cnonce: &str) -> String {
-        let ha1 = md5_hex(format!("{}:{}:{}", self.user, self.realm, self.pass).as_bytes());
-        let ha1 = if self.sess { md5_hex(format!("{ha1}:{}:{cnonce}", self.nonce).as_bytes()) } else { ha1 };
-        let ha2 = md5_hex(format!("{method}:{uri}").as_bytes());
+        let ha1 = self.hash.hex(format!("{}:{}:{}", self.user, self.realm, self.pass).as_bytes());
+        let ha1 = if self.sess { self.hash.hex(format!("{ha1}:{}:{cnonce}", self.nonce).as_bytes()) } else { ha1 };
+        let ha2 = self.hash.hex(format!("{method}:{uri}").as_bytes());
         if self.qop {
-            md5_hex(format!("{ha1}:{}:{nc:08x}:{cnonce}:auth:{ha2}", self.nonce).as_bytes())
+            self.hash.hex(format!("{ha1}:{}:{nc:08x}:{cnonce}:auth:{ha2}", self.nonce).as_bytes())
         } else {
-            md5_hex(format!("{ha1}:{}:{ha2}", self.nonce).as_bytes())
+            self.hash.hex(format!("{ha1}:{}:{ha2}", self.nonce).as_bytes())
         }
     }
 }
 
 /// The answer to a 401's challenges (its `WWW-Authenticate` values, each of which may hold several).
-/// Digest is preferred, since it does not send the password. When Digest is offered only in a form
-/// IronAV does not speak, the password is not sent in the clear instead, even if Basic is offered too.
+/// Digest is preferred, since it does not send the password, and SHA-256 Digest over MD5. When Digest
+/// is offered only in a form IronAV does not speak, the password is not sent in the clear instead,
+/// even if Basic is offered too.
 pub(crate) fn choose(challenges: &[String], user: &str, pass: &str) -> Result<Auth, String> {
     let all: Vec<String> = challenges.iter().flat_map(|c| split_challenges(c)).collect();
     let digest: Vec<&String> = all.iter().filter(|c| scheme_is(c, "digest")).collect();
     if digest.is_empty() {
         return all.iter().find_map(|c| Auth::answer(c, user, pass).ok()).ok_or_else(|| format!("asks for an authentication scheme IronAV does not speak: {}", challenges.join("; ")));
     }
-    let mut why = Vec::new();
+    let (mut answers, mut why) = (Vec::new(), Vec::new());
     for c in digest {
         match Auth::answer(c, user, pass) {
-            Ok(a) => return Ok(a),
+            Ok(a) => answers.push(a),
             Err(w) => why.push(w),
         }
     }
-    Err(format!("asks for Digest authentication IronAV does not implement ({}), and the password is not sent in the clear instead", why.join(", ")))
+    answers.sort_by_key(|a| !a.is_sha256());
+    answers.into_iter().next().ok_or_else(|| format!("asks for Digest authentication IronAV does not implement ({}), and the password is not sent in the clear instead", why.join(", ")))
 }
 
 fn scheme_is(challenge: &str, scheme: &str) -> bool {
@@ -209,9 +237,39 @@ mod tests {
     }
 
     #[test]
+    fn rfc_7616_sha256_example() {
+        // RFC 7616 3.9.1, with SHA-256 in place of MD5
+        let challenge = r#"Digest realm="http-auth@example.org", qop="auth, auth-int", algorithm=SHA-256, nonce="7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v", opaque="FQhe/qaU925kfnzjCev0ciny7QMkPqMAFRtzCUYo5tdS""#;
+        let Auth::Digest(d) = Auth::answer(challenge, "Mufasa", "Circle of Life").unwrap() else { panic!("not Digest") };
+        assert_eq!(d.response("GET", "/dir/index.html", 1, "f2/wE4q74E6zIJEtWaHKaf5wv/H5QzzpXusqGemxURZJ"), "753927fa0e85d155564e2e272a28d1802ca10daf4496794697cf8db5856cb6c1");
+        let h = Auth::answer(challenge, "Mufasa", "Circle of Life").unwrap().header("GET", "/dir/index.html");
+        assert!(h.contains("algorithm=SHA-256") && h.contains("qop=auth, nc=00000001"), "{h}");
+    }
+
+    #[test]
+    fn sha256_sess_hashes_the_session_key_with_sha256() {
+        let Auth::Digest(d) = Auth::answer(r#"Digest realm="r", nonce="n", qop=auth, algorithm=SHA-256-sess"#, "u", "p").unwrap() else { panic!("not Digest") };
+        let ha1 = sha256_hex(format!("{}:n:cn", sha256_hex(b"u:r:p")).as_bytes());
+        let ha2 = sha256_hex(b"GET:/x");
+        assert_eq!(d.response("GET", "/x", 1, "cn"), sha256_hex(format!("{ha1}:n:00000001:cn:auth:{ha2}").as_bytes()));
+    }
+
+    #[test]
+    fn sha256_is_preferred_to_md5_whichever_comes_first() {
+        let md5 = r#"Digest realm="r", nonce="n", qop=auth"#.to_string();
+        let sha = r#"Digest realm="r", nonce="n", qop=auth, algorithm=SHA-256"#.to_string();
+        for offered in [[md5.clone(), sha.clone()], [sha.clone(), md5.clone()]] {
+            let mut picked = choose(&offered, "u", "p").unwrap();
+            assert!(picked.header("GET", "/x").contains("algorithm=SHA-256"));
+        }
+        let mut picked = choose(&[md5], "u", "p").unwrap();
+        assert!(!picked.header("GET", "/x").contains("algorithm="));
+    }
+
+    #[test]
     fn unsupported_digest_is_named_and_not_downgraded() {
-        let e = choose(&[r#"Digest realm="r", nonce="n", algorithm=SHA-256"#.into(), r#"Basic realm="r""#.into()], "u", "p").err().unwrap();
-        assert!(e.contains("SHA-256") && e.contains("not sent in the clear"), "{e}");
+        let e = choose(&[r#"Digest realm="r", nonce="n", algorithm=SHA-512-256"#.into(), r#"Basic realm="r""#.into()], "u", "p").err().unwrap();
+        assert!(e.contains("SHA-512-256") && e.contains("not sent in the clear"), "{e}");
         assert!(choose(&[r#"Digest realm="r", nonce="n", qop="auth-int""#.into()], "u", "p").is_err());
     }
 

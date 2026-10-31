@@ -42,8 +42,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   packets the same as IronAV does.
 - **Containers (copy):** VP9 and AV1 are copied between WebM, Matroska and MP4; AAC keeps its encoder
   delay in MP4; Opus ends where the source did in Matroska (DiscardPadding) and Ogg.
-- **Live input and streaming (HTTP authentication):** Digest (MD5 and MD5-sess, RFC 7616 and RFC 2069 forms) and
-  Basic credentials in http(s) URLs, answered per host so that later segments need no extra round trip. SHA-256 Digest is not supported.
+- **Live input and streaming (HTTP authentication):** Digest (MD5, MD5-sess, SHA-256 and SHA-256-sess, RFC 7616, and RFC 2069 forms; SHA-256 is preferred) and
+  Basic credentials in http(s) URLs, answered per host so that later segments need no extra round trip.
 - **Live input and streaming:** byte sources for growing files, standard input, named pipes, TCP, UDP,
   RTSP (cameras and servers, RTP over UDP), HTTP (HLS, including alternate audio renditions, and
   progressive download), and HTTPS and RTSPS through IronSocketLayer with IronPKI certificate checks.

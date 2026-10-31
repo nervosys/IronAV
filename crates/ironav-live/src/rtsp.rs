@@ -616,9 +616,9 @@ mod tests {
         let want = md5_hex(format!("{}:n:{}", md5_hex(b"u:r:p"), md5_hex(b"DESCRIBE:rtsp://h/s")).as_bytes());
         assert!(a.header("DESCRIBE", "rtsp://h/s").contains(&format!("response=\"{want}\"")));
         assert_eq!(Auth::answer("Basic realm=\"x\"", "Aladdin", "open sesame").unwrap().header("X", "y"), "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==");
-        assert!(Auth::answer("Digest realm=\"r\", nonce=\"n\", algorithm=SHA-256", "u", "p").is_err());
+        assert!(Auth::answer("Digest realm=\"r\", nonce=\"n\", algorithm=SHA-512-256", "u", "p").is_err());
         // Digest in a form we do not speak does not fall back to Basic
-        let offered = ["Digest realm=\"r\", nonce=\"n\", algorithm=SHA-256".to_string(), "Basic realm=\"r\"".to_string()];
+        let offered = ["Digest realm=\"r\", nonce=\"n\", algorithm=SHA-512-256".to_string(), "Basic realm=\"r\"".to_string()];
         assert!(choose(&offered, "u", "p").is_err());
         assert!(matches!(choose(&offered[1..], "u", "p"), Ok(Auth::Basic(_))));
         assert_eq!(param("RTP/AVP/TCP;unicast;Interleaved=4-5", "interleaved"), Some("4-5"));

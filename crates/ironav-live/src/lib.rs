@@ -17,6 +17,7 @@ pub mod reconnect;
 pub mod onvif;
 mod rtsp;
 mod sha1;
+mod sha256;
 mod source;
 pub mod synthetic;
 pub mod tls;

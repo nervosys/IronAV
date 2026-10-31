@@ -110,8 +110,8 @@ through the same allow-list as a source's.
 decodes, no taller than `?height=` when given; TS or fMP4 segments with
 `EXT-X-MAP` and byte ranges; a live playlist is followed from three segments before its end), and downloads anything
 else as it arrives. Credentials in the URL (`http://user:password@host/...`) answer a Basic or Digest challenge (Digest
-is preferred, and its password is never sent; the answer is reused for the host's later requests). SHA-256 Digest is
-not supported. A variant whose audio is a separate rendition (`EXT-X-MEDIA` with `TYPE=AUDIO`) plays with it: the
+is preferred, SHA-256 over MD5, and its password is never sent; the answer is reused for the host's later requests).
+A variant whose audio is a separate rendition (`EXT-X-MEDIA` with `TYPE=AUDIO`) plays with it: the
 default one, or the one `?audio=` names by language or name (`?audio=fr`). The two playlists are fetched side by side
 and their packets merged in time order; packed AAC with Apple's ID3 timestamp lines up with the video. Encrypted
 playlists are not supported. A variant with WebVTT subtitles (`TYPE=SUBTITLES`) has them followed as well: the default
