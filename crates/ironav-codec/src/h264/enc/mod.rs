@@ -8,7 +8,7 @@
 //! quarter samples. Pictures are cut into slices of macroblock rows that are coded on separate
 //! threads. Output is Annex B with SPS and PPS ahead of every IDR picture.
 
-mod bitw;
+pub(crate) mod bitw;
 mod cabac;
 mod cavlc;
 mod frame;

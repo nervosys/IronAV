@@ -10,7 +10,7 @@ pub(crate) mod cabac;
 mod cavlc;
 mod deblock;
 mod dpb;
-mod enc;
+pub(crate) mod enc;
 mod idct;
 mod inter;
 mod intra;

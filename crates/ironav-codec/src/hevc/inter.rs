@@ -14,7 +14,7 @@ fn same_motion(a: &MvField, b: &MvField) -> bool {
     a.pred & 3 == b.pred & 3 && (!a.uses(0) || (a.mv[0] == b.mv[0] && a.ref_idx[0] == b.ref_idx[0])) && (!a.uses(1) || (a.mv[1] == b.mv[1] && a.ref_idx[1] == b.ref_idx[1]))
 }
 
-fn scale_mv(mv: [i16; 2], td: i32, tb: i32) -> [i16; 2] {
+pub(super) fn scale_mv(mv: [i16; 2], td: i32, tb: i32) -> [i16; 2] {
     let td = td.clamp(-128, 127);
     let tb = tb.clamp(-128, 127);
     if td == 0 {
@@ -608,7 +608,7 @@ fn interpolate<const T: usize>(src: &[u16], pw: usize, ph: usize, ix: i32, iy: i
 
 /// Luma sample interpolation (8.5.3.3.3.1).
 #[allow(clippy::too_many_arguments)]
-fn luma_mc(src: &[u16], pw: usize, ph: usize, bx: i32, by: i32, mv: [i16; 2], bw: usize, bh: usize, bd: u32, out: &mut [i16]) {
+pub(super) fn luma_mc(src: &[u16], pw: usize, ph: usize, bx: i32, by: i32, mv: [i16; 2], bw: usize, bh: usize, bd: u32, out: &mut [i16]) {
     let (fx, fy) = ((mv[0] & 3) as usize, (mv[1] & 3) as usize);
     let (ix, iy) = (bx + (mv[0] >> 2) as i32, by + (mv[1] >> 2) as i32);
     interpolate::<8>(src, pw, ph, ix, iy, if fx != 0 { Some(&QPEL_FILTERS[fx]) } else { None }, if fy != 0 { Some(&QPEL_FILTERS[fy]) } else { None }, bw, bh, bd, out);
@@ -617,7 +617,7 @@ fn luma_mc(src: &[u16], pw: usize, ph: usize, bx: i32, by: i32, mv: [i16; 2], bw
 /// Chroma sample interpolation (8.5.3.3.3.2). The luma vector is in quarter samples, so it is in
 /// eighths of a chroma sample along a subsampled axis and in quarters (taken as even eighths) along a full one.
 #[allow(clippy::too_many_arguments)]
-fn chroma_mc(src: &[u16], pw: usize, ph: usize, bx: i32, by: i32, mv: [i16; 2], (sx, sy): (usize, usize), bw: usize, bh: usize, bd: u32, out: &mut [i16]) {
+pub(super) fn chroma_mc(src: &[u16], pw: usize, ph: usize, bx: i32, by: i32, mv: [i16; 2], (sx, sy): (usize, usize), bw: usize, bh: usize, bd: u32, out: &mut [i16]) {
     let split = |v: i16, s: usize| -> (i32, usize) {
         if s == 1 {
             ((v >> 3) as i32, (v & 7) as usize)

@@ -1,6 +1,7 @@
 use crate::job::{Job, OpusJob};
 use crate::plan::{plan, rate_control, Action, Plan};
 use ironav_codec::h264::H264Encoder;
+use ironav_codec::hevc::HevcEncoder;
 use ironav_codec::jpeg::JpegEncoder;
 use ironav_codec::vp8::Vp8Encoder;
 use ironav_codec::{build_filter, new_encoder_with_opts};
@@ -179,6 +180,13 @@ fn execute(
                 _ if dst.codec == CodecId::Mjpeg && dst.params.media_type() == MediaType::Video => {
                     let quality = st.qp.map_or(JpegEncoder::default_quality(), JpegEncoder::quality_for_qp);
                     Box::new(JpegEncoder::new(quality))
+                }
+                _ if dst.codec == CodecId::Hevc && dst.params.media_type() == MediaType::Video => {
+                    let (qp, bitrate) = match rate {
+                        RateControl::ConstQp(q) => (Some(q), None),
+                        RateControl::Bitrate(b) => (None, Some(b)),
+                    };
+                    Box::new(HevcEncoder::new(&dst.params, qp, bitrate)?)
                 }
                 _ if dst.codec == CodecId::H264 && dst.params.media_type() == MediaType::Video => {
                     let (qp, bitrate) = match rate {

@@ -11,6 +11,8 @@ mod filter;
 mod frame;
 mod inter;
 mod intra;
+mod enc;
+pub use enc::HevcEncoder;
 pub(crate) mod ps;
 mod slice;
 mod tables;

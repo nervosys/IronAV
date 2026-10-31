@@ -5,7 +5,7 @@ use super::tables::{DIAG_SCAN4X4_X, DIAG_SCAN4X4_Y, DIAG_SCAN8X8_X, DIAG_SCAN8X8
 
 pub const LEVEL_SCALE: [i32; 6] = [40, 45, 51, 57, 64, 72];
 
-const DST4: [[i32; 4]; 4] = [[29, 55, 74, 84], [74, 74, 0, -74], [84, -29, -74, 55], [55, -84, 74, -29]];
+pub(super) const DST4: [[i32; 4]; 4] = [[29, 55, 74, 84], [74, 74, 0, -74], [84, -29, -74, 55], [55, -84, 74, -29]];
 
 /// Expanded scaling factors: `factor[size_id][matrix_id]` is a row-major `n * n` array.
 pub struct ScalingFactors {
