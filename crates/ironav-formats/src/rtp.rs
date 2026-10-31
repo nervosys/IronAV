@@ -20,7 +20,7 @@
 //! same instant for all of them; a track without one counts from its first packet. Video starts at
 //! a keyframe, and the parameter sets from the SDP are put in front of each keyframe that lacks
 //! them, so the packets decode on their own. The streams are published once each track has what
-//! its description needs (a video track: its sequence parameter set), or once [`MAX_HELD`] packets
+//! its description needs (a video track: its sequence parameter set), or once `MAX_HELD` packets
 //! have waited, without the tracks still missing it.
 
 use crate::stream::{StreamDemuxer, StreamPacket};

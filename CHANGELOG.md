@@ -13,11 +13,11 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   CAVLC and CABAC P and B slices, lossless), HEVC (Main, Main 10, 4:2:2, 4:4:4, 12-bit), VP8, VP9
   (profiles 0-1, tile columns and a multi-threaded loop filter), baseline and progressive JPEG and
   Motion-JPEG, AAC-LC with HE-AAC v1, MP3 (MPEG-1/2/2.5 Layer III), Vorbis, Opus (SILK, CELT and hybrid)
-  and FLAC (24-bit).
+  and FLAC (4 to 32 bits).
 - **Codecs (encoders):** software H.264 (Constrained Baseline, then Main with CABAC and High with the 8x8
   transform, B pictures, rate-distortion mode decisions), AAC-LC with an ADTS writer, MP3 Layer III with
   an MP3 writer, Vorbis, Opus (CELT, wideband SILK, hybrid, DTX, in-band FEC, automatic mode switching,
-  2.5 to 60 ms frames), JPEG and Motion-JPEG, and FLAC.
+  2.5 to 60 ms frames; the CLI and job JSON write CELT mode at 20 ms), JPEG and Motion-JPEG, and FLAC.
 - **Codecs (voice link):** a playout buffer, a streaming resampler, speech detection with push-to-talk
   trimming, automatic gain control, noise suppression, and Opus packet-loss concealment.
 - **Containers:** WAV, FLAC, Y4M, MP4, Matroska and WebM (read and write), Ogg (Opus, Vorbis and FLAC),
@@ -64,7 +64,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   VideoToolbox, D3D11VA, AMF, Vulkan Video, MediaCodec and OpenCL, driver detection, and selection by
   policy (`auto`, `off`, `require`, or a named backend) that reports each rejected candidate.
 - **CLI:** `ironav` with `convert`, `probe`, `plan`, `run`, `analyze`, `watch`, `play`, `gui`, `mcp`,
-  `tools`, `capabilities` and `ontology`. Every command prints one JSON envelope with a distinct exit
+  `tools`, `capabilities`, `ontology`, `devices`, `onvif` and `hw`. Every command prints one JSON envelope with a distinct exit
   code per error class. A lean build without the GUI and sound stacks is available with
   `--no-default-features`.
 - **Build and test:** a workspace test suite, and a GitHub Actions workflow for Linux, macOS and Windows

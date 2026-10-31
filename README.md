@@ -4,7 +4,7 @@ Audio and video conversion in Rust, built to be driven by AI agents as well as p
 A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so they cannot drift apart.
 
 > **Status: foundation (v0.1).** The architecture, agent interface, ontology, hardware model, CLI, MCP server
-> and both GUIs are working and tested. Containers: **WAV, FLAC, Y4M, MP4, Matroska/WebM (read and write), Ogg, ADTS, MP3 and JPEG.**
+> and both GUIs are working and tested. Containers: **WAV, FLAC, Y4M, MP4, Matroska/WebM (read and write), Ogg, ADTS, MP3, JPEG and MPEG transport streams (read and write).**
 > Audio codecs, each decoded and encoded: **PCM, FLAC, AAC-LC (plus HE-AAC v1 decode), MP3, Opus and Vorbis.**
 > Video: **software decoders for H.264, HEVC (including 4:2:2 and 4:4:4), VP8 and VP9; a software H.264 encoder (High profile: CABAC and the 8x8 transform); JPEG/Motion-JPEG decoded and encoded in software.**
 > NVIDIA GPUs encode H.264 and HEVC (NVENC, preferred for H.264 when usable; HEVC has no software encoder) and decode H.264, HEVC and AV1 (NVDEC).
@@ -148,8 +148,8 @@ sends it: Segment and Clusters of unknown size, no Cues. The packets are the one
 bytes arrive in. So `ironav watch tcp://:9000` can follow a webcam that a web page streams as WebM.
 A camera or microphone on this machine is a source too, on Windows (Media Foundation) and 64-bit Linux (Video4Linux2
 cameras in YUYV, NV12 or I420 modes, or Motion JPEG when a camera offers nothing uncompressed, streamed through
-memory-mapped buffers; ALSA microphones through `arecord` from alsa-utils, at 48 kHz mono; built and checked for Linux but not
-yet run on a Linux machine): `ironav devices` lists them, and `device://video` (the first camera), `device://video/1` or `device://audio/usb` (by a part of the name) open
+memory-mapped buffers; ALSA microphones through `arecord` from alsa-utils, at 48 kHz mono; built and tested on Linux (Debian
+under WSL 2) but not yet run with a real camera or microphone there): `ironav devices` lists them, and `device://video` (the first camera), `device://video/1` or `device://audio/usb` (by a part of the name) open
 one. `size=1280x720` and `fps=30` ask a camera for its nearest mode. A camera's pictures arrive as Y4M (converted from
 the NV12 or YUY2 it gives to 4:2:0) and are timed at the mode's frame rate, or, from a Motion JPEG camera on Linux, as
 live Matroska timed by the driver's clock and decoded by the JPEG decoder (which supplies the standard Huffman tables
@@ -310,7 +310,7 @@ exact 8.000 s duration, all frames decoded, and seeking lands on the right keyfr
 
 `ironav probe`, `convert` and the other tools read MP4 (regular files with the index anywhere, and fragmented files). H.264/HEVC video is decoded by NVDEC through the driver's `nvcuvid` library, loaded at run time like NVENC;
 the output is cropped to the display size and returned as planar `yuv420p` in display order, so B-frame streams work.
-8-bit and 10-bit 4:2:0, 4:2:2 (`yuv422p`, `yuv422p10le`) and 4:4:4 (`yuv444p`, `yuv444p10le`; including the lossless transform-bypass mode) and monochrome (8-bit comes back as `gray`) are accepted (10-bit 4:2:0 comes back as `yuv420p10le`); 12-bit HEVC (`yuv420p12le`, `yuv422p12le`, `yuv444p12le`) goes to the software decoder; interlaced video is refused with a clear error. The GPU cannot take 4:2:2, 4:4:4 or monochrome, so those use the software decoder even with `--hwaccel auto`.
+8-bit 4:2:0 H.264 goes to the GPU (10-bit H.264 is decoded in software, as NVDEC cannot take it); for HEVC, 8-bit and 10-bit 4:2:0, 4:2:2 (`yuv422p`, `yuv422p10le`) and 4:4:4 (`yuv444p`, `yuv444p10le`; including the lossless transform-bypass mode) and monochrome (8-bit comes back as `gray`) are accepted (10-bit 4:2:0 comes back as `yuv420p10le`); 12-bit HEVC (`yuv420p12le`, `yuv422p12le`, `yuv444p12le`) goes to the software decoder; interlaced video is refused with a clear error. The GPU cannot take 4:2:2, 4:4:4 or monochrome, so those use the software decoder even with `--hwaccel auto`.
 HEVC also has a software decoder (`--hwaccel off`, or automatically where the GPU cannot take a stream): Main and Main 10 (and monochrome, 4:2:2 and 4:4:4 at 8, 10 and 12 bits) with I, P and B pictures,
 merge and AMVP motion prediction, temporal motion vectors, weighted prediction, wavefronts, multiple slices, default scaling lists, transform skip, lossless (transquant bypass),
 QP deltas, constrained intra, the deblocking filter and sample adaptive offset. These are checked sample-for-sample against FFmpeg on x265 streams (the
@@ -338,7 +338,7 @@ first, as the specification orders, and matches NVDEC on every sample of every s
 `hevc_sao_on_16x16_blocks_decodes_to_what_hardware_decodes` test keeps one); 4:2:2, which this GPU cannot decode, was checked by
 hand at the first differing sample.
 10-bit HEVC GPU decoding was compared with FFmpeg's software decoder on a 60-frame 720p Main 10 clip: every sample of every
-frame is identical. 10-bit H.264 (High 10) and 10-bit encoding of H.264 are not offered (consumer NVENC cannot encode it).
+frame is identical. 10-bit H.264 (High 10) is decoded in software only, and 10-bit H.264 encoding is not offered (consumer NVENC cannot encode it).
 
 ```
 ironav convert -i in.mp4 -o out.y4m --vcodec rawvideo                    # decode to raw frames
@@ -372,7 +372,7 @@ Checked on files remuxed by FFmpeg: an x264 file with B-frames and AAC and an HE
 as FFmpeg's decoder; AAC in a `.mka` decodes to within 1 LSB of FFmpeg's. Opus in Matroska decodes too (see below), and so do VP9 and
 AV1 in WebM (see "VP9" and "AV1").
 Not handled: tracks with a content encoding (header stripping, compression, encryption) are refused; chapters, tags, cues
-and attachments are ignored; subtitle tracks are skipped; Matroska is never written. A copied track starts at its own first
+and attachments are ignored; subtitle tracks are skipped (for what Matroska output holds, see "Matroska output" below). A copied track starts at its own first
 timestamp rounded to the output's frame grid, so a video that starts a fraction of a frame after the audio in the source
 (23 ms in one test file) ends up up to half a frame (20 ms at 25 fps) away from where it was.
 
@@ -542,7 +542,8 @@ I did not isolate it further. Three of those streams are committed with FFmpeg's
 LSB, SILK and hybrid above 35 dB).
 Not covered: multichannel Opus (channel-mapping families 1 and 255 are refused), and the way the reference decoder flushes its resampler when the stream switches between SILK
 and CELT, which our fixed-delay filter does not reproduce, so the few samples at such a switch can differ. The libopus encoder
-only produced streams in one mode at a time, so **mode switches within a stream were not tested**, nor were redundancy frames.
+only produced streams in one mode at a time; mode switches and their redundant CELT frames are covered by IronAV's own
+automatic-mode streams instead, which this decoder and libopus both decode (see the encoder's automatic mode below).
 Opus is read from Matroska/WebM (`.mka`, `.webm`) and from Ogg (`.opus`, `.ogg`); for writing see "Opus encoder" below. The Ogg reader (pages are checksummed; the file is read into memory, up to 1 GiB) takes only the first Opus, Vorbis or FLAC stream: Speex and Theora in Ogg are refused with a message naming the codec, and chained streams after the first are ignored. The final page's granule position shortens the last packet, so the output ends where the file says (for Opus the length is the granule minus the pre-skip). Tested on libopus files remuxed to Ogg (identical samples to the Matroska copies); multi-page packets are covered by a synthetic unit test only. FLAC in Ogg (the native-FLAC mapping, as FFmpeg's muxer writes it) decodes bit for bit to the PCM it was made from.
 
 
@@ -558,8 +559,9 @@ window (48 samples in the test file) long, because Matroska does not record wher
 
 ### Opus encoder
 
-`--acodec opus` writes CELT-mode Opus: 48 kHz mono or stereo, 20 ms frames, constant bit rate (64 kb/s per channel; the
-planner refuses other sample rates, naming the way out), into `.opus` (Ogg), `.mka`, `.mkv` and `.webm` with the `OpusHead` and the
+`--acodec opus` writes CELT-mode Opus: 48 kHz mono or stereo (other rates are resampled first, with a warning), 20 ms
+frames, constant bit rate (64 kb/s per channel); the library also has SILK, hybrid and automatic modes, DTX, in-band FEC
+and 2.5 to 60 ms frames (below), which the CLI and job JSON do not select yet. It goes into `.opus` (Ogg), `.mka`, `.mkv` and `.webm` with the `OpusHead` and the
 pre-skip. It is written against the decoder: the bit allocation and the band quantiser are the decoder's own code, made
 generic over a `Coder` trait so that one body of code reads or writes a frame and the two cannot disagree, and what the
 encoder adds is the forward MDCT (checked to invert the decoder's synthesis), the band energies and their coarse/fine
@@ -576,7 +578,7 @@ Checked: FFmpeg (through PyAV) opens the Matroska files and decodes them; our de
 83 dB, and both are 20.4 dB SNR against the source on a 6 s, 128 kb/s stereo test signal. Quality grows with the bit
 rate as it should (a tone-and-noise test signal, mono: 10 dB at 16 kb/s, 22 dB at 64, 29 at 128, 39 at 256). This is a first encoder, not libopus: there
 is only a simple transient detector (a frame with a sudden attack is coded as eight short blocks; on a test of decaying hits that is +1.3 dB SNR),
-no band boosts or tuned allocation trim, and no variable bit rate or hybrid mode, so at the same size it will sound
+no band boosts or tuned allocation trim, and CELT mode is constant bit rate, so at the same size it will sound
 worse than libopus. The end of a stream is exact in Ogg (the last page's granule position) and in Matroska/WebM (the last block carries a
 `DiscardPadding`, which our reader honours); FFmpeg decodes both to exactly the source's length.
 
@@ -598,7 +600,7 @@ spectrum's tilt, was tried and measured 1 to 4 dB worse here, so the trim stays 
 `IRONAV_OPUS_OUT=dir` writes the streams for such a check.
 
 For speech at low rates there is SILK mode (`OpusEncoder::with_mode(OpusMode::Silk)`): wideband (audio to 8 kHz),
-mono or stereo, frames of 10 or 20 ms, at a variable rate that averages the one asked for
+mono or stereo, frames of 10, 20, 40 or 60 ms (see the packets of 40 and 60 ms below), at a variable rate that averages the one asked for
 (about 8 to 30 kb/s). It is written from the decoder, like the CELT side: LPC by autocorrelation and Levinson, turned
 into NLSFs and quantized with the two-stage codebook and its backward prediction; an open-loop pitch search on the LPC
 residual, checked against fractions of the lag, with the per-subframe contour chosen jointly; five-tap long-term
@@ -817,8 +819,8 @@ multiple references, 10-bit.
 VP8 video is decoded in software (`ironav-codec/src/vp8`, a port of FFmpeg's `vp8.c` and `vp8dsp.c`; the probability, quantiser and
 motion tables are generated by `tools/gen_vp8_tables.py`). All four profiles work: six-tap and bilinear motion compensation, the
 normal and simple loop filters, segmentation, loop-filter deltas, one to eight token partitions, golden and altref references
-(with sign bias), split motion vectors, and frames that are not shown. Output is 4:2:0 8-bit, cropped to the coded size. It is the
-first software video codec, so `ironav convert -i clip.webm -o out.y4m --vcodec rawvideo` now works on a machine without a GPU.
+(with sign bias), split motion vectors, and frames that are not shown. Output is 4:2:0 8-bit, cropped to the coded size. Being
+software, it lets `ironav convert -i clip.webm -o out.y4m --vcodec rawvideo` work on a machine without a GPU.
 
 Checked bit for bit against FFmpeg's decoder (through PyAV) on libvpx output: twelve clips from 54x38 to 176x144 (odd and
 non-multiple-of-16 sizes, profiles 0 to 3, one to eight partitions, constant-quality extremes, error-resilient streams with
@@ -1016,6 +1018,7 @@ any directory the process can read, so treat the launch URL like a credential.
 ## Layout
 
 `ironav-core` types/traits · `ironav-hwaccel` · `ironav-codec` · `ironav-formats` · `ironav-ontology` ·
+`ironav-analyze` (analyzers and observations) · `ironav-live` (live sources) ·
 `ironav-player` (playback engine) · `ironav-engine` (jobs, planner, pipeline, tool registry) · `ironav-gui` (native, egui) · `ironav-webui` (browser) ·
 `ironav-cli`
 

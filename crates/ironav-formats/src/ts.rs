@@ -1,7 +1,7 @@
 //! MPEG transport streams (`.ts`, `.m2ts`): the container of broadcast, IPTV, HLS and most cameras.
 //!
-//! Reading: one push parser ([`TsParser`]) serves both the file reader and the live
-//! [`StreamDemuxer`](crate::stream::StreamDemuxer), so a socket and a file give the same packets.
+//! Reading: one push parser (`TsParser`) serves both the file reader and the live
+//! [`StreamDemuxer`], so a socket and a file give the same packets.
 //! 188-byte packets are read, and 192-byte ones (M2TS, with a 4-byte arrival stamp in front). The
 //! first program of the PAT is followed; its H.264, HEVC, AAC (ADTS) and MP3 streams come out, and
 //! other stream types are skipped. A stream's parameters come from its first units (the SPS, the

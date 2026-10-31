@@ -5,7 +5,7 @@
 //!
 //! The formats here are the self-delimiting ones: Y4M, WAV, ADTS (AAC), Annex B H.264/HEVC and
 //! MPEG-TS ([`crate::ts`]), Matroska/WebM (`mkv::live`), fragmented MP4 (`mp4demux::live`), RTP
-//! in RTSP's interleaved framing ([`crate::rtp`]), and Ogg and MP3 ([`crate::audio_stream`]).
+//! in RTSP's interleaved framing ([`crate::rtp`]), and Ogg and MP3 (`audio_stream`).
 
 use crate::{adts, wav, y4m};
 use ironav_core::{CodecId, Error, ErrorCode, Packet, PixelFormat, Rational, Result, StreamInfo, StreamParams};

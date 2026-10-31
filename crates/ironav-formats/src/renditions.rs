@@ -7,7 +7,7 @@
 //! The streams are settled once every part has found its own (or has ended, or the other has a
 //! backlog): a part's streams that turn up later are not added. Packets wait for the other part's
 //! next one, so the order holds, unless that part has ended or fallen this far behind
-//! ([`MAX_WAITING`] packets, or [`MAX_WAITING_SECONDS`] of media). A second part whose format
+//! (`MAX_WAITING` packets, or `MAX_WAITING_SECONDS` of media). A second part whose format
 //! cannot be read is left out; the first part's errors are the stream's.
 
 use crate::stream::{stream_demuxer, Pending, StreamDemuxer, StreamOptions, StreamPacket, MAX_PENDING, SNIFF_BYTES};
