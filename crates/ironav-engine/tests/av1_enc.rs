@@ -206,3 +206,46 @@ fn inter_frames_decode_identically_and_are_smaller_than_key_frames() {
         assert!(inter * 100 < key_only * 85, "{name}: inter frames {inter} bytes, key frames only {key_only} bytes");
     }
 }
+
+/// Encodes `src` at `kbps` (an average bit rate) into `dir`'s `name` WebM and returns its path.
+fn encode_at_rate(dir: &Path, name: &str, src: &Path, kbps: u32) -> PathBuf {
+    let out = dir.join(format!("{name}.webm"));
+    let mut j = Job { input: src.display().to_string(), output: out.display().to_string(), hwaccel: "off".into(), overwrite: true, ..Job::default() };
+    j.video.codec = Some("av1".into());
+    j.video.bitrate_kbps = Some(kbps);
+    run(&j, &mut |_| {}).unwrap_or_else(|e| panic!("{name}: IronAV could not encode at {kbps} kbit/s: {e}"));
+    out
+}
+
+/// Encodes testsrc2 at `w` x `h` for `frames` frames at `kbps`, checks the decode, and returns the
+/// bit rate the stream achieves at 25 frames a second (its size, container included, over the clip's
+/// duration) and the luma PSNR.
+fn bit_rate_round_trip(name: &str, w: usize, h: usize, frames: usize, kbps: u32) -> (f64, f64) {
+    let dir = scratch(name);
+    let clip = source(&dir, w, h, frames);
+    let src = dir.join("src.y4m");
+    std::fs::write(&src, clip.y4m()).unwrap();
+    let stream = encode_at_rate(&dir, name, &src, kbps);
+    let decoded = decode_both(&dir, &stream, name);
+    assert_eq!(decoded.len(), clip.frames.len() * clip.frames[0].len(), "{name}: picture count");
+    let (y, c) = psnr(&clip, &decoded);
+    let rate = std::fs::metadata(&stream).unwrap().len() as f64 * 8.0 * 25.0 / frames as f64;
+    eprintln!("{name}: {w}x{h} at {kbps} kbit/s: {:.1} kbit/s achieved, luma {y:.2} dB, chroma {c:.2} dB", rate / 1000.0);
+    let _ = std::fs::remove_dir_all(&dir);
+    (rate, y)
+}
+
+/// A bit rate is followed: at three rates the 60-frame clip lands within 10% of the target, decodes
+/// identically in libaom and IronAV, and gets better as the rate rises.
+#[test]
+fn bit_rate_is_followed_and_quality_rises_with_it() {
+    need_ffmpeg!();
+    let mut last_psnr = 0.0;
+    for kbps in [300u32, 800, 2000] {
+        let (rate, y) = bit_rate_round_trip(&format!("rate{kbps}"), 352, 288, 60, kbps);
+        let target = kbps as f64 * 1000.0;
+        assert!((rate / target - 1.0).abs() <= 0.10, "{kbps} kbit/s: {rate:.0} bit/s achieved, more than 10% off");
+        assert!(y > last_psnr, "{kbps} kbit/s: luma PSNR {y:.2} dB does not rise from {last_psnr:.2} dB");
+        last_psnr = y;
+    }
+}

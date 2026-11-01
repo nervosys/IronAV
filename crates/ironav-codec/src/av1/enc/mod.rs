@@ -9,7 +9,8 @@
 //! every block is coded with one transform of its size). Each block is coded as intra or inter by
 //! rate-distortion cost, and intra blocks take the best of the 13 intra modes with angle deltas.
 //! Coefficients are quantised at the base quantiser index that `qp` maps to (as for the other
-//! encoders, 0 to 51). The deblocking filter and CDEF run on each reconstructed frame, with levels
+//! encoders, 0 to 51), or with a rate control that moves the quantiser so the stream's average bit
+//! rate follows the one asked for. The deblocking filter and CDEF run on each reconstructed frame, with levels
 //! and strengths that follow the quantiser, and the reference is the filtered frame.
 //!
 //! The encoder keeps the decoder's own per-frame state (`av1::block::FrameDec`) and reconstructs
@@ -43,15 +44,23 @@ const DEFAULT_QP: u8 = 23;
 /// The key frame interval when none is set (the VP9 and HEVC encoders' default).
 const DEFAULT_KEYINT: u64 = 250;
 
+/// Bits per pixel at quantiser 26, roughly, for the rate control's first guess (as the H.264 encoder's).
+const BPP: f64 = 0.1;
+
 /// The largest picture one tile holds: 4096 wide, and no more than 2304 superblocks, so that the
 /// minimum tile counts stay zero.
 const MAX_WIDTH: u32 = 4096;
 const MAX_SUPERBLOCKS: usize = 2304;
 
-/// The base quantiser index of a quantiser of 0 to 51 (as the VP9 encoder maps it). Index 0 would be
-/// lossless, which this encoder does not code.
-fn base_q(qp: u8) -> u32 {
-    (qp.min(51) as u32 * 255 / 51).max(1)
+/// The quantiser offset of key frames under rate control, in the 0 to 51 quantiser: key frames are
+/// finer, since the inter frames after them inherit their quality, and inter frames take the rate
+/// control's quantiser as it stands (as the H.264 encoder's IDR offset).
+const KEY_QP_OFFSET: f64 = -3.0;
+
+/// The base quantiser index of a quantiser of 0 to 51 (as the VP9 encoder maps it, 5 steps to each
+/// quantiser step). Index 0 would be lossless, which this encoder does not code.
+fn base_q(qp: f64) -> u32 {
+    (qp.clamp(0.0, 51.0) * 255.0 / 51.0).round().max(1.0) as u32
 }
 
 /// The deblocking level of a base quantiser index: a level that rises with the quantiser, from 0 at
@@ -69,7 +78,15 @@ fn cdef_strengths(q: u32) -> [u8; 4] {
 pub struct Av1Encoder {
     width: usize,
     height: usize,
-    base_q: u32,
+    /// A fixed quantiser (0 to 51), or a bit rate in bits per second to average.
+    qp: Option<u8>,
+    bitrate: Option<u32>,
+    /// The frame rate, and the rate control state: the quantiser (0 to 51) for the next inter frame,
+    /// and the bits spent against the bits allowed.
+    fps: f64,
+    rc_qp: f64,
+    spent: f64,
+    allowed: f64,
     keyint: u64,
     /// Frames since the last key frame (1 right after one).
     since_key: u64,
@@ -87,10 +104,11 @@ pub struct Av1Encoder {
 }
 
 impl Av1Encoder {
-    /// An encoder for `params` (yuv420p video) at a constant quantiser (`qp`, 0 to 51). A bit rate is
-    /// not followed: the quantiser stays where `qp` puts it.
-    pub fn new(params: &StreamParams, qp: Option<u8>) -> Result<Self> {
-        let StreamParams::Video { width, height, pix_fmt, .. } = *params else {
+    /// An encoder for `params` (yuv420p video) at a constant quantiser (`qp`, 0 to 51) or an average
+    /// bit rate in bits per second. With a bit rate the quantiser follows it, starting from a guess
+    /// from the bits per pixel the rate allows; `qp` is then ignored.
+    pub fn new(params: &StreamParams, qp: Option<u8>, bitrate: Option<u32>) -> Result<Self> {
+        let StreamParams::Video { width, height, pix_fmt, frame_rate } = *params else {
             return Err(Error::invalid_arg("the AV1 encoder takes video"));
         };
         if pix_fmt != PixelFormat::Yuv420p {
@@ -102,10 +120,20 @@ impl Av1Encoder {
             return Err(Error::invalid_arg(format!("{width}x{height} is too large for the software AV1 encoder (one tile, up to 4096 wide)")));
         }
         let seq = parse_sequence_header(&headers::sequence_header(width, height))?;
+        let fps = if frame_rate.num > 0 && frame_rate.den > 0 { frame_rate.num as f64 / frame_rate.den as f64 } else { 25.0 };
+        // a first guess from the bits per pixel the rate allows, about 26 at a tenth of a bit per pixel
+        let rc_qp = bitrate.map_or(DEFAULT_QP as f64, |r| {
+            (26.0 - 7.0 * (r as f64 / (fps * width as f64 * height as f64) / BPP).log2()).clamp(10.0, 45.0)
+        });
         Ok(Self {
             width: width as usize,
             height: height as usize,
-            base_q: base_q(qp.unwrap_or(DEFAULT_QP)),
+            qp: if bitrate.is_none() { Some(qp.unwrap_or(DEFAULT_QP).min(51)) } else { None },
+            bitrate,
+            fps,
+            rc_qp,
+            spent: 0.0,
+            allowed: 0.0,
             keyint: DEFAULT_KEYINT,
             since_key: 0,
             seq,
@@ -150,6 +178,35 @@ impl Av1Encoder {
         self.seq = parse_sequence_header(&hdr).expect("the sequence header of the options parses");
     }
 
+    /// The quantiser (0 to 51) of the next frame: the one set, or the rate control's, with the key
+    /// frame offset.
+    fn next_qp(&self, key: bool) -> f64 {
+        match self.qp {
+            Some(q) => q as f64,
+            None => (self.rc_qp + if key { KEY_QP_OFFSET } else { 0.0 }).clamp(1.0, 51.0),
+        }
+    }
+
+    /// Steers the quantiser so the bits spent follow the bits the rate allows, as the H.264 encoder
+    /// does: a frame's size roughly halves for every 6 added to the quantiser, so the size of the last
+    /// frame says what quantiser it would have needed, and the surplus or deficit against a second's
+    /// worth of bits pulls the next quantiser further. A key frame is expected to cost four frames'
+    /// worth. The quantiser moves at most 4 steps a frame.
+    fn rate_update(&mut self, bits: usize, qp: f64, key: bool) {
+        let Some(rate) = self.bitrate else {
+            return;
+        };
+        let per_frame = rate as f64 / self.fps;
+        self.spent += bits as f64;
+        self.allowed += per_frame;
+        let window = rate as f64;
+        let budget = 6.0 * ((self.spent + window) / (self.allowed + window).max(1.0)).log2();
+        let (offset, expected) = if key { (KEY_QP_OFFSET, per_frame * 4.0) } else { (0.0, per_frame) };
+        let wanted = (qp - offset) + 6.0 * (bits as f64 / expected).max(1e-3).log2();
+        let next = 0.5 * self.rc_qp + 0.5 * wanted + budget;
+        self.rc_qp = next.clamp(self.rc_qp - 4.0, self.rc_qp + 4.0).clamp(1.0, 51.0);
+    }
+
     /// The temporal unit of one picture.
     pub fn encode_frame(&mut self, v: &VideoFrame) -> Result<Vec<u8>> {
         let (w, h) = (self.width, self.height);
@@ -161,13 +218,15 @@ impl Av1Encoder {
             return Err(Error::invalid_input("a video frame plane is shorter than its dimensions"));
         }
         let key = self.last.is_none() || self.since_key >= self.keyint;
+        let qp = self.next_qp(key);
+        let q = base_q(qp);
         let params = FrameParams {
             key,
             width: w as u32,
             height: h as u32,
-            base_q_idx: self.base_q,
-            lf_level: filter_level(self.base_q),
-            cdef: cdef_strengths(self.base_q),
+            base_q_idx: q,
+            lf_level: filter_level(q),
+            cdef: cdef_strengths(q),
             superres: self.superres,
             restoration: self.restoration,
         };
@@ -234,6 +293,7 @@ impl Av1Encoder {
         let mut out = headers::obu(headers::OBU_TEMPORAL_DELIMITER, &[]);
         out.extend(headers::obu(headers::OBU_SEQUENCE_HEADER, &headers::sequence_header_with(w as u32, h as u32, self.superres.is_some(), self.restoration)));
         out.extend(headers::obu(headers::OBU_FRAME, &frame));
+        self.rate_update(out.len() * 8, qp, key);
         Ok(out)
     }
 }
@@ -328,7 +388,7 @@ mod tests {
     fn round_trips_through_the_decoder() {
         for &(w, h) in &[(64usize, 48usize), (177, 99)] {
             let src = picture(w, h);
-            let mut enc = Av1Encoder::new(&params(w, h), Some(20)).unwrap();
+            let mut enc = Av1Encoder::new(&params(w, h), Some(20), None).unwrap();
             let data = enc.encode_frame(&src).unwrap();
             let mut dec = Av1Decoder::new(&[]);
             let mut frames = dec.decode(&Packet { stream: 0, pts: 0, duration: 1, data }).unwrap();
@@ -343,7 +403,7 @@ mod tests {
     #[test]
     fn inter_frames_decode_to_the_encoders_reconstruction() {
         for &(w, h) in &[(96usize, 64usize), (177, 99)] {
-            let mut enc = Av1Encoder::new(&params(w, h), Some(24)).unwrap().with_keyint(4);
+            let mut enc = Av1Encoder::new(&params(w, h), Some(24), None).unwrap().with_keyint(4);
             let mut dec = Av1Decoder::new(&[]);
             for t in 0..6 {
                 let src = picture_shifted(w, h, 2 * t);
@@ -368,7 +428,7 @@ mod tests {
     fn superres_frames_decode_to_the_encoders_reconstruction() {
         for &(denom, restoration) in &[(9u32, false), (12, false), (16, false), (9, true), (12, true), (16, true)] {
             for &(w, h) in &[(352usize, 288usize), (177, 99)] {
-                let mut enc = Av1Encoder::new(&params(w, h), Some(24)).unwrap().with_keyint(3).with_superres(denom);
+                let mut enc = Av1Encoder::new(&params(w, h), Some(24), None).unwrap().with_keyint(3).with_superres(denom);
                 if restoration {
                     enc = enc.with_restoration();
                 }

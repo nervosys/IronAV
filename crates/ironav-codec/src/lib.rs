@@ -395,7 +395,7 @@ pub fn new_encoder_with_opts(codec: CodecId, params: &StreamParams, bits: Option
         (CodecId::Hevc, StreamParams::Video { .. }) => Ok(Box::new(hevc::HevcEncoder::new(params, None, bitrate_kbps.map(|k| k.saturating_mul(1000)))?)),
         (CodecId::Vp8, StreamParams::Video { .. }) => Ok(Box::new(vp8::Vp8Encoder::new(params, None, bitrate_kbps.map(|k| k.saturating_mul(1000)))?)),
         (CodecId::Vp9, StreamParams::Video { .. }) => Ok(Box::new(vp9::Vp9Encoder::new(params, None)?)),
-        (CodecId::Av1, StreamParams::Video { .. }) => Ok(Box::new(av1::enc::Av1Encoder::new(params, None)?)),
+        (CodecId::Av1, StreamParams::Video { .. }) => Ok(Box::new(av1::enc::Av1Encoder::new(params, None, bitrate_kbps.map(|k| k.saturating_mul(1000)))?)),
         (c, p) if c.media_type() != p.media_type() => Err(Error::invalid_arg(format!(
             "codec {} is {:?} but the stream is {:?}",
             c.name(),

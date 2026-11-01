@@ -217,10 +217,11 @@ fn execute(
                     })
                 }
                 _ if dst.codec == CodecId::Av1 && dst.params.media_type() == MediaType::Video => {
-                    let RateControl::ConstQp(q) = rate else {
-                        return Err(Error::invalid_arg("the software AV1 encoder is constant quality: set qp, not a bit rate").hint("qp 18-28 is the usual range"));
+                    let (qp, bitrate) = match rate {
+                        RateControl::ConstQp(q) => (Some(q), None),
+                        RateControl::Bitrate(b) => (None, Some(b)),
                     };
-                    let e = Av1Encoder::new(&dst.params, Some(q))?;
+                    let e = Av1Encoder::new(&dst.params, qp, bitrate)?;
                     Box::new(match st.keyint {
                         Some(k) => e.with_keyint(k.into()),
                         None => e,

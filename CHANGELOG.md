@@ -37,7 +37,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   and film grain loaded from a reference. It matches libaom bit for bit on key-frame-only, P-only and alt-ref streams at
   `-cpu-used` 1 to 8, and is used when no NVIDIA GPU decodes AV1. Superres is decoded (upscaling after CDEF and before loop
   restoration), and matches libaom bit for bit on IronAV-encoded superres streams at 1/9 to 1/16 of the width.
-- **Codecs (AV1 encoder):** profile 0, 8-bit 4:2:0, in WebM, Matroska and MP4, `--qp` only (no bit rate). It writes inter
+- **Codecs (AV1 encoder):** profile 0, 8-bit 4:2:0, in WebM, Matroska and MP4, `--qp` or an average bit rate (`--vbitrate`; see below). It writes inter
   frames after each key frame (every 250 frames by default, `--keyint`): LAST_FRAME prediction with quarter-sample vectors
   searched to half samples, the reference MV stack's modes, skip and intra blocks inside inter frames, deblocking and CDEF
   on every frame, and rate-distortion mode decisions from the CDF bit costs. It runs the decoder's own reconstruction, so
@@ -129,8 +129,9 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 - **Hardware:** only NVIDIA is driven: NVENC for H.264 and HEVC, NVDEC for H.264, HEVC and AV1. The other backends
   (VA-API, Quick Sync, VideoToolbox, D3D11VA, AMF, Vulkan Video, MediaCodec and OpenCL) are planned.
-- **AV1 encoder:** one reference (the previous frame), no compound prediction, no rate control by bit rate (`--qp`
-  only), 8-bit 4:2:0 and one tile; the motion search stops at half samples.
+- **AV1 encoder:** one reference (the previous frame), no compound prediction, 8-bit 4:2:0 and one tile; the motion
+  search stops at half samples. Rate control is an average bit rate only: no maximum rate or buffer size (`--maxrate`,
+  `--bufsize` are not options of any encoder.
 - **HEVC encoder:** Main profile, 8-bit 4:2:0 only, with no sign data hiding; B pictures are an option (`with_bframes`), off by default because they cost more bits than P pictures at the same quantiser on the 720p clips measured (see the HEVC section of the README); wider HEVC encoding needs
   an NVIDIA GPU.
 - **HEVC decoder:** the range extension coding tools (RDPCM, cross-component prediction, extended precision, persistent

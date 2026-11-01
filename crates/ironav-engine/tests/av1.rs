@@ -359,7 +359,7 @@ fn check_superres(name: &str, w: usize, h: usize, denom: u32, frames: usize, key
     let d = scratch(name);
     let path = d.join("superres.ivf");
     let raw = d.join("ref.raw");
-    let mut enc = Av1Encoder::new(&StreamParams::Video { width: w as u32, height: h as u32, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational { num: 25, den: 1 } }, Some(24))
+    let mut enc = Av1Encoder::new(&StreamParams::Video { width: w as u32, height: h as u32, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational { num: 25, den: 1 } }, Some(24), None)
         .unwrap_or_else(|e| panic!("{name}: {e}"))
         .with_keyint(keyint);
     if denom != 8 {
