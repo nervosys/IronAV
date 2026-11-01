@@ -72,7 +72,10 @@ pub fn implemented() -> Vec<CodecImpl> {
             if c == CodecId::Mpeg4 {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-mpeg4" });
             }
-            if c == CodecId::Mpeg2Video || c == CodecId::Mpeg1Video {
+            if c == CodecId::Mpeg2Video {
+                return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-mpeg2" });
+            }
+            if c == CodecId::Mpeg1Video {
                 return Some(CodecImpl { codec: c, decode: true, encode: false, implementation: "ironav-mpeg2" });
             }
             if c == CodecId::ProRes {
@@ -439,7 +442,7 @@ impl OpusOptions {
 /// half-sample motion search only, and no hidden ALTREF frames.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct VideoOptions {
-    /// B pictures between anchor pictures, for HEVC and MPEG-4 (0 to 3).
+    /// B pictures between anchor pictures, for HEVC, MPEG-4 and MPEG-2 (0 to 3).
     pub bframes: Option<usize>,
     /// Tile columns and rows as log2 counts, for AV1 (`with_tiles`).
     pub tiles: Option<(u32, u32)>,
@@ -460,6 +463,14 @@ impl VideoOptions {
 
     /// The settings for an MPEG-4 encoder.
     pub fn apply_mpeg4(&self, enc: mpeg4::enc::Mpeg4Encoder) -> mpeg4::enc::Mpeg4Encoder {
+        match self.bframes {
+            Some(n) => enc.with_bframes(n),
+            None => enc,
+        }
+    }
+
+    /// The settings for an MPEG-2 encoder.
+    pub fn apply_mpeg2(&self, enc: mpeg2::enc::Mpeg2Encoder) -> mpeg2::enc::Mpeg2Encoder {
         match self.bframes {
             Some(n) => enc.with_bframes(n),
             None => enc,
@@ -543,6 +554,13 @@ pub fn new_encoder_with_opts(codec: CodecId, params: &StreamParams, bits: Option
                 None => enc,
             }))
         }
+        (CodecId::Mpeg2Video, StreamParams::Video { .. }) => {
+            let enc = mpeg2::enc::Mpeg2Encoder::new(params, None, bitrate_kbps.map(|k| k.saturating_mul(1000)))?;
+            Ok(Box::new(match video {
+                Some(v) => v.apply_mpeg2(enc),
+                None => enc,
+            }))
+        }
         (CodecId::Av1, StreamParams::Video { .. }) => {
             let enc = av1::enc::Av1Encoder::new(params, None, bitrate_kbps.map(|k| k.saturating_mul(1000)))?;
             Ok(Box::new(match video {
@@ -590,6 +608,10 @@ pub fn encoder_extradata(codec: CodecId, params: &StreamParams) -> Vec<u8> {
         (CodecId::ProRes, _) => prores::Profile::Hq.fourcc().to_vec(),
         (CodecId::Av1, StreamParams::Video { width, height, .. }) => av1::enc::config_record(*width, *height),
         (CodecId::Mpeg4, StreamParams::Video { width, height, frame_rate, .. }) => mpeg4::enc::config(*width, *height, if frame_rate.num > 0 { frame_rate.num } else { 25 }),
+        (CodecId::Mpeg2Video, StreamParams::Video { width, height, frame_rate, .. }) => {
+            let (num, den) = if frame_rate.num > 0 && frame_rate.den > 0 { (frame_rate.num, frame_rate.den) } else { (25, 1) };
+            mpeg2::enc::config(*width, *height, num, den)
+        }
         _ => Vec::new(),
     }
 }
