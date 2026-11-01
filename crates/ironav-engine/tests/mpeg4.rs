@@ -45,12 +45,17 @@ fn y4m_payload(b: &[u8]) -> Vec<u8> {
 /// Encodes `frames` pictures of 178x98 with `args`, then checks that IronAV's decode of the file
 /// is FFmpeg's bit for bit. Returns the number of frames compared.
 fn check(name: &str, container: &str, args: &[&str], frames: u32) -> usize {
+    check_sized(name, container, args, frames, 178, 98)
+}
+
+fn check_sized(name: &str, container: &str, args: &[&str], frames: u32, w: u32, h: u32) -> usize {
     let d = scratch(name);
     let src = d.join(format!("src.{container}"));
     let raw = d.join("ref.raw");
     let y4m = d.join("out.y4m");
     let n = frames.to_string();
-    let mut enc = vec!["-f", "lavfi", "-i", "testsrc2=size=178x98:rate=25", "-frames:v", &n, "-c:v", "mpeg4", "-pix_fmt", "yuv420p"];
+    let size = format!("testsrc2=size={w}x{h}:rate=25");
+    let mut enc = vec!["-f", "lavfi", "-i", &size, "-frames:v", &n, "-c:v", "mpeg4", "-pix_fmt", "yuv420p"];
     enc.extend_from_slice(args);
     enc.push(src.to_str().unwrap());
     assert!(ffmpeg(&enc), "{name}: ffmpeg could not encode the stream");
@@ -62,7 +67,7 @@ fn check(name: &str, container: &str, args: &[&str], frames: u32) -> usize {
     assert_eq!(r.format, "y4m", "{name}");
     let (got, want) = (y4m_payload(&std::fs::read(&y4m).unwrap()), std::fs::read(&raw).unwrap());
     assert!(got == want, "{name}: IronAV decodes FFmpeg's MPEG-4 differently ({} bytes, FFmpeg {} bytes)", got.len(), want.len());
-    want.len() / (178 * 98 * 3 / 2)
+    want.len() / (w as usize * h as usize * 3 / 2)
 }
 
 #[test]
@@ -109,4 +114,16 @@ fn data_partitioned_streams_are_rejected_with_an_error() {
     assert!(ffmpeg(&["-f", "lavfi", "-i", "testsrc2=size=178x98:rate=25", "-frames:v", "3", "-c:v", "mpeg4", "-data_partitioning", "1", "-pix_fmt", "yuv420p", src.to_str().unwrap()]));
     let err = run(&job(&src, &d.join("out.y4m")), &mut |_| {}).expect_err("data partitioning is not decoded");
     assert!(err.to_string().contains("data partitioning"), "unexpected error: {err}");
+}
+
+#[test]
+fn four_vector_and_rate_distorted_streams_at_cif_decode_bit_exactly() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not on PATH; skipping");
+        return;
+    }
+    for q in ["3", "12"] {
+        let name = format!("cif-mv4-rd-q{q}");
+        assert_eq!(check_sized(&name, "mp4", &["-g", "30", "-bf", "0", "-flags", "+mv4", "-mbd", "rd", "-qscale:v", q], 30, 352, 288), 30);
+    }
 }
