@@ -210,3 +210,27 @@ fn report_720p_table() {
         println!("| {qp} | {size} | {p:.2} | {fps:.1} | {gs} | {fp:.2} |");
     }
 }
+
+/// MPEG-4 takes a quantiser scale of 1 to 31; the plan refuses anything else by name before any output is written.
+#[test]
+fn qp_outside_the_mpeg4_range_is_refused_by_name() {
+    if !ffmpeg_available() {
+        eprintln!("skipped: ffmpeg is not on PATH");
+        return;
+    }
+    let dir = scratch("qp-range");
+    let src = source(&dir, 176, 144, 2, 25);
+    for qp in [0u8, 32, 51] {
+        let out = dir.join(format!("bad{qp}.mp4"));
+        let mut j = job(&src, &out);
+        j.video.codec = Some("mpeg4".into());
+        j.video.qp = Some(qp);
+        let msg = run(&j, &mut |_| {}).expect_err("qp outside 1-31 is refused").to_string();
+        assert!(msg.contains("mpeg4") && msg.contains("1-31"), "qp {qp}: {msg}");
+        assert!(!out.exists(), "qp {qp} wrote an output");
+    }
+    for qp in [1u8, 31] {
+        let out = dir.join(format!("ok{qp}.mp4"));
+        encode(&src, &out, Some(qp), None, None);
+    }
+}

@@ -363,6 +363,10 @@ pub fn plan(job: &Job) -> Result<Plan> {
         }
         if media == MediaType::Video && action == Action::Transcode {
             rate_control(opts)?;
+            if to == CodecId::Mpeg4 && opts.qp.is_some_and(|q| !(1..=31).contains(&q)) {
+                return Err(Error::invalid_arg(format!("qp for mpeg4 must be 1-31, got {}", opts.qp.unwrap_or(0)))
+                    .hint("the MPEG-4 quantiser scale runs from 1 (best) to 31; use bitrate_kbps for a size target"));
+            }
         } else if media == MediaType::Video && (opts.bitrate_kbps.is_some() || opts.qp.is_some()) {
             return Err(Error::invalid_arg("bitrate_kbps and qp have no effect when the stream is copied")
                 .hint("set a video codec (for example h264) to re-encode"));
