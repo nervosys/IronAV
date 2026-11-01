@@ -20,14 +20,22 @@ fn fill(out: &mut [u16], w: usize, h: usize, f: impl Fn(usize, usize) -> i32) {
 /// Predicts a `w` x `h` luma block whose top-left is at (`x`, `y`) in the reference, displaced by
 /// the quarter-sample vector (`mx`, `my`). The reference is `pw` x `ph`; samples outside it repeat
 /// the nearest edge sample.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn luma_mc(refp: &[u16], pw: usize, ph: usize, x: i32, y: i32, mx: i32, my: i32, w: usize, h: usize, out: &mut [u16], maxv: i32) {
+    luma_mc_st(refp, pw, pw, ph, x, y, mx, my, w, h, out, maxv)
+}
+
+/// `luma_mc` from a reference whose rows are `stride` samples apart (a field of a frame: twice
+/// the width, from the field's first row).
+#[allow(clippy::too_many_arguments)]
+pub fn luma_mc_st(refp: &[u16], stride: usize, pw: usize, ph: usize, x: i32, y: i32, mx: i32, my: i32, w: usize, h: usize, out: &mut [u16], maxv: i32) {
     let (fx, fy) = ((mx & 3) as usize, (my & 3) as usize);
     let (x0, y0) = (x + (mx >> 2), y + (my >> 2));
     if fx == 0 && fy == 0 {
         if x0 >= 0 && y0 >= 0 && x0 as usize + w <= pw && y0 as usize + h <= ph {
             for r in 0..h {
-                let o = (y0 as usize + r) * pw + x0 as usize;
+                let o = (y0 as usize + r) * stride + x0 as usize;
                 out[r * w..r * w + w].copy_from_slice(&refp[o..o + w]);
             }
         } else {
@@ -35,7 +43,7 @@ pub fn luma_mc(refp: &[u16], pw: usize, ph: usize, x: i32, y: i32, mx: i32, my: 
                 let yy = (y0 + r as i32).clamp(0, ph as i32 - 1) as usize;
                 for c in 0..w {
                     let xx = (x0 + c as i32).clamp(0, pw as i32 - 1) as usize;
-                    out[r * w + c] = refp[yy * pw + xx];
+                    out[r * w + c] = refp[yy * stride + xx];
                 }
             }
         }
@@ -47,13 +55,13 @@ pub fn luma_mc(refp: &[u16], pw: usize, ph: usize, x: i32, y: i32, mx: i32, my: 
     let inside = x0 >= 2 && y0 >= 2 && (x0 as usize + w + 3) <= pw && (y0 as usize + h + 3) <= ph;
     let mut win = [0u16; 21 * 21];
     let (src, st, base) = if inside {
-        (refp, pw, (y0 as usize - 2) * pw + x0 as usize - 2)
+        (refp, stride, (y0 as usize - 2) * stride + x0 as usize - 2)
     } else {
         for r in 0..wh {
             let yy = (y0 - 2 + r as i32).clamp(0, ph as i32 - 1) as usize;
             for c in 0..ww {
                 let xx = (x0 - 2 + c as i32).clamp(0, pw as i32 - 1) as usize;
-                win[r * ww + c] = refp[yy * pw + xx];
+                win[r * ww + c] = refp[yy * stride + xx];
             }
         }
         (&win[..], ww, 0)
@@ -115,13 +123,19 @@ fn bilinear(out: &mut [u16], w: usize, h: usize, fx: i32, fy: i32, at: impl Fn(i
 /// Predicts a `w` x `h` chroma block; the vector is in eighth-sample units.
 #[allow(clippy::too_many_arguments)]
 pub fn chroma_mc(refp: &[u16], pw: usize, ph: usize, x: i32, y: i32, mx: i32, my: i32, w: usize, h: usize, out: &mut [u16]) {
+    chroma_mc_st(refp, pw, pw, ph, x, y, mx, my, w, h, out)
+}
+
+/// `chroma_mc` from a reference whose rows are `stride` samples apart.
+#[allow(clippy::too_many_arguments)]
+pub fn chroma_mc_st(refp: &[u16], stride: usize, pw: usize, ph: usize, x: i32, y: i32, mx: i32, my: i32, w: usize, h: usize, out: &mut [u16]) {
     let (fx, fy) = (mx & 7, my & 7);
     let (x0, y0) = (x + (mx >> 3), y + (my >> 3));
     // one sample past the block on each axis is read when the vector is fractional
     if x0 >= 0 && y0 >= 0 && (x0 as usize + w) < pw && (y0 as usize + h) < ph {
-        bilinear(out, w, h, fx, fy, |c, r| refp[(y0 + r) as usize * pw + (x0 + c) as usize] as i32);
+        bilinear(out, w, h, fx, fy, |c, r| refp[(y0 + r) as usize * stride + (x0 + c) as usize] as i32);
     } else {
-        let at = |c: i32, r: i32| refp[(r.clamp(0, ph as i32 - 1) as usize) * pw + c.clamp(0, pw as i32 - 1) as usize] as i32;
+        let at = |c: i32, r: i32| refp[(r.clamp(0, ph as i32 - 1) as usize) * stride + c.clamp(0, pw as i32 - 1) as usize] as i32;
         bilinear(out, w, h, fx, fy, |c, r| at(x0 + c, y0 + r));
     }
 }

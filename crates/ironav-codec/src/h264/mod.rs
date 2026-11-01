@@ -1,9 +1,14 @@
-//! A software H.264 decoder (ITU-T H.264 / ISO 14496-10) for progressive video: 8- and 10-bit 4:2:0, 4:2:2 and 4:4:4, and monochrome.
+//! A software H.264 decoder (ITU-T H.264 / ISO 14496-10) for frame pictures, progressive and
+//! MBAFF (macroblock-adaptive frame/field) interlaced: 8- and 10-bit 4:2:0, 4:2:2 and 4:4:4, and
+//! monochrome. Field pictures (PAFF) are not decoded.
 //!
 //! Intra pictures (I slices, CAVLC and CABAC, 4x4 / 8x8 / 16x16 prediction, I_PCM, 8x8 transform,
 //! scaling matrices, multiple slices, the loop filter), P slices and B slices (all partition sizes,
 //! skip and direct modes, multiple reference frames, bi-prediction, weighted prediction) are decoded
-//! with CAVLC and CABAC, with reference picture marking and output reordering.
+//! with CAVLC and CABAC, with reference picture marking and output reordering. The MBAFF parts
+//! (macroblock pair neighbours, field macroblocks predicting from reference fields, direct
+//! prediction between field and frame macroblocks, the mixed-edge loop filter) follow FFmpeg's
+//! h264 decoder (LGPL-2.1-or-later), which they were checked against sample for sample.
 
 pub(crate) mod bits;
 pub(crate) mod cabac;
@@ -55,7 +60,8 @@ struct Current {
     pps: Pps,
     hdr: SliceHeader,
     pts: i64,
-    poc: i32,
+    /// Order counts of the top and bottom fields.
+    poc: [i32; 2],
     mbs_done: usize,
 }
 
@@ -67,7 +73,7 @@ struct SliceJob {
 
 /// The pixel work of a picture on another thread: its slices, then the loop filter, a macroblock
 /// row behind the decoding, publishing each row as it becomes final.
-fn decode_picture(sps: Sps, pps: Pps, slices: Vec<SliceJob>, poc: i32, mut pic: Picture, out: Publisher) -> (Picture, Option<Error>) {
+fn decode_picture(sps: Sps, pps: Pps, slices: Vec<SliceJob>, poc: [i32; 2], mut pic: Picture, out: Publisher) -> (Picture, Option<Error>) {
     struct Rows {
         out: Publisher,
         bd: u32,
@@ -82,11 +88,14 @@ fn decode_picture(sps: Sps, pps: Pps, slices: Vec<SliceJob>, poc: i32, mut pic: 
                 self.decoded += 1;
             }
             // a row is filtered once the row below is decoded, as intra prediction there reads it
-            // unfiltered; it is final once the row below is filtered too
-            if self.decoded > self.filtered + 1 {
-                deblock::deblock_rows(pic, self.bd, self.filtered..self.decoded - 1);
-                self.filtered = self.decoded - 1;
-                self.out.publish(pic, self.filtered - 1);
+            // unfiltered; it is final once the row below is filtered too. MBAFF pictures go by
+            // macroblock pair rows.
+            let u = if pic.mbaff { 2 } else { 1 };
+            let decoded = self.decoded - self.decoded % u;
+            if decoded > self.filtered + u {
+                deblock::deblock_rows(pic, self.bd, self.filtered..decoded - u);
+                self.filtered = decoded - u;
+                self.out.publish(pic, self.filtered - u);
             }
         }
     }
@@ -220,8 +229,10 @@ impl H264Decoder {
         // memory_management_control_operation 5 makes the picture's order count 0 (8.2.1): its
         // frame order count is the lesser of its fields', which is subtracted from both
         let mmco5 = c.hdr.nal_ref_idc != 0 && c.hdr.marking.adaptive && c.hdr.marking.ops.iter().any(|o| o.0 == 5);
-        let poc = if mmco5 { 0 } else { c.poc };
-        let decoded = |data| DecodedPic { data, frame: Mutex::new(None), mb_w, mb_h, cf, cw: if cf == 3 { 16 } else { 8 }, poc, id, crop, bit_depth: bd };
+        let frame_poc = c.poc[0].min(c.poc[1]);
+        let field_poc = if mmco5 { c.poc.map(|p| p - frame_poc) } else { c.poc };
+        let poc = if mmco5 { 0 } else { frame_poc };
+        let decoded = |data| DecodedPic { data, frame: Mutex::new(None), mb_w, mb_h, cf, cw: if cf == 3 { 16 } else { 8 }, poc, field_poc, id, crop, bit_depth: bd };
         let pic = match c.pic.take() {
             Some(mut p) => {
                 deblock::deblock_picture(&mut p, bd);
@@ -231,7 +242,8 @@ impl H264Decoder {
                 while self.running.len() >= self.threads {
                     self.join_oldest();
                 }
-                let work = Picture::with_spare(mb_w, mb_h, cf, bd, self.dpb.spare.pop());
+                let mut work = Picture::with_spare(mb_w, mb_h, cf, bd, self.dpb.spare.pop());
+                work.mbaff = c.sps.mb_adaptive_frame_field;
                 let to = Picture::with_spare(mb_w, mb_h, cf, bd, self.dpb.spare.pop());
                 let (pic, out) = Publisher::new(decoded(Published::new((to.planes, to.mbs), mb_w, mb_h)));
                 let (sps, pps, slices, poc) = (c.sps.clone(), c.pps.clone(), std::mem::take(&mut c.slices), c.poc);
@@ -295,13 +307,17 @@ impl H264Decoder {
             let sps = self.sps[sps_id].as_ref().unwrap();
             let pps = self.pps[hdr.pps_id as usize].as_ref().unwrap();
             let poc = self.dpb.compute_poc(sps, &hdr);
-            let pic = (self.threads == 1).then(|| Picture::with_spare(sps.mb_width, sps.mb_height, sps.chroma_format_idc as u8, sps.bit_depth_luma, self.dpb.spare.pop()));
+            let pic = (self.threads == 1).then(|| {
+                let mut p = Picture::with_spare(sps.mb_width, sps.mb_height, sps.chroma_format_idc as u8, sps.bit_depth_luma, self.dpb.spare.pop());
+                p.mbaff = sps.mb_adaptive_frame_field;
+                p
+            });
             self.cur = Some(Current { pic, slices: Vec::new(), sps: sps.clone(), pps: pps.clone(), hdr: hdr.clone(), pts, poc, mbs_done: 0 });
         }
         let cur = self.cur.as_mut().unwrap();
         let sps = self.sps[sps_id].as_ref().unwrap();
         let pps = self.pps[hdr.pps_id as usize].as_ref().unwrap();
-        let refs: [RefList; 2] = if hdr.slice_type == SliceType::I { [Vec::new(), Vec::new()] } else { self.dpb.ref_lists(sps, &hdr, cur.poc)? };
+        let refs: [RefList; 2] = if hdr.slice_type == SliceType::I { [Vec::new(), Vec::new()] } else { self.dpb.ref_lists(sps, &hdr, cur.poc[0].min(cur.poc[1]))? };
         let Some(pic) = cur.pic.as_mut() else {
             cur.slices.push(SliceJob { rbsp: rbsp.to_vec(), hdr: hdr.clone(), refs });
             cur.hdr = hdr;

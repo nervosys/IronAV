@@ -20,6 +20,8 @@ pub struct DecodedPic {
     /// Width of a macroblock's chroma samples.
     pub cw: usize,
     pub poc: i32,
+    /// The order counts of the top and bottom fields; `poc` is the lesser.
+    pub field_poc: [i32; 2],
     /// Unique across the stream; deblocking and direct prediction compare references by it.
     pub id: i32,
     /// Cropping (left, right, top, bottom) in luma samples, applied when the picture is output.
@@ -111,8 +113,9 @@ impl Dpb {
         frames.clamp(1, 16)
     }
 
-    /// Picture order count of the picture the header starts (8.2.1).
-    pub fn compute_poc(&mut self, sps: &Sps, h: &SliceHeader) -> i32 {
+    /// Order counts of the top and bottom fields of the frame the header starts (8.2.1); the
+    /// frame's own is the lesser.
+    pub fn compute_poc(&mut self, sps: &Sps, h: &SliceHeader) -> [i32; 2] {
         let max_frame_num = 1i64 << sps.log2_max_frame_num;
         let frame_num_offset = if h.idr {
             0
@@ -139,7 +142,7 @@ impl Dpb {
                     self.prev_poc_msb = msb;
                     self.prev_poc_lsb = lsb;
                 }
-                top.min(bottom)
+                [top, bottom]
             }
             1 => {
                 let n = sps.offset_for_ref_frame.len() as i64;
@@ -159,16 +162,17 @@ impl Dpb {
                 }
                 let top = expected + h.delta_poc[0] as i64;
                 let bottom = top + sps.offset_for_top_to_bottom_field as i64 + h.delta_poc[1] as i64;
-                top.min(bottom) as i32
+                [top as i32, bottom as i32]
             }
             _ => {
-                if h.idr {
+                let p = if h.idr {
                     0
                 } else if h.nal_ref_idc == 0 {
                     (2 * (frame_num_offset + h.frame_num as i64) - 1) as i32
                 } else {
                     (2 * (frame_num_offset + h.frame_num as i64)) as i32
-                }
+                };
+                [p, p]
             }
         };
         self.prev_frame_num_offset = frame_num_offset;
