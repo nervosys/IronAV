@@ -176,6 +176,9 @@ fn median(a: i16, b: i16, c: i16) -> i16 {
 
 /// The partitions of each inter partitioning (16x16, 16x8, 8x16, 8x8), as (x, y, width, height) in
 /// 4x4 blocks, in decoding order.
+/// The reference indices of blocks that use none (for intra and B neighbours' in-macroblock lookups).
+const NO_REF: [i8; 16] = [0; 16];
+
 const PARTS: [&[(usize, usize, usize, usize)]; 4] = [&[(0, 0, 4, 4)], &[(0, 0, 4, 2), (0, 2, 4, 2)], &[(0, 0, 2, 4), (2, 0, 2, 4)], &[(0, 0, 2, 2), (2, 0, 2, 2), (0, 2, 2, 2), (2, 2, 2, 2)]];
 
 /// A value per 4x4 block, raster order, from one per partition of `part`.
@@ -238,6 +241,8 @@ struct MbCode {
     part: u8,
     mvs: [[i16; 2]; 4],
     mvds: [[i32; 2]; 4],
+    /// The reference index of each partition in a P macroblock.
+    refs: [u8; 4],
     /// In a B slice, per partition of `part`: the direction (0 direct, as B_Skip, B_Direct_16x16 or
     /// B_Direct_8x8; bit 0 list 0, bit 1 list 1); per 8x8 block the lists used; the motion per 4x4
     /// block of each list; and each list's vector difference per partition.
@@ -260,7 +265,7 @@ struct MbCode {
 
 impl MbCode {
     fn new(kind: Kind) -> Self {
-        MbCode { kind, skip: false, i16_mode: 0, modes: [2; 16], chroma_mode: 0, part: 0, mvs: [[0; 2]; 4], mvds: [[0; 2]; 4], bdir: [0; 4], buse: [[false; 2]; 4], bmv: [[[0; 2]; 16]; 2], bmvd: [[[0; 2]; 4]; 2], t8x8: false, luma8: [[0; 64]; 4], cbp: 0, luma: [[0; 16]; 16], dc: [0; 16], cdc: [[0; 4]; 2], cac: [[[0; 16]; 4]; 2], nnz: [0; 16], cnnz: [[0; 4]; 2] }
+        MbCode { kind, skip: false, i16_mode: 0, modes: [2; 16], chroma_mode: 0, part: 0, mvs: [[0; 2]; 4], mvds: [[0; 2]; 4], refs: [0; 4], bdir: [0; 4], buse: [[false; 2]; 4], bmv: [[[0; 2]; 16]; 2], bmvd: [[[0; 2]; 4]; 2], t8x8: false, luma8: [[0; 64]; 4], cbp: 0, luma: [[0; 16]; 16], dc: [0; 16], cdc: [[0; 4]; 2], cac: [[[0; 16]; 4]; 2], nnz: [0; 16], cnnz: [[0; 4]; 2] }
     }
 }
 
@@ -273,6 +278,9 @@ pub struct FrameCoder<'a> {
     src: &'a Source,
     refp: Option<&'a Picture>,
     half: Option<&'a HalfPel>,
+    /// For a P slice: its list 0, the reference pictures with their half samples, in reference
+    /// index order (entry 0 is `refp`).
+    plist: Vec<(&'a Picture, &'a HalfPel)>,
     /// For a B slice: the list 1 reference with its half samples.
     refp1: Option<&'a Picture>,
     half1: Option<&'a HalfPel>,
@@ -310,6 +318,7 @@ impl<'a> FrameCoder<'a> {
             src,
             refp: refp.map(|r| r.0),
             half: refp.map(|r| r.1),
+            plist: refp.into_iter().collect(),
             refp1: None,
             half1: None,
             dist: (1, 2),
@@ -331,6 +340,13 @@ impl<'a> FrameCoder<'a> {
             skip_run: 0,
             counts: [0; 3],
         }
+    }
+
+    /// Gives a P slice its whole list 0 (`list[0]` being the reference given to `new`), in reference
+    /// index order: `ref_idx` in the macroblocks picks among them.
+    pub fn with_refs(mut self, list: Vec<(&'a Picture, &'a HalfPel)>) -> Self {
+        self.plist = list;
+        self
     }
 
     /// Makes the slice a B slice predicting from the list 0 reference given to `new` and `l1`,
@@ -402,7 +418,7 @@ impl<'a> FrameCoder<'a> {
     /// vectors of the blocks set in the low 16 bits of `done`, and the high 16 bits mark those of
     /// them not using the list. None when the block is not available.
     #[allow(clippy::too_many_arguments)]
-    fn nb_motion(&self, l: usize, mbx: usize, mby: usize, cur: &[[i16; 2]; 16], done: u32, x: i32, y: i32) -> Option<(i8, [i16; 2])> {
+    fn nb_motion(&self, l: usize, mbx: usize, mby: usize, cur: &[[i16; 2]; 16], cref: &[i8; 16], done: u32, x: i32, y: i32) -> Option<(i8, [i16; 2])> {
         let (dx, dy, bx, by) = match (x < 0, x >= 4, y < 0) {
             (true, _, true) => (-1, -1, 3, 3),
             (true, _, false) => (-1, 0, 3, y),
@@ -411,7 +427,7 @@ impl<'a> FrameCoder<'a> {
             (_, _, true) => (0, -1, x, 3),
             _ => {
                 let b = y * 4 + x;
-                return ((done >> b) & 1 == 1).then(|| if (done >> (16 + b)) & 1 == 1 { (-1, [0, 0]) } else { (0, cur[b as usize]) });
+                return ((done >> b) & 1 == 1).then(|| if (done >> (16 + b)) & 1 == 1 { (-1, [0, 0]) } else { (cref[b as usize], cur[b as usize]) });
             }
         };
         self.nb_state(mbx as i32 + dx, mby as i32 + dy).map(|s| match s.refs[l][(by / 2 * 2 + bx / 2) as usize] {
@@ -423,24 +439,24 @@ impl<'a> FrameCoder<'a> {
     /// The motion vector predictor of the partition at (bx, by), `w` blocks wide (8.4.1.3); `dir`
     /// is 1 for a 16x8 and 2 for an 8x16 partition.
     #[allow(clippy::too_many_arguments)]
-    fn pred_mv(&self, l: usize, mbx: usize, mby: usize, cur: &[[i16; 2]; 16], done: u32, bx: i32, by: i32, w: i32, dir: u8) -> [i16; 2] {
-        let nb = |x, y| self.nb_motion(l, mbx, mby, cur, done, x, y);
+    fn pred_mv(&self, l: usize, mbx: usize, mby: usize, cur: &[[i16; 2]; 16], cref: &[i8; 16], done: u32, bx: i32, by: i32, w: i32, dir: u8, rf: i8) -> [i16; 2] {
+        let nb = |x, y| self.nb_motion(l, mbx, mby, cur, cref, done, x, y);
         let a = nb(bx - 1, by);
         let b = nb(bx, by - 1);
         let c = nb(bx + w, by - 1).or_else(|| nb(bx - 1, by - 1));
         let r = |n: Option<(i8, [i16; 2])>| n.map_or(-1, |v| v.0);
         let mv = |n: Option<(i8, [i16; 2])>| n.map_or([0, 0], |v| v.1);
         match dir {
-            1 if by == 0 && r(b) == 0 => return mv(b),
-            1 if by != 0 && r(a) == 0 => return mv(a),
-            2 if bx == 0 && r(a) == 0 => return mv(a),
-            2 if bx != 0 && r(c) == 0 => return mv(c),
+            1 if by == 0 && r(b) == rf => return mv(b),
+            1 if by != 0 && r(a) == rf => return mv(a),
+            2 if bx == 0 && r(a) == rf => return mv(a),
+            2 if bx != 0 && r(c) == rf => return mv(c),
             _ => {}
         }
         if b.is_none() && c.is_none() && a.is_some() {
             return mv(a);
         }
-        let (ra, rb, rc) = (r(a) == 0, r(b) == 0, r(c) == 0);
+        let (ra, rb, rc) = (r(a) == rf, r(b) == rf, r(c) == rf);
         match (ra as u8 + rb as u8 + rc as u8, ra, rb) {
             (1, true, _) => mv(a),
             (1, _, true) => mv(b),
@@ -453,20 +469,21 @@ impl<'a> FrameCoder<'a> {
     }
 
     /// The motion vector predictor of a 16x16 partition in list `l`.
-    fn mv_pred(&self, l: usize, mbx: usize, mby: usize) -> [i16; 2] {
-        self.pred_mv(l, mbx, mby, &[[0; 2]; 16], 0, 0, 0, 4, 0)
+    fn mv_pred(&self, l: usize, mbx: usize, mby: usize, rf: i8) -> [i16; 2] {
+        self.pred_mv(l, mbx, mby, &[[0; 2]; 16], &NO_REF, 0, 0, 0, 4, 0, rf)
     }
 
-    /// The predictors of the partitions of `part` whose vectors are `mvs` (each depends on the
-    /// partitions before it).
-    fn part_mvps(&self, mbx: usize, mby: usize, part: u8, mvs: &[[i16; 2]; 4]) -> [[i16; 2]; 4] {
-        let (mut cur, mut done, mut out) = ([[0i16; 2]; 16], 0u32, [[0i16; 2]; 4]);
+    /// The predictors of the partitions of `part` whose vectors are `mvs` and references `refs`
+    /// (each depends on the partitions before it).
+    fn part_mvps(&self, mbx: usize, mby: usize, part: u8, mvs: &[[i16; 2]; 4], refs: &[u8; 4]) -> [[i16; 2]; 4] {
+        let (mut cur, mut cref, mut done, mut out) = ([[0i16; 2]; 16], [0i8; 16], 0u32, [[0i16; 2]; 4]);
         let dir = [0, 1, 2, 0][part as usize];
         for (k, &(x, y, w, h)) in PARTS[part as usize].iter().enumerate() {
-            out[k] = self.pred_mv(0, mbx, mby, &cur, done, x as i32, y as i32, w as i32, dir);
+            out[k] = self.pred_mv(0, mbx, mby, &cur, &cref, done, x as i32, y as i32, w as i32, dir, refs[k] as i8);
             for by in y..y + h {
                 for bx in x..x + w {
                     cur[by * 4 + bx] = mvs[k];
+                    cref[by * 4 + bx] = refs[k] as i8;
                     done |= 1 << (by * 4 + bx);
                 }
             }
@@ -477,9 +494,9 @@ impl<'a> FrameCoder<'a> {
     /// The vector of a P_Skip macroblock (8.4.1.1).
     fn skip_mv(&self, mbx: usize, mby: usize) -> [i16; 2] {
         let none = [[0i16; 2]; 16];
-        match (self.nb_motion(0, mbx, mby, &none, 0, -1, 0), self.nb_motion(0, mbx, mby, &none, 0, 0, -1)) {
+        match (self.nb_motion(0, mbx, mby, &none, &NO_REF, 0, -1, 0), self.nb_motion(0, mbx, mby, &none, &NO_REF, 0, 0, -1)) {
             (None, _) | (_, None) | (Some((0, [0, 0])), _) | (_, Some((0, [0, 0]))) => [0, 0],
-            _ => self.mv_pred(0, mbx, mby),
+            _ => self.mv_pred(0, mbx, mby, 0),
         }
     }
 
@@ -540,9 +557,9 @@ impl<'a> FrameCoder<'a> {
     }
 
     /// SAD of the `w` x `h` source block at (x, y) against the reference at the integer part of `mv`.
-    fn sad_int(&self, l: usize, x: usize, y: usize, w: usize, h: usize, mv: [i16; 2]) -> i32 {
+    fn sad_int(&self, l: usize, r: usize, x: usize, y: usize, w: usize, h: usize, mv: [i16; 2]) -> i32 {
         let ls = self.ls();
-        let rows = self.half_of(l).rows(x as i32 + (mv[0] >> 2) as i32, y as i32 + (mv[1] >> 2) as i32, w, h);
+        let rows = self.ref_half(l, r).rows(x as i32 + (mv[0] >> 2) as i32, y as i32 + (mv[1] >> 2) as i32, w, h);
         let mut sad = 0;
         for (r, rrow) in rows.enumerate() {
             let srow = &self.src.planes[0][(y + r) * ls + x..(y + r) * ls + x + w];
@@ -551,16 +568,43 @@ impl<'a> FrameCoder<'a> {
         sad
     }
 
-    fn luma_pred(&self, l: usize, x: usize, y: usize, w: usize, h: usize, mv: [i16; 2], out: &mut [u16]) {
-        self.half_of(l).predict(x as i32, y as i32, mv, w, h, out);
+    fn luma_pred(&self, l: usize, r: usize, x: usize, y: usize, w: usize, h: usize, mv: [i16; 2], out: &mut [u16]) {
+        self.ref_half(l, r).predict(x as i32, y as i32, mv, w, h, out);
     }
 
-    /// The half-sample planes of the list `l` reference.
-    fn half_of(&self, l: usize) -> &HalfPel {
-        if l == 0 {
-            self.half.unwrap()
+    /// The half-sample planes of reference `r` of list `l`: a P slice's references are its list 0
+    /// (`plist`), a B slice has one reference in each of its two lists.
+    fn ref_half(&self, l: usize, r: usize) -> &HalfPel {
+        if self.b_slice {
+            if l == 0 {
+                self.half.unwrap()
+            } else {
+                self.half1.unwrap()
+            }
         } else {
-            self.half1.unwrap()
+            self.plist[r].1
+        }
+    }
+
+    /// The picture of reference `r` of list `l` (see `ref_half`).
+    fn ref_pic(&self, l: usize, r: usize) -> &Picture {
+        if self.b_slice {
+            if l == 0 {
+                self.refp.unwrap()
+            } else {
+                self.refp1.unwrap()
+            }
+        } else {
+            self.plist[r].0
+        }
+    }
+
+    /// Bits for coding reference index `r` (ref_idx_l0 with `plist` longer than one).
+    fn ref_bits(&self, r: u8) -> i32 {
+        match self.plist.len() {
+            0 | 1 => 0,
+            2 => 1,
+            _ => 2 * (r as u32 + 1).ilog2() as i32 + 1,
         }
     }
 
@@ -578,11 +622,11 @@ impl<'a> FrameCoder<'a> {
             // A prediction whose differences average a quantiser step or more cannot be skipped.
             let skip_mv = self.skip_mv(mbx, mby);
             let mut pred = [0u16; 256];
-            self.luma_pred(0, x0, y0, 16, 16, skip_mv, &mut pred);
+            self.luma_pred(0, 0, x0, y0, 16, 16, skip_mv, &mut pred);
             let ls = self.ls();
             let sad: i32 = (0..256).map(|i| (self.src.planes[0][(y0 + i / 16) * ls + x0 + i % 16] as i32 - pred[i] as i32).abs()).sum();
             if (sad as f64) < 256.0 * 0.625 * 2f64.powf(self.qp as f64 / 6.0) {
-                let mut code = self.code_inter(mbx, mby, 0, [skip_mv; 4], false);
+                let mut code = self.code_inter(mbx, mby, 0, [skip_mv; 4], [0; 4], false);
                 if code.cbp == 0 {
                     code.skip = true;
                     return code;
@@ -598,7 +642,7 @@ impl<'a> FrameCoder<'a> {
             return self.decide_rd(mbx, mby, i16.0, inter);
         }
         // Intra4x4 is tried by coding it, which leaves its reconstruction in place; it is kept only if it wins
-        let try_i4 = inter.is_none_or(|(_, _, c)| best_intra < c);
+        let try_i4 = inter.is_none_or(|(_, _, _, c)| best_intra < c);
         let mut i4 = None;
         if try_i4 {
             let code = self.code_i4(mbx, mby);
@@ -608,10 +652,10 @@ impl<'a> FrameCoder<'a> {
                 i4 = Some(code.0);
             }
         }
-        if let Some((part, mvs, cost)) = inter {
+        if let Some((part, mvs, refs, cost)) = inter {
             if cost <= best_intra {
-                let mut code = self.code_inter(mbx, mby, part, mvs, false);
-                if code.cbp == 0 && part == 0 && mvs[0] == self.skip_mv(mbx, mby) {
+                let mut code = self.code_inter(mbx, mby, part, mvs, refs, false);
+                if code.cbp == 0 && part == 0 && mvs[0] == self.skip_mv(mbx, mby) && refs[0] == 0 {
                     code.skip = true;
                 }
                 return code;
@@ -670,20 +714,35 @@ impl<'a> FrameCoder<'a> {
     }
 
     /// The best partitioning of an inter macroblock, a vector per partition, and their cost.
-    fn best_inter(&self, mbx: usize, mby: usize) -> (u8, [[i16; 2]; 4], i32) {
+    fn best_inter(&self, mbx: usize, mby: usize) -> (u8, [[i16; 2]; 4], [u8; 4], i32) {
+        let mut best: Option<(u8, [[i16; 2]; 4], [u8; 4], i32)> = None;
+        // every reference of list 0 is searched with the whole macroblock; the cheapest wins
+        for r in 0..self.plist.len() as u8 {
+            let (part, mvs, cost) = self.best_inter_ref(mbx, mby, r);
+            if best.is_none_or(|b| cost < b.3) {
+                best = Some((part, mvs, [r; 4], cost));
+            }
+        }
+        best.unwrap()
+    }
+
+    /// `best_inter` with every partition predicting from reference `r`.
+    fn best_inter_ref(&self, mbx: usize, mby: usize, r: u8) -> (u8, [[i16; 2]; 4], i32) {
         let lam = self.lambda;
-        let mvp = self.mv_pred(0, mbx, mby);
+        let refs = [r; 4];
+        let rb = lam * self.ref_bits(r);
+        let mvp = self.mv_pred(0, mbx, mby, r as i8);
         let col: Vec<_> = self.col_mv(self.refp.unwrap(), mbx, mby).into_iter().collect();
-        let (mv, cost) = self.motion_search(0, mbx, mby, PARTS[0][0], mvp, &col);
+        let (mv, cost) = self.motion_search(0, r as usize, mbx, mby, PARTS[0][0], mvp, &col);
         // costs carry the mb_type and sub_mb_type bits (as CAVLC codes them)
-        let mut best = (0u8, [mv; 4], cost + lam * (mvd_bits(mv, mvp) + 1));
+        let mut best = (0u8, [mv; 4], cost + lam * (mvd_bits(mv, mvp) + 1) + rb);
         let mut mvs8 = [mv; 4];
         let mut cost8 = lam * 9;
         for k in 0..4 {
-            let p = self.part_mvps(mbx, mby, 3, &mvs8)[k];
-            let (m, c) = self.motion_search(0, mbx, mby, PARTS[3][k], p, &[mv]);
+            let p = self.part_mvps(mbx, mby, 3, &mvs8, &refs)[k];
+            let (m, c) = self.motion_search(0, r as usize, mbx, mby, PARTS[3][k], p, &[mv]);
             mvs8[k] = m;
-            cost8 += c + lam * mvd_bits(m, p);
+            cost8 += c + lam * mvd_bits(m, p) + rb;
             // costs only add up: once 8x8 costs more than 16x16 it cannot win
             if cost8 >= best.2 {
                 break;
@@ -696,11 +755,11 @@ impl<'a> FrameCoder<'a> {
                 let mut mvs = [[0i16; 2]; 4];
                 let mut cost = lam * 3;
                 for k in 0..2 {
-                    let p = self.part_mvps(mbx, mby, part, &mvs)[k];
+                    let p = self.part_mvps(mbx, mby, part, &mvs, &refs)[k];
                     let cands = if part == 1 { [mvs8[2 * k], mvs8[2 * k + 1]] } else { [mvs8[k], mvs8[k + 2]] };
-                    let (m, c) = self.motion_search(0, mbx, mby, PARTS[part as usize][k], p, &cands);
+                    let (m, c) = self.motion_search(0, r as usize, mbx, mby, PARTS[part as usize][k], p, &cands);
                     mvs[k] = m;
-                    cost += c + lam * mvd_bits(m, p);
+                    cost += c + lam * mvd_bits(m, p) + rb;
                     if cost >= best.2 {
                         break;
                     }
@@ -722,18 +781,18 @@ impl<'a> FrameCoder<'a> {
         (col.kind == Kind::Inter).then(|| col.mv[0][5])
     }
 
-    fn motion_search(&self, l: usize, mbx: usize, mby: usize, (bx, by, w, h): (usize, usize, usize, usize), mvp: [i16; 2], extra: &[[i16; 2]]) -> ([i16; 2], i32) {
+    fn motion_search(&self, l: usize, r: usize, mbx: usize, mby: usize, (bx, by, w, h): (usize, usize, usize, usize), mvp: [i16; 2], extra: &[[i16; 2]]) -> ([i16; 2], i32) {
         let lam = self.lambda;
         let (x0, y0, w, h) = (mbx * 16 + bx * 4, mby * 16 + by * 4, w * 4, h * 4);
         let (lo_x, hi_x) = (-(x0 as i32 + 24) * 4, ((self.mb_w * 16 - x0) as i32 + 8) * 4);
         let (lo_y, hi_y) = (-(y0 as i32 + 24) * 4, ((self.mb_h * 16 - y0) as i32 + 8) * 4);
         let clamp = |mv: [i32; 2]| -> [i16; 2] { [mv[0].clamp(lo_x.max(-2048), hi_x.min(2047)) as i16, mv[1].clamp(lo_y.max(-512), hi_y.min(511)) as i16] };
         let int = |mv: [i16; 2]| -> [i16; 2] { [(mv[0] + 2) & !3, (mv[1] + 2) & !3] };
-        let cost_int = |mv: [i16; 2]| self.sad_int(l, x0, y0, w, h, mv) + lam * mvd_bits(mv, mvp);
+        let cost_int = |mv: [i16; 2]| self.sad_int(l, r, x0, y0, w, h, mv) + lam * mvd_bits(mv, mvp);
         let none = [[0i16; 2]; 16];
         let mut cands = vec![int(clamp([mvp[0] as i32, mvp[1] as i32])), [0, 0]];
         for (dx, dy) in [(-1, 0), (0, -1), (4, -1)] {
-            if let Some((0, mv)) = self.nb_motion(l, mbx, mby, &none, 0, dx, dy) {
+            if let Some((_, mv)) = self.nb_motion(l, mbx, mby, &none, &NO_REF, 0, dx, dy).filter(|n| n.0 == r as i8) {
                 cands.push(int(clamp([mv[0] as i32, mv[1] as i32])));
             }
         }
@@ -765,7 +824,7 @@ impl<'a> FrameCoder<'a> {
         let mut buf = [0u16; 256];
         let pred = &mut buf[..w * h];
         let cost_sub = |mv: [i16; 2], pred: &mut [u16]| {
-            self.luma_pred(l, x0, y0, w, h, mv, pred);
+            self.luma_pred(l, r, x0, y0, w, h, mv, pred);
             self.satd(0, x0, y0, w, h, pred) + lam * mvd_bits(mv, mvp)
         };
         best_cost = cost_sub(best, pred);
@@ -966,15 +1025,16 @@ impl<'a> FrameCoder<'a> {
 
     /// Codes an inter macroblock of partitioning `part` with a vector per partition, its luma with
     /// the 8x8 transform when `t8`.
-    fn code_inter(&mut self, mbx: usize, mby: usize, part: u8, mvs: [[i16; 2]; 4], t8: bool) -> MbCode {
+    fn code_inter(&mut self, mbx: usize, mby: usize, part: u8, mvs: [[i16; 2]; 4], refs: [u8; 4], t8: bool) -> MbCode {
         let mut code = MbCode::new(Kind::Inter);
         code.part = part;
         code.mvs = mvs;
-        let mvps = self.part_mvps(mbx, mby, part, &mvs);
+        code.refs = refs;
+        let mvps = self.part_mvps(mbx, mby, part, &mvs, &refs);
         for k in 0..4 {
             code.mvds[k] = [0, 1].map(|c| mvs[k][c] as i32 - mvps[k][c] as i32);
         }
-        let (pred, cpred) = self.inter_pred(mbx, mby, part, &mvs);
+        let (pred, cpred) = self.inter_pred(mbx, mby, part, &mvs, &refs);
         self.code_inter_residual(code, mbx, mby, &pred, &cpred, t8)
     }
 
@@ -1154,7 +1214,7 @@ impl<'a> FrameCoder<'a> {
 
     /// Writes the inter prediction of a macroblock as its reconstruction (P_Skip's).
     fn put_inter_pred(&mut self, mbx: usize, mby: usize, mv: [i16; 2]) {
-        let (pred, cpred) = self.inter_pred(mbx, mby, 0, &[mv; 4]);
+        let (pred, cpred) = self.inter_pred(mbx, mby, 0, &[mv; 4], &[0; 4]);
         self.put_pred(mbx, mby, &pred, &cpred);
     }
 
@@ -1224,7 +1284,7 @@ impl<'a> FrameCoder<'a> {
     /// Codes P_Skip, the best inter partitioning (by SATD), Intra16x16 with its best mode and
     /// Intra4x4, and keeps the one of least rate-distortion cost. SATD is a poor judge between intra
     /// and inter, so intra is always tried.
-    fn decide_rd(&mut self, mbx: usize, mby: usize, i16: u8, inter: Option<(u8, [[i16; 2]; 4], i32)>) -> MbCode {
+    fn decide_rd(&mut self, mbx: usize, mby: usize, i16: u8, inter: Option<(u8, [[i16; 2]; 4], [u8; 4], i32)>) -> MbCode {
         // larger than the usual 0.85 * 2^((qp - 12) / 3): the residual decisions are not RD optimised
         let lam2 = 1.6 * 2f64.powf((self.qp as f64 - 12.0) / 3.0);
         let mut best: Option<(f64, MbCode, [u16; 384])> = None;
@@ -1233,7 +1293,7 @@ impl<'a> FrameCoder<'a> {
                 best = Some((j, code, this.save_mb(mbx, mby)));
             }
         };
-        if let Some((part, mvs, _)) = inter {
+        if let Some((part, mvs, refs, _)) = inter {
             let sm = self.skip_mv(mbx, mby);
             let mut code = MbCode::new(Kind::Inter);
             code.skip = true;
@@ -1241,15 +1301,15 @@ impl<'a> FrameCoder<'a> {
             self.put_inter_pred(mbx, mby, sm);
             let j = self.rd_cost(&code, mbx, mby, lam2);
             keep(self, j, code);
-            let code = self.code_inter(mbx, mby, part, mvs, false);
+            let code = self.code_inter(mbx, mby, part, mvs, refs, false);
             // with nothing coded and the skip vector, this is P_Skip at a higher price
-            if !(code.cbp == 0 && part == 0 && mvs[0] == sm) {
+            if !(code.cbp == 0 && part == 0 && mvs[0] == sm && refs[0] == 0) {
                 let j = self.rd_cost(&code, mbx, mby, lam2);
                 keep(self, j, code);
             }
             if self.transform8 {
                 // without luma levels it would be the 4x4 candidate again
-                let code = self.code_inter(mbx, mby, part, mvs, true);
+                let code = self.code_inter(mbx, mby, part, mvs, refs, true);
                 if code.t8x8 {
                     let j = self.rd_cost(&code, mbx, mby, lam2);
                     keep(self, j, code);
@@ -1311,7 +1371,7 @@ impl<'a> FrameCoder<'a> {
         }
         // 16x16 from either list or both; the costs carry an estimate of the mb_type bits
         let (x0, y0) = (mbx * 16, mby * 16);
-        let mvps = [self.mv_pred(0, mbx, mby), self.mv_pred(1, mbx, mby)];
+        let mvps = [self.mv_pred(0, mbx, mby, 0), self.mv_pred(1, mbx, mby, 0)];
         let mut mvs = [[0i16; 2]; 2];
         let mut costs = [0i32; 2];
         let mut preds = [[0u16; 256]; 2];
@@ -1324,10 +1384,10 @@ impl<'a> FrameCoder<'a> {
             if l == 1 {
                 extra.push(scale(mvs[0], tb - td, tb));
             }
-            let (mv, c) = self.motion_search(l, mbx, mby, PARTS[0][0], mvps[l], &extra);
+            let (mv, c) = self.motion_search(l, 0, mbx, mby, PARTS[0][0], mvps[l], &extra);
             mvs[l] = mv;
             costs[l] = c + lam * (mvd_bits(mv, mvps[l]) + 3);
-            self.luma_pred(l, x0, y0, 16, 16, mv, &mut preds[l]);
+            self.luma_pred(l, 0, x0, y0, 16, 16, mv, &mut preds[l]);
         }
         let avg: [u16; 256] = std::array::from_fn(|i| (preds[0][i] + preds[1][i] + 1) >> 1);
         let bi = self.satd(0, x0, y0, 16, 16, &avg) + lam * (mvd_bits(mvs[0], mvps[0]) + mvd_bits(mvs[1], mvps[1]) + 5);
@@ -1397,8 +1457,8 @@ impl<'a> FrameCoder<'a> {
             let mut cost = [0i32; 2];
             let mut preds = [[0u16; 128]; 2];
             for l in 0..2 {
-                (mv[l], cost[l]) = self.motion_search(l, mbx, mby, rect, mvps[l], extra[l]);
-                self.luma_pred(l, x0, y0, pw, ph, mv[l], &mut preds[l][..pw * ph]);
+                (mv[l], cost[l]) = self.motion_search(l, 0, mbx, mby, rect, mvps[l], extra[l]);
+                self.luma_pred(l, 0, x0, y0, pw, ph, mv[l], &mut preds[l][..pw * ph]);
             }
             let avg: [u16; 128] = std::array::from_fn(|i| (preds[0][i] + preds[1][i] + 1) >> 1);
             let bi = self.satd(0, x0, y0, pw, ph, &avg[..pw * ph]) + lam * (mvd_bits(mv[0], mvps[0]) + mvd_bits(mv[1], mvps[1]) + 2);
@@ -1457,7 +1517,7 @@ impl<'a> FrameCoder<'a> {
             let (mut cur, mut done) = ([[0i16; 2]; 16], 0u32);
             for (k, &(x, y, w, h)) in PARTS[part as usize].iter().enumerate() {
                 if bdir[k] >> l & 1 == 1 {
-                    let mvp = self.pred_mv(l, mbx, mby, &cur, done, x as i32, y as i32, w as i32, dir);
+                    let mvp = self.pred_mv(l, mbx, mby, &cur, &NO_REF, done, x as i32, y as i32, w as i32, dir, 0);
                     out[l][k] = [0, 1].map(|c| bmv[l][y * 4 + x][c] as i32 - mvp[c] as i32);
                 }
                 for b in (y..y + h).flat_map(|by| (x..x + w).map(move |bx| by * 4 + bx)) {
@@ -1480,7 +1540,7 @@ impl<'a> FrameCoder<'a> {
         let none = [[0i16; 2]; 16];
         let mut refs = [-1i8; 2];
         for (l, rf) in refs.iter_mut().enumerate() {
-            let nb = |x, y| self.nb_motion(l, mbx, mby, &none, 0, x, y);
+            let nb = |x, y| self.nb_motion(l, mbx, mby, &none, &NO_REF, 0, x, y);
             let r = |n: Option<(i8, [i16; 2])>| n.map_or(-1, |v| v.0);
             let minpos = |x: i8, y: i8| if x >= 0 && y >= 0 { x.min(y) } else { x.max(y) };
             *rf = minpos(r(nb(-1, 0)), minpos(r(nb(0, -1)), r(nb(4, -1).or_else(|| nb(-1, -1)))));
@@ -1490,7 +1550,7 @@ impl<'a> FrameCoder<'a> {
             return (d, [true, true]);
         }
         for l in (0..2).filter(|&l| refs[l] >= 0) {
-            d[l] = [self.mv_pred(l, mbx, mby); 16];
+            d[l] = [self.mv_pred(l, mbx, mby, 0); 16];
         }
         let col = &self.refp1.unwrap().mbs[mby * self.mb_w + mbx];
         if col.kind == Kind::Inter {
@@ -1521,7 +1581,7 @@ impl<'a> FrameCoder<'a> {
             let mut cp = [[[0u16; 16]; 2]; 2];
             for l in (0..2).filter(|&l| used[i8][l]) {
                 let v = mv[l][(by / 4) * 4 + bx / 4];
-                self.luma_pred(l, x0 + bx, y0 + by, 8, 8, v, &mut lp[l]);
+                self.luma_pred(l, 0, x0 + bx, y0 + by, 8, 8, v, &mut lp[l]);
                 for c in 0..2 {
                     chroma_mc(&refs[l].planes[1 + c], cs, self.mb_h * 8, ((x0 + bx) / 2) as i32, ((y0 + by) / 2) as i32, v[0] as i32, v[1] as i32, 4, 4, &mut cp[l][c]);
                 }
@@ -1544,15 +1604,16 @@ impl<'a> FrameCoder<'a> {
     }
 
     /// The luma and chroma prediction of an inter macroblock of partitioning `part`.
-    fn inter_pred(&self, mbx: usize, mby: usize, part: u8, mvs: &[[i16; 2]; 4]) -> ([u16; 256], [[u16; 64]; 2]) {
-        let refp = self.refp.unwrap();
+    fn inter_pred(&self, mbx: usize, mby: usize, part: u8, mvs: &[[i16; 2]; 4], refs: &[u8; 4]) -> ([u16; 256], [[u16; 64]; 2]) {
         let (x0, y0, cs) = (mbx * 16, mby * 16, self.cs());
         let mut pred = [0u16; 256];
         let mut cpred = [[0u16; 64]; 2];
         let mut tmp = [0u16; 256];
         for (k, &(bx, by, w, h)) in PARTS[part as usize].iter().enumerate() {
             let mv = mvs[k];
-            self.luma_pred(0, x0 + bx * 4, y0 + by * 4, w * 4, h * 4, mv, &mut tmp);
+            let r = refs[k] as usize;
+            let refp = self.ref_pic(0, r);
+            self.luma_pred(0, r, x0 + bx * 4, y0 + by * 4, w * 4, h * 4, mv, &mut tmp);
             for r in 0..h * 4 {
                 pred[(by * 4 + r) * 16 + bx * 4..][..w * 4].copy_from_slice(&tmp[r * w * 4..][..w * 4]);
             }
@@ -1722,6 +1783,17 @@ impl<'a> FrameCoder<'a> {
                 if code.part == 3 {
                     for _ in 0..4 {
                         self.w.ue(0); // P_L0_8x8
+                    }
+                }
+                // ref_idx_l0 of each partition, as te(v) with the range of the list
+                let nref = self.plist.len() as u32;
+                if nref > 1 {
+                    for &r in &code.refs[..PARTS[code.part as usize].len()] {
+                        if nref == 2 {
+                            self.w.flag(r == 0);
+                        } else {
+                            self.w.ue(r as u32);
+                        }
                     }
                 }
                 for d in &code.mvds[..PARTS[code.part as usize].len()] {
@@ -1911,6 +1983,30 @@ impl<'a> FrameCoder<'a> {
                 }
             }
         } else {
+            // ref_idx_l0 of each partition of a P macroblock with more than one reference (unary, with
+            // the contexts of 9.3.3.1.1.6: a neighbouring partition's index above 0 counts)
+            if !self.b_slice && self.plist.len() > 1 {
+                let mut grid = [0u8; 4];
+                for (k, &(bx, by, w, h)) in PARTS[code.part as usize].iter().enumerate() {
+                    let a = if bx > 0 { grid[(by / 2) * 2 + (bx - 1) / 2] > 0 } else { left.is_some_and(|m| m.refs[0][(by / 2) * 2 + 1] > 0) };
+                    let b = if by > 0 { grid[((by - 1) / 2) * 2 + bx / 2] > 0 } else { top.is_some_and(|m| m.refs[0][2 + bx / 2] > 0) };
+                    let r = code.refs[k] as usize;
+                    let base = 54 + a as usize + 2 * b as usize;
+                    for i in 0..=r {
+                        let ctx = match i {
+                            0 => base,
+                            1 => 58,
+                            _ => 59,
+                        };
+                        c.decision(ctx, i < r);
+                    }
+                    for y8 in by / 2..=(by + h - 1) / 2 {
+                        for x8 in bx / 2..=(bx + w - 1) / 2 {
+                            grid[y8 * 2 + x8] = code.refs[k];
+                        }
+                    }
+                }
+            }
             // list 0's differences for the partitions using it, then list 1's; within the
             // macroblock, the blocks left of and above a partition belong to earlier ones
             for l in 0..if self.b_slice { 2 } else { 1 } {
@@ -2011,6 +2107,9 @@ impl<'a> FrameCoder<'a> {
         let cbf_dc = (code.kind == Kind::I16x16 && code.dc.iter().any(|&l| l != 0)) as u8
             | ((cbpc > 0 && code.cdc[0].iter().any(|&l| l != 0)) as u8) << 1
             | ((cbpc > 0 && code.cdc[1].iter().any(|&l| l != 0)) as u8) << 2;
+        // a P macroblock's reference index per 8x8 block: that of the partition covering it
+        let r16 = spread(code.part, &code.refs.map(|r| r as i8));
+        let r8: [i8; 4] = std::array::from_fn(|b8| r16[(b8 / 2) * 8 + (b8 % 2) * 2]);
         self.state[idx] = MbState {
             i4: matches!(code.kind, Kind::I4x4 | Kind::I8x8),
             t8x8: code.t8x8,
@@ -2020,7 +2119,7 @@ impl<'a> FrameCoder<'a> {
             cnnz: code.cnnz,
             mvs,
             mvs1,
-            refs: [0, 1].map(|l| used.map(|u| if u[l] { 0 } else { -1 })),
+            refs: [0, 1].map(|l| if l == 0 && inter && !b { r8 } else { used.map(|u| if u[l] { 0 } else { -1 }) }),
             bdirect,
             skip: code.skip,
             kind: code.kind,
@@ -2038,8 +2137,11 @@ impl<'a> FrameCoder<'a> {
         info.t8x8 = code.t8x8;
         info.mv = [mvs, mvs1];
         for (l, b8) in (0..2).flat_map(|l| (0..4).map(move |b8| (l, b8))).filter(|&(l, b8)| used[b8][l]) {
-            info.ref_idx[l][b8] = 0;
-            info.ref_id[l][b8] = 1 + l as i32;
+            // the reference index as the decoder's list gives it; the identity tells the deblocking
+            // filter which picture it is (B pictures use one reference per list)
+            let r = if b { 0 } else { r8[b8] };
+            info.ref_idx[l][b8] = r;
+            info.ref_id[l][b8] = if b { 1 + l as i32 } else { 1 + r as i32 };
         }
         info.bdirect = bdirect;
         info.direct8 = if bdirect { 15 } else if b && code.part == 3 { (0..4).filter(|&k| code.bdir[k] == 0).fold(0, |m, k| m | 1 << k) } else { 0 };
