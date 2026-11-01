@@ -48,6 +48,25 @@ fn analyzers(status: &Value) -> Vec<String> {
     status["analyzed"][0]["analyzers"].as_array().unwrap().iter().map(|a| a.as_str().unwrap().to_string()).collect()
 }
 
+/// Polls the session's status until `done` holds: waits for a condition on its progress, not a time.
+fn wait_status(id: &str, what: &str, done: impl Fn(&Value) -> bool) -> Value {
+    let t0 = std::time::Instant::now();
+    loop {
+        let st = call_tool("stream_status", &json!({ "session": id })).unwrap();
+        if done(&st) {
+            return st;
+        }
+        assert!(matches!(st["state"].as_str(), Some("running" | "waiting")), "the session ended before {what}: {st}");
+        assert!(t0.elapsed() < std::time::Duration::from_secs(60), "gave up waiting for {what}: {st}");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Media time reached by the session, in seconds.
+fn media(st: &Value) -> f64 {
+    st["media_seconds"].as_f64().unwrap_or(0.0)
+}
+
 #[test]
 fn a_running_session_is_reconfigured_and_its_log_searched() {
     let dir = scratch("configure");
@@ -89,16 +108,22 @@ fn a_session_nobody_asks_about_is_closed() {
     let dir = scratch("idle");
     let src = dir.join("long.wav");
     wav(&src, 30.0);
-    let s = call_tool("stream_open", &json!({ "source": format!("{}?pace=realtime", src.display()), "analyzers": ["levels"], "idle_timeout_seconds": 0.5 })).unwrap();
+    let s = call_tool("stream_open", &json!({ "source": format!("{}?pace=realtime", src.display()), "analyzers": ["levels"], "idle_timeout_seconds": 2.0 })).unwrap();
     let id = s["session"].as_str().unwrap().to_string();
-    // asking keeps it open
-    for _ in 0..4 {
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        call_tool("stream_status", &json!({ "session": id })).unwrap();
+    // asking keeps it open: a wait for an event counts as asking for as long as it lasts
+    for _ in 0..3 {
+        call_tool("stream_events", &json!({ "session": id, "after": u64::MAX, "wait_ms": 300 })).unwrap();
     }
-    std::thread::sleep(std::time::Duration::from_millis(900));
-    let all = call_tool("stream_status", &json!({})).unwrap();
-    assert!(!all["sessions"].as_array().unwrap().iter().any(|x| x["session"] == id), "{all}");
+    // once nobody asks, it is closed after its idle timeout: the close is waited for, not timed
+    let t0 = std::time::Instant::now();
+    loop {
+        let all = call_tool("stream_status", &json!({})).unwrap();
+        if !all["sessions"].as_array().unwrap().iter().any(|x| x["session"] == id) {
+            break;
+        }
+        assert!(t0.elapsed() < std::time::Duration::from_secs(60), "{all}");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
     assert_eq!(call_tool("stream_status", &json!({ "session": id })).unwrap_err().code, ErrorCode::NotFound);
 }
 
@@ -131,7 +156,7 @@ fn a_recording_is_started_and_moved_to_a_new_file_while_a_session_runs() {
     let s = call_tool("stream_open", &json!({ "source": format!("{src}?pace=realtime"), "analyzers": ["structure"] })).unwrap();
     let id = s["session"].as_str().unwrap().to_string();
     let (a, b) = (dir.join("a.ts"), dir.join("b.mp4"));
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    wait_status(&id, "media to flow", |st| media(st) > 0.0);
     let c = call_tool("stream_configure", &json!({ "session": id, "record": a.to_str().unwrap() })).unwrap();
     assert_eq!(c["applied"], true, "{c}");
     assert_eq!(c["record"]["path"], a.to_str().unwrap(), "{c}");
@@ -140,7 +165,7 @@ fn a_recording_is_started_and_moved_to_a_new_file_while_a_session_runs() {
     assert_eq!(e.code, ErrorCode::InvalidArgument, "{e:?}");
     let e = call_tool("stream_configure", &json!({ "session": id, "keep_segments": 2 })).unwrap_err();
     assert_eq!(e.code, ErrorCode::InvalidArgument, "{e:?}");
-    std::thread::sleep(std::time::Duration::from_millis(700));
+    wait_status(&id, "the first recording to run a while", |st| media(st) >= 0.8);
     let c = call_tool("stream_configure", &json!({ "session": id, "stop_recording": true, "record": b.to_str().unwrap() })).unwrap();
     assert_eq!(c["applied"], true, "{c}");
     wait_end(&id);
@@ -211,7 +236,7 @@ fn a_transcode_is_started_and_moved_to_a_new_file_while_a_session_runs() {
     let s = call_tool("stream_open", &json!({ "source": format!("{src}?pace=realtime"), "analyzers": ["structure"] })).unwrap();
     let id = s["session"].as_str().unwrap().to_string();
     let (a, b) = (dir.join("a.ts"), dir.join("b.ts"));
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    wait_status(&id, "media to flow", |st| media(st) > 0.0);
     let tc = |p: &std::path::Path| json!({ "output": p.to_str().unwrap(), "width": 64, "qp": 30 });
     let c = call_tool("stream_configure", &json!({ "session": id, "transcode": tc(&a) })).unwrap();
     assert_eq!(c["applied"], true, "{c}");
@@ -219,7 +244,7 @@ fn a_transcode_is_started_and_moved_to_a_new_file_while_a_session_runs() {
     let e = call_tool("stream_configure", &json!({ "session": id, "transcode": tc(&b) })).unwrap_err();
     assert_eq!(e.code, ErrorCode::InvalidArgument, "{e:?}");
     // well before the 1.1 s clip ends, even on a loaded machine
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    wait_status(&id, "the first transcode to run a while", |st| media(st) >= 0.6);
     // stopping the first transcode flushes its encoder, which can take longer than configure waits
     // (1 s) on a loaded machine, so `applied` may still be false here; the status below shows the change
     call_tool("stream_configure", &json!({ "session": id, "stop_transcode": true, "transcode": tc(&b) })).unwrap();
