@@ -583,7 +583,7 @@ Not covered: the way libopus clears its SILK state and resampler when a stream s
 from cleared state, so the few samples at such a switch can differ. The libopus encoder
 only produced streams in one mode at a time; mode switches and their redundant CELT frames are covered by IronAV's own
 automatic-mode streams instead, which this decoder and libopus both decode (see the encoder's automatic mode below).
-Opus is read from Matroska/WebM (`.mka`, `.webm`) and from Ogg (`.opus`, `.ogg`); for writing see "Opus encoder" below. The Ogg reader (pages are checksummed; the file is read into memory, up to 1 GiB) reads every logical stream: multiplexed Opus, Vorbis or FLAC streams are separate tracks, and chained Vorbis or FLAC links with the same setup are one track (the timeline carries on); chained Opus links are separate tracks, each with its own pre-skip. Speex and Theora in Ogg are refused with a message naming the codec when a file holds nothing else, and passed over otherwise. The final page's granule position shortens the last packet, so the output ends where the file says (for Opus the length is the granule minus the pre-skip). Tested on libopus files remuxed to Ogg (identical samples to the Matroska copies); multi-page packets are covered by a synthetic unit test only. FLAC in Ogg (the native-FLAC mapping, as FFmpeg's muxer writes it) decodes bit for bit to the PCM it was made from.
+Opus is read from Matroska/WebM (`.mka`, `.webm`), from Ogg (`.opus`, `.ogg`) and from MPEG-TS (see "MPEG transport streams"); for writing see "Opus encoder" below. The Ogg reader (pages are checksummed; the file is read into memory, up to 1 GiB) reads every logical stream: multiplexed Opus, Vorbis or FLAC streams are separate tracks, and chained Vorbis or FLAC links with the same setup are one track (the timeline carries on); chained Opus links are separate tracks, each with its own pre-skip. Speex and Theora in Ogg are refused with a message naming the codec when a file holds nothing else, and passed over otherwise. The final page's granule position shortens the last packet, so the output ends where the file says (for Opus the length is the granule minus the pre-skip). Tested on libopus files remuxed to Ogg (identical samples to the Matroska copies); multi-page packets are covered by a synthetic unit test only. FLAC in Ogg (the native-FLAC mapping, as FFmpeg's muxer writes it) decodes bit for bit to the PCM it was made from.
 
 
 ### Ogg Opus, Vorbis and FLAC output
@@ -1047,7 +1047,7 @@ carried over and the Opus pre-skip is carried only as the OpusHead plus CodecDel
 
 ## MPEG transport streams
 
-`.ts`, `.m2ts` and `.mts` are read and written (format `mpegts`): H.264 or HEVC video with AAC or MP3 audio. Reading takes
+`.ts`, `.m2ts` and `.mts` are read and written (format `mpegts`): H.264 or HEVC video with AAC, MP3 or Opus audio. Reading takes
 188-byte packets and 192-byte M2TS ones and follows the first program. The parameters of each stream come from its first
 units (the SPS, the ADTS or MP3 header), and the frame rate comes from the spacing of the timestamps. 33-bit timestamps are
 unwrapped. A gap in the continuity counter drops only the unit it breaks. Video starts at a keyframe. The same parser reads
@@ -1058,12 +1058,21 @@ Writing puts the video on PID 0x100 with the PCR, and repeats the PAT and PMT be
 Access units get an access unit delimiter, AAC gets ADTS headers, and video decode times are derived from the
 presentation times, so B-frames from the encoder or a copy come out right.
 
+Opus follows ETSI TS 102 366 as FFmpeg writes it: stream type 0x06 with the `Opus` registration descriptor and the 0x7F extension
+descriptor that names the channel configuration, and each packet behind a control header. Mono, stereo and 3 to 8 channels
+(channel-mapping family 1, RFC 7845 layout) are written. The pre-skip goes in the start trims of the first packets, and a packet
+the stream shortens at its end carries an end trim; the reader puts the pre-skip back in the OpusHead and shortens the packet. Checked
+with FFmpeg's libopus (`crates/ironav-engine/tests/opus_ts.rs`): what IronAV writes decodes in FFmpeg to IronAV's decode of the
+source, after the pre-skip, to 107 dB or more (within 1 LSB) at mono, stereo and 6 channels; and the packets FFmpeg writes into a
+`.ts` (several to a PES) are the packets of its Ogg and Matroska copies. FFmpeg's decoder does not apply the trims, so its decode of an
+IronAV transport stream keeps the pre-skip samples at the front and the end trim is not applied to the last packet.
+
 Checked with FFmpeg (through PyAV): files that FFmpeg wrote (libx264 or libx265 with B-frames, AAC or MP3) read with the same
 packet counts and times, and FFmpeg reads what IronAV writes without a decode error. That covers copies of those files,
 IronAV's own H.264 encoder with B-frames, a Matroska file remuxed to TS, and HEVC+MP3 transcoded to H.264+AAC. In all of
 them every frame decodes, the decode times always increase, and no presentation time is before its decode time.
 
-Not handled: Opus, AC-3, MPEG-2 video and subtitles (skipped when reading, refused when writing), more than one program,
+Not handled: AC-3, MPEG-2 video and subtitles (skipped when reading, refused when writing), more than one program,
 and PMT changes during a stream.
 
 ## Performance

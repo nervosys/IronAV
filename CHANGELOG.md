@@ -63,6 +63,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   (`altref_streams_decode_identically_with_libaom_and_ironav` in `crates/ironav-engine/tests/av1_enc.rs`).
 - **Containers:** WAV, FLAC, Y4M, MP4, QuickTime MOV, Matroska and WebM (read and write), Ogg (Opus, Vorbis and FLAC),
   ADTS, MP3, JPEG, and MPEG transport streams (read and write), and raw H.264 and HEVC (Annex B: write only as files, read as live sources).
+- **Containers (MPEG-TS Opus):** Opus is read and written in MPEG transport streams as ETSI TS 102 366 has it (as FFmpeg writes it), in mono, stereo and 3 to 8 channels, with the pre-skip and end trims in each packet's control header. What IronAV writes decodes in FFmpeg to IronAV's decode of the source, after the pre-skip, which FFmpeg's decoder keeps.
 - **Containers (MP4):** fragmented MP4 is read as it arrives, and written with `fragment_seconds` in a job (`--fragment-seconds S`
   on the CLI): the index first, with no samples in it, then a `moof` and `mdat` for each fragment, cut at a key frame once
   it is at least S seconds long (at any audio packet in a file with no video). Composition offsets are signed, as in
@@ -172,8 +173,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   decode but have no FFmpeg reference; MP2 is not encoded; JPEG arithmetic-coded and 12-bit files are refused, and so are four-component CMYK and YCCK files and progressive or lossless files over 67 megapixels (lossless JPEG decodes, but not with restart intervals);
   ProRes interlaced pictures are refused.
 - **Containers:** Matroska tracks with encryption, bzip2 or lzo content encodings are refused (header stripping and zlib are read;
-  the live reader refuses any content encoding); MPEG-TS does not carry Opus,
-  AC-3 or MPEG-2 video; raw H.264 and HEVC are write-only as files (the live reader reads them); Ogg refuses files
+  the live reader refuses any content encoding); MPEG-TS does not carry AC-3 or
+  MPEG-2 video; raw H.264 and HEVC are write-only as files (the live reader reads them); Ogg refuses files
   holding only Speex or Theora (other streams in a file are passed over).
 - **Live:** servers that speak only TLS 1.2 cannot be reached; cameras and microphones are read on Windows and Linux
   only (no AVFoundation).

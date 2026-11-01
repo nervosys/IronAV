@@ -3,7 +3,7 @@
 //! Reading: one push parser (`TsParser`) serves both the file reader and the live
 //! [`StreamDemuxer`], so a socket and a file give the same packets.
 //! 188-byte packets are read, and 192-byte ones (M2TS, with a 4-byte arrival stamp in front). The
-//! first program of the PAT is followed; its H.264, HEVC, AAC (ADTS) and MP3 streams come out, and
+//! first program of the PAT is followed; its H.264, HEVC, AAC (ADTS), MP3 and Opus streams come out, and
 //! other stream types are skipped. A stream's parameters come from its first units (the SPS, the
 //! ADTS or MP3 header), so packets are held until every stream is known, and video starts at a
 //! keyframe. Timestamps (90 kHz, 33 bits) are unwrapped and start from the earliest one; video keeps
@@ -17,7 +17,14 @@
 //! presentation times seen so far: the one `REORDER` places back in their sorted order, which is
 //! never after a presentation time when pictures are reordered by at most that many places.
 //!
-//! Not handled: Opus, AC-3 and MPEG-2 video (skipped when reading, refused when writing), more than
+//! Opus follows ETSI TS 102 366 as FFmpeg writes it: stream type 0x06 with the `Opus` registration
+//! descriptor and the 0x7F extension descriptor (tag 0x80) naming the channel configuration, and
+//! each packet behind a control header (0x7FE0, its size, and optional start and end trims). The
+//! start trims of the first packets are the stream's pre-skip, which goes in the OpusHead the reader
+//! makes; the end trim is the part of a packet that is not shown. FFmpeg's decoder does not apply
+//! the trims, so its output of such a stream keeps the pre-skip samples.
+//!
+//! Not handled: AC-3 and MPEG-2 video (skipped when reading, refused when writing), more than
 //! one program, and PMT changes after the first.
 
 use crate::stream::{StreamDemuxer, StreamPacket};
@@ -80,6 +87,122 @@ fn codec_of(stream_type: u8) -> Option<CodecId> {
     }
 }
 
+/// Opus is always 48 kHz in a transport stream, and its PES has stream_id private_stream_1.
+const OPUS_RATE: i64 = 48_000;
+const PRIVATE_STREAM_1: u8 = 0xBD;
+/// The number of streams and coupled streams, and the channel mapping table, of the channel
+/// configuration codes 1 to 8 (indexed by the code), as the descriptor names them.
+const OPUS_STREAMS: [u8; 9] = [1, 1, 1, 2, 2, 3, 4, 4, 5];
+const OPUS_COUPLED: [u8; 9] = [1, 0, 1, 1, 2, 2, 2, 3, 3];
+const OPUS_MAP: [&[u8]; 8] = [&[0], &[0, 1], &[0, 2, 1], &[0, 1, 2, 3], &[0, 4, 1, 2, 3], &[0, 4, 1, 2, 3, 5], &[0, 4, 1, 2, 3, 5, 6], &[0, 6, 1, 2, 3, 4, 5, 7]];
+
+/// The OpusHead (with no pre-skip yet) that channel configuration `code` of the Opus descriptor
+/// stands for: 1 and 2 are mono and stereo, 3 to 8 are that many channels in channel-mapping family
+/// 1, and 0 is dual mono, which FFmpeg reads as one coupled stream in family 255.
+fn opus_head_for(code: u8) -> Option<Vec<u8>> {
+    let (channels, family) = match code {
+        0 => (2, 255),
+        1 | 2 => (code, 0),
+        3..=8 => (code, 1),
+        _ => return None,
+    };
+    let mut h = b"OpusHead".to_vec();
+    h.push(1);
+    h.push(channels);
+    h.extend_from_slice(&[0, 0]);
+    h.extend_from_slice(&(OPUS_RATE as u32).to_le_bytes());
+    h.extend_from_slice(&[0, 0, family]);
+    if family != 0 {
+        let c = code as usize;
+        let (streams, coupled, map) = if family == 255 { (1, 1, OPUS_MAP[1]) } else { (OPUS_STREAMS[c], OPUS_COUPLED[c], OPUS_MAP[c - 1]) };
+        h.extend_from_slice(&[streams, coupled]);
+        h.extend_from_slice(map);
+    }
+    Some(h)
+}
+
+/// The channel configuration code of an OpusHead that the descriptor can name (the inverse of
+/// `opus_head_for`): mono and stereo in family 0, and family 1 with 3 to 8 channels in the RFC 7845
+/// layout.
+fn opus_code(head: &[u8]) -> Option<u8> {
+    if head.len() < 19 || &head[..8] != b"OpusHead" {
+        return None;
+    }
+    let ch = head[9] as usize;
+    match head[18] {
+        0 if (1..=2).contains(&ch) => Some(ch as u8),
+        1 if (3..=8).contains(&ch) && head.len() >= 21 + ch && head[19] == OPUS_STREAMS[ch] && head[20] == OPUS_COUPLED[ch] && head[21..21 + ch] == *OPUS_MAP[ch - 1] => Some(ch as u8),
+        _ => None,
+    }
+}
+
+/// The OpusHead of an Opus stream from its PMT descriptors: the `Opus` registration descriptor
+/// (tag 0x05) and the user-defined extension descriptor 0x7F whose first byte is 0x80, followed by
+/// the channel configuration code. `None` when either is missing or the code is not one of 0 to 8.
+fn opus_head_from_descriptors(desc: &[u8]) -> Option<Vec<u8>> {
+    let (mut opus, mut code) = (false, None);
+    let mut i = 0;
+    while i + 2 <= desc.len() {
+        let (tag, len) = (desc[i], desc[i + 1] as usize);
+        let body = desc.get(i + 2..i + 2 + len)?;
+        match tag {
+            0x05 if body.starts_with(b"Opus") => opus = true,
+            0x7F if body.len() >= 2 && body[0] == 0x80 => code = Some(body[1]),
+            _ => {}
+        }
+        i += 2 + len;
+    }
+    if !opus {
+        return None;
+    }
+    opus_head_for(code?)
+}
+
+/// The number of 48 kHz samples in an Opus packet, from its TOC byte and frame count.
+fn opus_samples(packet: &[u8]) -> Option<i64> {
+    ironav_codec::opus::packet_samples(packet).filter(|&n| n > 0).map(|n| n as i64)
+}
+
+fn be16(p: &[u8], i: usize) -> Option<usize> {
+    Some(u16::from_be_bytes([*p.get(i)?, *p.get(i + 1)?]) as usize)
+}
+
+/// One packet of an Opus PES from the control header at the start of `p`: the length of the header
+/// and packet together, the start and end trims, and the packet. `None` at a bad header.
+fn opus_control(p: &[u8]) -> Option<(usize, usize, usize, &[u8])> {
+    if be16(p, 0)? & 0xFFE0 != 0x7FE0 {
+        return None;
+    }
+    let flags = p[1];
+    let mut i = 2;
+    let mut size = 0usize;
+    loop {
+        let b = *p.get(i)?;
+        i += 1;
+        size += b as usize;
+        if b != 0xFF {
+            break;
+        }
+    }
+    let start = if flags & 0x10 != 0 {
+        i += 2;
+        be16(p, i - 2)?
+    } else {
+        0
+    };
+    let end = if flags & 0x08 != 0 {
+        i += 2;
+        be16(p, i - 2)?
+    } else {
+        0
+    };
+    if flags & 0x04 != 0 {
+        i += 1 + *p.get(i)? as usize;
+    }
+    let data = p.get(i..i.checked_add(size)?)?;
+    Some((i + size, start, end, data))
+}
+
 /// NAL units of an Annex B access unit, without their start codes.
 pub(crate) fn nals(d: &[u8]) -> impl Iterator<Item = &[u8]> {
     let mut starts = Vec::new();
@@ -119,6 +242,9 @@ struct Unit {
     pts: i64,
     data: Vec<u8>,
     key: bool,
+    /// The samples the unit plays for, when it is not the codec's usual frame (an Opus packet
+    /// with an end trim).
+    dur: Option<i64>,
 }
 
 /// One elementary stream of the program.
@@ -145,6 +271,11 @@ struct Es {
     started: bool,
     /// Video frame duration (90 kHz), measured from the held units.
     frame: i64,
+    /// Opus: the OpusHead without its pre-skip, the pre-skip so far (the start trims of the leading
+    /// packets), and whether those leading packets are still coming.
+    opus_head: Vec<u8>,
+    opus_pre: u32,
+    opus_lead: bool,
 }
 
 #[derive(Default)]
@@ -207,6 +338,11 @@ impl TsParser {
         for i in 0..self.es.len() {
             // with `ended` set, an audio PES gives up its last frames instead of carrying them
             self.finish_pes(i);
+        }
+        for i in 0..self.es.len() {
+            if self.es[i].opus_lead {
+                self.opus_finish(i);
+            }
         }
         self.publish();
     }
@@ -325,7 +461,9 @@ impl TsParser {
             while i + 5 <= body.len() {
                 let (ty, pid) = (body[i], (((body[i + 1] & 0x1F) as u16) << 8) | body[i + 2] as u16);
                 let es_len = (((body[i + 3] & 0x0F) as usize) << 8) | body[i + 4] as usize;
-                if let Some(codec) = codec_of(ty) {
+                // private PES (0x06) carries Opus when its descriptors say so
+                let opus = if ty == 0x06 { body.get(i + 5..i + 5 + es_len).and_then(opus_head_from_descriptors) } else { None };
+                if let Some(codec) = if opus.is_some() { Some(CodecId::Opus) } else { codec_of(ty) } {
                     self.es.push(Es {
                         pid,
                         codec,
@@ -341,6 +479,9 @@ impl TsParser {
                         out: None,
                         started: false,
                         frame: 0,
+                        opus_lead: opus.is_some(),
+                        opus_head: opus.unwrap_or_default(),
+                        opus_pre: 0,
                     });
                 }
                 i += 5 + es_len;
@@ -408,7 +549,9 @@ impl TsParser {
                 }
                 self.es[k].started = true;
             }
-            self.unit(k, Unit { pts, data: payload, key });
+            self.unit(k, Unit { pts, data: payload, key, dur: None });
+        } else if codec == CodecId::Opus {
+            self.opus_packets(k, &payload, pts);
         } else {
             let mut data = std::mem::take(&mut self.es[k].carry);
             let carried = data.len();
@@ -479,12 +622,61 @@ impl TsParser {
             e.next = Some(t + ticks / rate as i64);
             e.rem = ticks % rate as i64;
             let frame = data[i + hdr..i + len].to_vec();
-            self.unit(k, Unit { pts: t, data: frame, key: true });
+            self.unit(k, Unit { pts: t, data: frame, key: true, dur: None });
             i += len;
         }
         if !last {
             self.es[k].carry = data[i..].to_vec();
         }
+    }
+
+    /// Opus packets of a PES, each behind its control header. The first has the PES time; the
+    /// others follow on from the packet before, as FFmpeg bundles several into one PES.
+    fn opus_packets(&mut self, k: usize, payload: &[u8], pts: Option<i64>) {
+        if let Some(p) = pts {
+            self.es[k].next = Some(p);
+            self.es[k].rem = 0;
+        }
+        let mut at = 0;
+        while let Some((used, start, end, data)) = opus_control(&payload[at..]) {
+            at += used;
+            let Some(samples) = opus_samples(data) else { break };
+            // the pre-skip is the start trims of the packets at the front; the first packet
+            // without one ends it
+            if self.es[k].opus_lead {
+                if start == 0 {
+                    self.opus_finish(k);
+                } else {
+                    self.es[k].opus_pre = self.es[k].opus_pre.saturating_add(start as u32);
+                }
+            }
+            let Some(t) = self.es[k].next else { continue };
+            let e = &mut self.es[k];
+            let ticks = samples * CLOCK + e.rem;
+            e.next = Some(t + ticks / OPUS_RATE);
+            e.rem = ticks % OPUS_RATE;
+            let dur = (samples - end as i64).max(0);
+            self.unit(k, Unit { pts: t, data: data.to_vec(), key: true, dur: Some(dur) });
+        }
+    }
+
+    /// Fixes an Opus stream's OpusHead, with the pre-skip its leading packets trimmed.
+    fn opus_finish(&mut self, k: usize) {
+        let e = &mut self.es[k];
+        e.opus_lead = false;
+        let mut head = e.opus_head.clone();
+        head[10..12].copy_from_slice(&(e.opus_pre.min(u16::MAX as u32) as u16).to_le_bytes());
+        let channels = head[9] as u16;
+        e.info = Some(StreamInfo {
+            index: 0,
+            codec: CodecId::Opus,
+            time_base: Rational::new(1, OPUS_RATE),
+            duration: None,
+            bits: None,
+            extradata: head,
+            lead_in: 0,
+            params: StreamParams::Audio { sample_rate: OPUS_RATE as u32, channels },
+        });
     }
 
     fn unit(&mut self, k: usize, u: Unit) {
@@ -541,7 +733,7 @@ impl TsParser {
         let (pts, duration) = match e.info.as_ref().map(|i| &i.params) {
             Some(StreamParams::Audio { sample_rate, .. }) => {
                 let r = *sample_rate as i64;
-                let samples = if e.codec == CodecId::Aac { 1024 } else { ironav_codec::mp3::parse_header(&u.data).map_or(1152, |h| h.samples() as i64) };
+                let samples = u.dur.unwrap_or_else(|| if e.codec == CodecId::Aac { 1024 } else { ironav_codec::mp3::parse_header(&u.data).map_or(1152, |h| h.samples() as i64) });
                 ((t * r + CLOCK / 2).div_euclid(CLOCK), samples)
             }
             _ => (t, e.frame.max(1)),
@@ -662,7 +854,12 @@ impl<R: Read + Seek + Send> TsDemuxer<R> {
             let s = &mut self.p.streams[i];
             let span = t - self.p.base;
             s.duration = Some(match s.params {
-                StreamParams::Audio { sample_rate, .. } => span * sample_rate as i64 / CLOCK + if e.codec == CodecId::Aac { 1024 } else { 1152 },
+                // an Opus frame is 20 ms; the last one's length is not read from the tail
+                StreamParams::Audio { sample_rate, .. } => span * sample_rate as i64 / CLOCK + match e.codec {
+                    CodecId::Aac => 1024,
+                    CodecId::Opus => 960,
+                    _ => 1152,
+                },
                 _ => span + e.frame,
             });
         }
@@ -752,6 +949,8 @@ struct OutStream {
     seen: Vec<i64>,
     count: usize,
     last_dts: i64,
+    /// Opus: the channel configuration code, and the pre-skip still to trim from the first packets.
+    opus: Option<(u8, u32)>,
 }
 
 pub struct TsMuxer {
@@ -831,9 +1030,13 @@ impl TsMuxer {
                 CodecId::H264 => 0x1B,
                 CodecId::Hevc => 0x24,
                 CodecId::Aac => 0x0F,
+                CodecId::Opus => 0x06,
                 _ => 0x03,
             };
-            body.extend_from_slice(&[ty, 0xE0 | (s.pid >> 8) as u8, s.pid as u8, 0xF0, 0]);
+            // Opus: the registration descriptor 'Opus' and the extension descriptor naming the configuration
+            let desc = s.opus.map(|(code, _)| vec![0x05, 4, b'O', b'p', b'u', b's', 0x7F, 2, 0x80, code]).unwrap_or_default();
+            body.extend_from_slice(&[ty, 0xE0 | (s.pid >> 8) as u8, s.pid as u8, 0xF0 | (desc.len() >> 8) as u8, desc.len() as u8]);
+            body.extend_from_slice(&desc);
         }
         self.section(PMT_PID, 0x02, 1, &body)
     }
@@ -851,8 +1054,8 @@ impl Muxer for TsMuxer {
         }
         let video = streams.iter().position(|s| s.params.media_type() == ironav_core::MediaType::Video);
         for (i, s) in streams.iter().enumerate() {
-            let adts = match s.codec {
-                CodecId::H264 | CodecId::Hevc | CodecId::Mp3 => None,
+            let (adts, opus) = match s.codec {
+                CodecId::H264 | CodecId::Hevc | CodecId::Mp3 => (None, None),
                 CodecId::Aac => {
                     let [a, b, ..] = s.extradata[..] else {
                         return Err(Error::new(ErrorCode::UnsupportedFormat, "AAC in a transport stream needs the AudioSpecificConfig").hint("encode to aac, or copy from a file that carries it"));
@@ -862,10 +1065,16 @@ impl Muxer for TsMuxer {
                     if !(1..=4).contains(&aot) || sfi >= 13 || !(1..=7).contains(&ch) {
                         return Err(Error::new(ErrorCode::UnsupportedFormat, "ADTS cannot describe this AudioSpecificConfig").hint("write it to mp4 or mkv"));
                     }
-                    Some([0xF1, (((aot - 1) << 6) | (sfi << 2) | (ch >> 2)) as u8, ((ch & 3) << 6) as u8])
+                    (Some([0xF1, (((aot - 1) << 6) | (sfi << 2) | (ch >> 2)) as u8, ((ch & 3) << 6) as u8]), None)
+                }
+                CodecId::Opus => {
+                    let Some(code) = opus_code(&s.extradata) else {
+                        return Err(Error::new(ErrorCode::UnsupportedFormat, "a transport stream holds Opus in mono, stereo, or 3 to 8 channels in channel-mapping family 1").hint("encode to opus with 1 to 8 channels, or write it to ogg or matroska"));
+                    };
+                    (None, Some((code, u16::from_le_bytes([s.extradata[10], s.extradata[11]]) as u32)))
                 }
                 c => {
-                    return Err(Error::new(ErrorCode::UnsupportedCodec, format!("a transport stream cannot hold {} here", c.name())).alternatives(["h264", "hevc", "aac", "mp3"]));
+                    return Err(Error::new(ErrorCode::UnsupportedCodec, format!("a transport stream cannot hold {} here", c.name())).alternatives(["h264", "hevc", "aac", "mp3", "opus"]));
                 }
             };
             // video first, so it gets 0x100 and carries the PCR
@@ -874,7 +1083,7 @@ impl Muxer for TsMuxer {
                 Some(v) if i < v => i + 1,
                 _ => i,
             };
-            self.streams.push(OutStream { pid: 0x100 + order as u16, codec: s.codec, tb: s.time_base, cc: 0, adts, seen: Vec::new(), count: 0, last_dts: i64::MIN });
+            self.streams.push(OutStream { pid: 0x100 + order as u16, codec: s.codec, tb: s.time_base, cc: 0, adts, seen: Vec::new(), count: 0, last_dts: i64::MIN, opus });
         }
         self.pcr_pid = self.streams[video.unwrap_or(0)].pid;
         Ok(())
@@ -929,9 +1138,47 @@ impl Muxer for TsMuxer {
                 es.extend_from_slice(&[0xFF, f[0], f[1], f[2] | (len >> 11) as u8, (len >> 3) as u8, (((len & 7) << 5) | 0x1F) as u8, 0xFC]);
                 es.extend_from_slice(&p.data);
             }
+            CodecId::Opus => {
+                let Some(samples) = opus_samples(&p.data) else {
+                    return Err(Error::invalid_input("an Opus packet that its TOC byte does not time"));
+                };
+                let s = &mut self.streams[p.stream];
+                // the pre-skip is trimmed from the first packets, as FFmpeg writes it
+                let mut start = 0;
+                if let Some((_, pending)) = s.opus.as_mut() {
+                    if *pending > 0 {
+                        start = (*pending as i64).min(samples);
+                        *pending -= start as u32;
+                    }
+                }
+                // what the packet's duration leaves out at its end
+                let end = (samples - p.duration).max(0);
+                let flags = (if start > 0 { 0x10 } else { 0 }) | (if end > 0 { 0x08 } else { 0 });
+                es.extend_from_slice(&[0x7F, 0xE0 | flags]);
+                let mut n = p.data.len();
+                while n >= 255 {
+                    es.push(255);
+                    n -= 255;
+                }
+                es.push(n as u8);
+                if start > 0 {
+                    es.extend_from_slice(&(start as u16).to_be_bytes());
+                }
+                if end > 0 {
+                    es.extend_from_slice(&(end as u16).to_be_bytes());
+                }
+                es.extend_from_slice(&p.data);
+            }
             _ => es.extend_from_slice(&p.data),
         }
-        let mut pes = vec![0, 0, 1, if video { 0xE0 } else { 0xC0 }, 0, 0, 0x84];
+        let stream_id = if video {
+            0xE0
+        } else if codec == CodecId::Opus {
+            PRIVATE_STREAM_1
+        } else {
+            0xC0
+        };
+        let mut pes = vec![0, 0, 1, stream_id, 0, 0, 0x84];
         if dts != pts {
             pes.extend_from_slice(&[0xC0, 10]);
             write_ts_time(&mut pes, 3, pts);
@@ -1177,5 +1424,65 @@ mod tests {
         assert!(is_keyframe(CodecId::H264, &p.data));
         // the audio starts first; the first picture is shown 21 ms in
         assert!(d.seek(0.0).unwrap() < 0.05);
+    }
+
+    #[test]
+    fn opus_channel_configurations_name_their_heads() {
+        for code in 1..=8u8 {
+            let head = opus_head_for(code).unwrap();
+            assert_eq!(opus_code(&head), Some(code), "code {code}");
+        }
+        // dual mono is read, but not written: it has no layout the descriptor could name back
+        assert_eq!(opus_code(&opus_head_for(0).unwrap()), None);
+        assert!(opus_head_for(9).is_none());
+        let desc = [0x05, 4, b'O', b'p', b'u', b's', 0x7F, 2, 0x80, 6];
+        let head = opus_head_from_descriptors(&desc).unwrap();
+        assert_eq!((head[9], head[18], head[19], head[20]), (6, 1, 4, 2));
+        assert_eq!(&head[21..], &[0, 4, 1, 2, 3, 5]);
+        // without the registration, or without the configuration, the stream is not Opus
+        assert!(opus_head_from_descriptors(&desc[6..]).is_none());
+        assert!(opus_head_from_descriptors(&desc[..6]).is_none());
+    }
+
+    /// An Opus packet of one 20 ms CELT frame (TOC 0xF8) with `n` bytes after the TOC.
+    fn opus_packet(n: usize, seed: u8) -> Vec<u8> {
+        let mut p = vec![0xF8];
+        p.extend((0..n).map(|i| (i as u8).wrapping_mul(7).wrapping_add(seed)));
+        p
+    }
+
+    #[test]
+    fn opus_round_trips_with_its_pre_skip_and_end_trims() {
+        let mut head = opus_head_for(2).unwrap();
+        head[10..12].copy_from_slice(&312u16.to_le_bytes());
+        let info = StreamInfo {
+            index: 0,
+            codec: CodecId::Opus,
+            time_base: Rational::new(1, OPUS_RATE),
+            duration: None,
+            bits: None,
+            extradata: head.clone(),
+            lead_in: 0,
+            params: StreamParams::Audio { sample_rate: 48_000, channels: 2 },
+        };
+        // the sizes cross the 255 boundary (a size is a run of 0xFF and a last byte) and one packet is shortened at its end
+        let packets = [(0, 960, opus_packet(300, 1)), (960, 960, opus_packet(40, 2)), (1920, 860, opus_packet(1000, 3)), (2880, 960, opus_packet(255, 4))];
+        let path = std::env::temp_dir().join(format!("ironav-ts-opus-{}.ts", std::process::id()));
+        let mut m = TsMuxer::new(Box::new(std::io::BufWriter::new(std::fs::File::create(&path).unwrap())));
+        m.write_header(&[info]).unwrap();
+        for (pts, duration, data) in &packets {
+            m.write_packet(&Packet { stream: 0, pts: *pts, duration: *duration, data: data.clone() }).unwrap();
+        }
+        m.finish().unwrap();
+        drop(m);
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let mut d = TsDemuxer::open(std::io::Cursor::new(bytes)).unwrap();
+        let s = d.streams().to_vec();
+        assert_eq!((s.len(), s[0].codec), (1, CodecId::Opus));
+        assert_eq!(s[0].extradata, head, "the pre-skip is read back from the start trims");
+        let got: Vec<(i64, i64, Vec<u8>)> = read_all(&mut d).into_iter().map(|p| (p.pts, p.duration, p.data)).collect();
+        let want: Vec<(i64, i64, Vec<u8>)> = packets.iter().map(|(t, dur, data)| (*t, *dur, data.clone())).collect();
+        assert_eq!(got, want);
     }
 }

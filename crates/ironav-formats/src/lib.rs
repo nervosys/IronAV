@@ -177,7 +177,7 @@ pub static FORMATS: &[FormatSpec] = &[
         media: MediaType::Video,
         demux: true,
         mux: true,
-        codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Aac, CodecId::Mp3],
+        codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Aac, CodecId::Mp3, CodecId::Opus],
     },
 ];
 
