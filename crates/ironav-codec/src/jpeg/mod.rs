@@ -355,6 +355,8 @@ struct Frame0 {
     lossless: bool,
     /// Sample precision: 8, or 9 for the RGB frames FFmpeg writes with its colour transform.
     bits: u32,
+    /// A lossy frame of three components whose samples are RGB, not YCbCr (see `is_rgb`).
+    rgb: bool,
 }
 
 impl Frame0 {
@@ -370,6 +372,13 @@ impl Frame0 {
         if self.lossless && s.len() == 3 && s.iter().all(|&f| f == (1, 1)) {
             return Ok(PixelFormat::Rgb24);
         }
+        // a lossy RGB frame (no colour conversion) is interleaved; its components must be unsubsampled
+        if self.rgb {
+            if s.iter().all(|&f| f == (1, 1)) {
+                return Ok(PixelFormat::Rgb24);
+            }
+            return Err(unsupported(format!("JPEG RGB sampling factors {s:?} are not supported (RGB must be unsubsampled)")));
+        }
         let (hm, vm) = (self.hmax(), self.vmax());
         // luma carries the highest factors; the two chroma components match each other and divide them
         let ok = s.len() == 1 || (s[0] == (hm, vm) && s[1] == s[2] && hm % s[1].0 == 0 && vm % s[1].1 == 0);
@@ -380,6 +389,21 @@ impl Frame0 {
             (3, (1, 1)) if ok => Ok(PixelFormat::Yuv444p),
             _ => Err(unsupported(format!("JPEG sampling factors {s:?} are not supported (gray, 4:2:0, 4:2:2 and 4:4:4 are)"))),
         }
+    }
+}
+
+/// Whether a three-component lossy frame holds RGB samples, by libjpeg's `default_decompress_parms`
+/// (jdapimin.c): a JFIF marker means YCbCr; else an Adobe marker's transform 0 means RGB and any
+/// other transform YCbCr; else the component ids decide, 'R' 'G' 'B' (82, 71, 66) meaning RGB and
+/// anything else YCbCr. (FFmpeg reads an Adobe transform 0 as RGB even beside a JFIF marker;
+/// this follows libjpeg, which reads the JFIF marker first.)
+fn is_rgb(comps: &[Comp], jfif: bool, adobe: Option<u8>) -> bool {
+    if jfif {
+        return false;
+    }
+    match adobe {
+        Some(t) => t == 0,
+        None => comps.iter().map(|c| c.id).eq([82, 71, 66]),
     }
 }
 
@@ -456,6 +480,8 @@ fn parse_headers(d: &[u8]) -> Result<Headers> {
     let (mut dc, mut ac) = standard_huffs();
     let mut restart = 0usize;
     let mut frame: Option<Frame0> = None;
+    // the colour-space markers that decide RGB or YCbCr (see `is_rgb`)
+    let (mut jfif, mut adobe) = (false, None);
     let mut pos = 2;
     loop {
         // find the next marker
@@ -479,12 +505,19 @@ fn parse_headers(d: &[u8]) -> Result<Headers> {
             0xDB => read_dqt(seg, &mut qt)?,
             0xC4 => read_dht(seg, &mut dc, &mut ac)?,
             0xDD => restart = be16(seg, 0)?,
+            0xE0 if seg.starts_with(b"JFIF\0") => jfif = true,
+            // Adobe: "Adobe", version, two flags, then the colour transform (0 RGB or CMYK, 1 YCbCr, 2 YCCK)
+            0xEE if seg.len() >= 12 && seg.starts_with(b"Adobe") => adobe = Some(seg[11]),
             0xC0..=0xC3 => {
                 let bits = seg.first().copied().unwrap_or(0) as u32;
                 if seg.len() < 6 || !(bits == 8 || (bits == 9 && m == 0xC3)) {
                     return Err(unsupported(format!("JPEG sample precision {bits} is not supported (8 bit is; 9 bit is for lossless RGB)")));
                 }
                 let (h, w, n) = (be16(seg, 1)?, be16(seg, 3)?, seg[5] as usize);
+                // Adobe's CMYK (transform 0) and YCCK (transform 2) files: no CMYK pixel format here
+                if n == 4 {
+                    return Err(unsupported("JPEG with 4 components (CMYK or YCCK) is not supported: IronAV has no CMYK pixel format".into()));
+                }
                 if w == 0 || h == 0 || !(n == 1 || n == 3) || seg.len() < 6 + 3 * n {
                     return Err(unsupported(format!("JPEG frame of {w}x{h} with {n} components is not supported (1 or 3 components, non-zero size)")));
                 }
@@ -500,11 +533,12 @@ fn parse_headers(d: &[u8]) -> Result<Headers> {
                 if comps.iter().any(|c| c.h == 0 || c.v == 0 || c.h > 4 || c.v > 4) {
                     return Err(Error::invalid_input("JPEG sampling factor is out of range"));
                 }
-                frame = Some(Frame0 { width: w, height: h, comps, progressive: m == 0xC2, lossless: m == 0xC3, bits });
+                frame = Some(Frame0 { width: w, height: h, comps, progressive: m == 0xC2, lossless: m == 0xC3, bits, rgb: false });
             }
             0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF => return Err(unsupported(format!("JPEG coding process SOF{} (hierarchical or arithmetic) is not supported", m - 0xC0))),
             0xDA => {
-                let f = frame.ok_or_else(|| Error::invalid_input("JPEG scan comes before its frame header"))?;
+                let mut f = frame.ok_or_else(|| Error::invalid_input("JPEG scan comes before its frame header"))?;
+                f.rgb = !f.lossless && f.comps.len() == 3 && is_rgb(&f.comps, jfif, adobe);
                 return Ok((f, qt, dc, ac, restart, pos));
             }
             _ => {}
@@ -515,6 +549,19 @@ fn parse_headers(d: &[u8]) -> Result<Headers> {
 
 /// Crops the padded component planes to the picture.
 fn finish(f: &Frame0, pix_fmt: PixelFormat, pts: i64) -> VideoFrame {
+    if pix_fmt == PixelFormat::Rgb24 {
+        // an RGB frame: its three unsubsampled components are R, G and B, interleaved
+        let (w, h) = (f.width, f.height);
+        let mut out = vec![0u8; w * h * 3];
+        for (k, c) in f.comps.iter().enumerate() {
+            for r in 0..h {
+                for x in 0..w {
+                    out[(r * w + x) * 3 + k] = c.plane[r * c.stride + x];
+                }
+            }
+        }
+        return VideoFrame { width: w as u32, height: h as u32, pix_fmt, pts, planes: vec![out] };
+    }
     let layout = pix_fmt.planes(f.width, f.height);
     let planes = f
         .comps

@@ -2396,6 +2396,63 @@ fn lossless_jpeg_decodes_to_what_ffmpeg_decodes() {
     }
 }
 
+/// Decoded samples against FFmpeg's: within one level (the two use different IDCTs), and mostly equal.
+fn assert_within_one(got: &[u8], want: &[u8], name: &str) {
+    assert_eq!(got.len(), want.len(), "{name}");
+    let worst = got.iter().zip(want).map(|(a, b)| (*a as i32 - *b as i32).abs()).max().unwrap();
+    let differing = got.iter().zip(want).filter(|(a, b)| a != b).count();
+    assert!(worst <= 1, "{name}: largest difference from FFmpeg is {worst}");
+    assert!(differing * 20 < got.len(), "{name}: {differing} of {} samples differ", got.len());
+}
+
+/// Lossy three-component JPEGs follow libjpeg's colour-space rules. A file with an Adobe transform
+/// 0, or component ids 'R' 'G' 'B', holds RGB: it decodes to RGB samples with no colour conversion,
+/// as FFmpeg's rgb24 output. A JFIF file (even with an Adobe transform 0 beside it) holds YCbCr,
+/// and so does a file with no markers and ids 1 2 3; they decode to YCbCr planes as before.
+#[test]
+fn lossy_jpeg_rgb_and_ycbcr_follow_their_markers() {
+    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    for name in ["jpeg_rgb_adobe", "jpeg_rgb_ids"] {
+        let f = jpeg_frame(&data.join(format!("{name}.jpg")));
+        assert_eq!(f.pix_fmt, ironav_core::PixelFormat::Rgb24, "{name}");
+        let want = std::fs::read(data.join(format!("{name}.ffmpeg.rgb"))).unwrap();
+        assert_within_one(&f.planes.concat(), &want, name);
+    }
+    // the reference of jpeg_rgb_jfif is FFmpeg's decode of the same file without the Adobe marker
+    for name in ["jpeg_rgb_jfif", "jpeg_ycc_ids"] {
+        let f = jpeg_frame(&data.join(format!("{name}.jpg")));
+        assert_eq!(f.pix_fmt, ironav_core::PixelFormat::Yuv444p, "{name}");
+        let want = std::fs::read(data.join(format!("{name}.ffmpeg.yuv"))).unwrap();
+        assert_within_one(&f.planes.concat(), &want, name);
+    }
+}
+
+/// An Adobe marker whose transform is 1 means YCbCr: the file decodes exactly as the same bits
+/// with no marker (jpeg_ycc_ids).
+#[test]
+fn adobe_transform_one_is_ycbcr() {
+    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    let mut bytes = std::fs::read(data.join("jpeg_rgb_adobe.jpg")).unwrap();
+    // the transform byte is the twelfth byte of the Adobe payload, which starts with "Adobe"
+    let at = bytes.windows(5).position(|w| w == b"Adobe").unwrap() + 11;
+    assert_eq!(bytes[at], 0);
+    bytes[at] = 1;
+    let dir = scratch("jpeg-adobe-transform-1");
+    let p = dir.join("ycbcr.jpg");
+    std::fs::write(&p, &bytes).unwrap();
+    let f = jpeg_frame(&p);
+    assert_eq!(f.pix_fmt, ironav_core::PixelFormat::Yuv444p);
+    assert_eq!(f.planes, jpeg_frame(&data.join("jpeg_ycc_ids.jpg")).planes);
+}
+
+/// A four-component JPEG (CMYK or YCCK) is refused, and the error says it is CMYK.
+#[test]
+fn cmyk_jpeg_is_refused_with_a_clear_error() {
+    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    let err = ironav_formats::open_demuxer(&data.join("jpeg_cmyk.jpg")).err().expect("a CMYK JPEG should not open");
+    assert!(err.to_string().contains("CMYK"), "{err}");
+}
+
 /// A lossless JPEG written by a small test encoder that follows T.81 H.1.2 on its own. FFmpeg's
 /// encoder writes predictors 1 to 3 only, so this covers 4 to 7 and the point transform. The
 /// samples of `planes[c]` cover whole MCUs (`mcux * h` samples a row, `mcuy * v` rows).
