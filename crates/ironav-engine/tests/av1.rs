@@ -66,12 +66,7 @@ fn check(c: &Case) -> usize {
     let src = d.join(format!("src.{}", c.container));
     let raw = d.join("ref.raw");
     let y4m = d.join("out.y4m");
-    let n = c.frames.to_string();
-    let mut enc = vec!["-f", "lavfi", "-i", c.src, "-frames:v", &n, "-c:v", "libaom-av1", "-g", c.gop, "-cpu-used", c.cpu, "-pix_fmt", c.pix_fmt, "-aom-params", c.params];
-    enc.extend_from_slice(c.args);
-    enc.push(src.to_str().unwrap());
-    assert!(ffmpeg(&enc), "{}: ffmpeg could not encode the stream", c.name);
-    assert!(ffmpeg(&["-c:v", "libaom-av1", "-i", src.to_str().unwrap(), "-f", "rawvideo", "-pix_fmt", c.pix_fmt, raw.to_str().unwrap()]), "{}: ffmpeg could not decode", c.name);
+    encode_and_reference(c, &src, &raw);
     let j = Job { input: src.display().to_string(), output: y4m.display().to_string(), hwaccel: "off".into(), ..Job::default() };
     let r = run(&j, &mut |_| {}).unwrap_or_else(|e| panic!("{}: {e}", c.name));
     assert_eq!(r.format, "y4m", "{}", c.name);
@@ -79,6 +74,61 @@ fn check(c: &Case) -> usize {
     if got != want {
         let i = got.iter().zip(&want).position(|(a, b)| a != b).unwrap_or(got.len().min(want.len()));
         panic!("{}: IronAV decodes libaom's AV1 differently ({} bytes, libaom {}; first difference at byte {i})", c.name, got.len(), want.len());
+    }
+    let _ = std::fs::remove_dir_all(&d);
+    want.len()
+}
+
+/// Encodes the case into `src` with libaom and decodes it with libaom into `raw`.
+fn encode_and_reference(c: &Case, src: &std::path::Path, raw: &std::path::Path) {
+    let n = c.frames.to_string();
+    let mut enc = vec!["-f", "lavfi", "-i", c.src, "-frames:v", &n, "-c:v", "libaom-av1", "-g", c.gop, "-cpu-used", c.cpu, "-pix_fmt", c.pix_fmt, "-aom-params", c.params];
+    enc.extend_from_slice(c.args);
+    enc.push(src.to_str().unwrap());
+    assert!(ffmpeg(&enc), "{}: ffmpeg could not encode the stream", c.name);
+    assert!(ffmpeg(&["-c:v", "libaom-av1", "-i", src.to_str().unwrap(), "-f", "rawvideo", "-pix_fmt", c.pix_fmt, raw.to_str().unwrap()]), "{}: ffmpeg could not decode", c.name);
+}
+
+/// The temporal units of an IVF file: a header of the size its bytes 6 and 7 give, then each unit
+/// after a 12-byte header.
+fn ivf_units(b: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut at = u16::from_le_bytes([b[6], b[7]]) as usize;
+    while at + 12 <= b.len() {
+        let n = u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]) as usize;
+        at += 12;
+        out.push(b[at..(at + n).min(b.len())].to_vec());
+        at += n;
+    }
+    out
+}
+
+/// Tiles on threads: libaom encodes the case into IVF, and IronAV's decoder must equal libaom's
+/// decode byte for byte with its tiles on one thread, on four, and on the default number.
+/// Returns the number of bytes compared.
+fn check_threads(c: &Case) -> usize {
+    let d = scratch(c.name);
+    let (src, raw) = (d.join("src.ivf"), d.join("ref.raw"));
+    encode_and_reference(c, &src, &raw);
+    let want = std::fs::read(&raw).unwrap();
+    let units = ivf_units(&std::fs::read(&src).unwrap());
+    for threads in [1, 4, 0] {
+        let mut dec = if threads == 0 { Av1Decoder::new(&[]) } else { Av1Decoder::with_threads(&[], threads) };
+        let mut got: Vec<u8> = Vec::new();
+        let mut take = |frames: Vec<Frame>| {
+            for f in frames {
+                let Frame::Video(v) = f else { panic!("{}: no picture", c.name) };
+                got.extend(v.planes.iter().flatten());
+            }
+        };
+        for (t, u) in units.iter().enumerate() {
+            take(dec.decode(&Packet { stream: 0, pts: t as i64, duration: 1, data: u.clone() }).unwrap_or_else(|e| panic!("{}: {e}", c.name)));
+        }
+        take(dec.flush().unwrap_or_else(|e| panic!("{}: {e}", c.name)));
+        if got != want {
+            let i = got.iter().zip(&want).position(|(a, b)| a != b).unwrap_or(got.len().min(want.len()));
+            panic!("{} on {threads} threads (0: the default): IronAV decodes libaom's AV1 differently ({} bytes, libaom {}; first difference at byte {i})", c.name, got.len(), want.len());
+        }
     }
     let _ = std::fs::remove_dir_all(&d);
     want.len()
@@ -310,6 +360,31 @@ fn inter_tiles_and_long_streams_decode_bit_exactly() {
     // segmentation, delta q and error resilience
     check(&inter("aq", TESTSRC, &format!("{TOOLS}:aq-mode=1:deltaq-mode=1"), ALTREF, 8, "6"));
     check(&inter("resilient", TESTSRC, &format!("{TOOLS}:error-resilient=1"), P_ONLY, 6, "6"));
+}
+
+/// Tiles decoded in parallel: 2x2, 4x1 and 4x2 tile layouts at 720p and 1080p, intra and inter,
+/// with CDEF and loop restoration, at 10 bits, at 4:4:4, with 128x128 superblocks, delta q and
+/// delta LF, and with palettes; each must decode alike on one thread and on several.
+#[test]
+fn tiles_on_threads_decode_bit_exactly() {
+    need_ffmpeg!();
+    let (hd, fhd) = ("testsrc2=size=1280x720:rate=25", "testsrc2=size=1920x1080:rate=25");
+    let filters = "enable-cdef=1:enable-restoration=1:enable-intrabc=0";
+    let t2x2: &[&str] = &["-crf", "35", "-tiles", "2x2"];
+    let t4x1: &[&str] = &["-crf", "35", "-tiles", "4x1"];
+    let c2r1: &[&str] = &["-crf", "35", "-tile-columns", "2", "-tile-rows", "1"];
+    let ivf = |c: Case<'static>| Case { container: "ivf", ..c };
+    check_threads(&ivf(case("mt-key-2x2", hd, filters, t2x2)));
+    check_threads(&ivf(inter("mt-inter-2x2", hd, filters, t2x2, 6, "6")));
+    check_threads(&ivf(inter("mt-inter-4x1", hd, filters, t4x1, 6, "6")));
+    check_threads(&ivf(case("mt-key-1080-c2r1", fhd, filters, c2r1)));
+    check_threads(&ivf(inter("mt-inter-1080-c2r1", fhd, filters, c2r1, 4, "6")));
+    check_threads(&Case { pix_fmt: "yuv420p10le", ..ivf(inter("mt-inter-10bit", hd, filters, t2x2, 4, "6")) });
+    check_threads(&Case { pix_fmt: "yuv444p", ..ivf(inter("mt-inter-444", hd, filters, t2x2, 4, "6")) });
+    let deltas = "enable-cdef=1:enable-restoration=1:enable-intrabc=0:sb-size=128:aq-mode=1:deltaq-mode=1:delta-lf-mode=1";
+    check_threads(&ivf(inter("mt-sb128-deltas", hd, deltas, t2x2, 4, "6")));
+    let screen = "enable-cdef=1:enable-restoration=1:enable-intrabc=0:tune-content=screen:enable-palette=1";
+    check_threads(&ivf(inter("mt-palette", "testsrc=size=640x360:rate=25", screen, &["-crf", "30", "-tiles", "2x2"], 4, "6")));
 }
 
 /// A test picture: a moving gradient with a diagonal edge and a little noise, so that intra and
