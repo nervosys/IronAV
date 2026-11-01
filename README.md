@@ -8,7 +8,7 @@ A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so 
 > Audio codecs, each decoded and encoded: **PCM, FLAC, ALAC, AAC-LC (plus HE-AAC v1 decode), MP3, Opus and Vorbis.**
 > Video: **software decoders for H.264, HEVC (including 4:2:2 and 4:4:4), VP8 and VP9; a software H.264 encoder (High profile: CABAC and the 8x8 transform), a software HEVC encoder (Main profile, 8-bit 4:2:0, merge and skip, SAO), a software VP8 encoder, and a software VP9 encoder (key and inter frames), and a software AV1 encoder (key and inter frames, profile 0, 8-bit 4:2:0); JPEG/Motion-JPEG and Apple ProRes decoded and encoded in software; MPEG-4 Part 2 (Simple and Advanced Simple profiles) decoded in software.**
 > NVIDIA GPUs encode H.264 and HEVC (NVENC, preferred when usable) and decode H.264, HEVC and AV1 (NVDEC).
-> AV1 is decoded on NVIDIA GPUs (NVDEC) or in software (key, intra-only and inter frames; superres is refused). VP9 and AV1 copy between WebM, Matroska and MP4.
+> AV1 is decoded on NVIDIA GPUs (NVDEC) or in software (key, intra-only and inter frames, superres included). VP9 and AV1 copy between WebM, Matroska and MP4.
 > IronAV is not yet a drop-in replacement for FFmpeg or HandBrake.
 
 ## Interfaces
@@ -905,7 +905,7 @@ every intra tool (partitions to 128x128, directional, smooth, Paeth, CFL, palett
 (single and compound references, skip mode, the motion vector stack and the projected motion field, eight-tap and dual filters, global and local warped
 motion, OBMC, wedge, difference-weighted and distance-weighted compound, smooth and wedge interintra, variable inter transform sizes, segmentation and
 delta q), hidden frames, overlays and `show_existing_frame`, tiles, the deblocking filter, CDEF, loop restoration (Wiener, self-guided and switchable),
-quantiser matrices, film grain (added to the output only), 8, 10 and 12 bits, 4:2:0, 4:2:2, 4:4:4 (RGB as `rgb24`) and monochrome, with intra block copy (IntraBC, for screen content). Superres is refused with an error naming the tool. On libaom's output (`ffmpeg -c:v libaom-av1`) the pictures equal libaom's bit for bit: key-frame-only,
+quantiser matrices, film grain (added to the output only), 8, 10 and 12 bits, 4:2:0, 4:2:2, 4:4:4 (RGB as `rgb24`) and monochrome, with intra block copy (IntraBC, for screen content), and superres (spec 7.16: the frame is decoded at its downscaled width, upscaled after CDEF, and loop restoration runs on the upscaled frame). Superres streams come from IronAV's own encoder, since FFmpeg's libaom cannot encode superres; libaom decodes them to the same pictures, at 1/9, 1/12 and 1/16 of the width, 352x288 and 177x99, key-only and key and inter, with and without loop restoration (`superres_decodes_bit_exactly` and `superres_with_loop_restoration_decodes_bit_exactly` in tests/av1.rs). Superres with warped or global motion is not covered by a test. On libaom's output (`ffmpeg -c:v libaom-av1`) the pictures equal libaom's bit for bit: key-frame-only,
 P-only and alt-ref streams, `-cpu-used` 1 to 8, 128x72 to 1280x720, odd sizes, crf 0 to 63, 4x2 tiles, 32-frame streams, the bit depths and samplings
 above, palettes, intra block copy (`tune-content=screen`, `enable-intrabc=1`), lossless coding, CDEF, loop restoration, quantiser matrices and film grain, in WebM, Matroska and MP4 (tests/av1.rs). Reference scaling
 and switch frames are implemented but untested (FFmpeg's libaom wrapper cannot make them). About 30 frames a second at 720p with CDEF and loop
@@ -919,7 +919,7 @@ block is intra or inter by squared error plus lambda times the bits its syntax c
 modes and their angle deltas the same way. Deblocking and CDEF run on every frame, at levels that follow the quantiser. The encoder reconstructs
 through the decoder's own state, so every picture it keeps as a reference is the one the decoder makes: the decoder's output equals the encoder's
 reconstruction bit for bit, and libaom decodes the same pictures (`inter_frames_decode_identically_and_are_smaller_than_key_frames` in
-`tests/av1_enc.rs`). The motion search reaches half samples only, for speed. Not yet: compound prediction, more than one reference, and rate control by bit rate (it is `--qp` only; `--vbitrate` is refused).
+`tests/av1_enc.rs`). The motion search reaches half samples only, for speed. Not yet: compound prediction, more than one reference, and rate control by bit rate (it is `--qp` only; `--vbitrate` is refused). Superres and loop restoration are options of the encoder's API (`with_superres`, `with_restoration`), which the tests use; the command line does not set them.
 
 Speed: at 720p (FFmpeg's testsrc2, 60 frames, the default key interval) the encoder runs at about 5 frames a second at qp 20, 30 and 40, against about 1.6 before the open-loop planner, the motion search and the transform bases were made cheaper. Its files are 1 to 3.5 % smaller than before at the same or a slightly higher PSNR.
 

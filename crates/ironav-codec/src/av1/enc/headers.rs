@@ -2,6 +2,8 @@
 //! key or inter frame (spec 5.3 to 5.9), and the av1C record that carries the sequence header in a
 //! container.
 
+use crate::av1::superres::downscaled_width;
+
 /// seq_level_idx: level 5.1, which covers every size this encoder takes.
 const SEQ_LEVEL: u32 = 13;
 
@@ -76,6 +78,12 @@ pub fn obu(kind: u8, payload: &[u8]) -> Vec<u8> {
 /// prediction or temporal motion), screen content tools off, CDEF on, loop restoration off, no
 /// superres, no film grain.
 pub fn sequence_header(width: u32, height: u32) -> Vec<u8> {
+    sequence_header_with(width, height, false, false)
+}
+
+/// The sequence header payload of `sequence_header`, with superres (`enable_superres`) and loop
+/// restoration (`enable_restoration`) allowed or not.
+pub fn sequence_header_with(width: u32, height: u32, superres: bool, restoration: bool) -> Vec<u8> {
     let mut b = BitWriter::default();
     b.put(0, 3); // seq_profile
     b.put(0, 1); // still_picture
@@ -102,9 +110,9 @@ pub fn sequence_header(width: u32, height: u32) -> Vec<u8> {
     b.put(0, 1); // enable_order_hint
     b.put(0, 1); // seq_choose_screen_content_tools
     b.put(0, 1); // seq_force_screen_content_tools (no integer MV syntax follows)
-    b.put(0, 1); // enable_superres
+    b.put(superres as u32, 1); // enable_superres
     b.put(1, 1); // enable_cdef
-    b.put(0, 1); // enable_restoration
+    b.put(restoration as u32, 1); // enable_restoration
     // color_config: 8 bits, not monochrome, no colour description, limited range, 4:2:0
     b.put(0, 1); // high_bitdepth
     b.put(0, 1); // mono_chrome
@@ -152,13 +160,24 @@ pub struct FrameParams {
     pub lf_level: u8,
     /// The CDEF strengths of the one CDEF strength set: primary and secondary, luma and chroma.
     pub cdef: [u8; 4],
+    /// The superres denominator (9 to 16, or 8 for none) when the sequence header allows superres;
+    /// `None` when it does not, and then no superres syntax is written.
+    pub superres: Option<u32>,
+    /// Whether the sequence header allows loop restoration, and then whether the frame uses it: the
+    /// Wiener filter on every plane, with 64-sample luma units and 32-sample chroma units.
+    pub restoration: bool,
 }
 
 /// The uncompressed header of a shown frame, byte aligned, as the frame OBU starts with it. A key
 /// frame refreshes every slot; an inter frame refreshes slot 0 (LAST_FRAME), so LAST_FRAME is the
-/// frame before it.
+/// frame before it. `p.width` is the upscaled width: with superres the frame is coded at the
+/// downscaled width that `superres_params` derives from it.
 pub fn frame_header(p: &FrameParams) -> Vec<u8> {
-    let (mi_cols, mi_rows) = (2 * (p.width as usize).div_ceil(8), 2 * (p.height as usize).div_ceil(8));
+    let coded_width = match p.superres {
+        Some(d) => downscaled_width(p.width, d),
+        None => p.width,
+    };
+    let (mi_cols, mi_rows) = (2 * (coded_width as usize).div_ceil(8), 2 * (p.height as usize).div_ceil(8));
     let mut b = BitWriter::default();
     b.put(0, 1); // show_existing_frame
     b.put(if p.key { 0 } else { 1 }, 2); // frame_type: KEY_FRAME or INTER_FRAME
@@ -167,12 +186,19 @@ pub fn frame_header(p: &FrameParams) -> Vec<u8> {
         b.put(0, 1); // error_resilient_mode
     }
     b.put(0, 1); // disable_cdf_update
-    b.put(0, 1); // frame_size_override_flag
+    b.put(0, 1); // frame_size_override_flag: the size is the sequence's maximum
     if !p.key {
         b.put(7, 3); // primary_ref_frame: none, so the CDFs are the defaults
         b.put(0x01, 8); // refresh_frame_flags: slot 0
         for _ in 0..7 {
             b.put(0, 3); // ref_frame_idx: slot 0 for every reference
+        }
+    }
+    if let Some(denom) = p.superres {
+        let on = denom != 8;
+        b.put(on as u32, 1); // use_superres
+        if on {
+            b.put(denom - 9, 3); // coded_denom
         }
     }
     b.put(0, 1); // render_and_frame_size_different
@@ -213,6 +239,15 @@ pub fn frame_header(p: &FrameParams) -> Vec<u8> {
     b.put(sec(p.cdef[1]), 2); // cdef_y_sec_strength[0]
     b.put(p.cdef[2] as u32, 4); // cdef_uv_pri_strength[0]
     b.put(sec(p.cdef[3]), 2); // cdef_uv_sec_strength[0]
+    if p.restoration {
+        // lr_params: lr_type 2 (Remap_Lr_Type gives WIENER) on each plane, lr_unit_shift 0 (64
+        // samples) and lr_uv_shift 1 (32 chroma samples)
+        for _ in 0..3 {
+            b.put(2, 2); // lr_type
+        }
+        b.put(0, 1); // lr_unit_shift
+        b.put(1, 1); // lr_uv_shift
+    }
     b.put(0, 1); // read_tx_mode: TX_MODE_LARGEST
     if !p.key {
         b.put(0, 1); // reference_select: single reference
@@ -255,7 +290,7 @@ mod tests {
 
     #[test]
     fn frame_headers_read_back() {
-        let p = FrameParams { key: true, width: 352, height: 288, base_q_idx: 115, lf_level: 10, cdef: [3, 1, 1, 0] };
+        let p = FrameParams { key: true, width: 352, height: 288, base_q_idx: 115, lf_level: 10, cdef: [3, 1, 1, 0], superres: None, restoration: false };
         let hdr = frame_header(&p);
         let mut b = Bits::new(&hdr);
         assert_eq!(b.f(1).unwrap(), 0); // show_existing_frame

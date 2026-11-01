@@ -31,10 +31,10 @@ use std::sync::Arc;
 use ironav_core::{Encoder, Error, ErrorCode, Frame, Packet, PixelFormat, Result, StreamParams, VideoFrame};
 
 use crate::av1::block::{FrameDec, Picture};
-use crate::av1::cdef;
 use crate::av1::ipred::Plane;
-use crate::av1::lf;
 use crate::av1::obu::{parse_frame_header, parse_sequence_header, RefInfo, RefState, SequenceHeader};
+use crate::av1::postfilter;
+use crate::av1::superres::downscaled_width;
 use headers::FrameParams;
 
 /// The quantiser when none is set (the VP9 encoder's default).
@@ -80,6 +80,10 @@ pub struct Av1Encoder {
     prev_src: Option<Plane>,
     /// The forward transform bases, built on first use and kept across frames.
     bases: fwd::Bases,
+    /// The superres denominator, when frames are coded at a downscaled width (see `with_superres`).
+    superres: Option<u32>,
+    /// Whether frames use loop restoration (see `with_restoration`).
+    restoration: bool,
 }
 
 impl Av1Encoder {
@@ -108,6 +112,8 @@ impl Av1Encoder {
             last: None,
             prev_src: None,
             bases: fwd::Bases::default(),
+            superres: None,
+            restoration: false,
         })
     }
 
@@ -115,6 +121,33 @@ impl Av1Encoder {
     pub fn with_keyint(mut self, n: u64) -> Self {
         self.keyint = n.max(1);
         self
+    }
+
+    /// Codes every frame with superres at `denom` (9 to 16, the denominator of 8ths of the width):
+    /// the frame is coded at the downscaled width (the source is resampled horizontally), and its
+    /// reconstruction is upscaled before it becomes a reference, as the decoder does. Used by the
+    /// tests, which compare the decoder's output with libaom's.
+    pub fn with_superres(mut self, denom: u32) -> Self {
+        assert!((9..=16).contains(&denom), "superres denominator {denom} is not 9 to 16");
+        self.superres = Some(denom);
+        self.set_sequence_header();
+        self
+    }
+
+    /// Codes every frame with loop restoration: the Wiener filter on each plane, in units of 64
+    /// luma samples (32 chroma) of which every other one is filtered and the rest are left alone.
+    /// The filter's coefficients are the midpoints, so the filter is the same in every unit that
+    /// uses it. Used by the tests, with superres.
+    pub fn with_restoration(mut self) -> Self {
+        self.restoration = true;
+        self.set_sequence_header();
+        self
+    }
+
+    /// Parses the sequence header of the options set so far, for the encoder's own frame headers.
+    fn set_sequence_header(&mut self) {
+        let hdr = headers::sequence_header_with(self.width as u32, self.height as u32, self.superres.is_some(), self.restoration);
+        self.seq = parse_sequence_header(&hdr).expect("the sequence header of the options parses");
     }
 
     /// The temporal unit of one picture.
@@ -135,27 +168,33 @@ impl Av1Encoder {
             base_q_idx: self.base_q,
             lf_level: filter_level(self.base_q),
             cdef: cdef_strengths(self.base_q),
+            superres: self.superres,
+            restoration: self.restoration,
         };
         let hdr = headers::frame_header(&params);
 
         // the frame's header as the decoder reads it, with every slot holding the last frame's state
         let refs = RefInfo { slots: std::array::from_fn(|_| self.last.as_ref().map(|(_, s)| s.clone())) };
         let fh = parse_frame_header(&hdr, &self.seq, &refs, 0, 0)?;
+        // with superres the frame is coded at its downscaled width, from the resampled source
+        let coded_w = self.superres.map_or(w, |d| downscaled_width(w as u32, d) as usize);
+        let resampled = self.superres.map(|_| resample_planes(v, w, h, coded_w));
+        let planes = match &resampled {
+            Some(p) => [&p[0][..], &p[1][..], &p[2][..]],
+            None => [&v.planes[0][..], &v.planes[1][..], &v.planes[2][..]],
+        };
         let mut f = FrameDec::new(self.seq.clone(), fh);
         if let (false, Some((pic, _))) = (key, &self.last) {
             for slot in f.refs.iter_mut().skip(1) {
                 *slot = Some(pic.clone());
             }
         }
-        let enc = tile::FrameEnc::new(f, &v.planes[0], &v.planes[1], &v.planes[2], (w, h), self.prev_src.clone(), std::mem::take(&mut self.bases));
+        let enc = tile::FrameEnc::new(f, planes[0], planes[1], planes[2], (coded_w, h), self.prev_src.clone(), std::mem::take(&mut self.bases));
         let (tile_bytes, mut f, src_luma, bases) = enc.encode();
         self.bases = bases;
 
-        // the loop filters, as the decoder runs them on the frame
-        if f.h.lf_level[0] != 0 || f.h.lf_level[1] != 0 {
-            lf::deblock(&mut f);
-        }
-        cdef::cdef(&mut f);
+        // the post filters, as the decoder runs them on the frame
+        postfilter(&mut f);
         let state = RefState {
             frame_type: f.h.frame_type,
             order_hint: f.h.order_hint,
@@ -193,10 +232,39 @@ impl Av1Encoder {
         let mut frame = hdr;
         frame.extend_from_slice(&tile_bytes);
         let mut out = headers::obu(headers::OBU_TEMPORAL_DELIMITER, &[]);
-        out.extend(headers::obu(headers::OBU_SEQUENCE_HEADER, &headers::sequence_header(w as u32, h as u32)));
+        out.extend(headers::obu(headers::OBU_SEQUENCE_HEADER, &headers::sequence_header_with(w as u32, h as u32, self.superres.is_some(), self.restoration)));
         out.extend(headers::obu(headers::OBU_FRAME, &frame));
         Ok(out)
     }
+}
+
+/// The planes of a yuv420p picture of `w` x `h` resampled horizontally to `dw` luma columns (and
+/// (dw + 1) / 2 chroma columns), tightly packed. Each output sample is the average of the source
+/// samples its span covers, weighted by the overlap.
+fn resample_planes(v: &VideoFrame, w: usize, h: usize, dw: usize) -> [Vec<u8>; 3] {
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let resample = |src: &[u8], sw: usize, rows: usize, ow: usize| -> Vec<u8> {
+        let mut out = Vec::with_capacity(ow * rows);
+        let scale = sw as f64 / ow as f64;
+        for y in 0..rows {
+            let s = &src[y * sw..(y + 1) * sw];
+            for x in 0..ow {
+                let (a, b) = (x as f64 * scale, (x + 1) as f64 * scale);
+                let (mut acc, mut total) = (0.0, 0.0);
+                for (i, &p) in s.iter().enumerate().take((b.ceil() as usize).min(sw)).skip(a.floor() as usize) {
+                    let overlap = (i as f64 + 1.0).min(b) - (i as f64).max(a);
+                    if overlap > 0.0 {
+                        acc += overlap * p as f64;
+                        total += overlap;
+                    }
+                }
+                out.push((acc / total).round() as u8);
+            }
+        }
+        out
+    };
+    let dcw = dw.div_ceil(2);
+    [resample(&v.planes[0], w, h, dw), resample(&v.planes[1][..cw * ch], cw, ch, dcw), resample(&v.planes[2][..cw * ch], cw, ch, dcw)]
 }
 
 impl Encoder for Av1Encoder {
@@ -289,6 +357,37 @@ mod tests {
                 if t % 2 == 1 {
                     let p = psnr(&src.planes[0], &got);
                     assert!(p > 30.0, "{w}x{h} frame {t}: luma PSNR {p:.1} dB");
+                }
+            }
+        }
+    }
+
+    /// Superres: frames coded at a downscaled width decode to the encoder's reconstruction, all
+    /// three planes, for key and inter frames at each denominator and at an odd width.
+    #[test]
+    fn superres_frames_decode_to_the_encoders_reconstruction() {
+        for &(denom, restoration) in &[(9u32, false), (12, false), (16, false), (9, true), (12, true), (16, true)] {
+            for &(w, h) in &[(352usize, 288usize), (177, 99)] {
+                let mut enc = Av1Encoder::new(&params(w, h), Some(24)).unwrap().with_keyint(3).with_superres(denom);
+                if restoration {
+                    enc = enc.with_restoration();
+                }
+                let mut dec = Av1Decoder::new(&[]);
+                for t in 0..4 {
+                    let src = picture_shifted(w, h, 2 * t);
+                    let data = enc.encode_frame(&src).unwrap();
+                    let recon = enc.last.as_ref().unwrap().0.clone();
+                    let mut frames = dec.decode(&Packet { stream: 0, pts: t as i64, duration: 1, data }).unwrap();
+                    assert_eq!(frames.len(), 1, "frame {t} shows one picture");
+                    let CoreFrame::Video(out) = frames.remove(0) else { panic!("no picture") };
+                    assert_eq!((out.width as usize, out.height as usize), (w, h), "the output is the upscaled size");
+                    for pl in 0..3 {
+                        let (pw, ph) = if pl == 0 { (w, h) } else { (w.div_ceil(2), h.div_ceil(2)) };
+                        let want: Vec<u8> = (0..pw * ph).map(|i| recon.planes[pl].at(i % pw, i / pw) as u8).collect();
+                        assert!(out.planes[pl] == want, "1/{denom} {w}x{h} frame {t} plane {pl}: decoder differs from the encoder's reconstruction");
+                    }
+                    let p = psnr(&src.planes[0], &out.planes[0]);
+                    assert!(p > 20.0, "1/{denom} {w}x{h} frame {t}: luma PSNR {p:.1} dB");
                 }
             }
         }

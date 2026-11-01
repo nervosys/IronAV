@@ -438,9 +438,10 @@ impl FrameDec {
         3 * (fwd == bck) as usize + f(self.above()) + f(self.left())
     }
 
-    /// Whether a reference frame has a different size than the frame.
+    /// Whether a reference frame has a different size than the frame (is_scaled): the reference's
+    /// upscaled width against this frame's FrameWidth, which superres makes smaller than it.
     pub(crate) fn is_scaled(&self, rf: i8) -> bool {
-        self.refs[rf as usize].as_ref().is_some_and(|p| p.width != self.h.upscaled_width as usize || p.height != self.h.height as usize)
+        self.refs[rf as usize].as_ref().is_some_and(|p| p.width != self.h.width as usize || p.height != self.h.height as usize)
     }
 
     /// read_mv: the difference from `pred`, with the MV CDFs of MvCtx `ctx` (1 for intra block copy).

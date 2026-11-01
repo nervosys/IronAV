@@ -2,7 +2,7 @@
 //! subsampling, tiles, palettes, intra block filters, lossless coding, every inter tool (compound
 //! modes, masks, inter-intra, OBMC, warped and global motion, reference scaling, temporal motion
 //! vectors), intra block copy, the deblocking filter, CDEF, loop restoration, quantiser matrices
-//! and film grain. Superres is refused with an error rather than decoded wrongly.
+//! and film grain. Superres upscales the decoded frame after CDEF, before loop restoration.
 
 pub mod block;
 pub mod cdef;
@@ -23,6 +23,7 @@ pub mod obu;
 pub mod qm_tables;
 pub mod quant_tables;
 pub mod scan_tables;
+pub mod superres;
 pub mod symbol;
 pub mod tables;
 
@@ -37,6 +38,24 @@ use symbol::Cdfs;
 
 fn unsupported(msg: &str) -> Error {
     Error::new(ErrorCode::UnsupportedFormat, format!("AV1: {msg}"))
+}
+
+/// The post filters of a decoded frame, in the spec's order: deblocking, CDEF on the frame at its
+/// downscaled width, superres upscaling, then loop restoration on the upscaled frame. Restoration
+/// reads the deblocked planes beside each stripe, so they are kept (and upscaled) before CDEF.
+pub(crate) fn postfilter(f: &mut FrameDec) {
+    if f.h.lf_level[0] != 0 || f.h.lf_level[1] != 0 {
+        lf::deblock(f);
+    }
+    let mut deblocked = f.h.uses_lr.then(|| f.planes.clone());
+    cdef::cdef(f);
+    if let Some(pre) = deblocked.as_mut() {
+        superres::upscale(f, pre);
+    }
+    superres::upscale_in_place(f);
+    if let Some(pre) = deblocked {
+        lr::loop_restore(f, &pre);
+    }
 }
 
 #[derive(Clone)]
@@ -130,7 +149,6 @@ impl Av1Decoder {
                         self.show_existing(&h, pts)?;
                         continue;
                     }
-                    check_supported(&h)?;
                     let rest = h.header_bytes;
                     self.cur = Some(self.start_frame(seq, h)?);
                     if o.kind == OBU_FRAME {
@@ -200,15 +218,7 @@ impl Av1Decoder {
     fn finish(&mut self, pts: i64) -> Result<()> {
         let Some(cur) = self.cur.take() else { return Ok(()) };
         let mut f = cur.f;
-        if f.h.lf_level[0] != 0 || f.h.lf_level[1] != 0 {
-            lf::deblock(&mut f);
-        }
-        // Loop restoration reads the deblocked rows beside each stripe, so keep them before CDEF.
-        let deblocked = f.h.uses_lr.then(|| f.planes.clone());
-        cdef::cdef(&mut f);
-        if let Some(pre) = deblocked {
-            lr::loop_restore(&mut f, &pre);
-        }
+        postfilter(&mut f);
         let mut cdfs = if f.h.disable_frame_end_update_cdf { cur.cdf } else { cur.saved.unwrap_or(cur.cdf) };
         cdfs.clear_counts();
         let h = &f.h;
@@ -330,32 +340,9 @@ impl Av1Decoder {
     }
 }
 
-/// Refuses frames that need a tool this decoder does not have yet.
-fn check_supported(h: &FrameHeader) -> Result<()> {
-    if h.superres_denom != 8 {
-        return Err(unsupported("superres is not decoded yet"));
-    }
-    Ok(())
-}
-
 impl Decoder for Av1Decoder {
     fn decode(&mut self, packet: &Packet) -> Result<Vec<Frame>> {
         self.temporal_unit(&packet.data, packet.pts)?;
         Ok(std::mem::take(&mut self.out))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// FFmpeg's libaom cannot turn superres on, so the refusal is checked on a hand-built header.
-    #[test]
-    fn superres_frames_are_refused() {
-        let mut h = FrameHeader { superres_denom: 8, ..FrameHeader::default() };
-        assert!(check_supported(&h).is_ok());
-        h.superres_denom = 16;
-        let e = check_supported(&h).unwrap_err();
-        assert!(e.to_string().contains("superres"), "{e}");
     }
 }

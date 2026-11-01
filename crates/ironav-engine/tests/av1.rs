@@ -3,6 +3,9 @@
 //! must equal libaom's (`ffmpeg -c:v libaom-av1 -i`) byte for byte. The tests skip when `ffmpeg`
 //! is not on the PATH.
 
+use ironav_codec::av1::enc::Av1Encoder;
+use ironav_codec::av1::Av1Decoder;
+use ironav_core::{Decoder, Frame, Packet, PixelFormat, Rational, StreamParams, VideoFrame};
 use ironav_engine::{run, Job};
 use std::path::PathBuf;
 use std::process::Command;
@@ -307,4 +310,122 @@ fn inter_tiles_and_long_streams_decode_bit_exactly() {
     // segmentation, delta q and error resilience
     check(&inter("aq", TESTSRC, &format!("{TOOLS}:aq-mode=1:deltaq-mode=1"), ALTREF, 8, "6"));
     check(&inter("resilient", TESTSRC, &format!("{TOOLS}:error-resilient=1"), P_ONLY, 6, "6"));
+}
+
+/// A test picture: a moving gradient with a diagonal edge and a little noise, so that intra and
+/// inter blocks of every kind are coded. Frame `t` is the picture moved by `2t` samples.
+fn superres_picture(w: usize, h: usize, t: usize) -> VideoFrame {
+    let mut seed = 7u32;
+    let mut noise = move || {
+        seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        ((seed >> 16) % 7) as i32 - 3
+    };
+    let luma: Vec<u8> = (0..w * h)
+        .map(|i| {
+            let (x, y) = ((i % w + 2 * t) % w, (i / w + t) % h);
+            let v = if x + y > (w + h) / 2 { 210 } else { (x * 2 + y) as i32 } + noise();
+            v.clamp(0, 255) as u8
+        })
+        .collect();
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let chroma = |k: usize| -> Vec<u8> { (0..cw * ch).map(|i| ((i % cw) * 3 + (i / cw) * k + t) as u8).collect() };
+    VideoFrame { width: w as u32, height: h as u32, pix_fmt: PixelFormat::Yuv420p, pts: 0, planes: vec![luma, chroma(1), chroma(2)] }
+}
+
+/// An IVF file of temporal units (the IVF header, then each unit with its size and timestamp).
+fn ivf(w: usize, h: usize, units: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = b"DKIF".to_vec();
+    out.extend([0u8, 0, 32, 0]);
+    out.extend(b"AV01");
+    out.extend((w as u16).to_le_bytes());
+    out.extend((h as u16).to_le_bytes());
+    out.extend(25u32.to_le_bytes());
+    out.extend(1u32.to_le_bytes());
+    out.extend((units.len() as u32).to_le_bytes());
+    out.extend(0u32.to_le_bytes());
+    for (t, u) in units.iter().enumerate() {
+        out.extend((u.len() as u32).to_le_bytes());
+        out.extend((t as u64).to_le_bytes());
+        out.extend_from_slice(u);
+    }
+    out
+}
+
+/// Superres from IronAV's encoder: `frames` pictures at `w` x `h`, each coded at 1/`denom` of the
+/// width (a key frame every `keyint` frames), with CDEF and, if `restoration`, loop restoration.
+/// libaom decodes the IVF stream and IronAV decodes the same units; the pictures must be equal.
+/// Returns the number of bytes compared.
+fn check_superres(name: &str, w: usize, h: usize, denom: u32, frames: usize, keyint: u64, restoration: bool) -> usize {
+    let d = scratch(name);
+    let path = d.join("superres.ivf");
+    let raw = d.join("ref.raw");
+    let mut enc = Av1Encoder::new(&StreamParams::Video { width: w as u32, height: h as u32, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational { num: 25, den: 1 } }, Some(24))
+        .unwrap_or_else(|e| panic!("{name}: {e}"))
+        .with_keyint(keyint);
+    if denom != 8 {
+        enc = enc.with_superres(denom);
+    }
+    if restoration {
+        enc = enc.with_restoration();
+    }
+    let units: Vec<Vec<u8>> = (0..frames).map(|t| enc.encode_frame(&superres_picture(w, h, t)).unwrap_or_else(|e| panic!("{name}: {e}"))).collect();
+    std::fs::write(&path, ivf(w, h, &units)).unwrap();
+    assert!(ffmpeg(&["-c:v", "libaom-av1", "-i", path.to_str().unwrap(), "-f", "rawvideo", "-pix_fmt", "yuv420p", raw.to_str().unwrap()]), "{name}: ffmpeg could not decode");
+    let want = std::fs::read(&raw).unwrap();
+    let mut dec = Av1Decoder::new(&[]);
+    let mut pictures = Vec::new();
+    for (t, u) in units.into_iter().enumerate() {
+        pictures.extend(dec.decode(&Packet { stream: 0, pts: t as i64, duration: 1, data: u }).unwrap_or_else(|e| panic!("{name}: {e}")));
+    }
+    pictures.extend(dec.flush().unwrap_or_else(|e| panic!("{name}: {e}")));
+    let mut got: Vec<u8> = Vec::new();
+    for f in pictures {
+        let Frame::Video(v) = f else { panic!("{name}: no picture") };
+        assert_eq!((v.width as usize, v.height as usize), (w, h), "{name}: the output is the upscaled size");
+        got.extend(v.planes.iter().flatten());
+    }
+    if got != want {
+        std::fs::write(d.join("ironav.raw"), &got).unwrap();
+        let i = got.iter().zip(&want).position(|(a, b)| a != b).unwrap_or(got.len().min(want.len()));
+        panic!("{name}: IronAV decodes libaom's superres stream differently ({} bytes, libaom {}; first difference at byte {i}); kept in {}", got.len(), want.len(), d.display());
+    }
+    let _ = std::fs::remove_dir_all(&d);
+    want.len()
+}
+
+/// The control for the superres tests: the same streams at full width (denominator 8), so that a
+/// mismatch in them is a fault in the frame tools rather than in superres.
+#[test]
+fn superres_control_without_superres_decodes_bit_exactly() {
+    need_ffmpeg!();
+    for (w, h) in [(352, 288), (177, 99)] {
+        check_superres(&format!("sr-off-key-{w}"), w, h, 8, 3, 1, false);
+        check_superres(&format!("sr-off-inter-{w}"), w, h, 8, 4, 1000, false);
+    }
+}
+
+/// Superres at 1/9, 1/12 and 1/16 of the width, 352x288 and an odd 177x99, with CDEF on: key frames
+/// only, then key and inter frames (inter prediction from upscaled references).
+#[test]
+fn superres_decodes_bit_exactly() {
+    need_ffmpeg!();
+    for denom in [9, 12, 16] {
+        for (w, h) in [(352, 288), (177, 99)] {
+            check_superres(&format!("sr-key-{denom}-{w}"), w, h, denom, 3, 1, false);
+            check_superres(&format!("sr-inter-{denom}-{w}"), w, h, denom, 4, 1000, false);
+        }
+    }
+}
+
+/// Superres with loop restoration: the Wiener filter runs on the upscaled frame, its units are in
+/// upscaled coordinates, and the restoration units of a superblock follow the superres mapping.
+#[test]
+fn superres_with_loop_restoration_decodes_bit_exactly() {
+    need_ffmpeg!();
+    for denom in [9, 12, 16] {
+        for (w, h) in [(352, 288), (177, 99)] {
+            check_superres(&format!("sr-lr-key-{denom}-{w}"), w, h, denom, 3, 1, true);
+            check_superres(&format!("sr-lr-inter-{denom}-{w}"), w, h, denom, 4, 1000, true);
+        }
+    }
 }

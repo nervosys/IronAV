@@ -403,19 +403,30 @@ impl FrameDec {
             if self.h.lr_type[plane] == lr::RESTORE_NONE {
                 continue;
             }
-            let (sx, sy) = self.sub(plane);
-            let unit = self.h.lr_size[plane] as usize;
-            let (rows, cols) = (self.lr[plane].rows, self.lr[plane].cols);
-            let row0 = (r * (4 >> sy)).div_ceil(unit);
-            let row1 = rows.min(((r + sb4) * (4 >> sy)).div_ceil(unit));
-            let col0 = (c * (4 >> sx)).div_ceil(unit);
-            let col1 = cols.min(((c + sb4) * (4 >> sx)).div_ceil(unit));
-            for ur in row0..row1 {
-                for uc in col0..col1 {
-                    self.read_lr_unit(t, plane, ur * cols + uc);
+            let (rows, cols) = self.lr_unit_ranges(plane, r, c, sb4);
+            let ncols = self.lr[plane].cols;
+            for ur in rows {
+                for uc in cols.clone() {
+                    self.read_lr_unit(t, plane, ur * ncols + uc);
                 }
             }
         }
+    }
+
+    /// The restoration units of `plane` whose top-left sample lies in the superblock at (`r`, `c`):
+    /// the unit rows and the unit columns (read_lr's ranges).
+    pub(crate) fn lr_unit_ranges(&self, plane: usize, r: usize, c: usize, sb4: usize) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
+        let (sx, sy) = self.sub(plane);
+        let unit = self.h.lr_size[plane] as usize;
+        let (rows, cols) = (self.lr[plane].rows, self.lr[plane].cols);
+        let row0 = (r * (4 >> sy)).div_ceil(unit);
+        let row1 = rows.min(((r + sb4) * (4 >> sy)).div_ceil(unit));
+        // Columns of the upscaled frame: with superres a superblock spans SuperresDenom / 8 times
+        // as many units' worth of upscaled samples.
+        let (num, den) = if self.h.superres_denom != 8 { ((4 >> sx) * self.h.superres_denom as usize, unit * 8) } else { (4 >> sx, unit) };
+        let col0 = (c * num).div_ceil(den);
+        let col1 = cols.min(((c + sb4) * num).div_ceil(den));
+        (row0..row1, col0..col1)
     }
 
     /// read_lr_unit (spec 5.11.58).

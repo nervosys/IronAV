@@ -25,6 +25,7 @@ use crate::av1::block::{base_ctx, br_ctx, partition_subsize, plane_block, scan_f
 use crate::av1::inter_tables::{TX_TYPE_INTER_INV_SET1, TX_TYPE_INTER_INV_SET2, TX_TYPE_INTER_INV_SET3};
 use crate::av1::ipred::{predict_intra, Edges, Plane};
 use crate::av1::itx::inverse_transform;
+use crate::av1::lr;
 use crate::av1::mvpred::{Mv, MvStack, GLOBALMV, NEARESTMV, NEARMV, NEWMV};
 use crate::av1::quant_tables::{AC_QLOOKUP_8, DC_QLOOKUP_8, SM_WEIGHTS};
 use crate::av1::symbol::Cdfs;
@@ -328,12 +329,63 @@ impl FrameEnc {
                 self.left_dc[p].fill(0);
             }
             for c in (0..self.mi_cols).step_by(16) {
+                self.write_lr(r, c, 16);
                 self.partition(r, c, BLOCK_64X64);
             }
         }
         let FrameEnc { f, se, src, bases, .. } = self;
         let [luma, _, _] = src;
         (se.finish(), f, luma, bases)
+    }
+
+    /// read_lr for the superblock at (`r`, `c`): each unit's filter type and, for a Wiener unit, its
+    /// coefficients as zero differences from their references, so every Wiener unit takes the
+    /// midpoint filter. The units alternate between the filter and none, by their index in the
+    /// plane, and the decoder's unit positions are what tell them apart.
+    fn write_lr(&mut self, r: usize, c: usize, sb4: usize) {
+        for plane in 0..self.f.num_planes {
+            if self.f.h.lr_type[plane] == lr::RESTORE_NONE {
+                continue;
+            }
+            let (rows, cols) = self.f.lr_unit_ranges(plane, r, c, sb4);
+            let ncols = self.f.lr[plane].cols;
+            for ur in rows {
+                for uc in cols.clone() {
+                    let idx = ur * ncols + uc;
+                    let on = idx.is_multiple_of(2);
+                    self.se.symbol(on as usize, &mut self.cdf.wiener);
+                    let mut u = lr::Unit::default();
+                    if on {
+                        u.typ = lr::RESTORE_WIENER;
+                        let first = if plane > 0 { 1 } else { 0 };
+                        for pass in 0..2 {
+                            for j in first..3 {
+                                u.wiener[pass][j] = lr::WIENER_TAPS_MID[j];
+                                self.write_zero_subexp((lr::WIENER_TAPS_MAX[j] + 1 - lr::WIENER_TAPS_MIN[j]) as u32, lr::WIENER_TAPS_K[j]);
+                            }
+                        }
+                    }
+                    self.f.lr[plane].u[idx] = u;
+                }
+            }
+        }
+    }
+
+    /// decode_signed_subexp_with_ref for a difference of zero, from the reference: the first code of
+    /// decode_subexp_bool, which is NS(0) when `num_syms` is at most 3 << k, and otherwise a 0 bit
+    /// and k zero bits.
+    fn write_zero_subexp(&mut self, num_syms: u32, k: u32) {
+        if num_syms <= 3 << k {
+            let w = 32 - num_syms.leading_zeros();
+            for _ in 0..w - 1 {
+                self.se.bool(false);
+            }
+        } else {
+            self.se.bool(false);
+            for _ in 0..k {
+                self.se.bool(false);
+            }
+        }
     }
 
     fn mi_at(&self, r: usize, c: usize) -> Mi {

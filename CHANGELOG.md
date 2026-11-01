@@ -35,7 +35,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   the motion vector stack and projected motion field, dual filters, global and local warped motion, OBMC, wedge,
   difference- and distance-weighted compound, interintra, variable inter transforms, hidden frames, `show_existing_frame`
   and film grain loaded from a reference. It matches libaom bit for bit on key-frame-only, P-only and alt-ref streams at
-  `-cpu-used` 1 to 8, and is used when no NVIDIA GPU decodes AV1. Superres is refused by name.
+  `-cpu-used` 1 to 8, and is used when no NVIDIA GPU decodes AV1. Superres is decoded (upscaling after CDEF and before loop
+  restoration), and matches libaom bit for bit on IronAV-encoded superres streams at 1/9 to 1/16 of the width.
 - **Codecs (AV1 encoder):** profile 0, 8-bit 4:2:0, in WebM, Matroska and MP4, `--qp` only (no bit rate). It writes inter
   frames after each key frame (every 250 frames by default, `--keyint`): LAST_FRAME prediction with quarter-sample vectors
   searched to half samples, the reference MV stack's modes, skip and intra blocks inside inter frames, deblocking and CDEF
@@ -104,7 +105,6 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 - **Hardware:** only NVIDIA is driven: NVENC for H.264 and HEVC, NVDEC for H.264, HEVC and AV1. The other backends
   (VA-API, Quick Sync, VideoToolbox, D3D11VA, AMF, Vulkan Video, MediaCodec and OpenCL) are planned.
-- **AV1 decoder:** superres is refused by name in software, so such streams need an NVIDIA GPU.
 - **AV1 encoder:** one reference (the previous frame), no compound prediction, no rate control by bit rate (`--qp`
   only), 8-bit 4:2:0 and one tile; the motion search stops at half samples.
 - **HEVC encoder:** Main profile, 8-bit 4:2:0 only, with no sign data hiding and no B pictures; wider HEVC encoding needs
