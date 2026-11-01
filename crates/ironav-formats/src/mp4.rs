@@ -194,7 +194,8 @@ impl Track {
             CodecId::Vp9 => (b"vp09", bx(b"vpcC", &self.config)),
             CodecId::Mjpeg => (b"jpeg", Vec::new()),
             CodecId::ProRes => (&prores, Vec::new()),
-            CodecId::Mpeg4 => (b"mp4v", visual_esds(&self.config)),
+            CodecId::Mpeg4 => (b"mp4v", visual_esds(&self.config, 0x20)),
+            CodecId::Mpeg2Video => (b"mp4v", visual_esds(&self.config, 0x61)),
             _ => (b"avc1", self.avcc(&missing)?),
         };
         let mut e = vec![0u8; 6];
@@ -510,16 +511,17 @@ impl Track {
                 None => Err(Error::invalid_input(format!("an AV1 packet at {} does not parse as OBUs", p.pts))),
             },
             CodecId::Mjpeg | CodecId::ProRes => Ok(Some((p.data.clone(), true))),
-            // an MPEG-4 picture is stored as it is; it is a key picture when its coding type is I
-            CodecId::Mpeg4 => Ok(Some((p.data.clone(), crate::keyframe::is_keyframe(CodecId::Mpeg4, &p.data) != Some(false)))),
+            // an MPEG-4 or MPEG-2 picture is stored as it is; it is a key picture when its coding type is I
+            CodecId::Mpeg4 | CodecId::Mpeg2Video => Ok(Some((p.data.clone(), crate::keyframe::is_keyframe(self.codec, &p.data) != Some(false)))),
             _ => Ok(annexb_sample(self.is_hevc(), &mut self.params, &p.data)),
         }
     }
 }
 
-/// The `esds` box of an MPEG-4 Visual sample entry: an ES descriptor whose decoder specific info is
-/// the visual object sequence and layer header (`config`), as the demuxer reads them back.
-fn visual_esds(config: &[u8]) -> Vec<u8> {
+/// The `esds` box of an MPEG-4 Visual (object type 0x20) or MPEG-2 Video (0x61, Main profile) sample
+/// entry: an ES descriptor whose decoder specific info is the sequence header and extension, or the
+/// visual object sequence and layer header (`config`), as the demuxer reads them back.
+fn visual_esds(config: &[u8], object: u8) -> Vec<u8> {
     // a descriptor's length takes four bytes of seven bits each, the continuation bit set on all but the last
     let desc = |tag: u8, body: &[u8]| {
         let n = body.len() as u32;
@@ -527,7 +529,7 @@ fn visual_esds(config: &[u8]) -> Vec<u8> {
         d.extend_from_slice(body);
         d
     };
-    let mut dec = vec![0x20, 0x11, 0, 0, 0]; // MPEG-4 Visual; a visual stream; buffer size unknown
+    let mut dec = vec![object, 0x11, 0, 0, 0]; // the object type; a visual stream; buffer size unknown
     dec.extend_from_slice(&[0u8; 8]); // maximum and average bit rate unknown
     dec.extend(desc(5, config));
     let mut es = vec![0, 1, 0]; // ES_ID 1, no optional fields
@@ -915,7 +917,7 @@ impl Muxer for Mp4Muxer {
                 (StreamParams::Video { .. }, CodecId::ProRes) if !self.quicktime => {
                     return Err(Error::new(ErrorCode::UnsupportedFormat, "ProRes is written to QuickTime (.mov) files").hint("write the output as .mov"));
                 }
-                (StreamParams::Video { width, height, frame_rate, .. }, CodecId::H264 | CodecId::Hevc | CodecId::Vp9 | CodecId::Av1 | CodecId::Mjpeg | CodecId::ProRes | CodecId::Mpeg4) => {
+                (StreamParams::Video { width, height, frame_rate, .. }, CodecId::H264 | CodecId::Hevc | CodecId::Vp9 | CodecId::Av1 | CodecId::Mjpeg | CodecId::ProRes | CodecId::Mpeg4 | CodecId::Mpeg2Video) => {
                     if frame_rate.num <= 0 || frame_rate.den <= 0 || frame_rate.num > u32::MAX as i64 || frame_rate.den > u32::MAX as i64 {
                         return Err(Error::invalid_arg("MP4 needs a known, constant frame rate"));
                     }

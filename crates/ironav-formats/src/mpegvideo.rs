@@ -12,9 +12,13 @@
 //! clock; every stream starts at the earliest of them, as FFmpeg's start time does, so audio and
 //! video stay aligned. A video stream's pictures are placed from its first timestamp by display
 //! index, and a stream that first shows up after the first few megabytes is not read.
+//!
+//! Writing is for elementary streams of MPEG-2 video: each packet's bytes go into the file as they are,
+//! in the order given.
 
+use crate::WriteSeek;
 use ironav_codec::mp3::parse_frame;
-use ironav_core::{CodecId, Demuxer, Error, ErrorCode, Packet, PixelFormat, Rational, Result, StreamInfo, StreamParams};
+use ironav_core::{CodecId, Demuxer, Error, ErrorCode, Muxer, Packet, PixelFormat, Rational, Result, StreamInfo, StreamParams};
 use std::collections::VecDeque;
 use std::io::Read;
 
@@ -812,6 +816,49 @@ impl<R: Read + Send> Demuxer for MpegVideoDemuxer<R> {
             }
             self.pump()?;
         }
+    }
+}
+
+/// Writes a video elementary stream: each packet's bytes, verbatim and in the order given. Only MPEG-2
+/// video is written. Key pictures carry their sequence headers, so the file reads back on its own.
+pub struct MpegVideoMuxer {
+    out: Box<dyn WriteSeek>,
+    started: bool,
+}
+
+impl MpegVideoMuxer {
+    pub fn new(out: Box<dyn WriteSeek>) -> Self {
+        Self { out, started: false }
+    }
+}
+
+impl Muxer for MpegVideoMuxer {
+    fn write_header(&mut self, streams: &[StreamInfo]) -> Result<()> {
+        let [s] = streams else {
+            return Err(Error::invalid_arg("a raw MPEG video stream holds exactly one video stream"));
+        };
+        if s.codec != CodecId::Mpeg2Video {
+            return Err(Error::new(ErrorCode::UnsupportedCodec, format!("a raw MPEG video stream is written as mpeg2video, not {}", s.codec.name()))
+                .alternatives([CodecId::Mpeg2Video.name()]));
+        }
+        Ok(())
+    }
+
+    fn write_packet(&mut self, p: &Packet) -> Result<()> {
+        // the first picture must open with a start code, or the file is not a video stream
+        if !self.started {
+            if !p.data.starts_with(&[0, 0, 1]) {
+                return Err(Error::new(ErrorCode::Internal, "encoder output is not MPEG video (no start code)"));
+            }
+            self.started = true;
+        }
+        self.out.write_all(&p.data)?;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        self.out.flush()?;
+        Ok(())
     }
 }
 

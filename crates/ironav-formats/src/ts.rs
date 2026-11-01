@@ -12,7 +12,9 @@
 //!
 //! Writing: one program; video gets PID 0x100 and carries the PCR, the others follow. The PAT and
 //! PMT go before every video keyframe and at least twice a second. H.264 and HEVC access units are
-//! written as Annex B behind an access unit delimiter; AAC gets an ADTS header per frame. Packets
+//! written as Annex B behind an access unit delimiter; AAC gets an ADTS header per frame; MPEG-2
+//! video pictures are written as they are (stream type 0x02), with keyframes from their picture
+//! headers. Packets
 //! carry presentation times only, in decode order, so a decode time is made for video from the
 //! presentation times seen so far: the one `REORDER` places back in their sorted order, which is
 //! never after a presentation time when pictures are reordered by at most that many places.
@@ -27,7 +29,7 @@
 //! AC-3 is written as stream type 0x81 with the `AC-3` registration descriptor, the way FFmpeg writes
 //! it by default (the DVB descriptor 0x6A form is read, not written), in private_stream_1 PES packets.
 //!
-//! Not handled: MPEG-2 video (skipped when reading, refused when writing), more than one program, and
+//! Not handled: more than one program, and
 //! PMT changes after the first.
 
 use crate::stream::{StreamDemuxer, StreamPacket};
@@ -1092,6 +1094,7 @@ impl TsMuxer {
             let ty = match s.codec {
                 CodecId::H264 => 0x1B,
                 CodecId::Hevc => 0x24,
+                CodecId::Mpeg2Video => 0x02,
                 CodecId::Aac => 0x0F,
                 CodecId::Opus => 0x06,
                 CodecId::Ac3 => 0x81,
@@ -1124,7 +1127,7 @@ impl Muxer for TsMuxer {
         let video = streams.iter().position(|s| s.params.media_type() == ironav_core::MediaType::Video);
         for (i, s) in streams.iter().enumerate() {
             let (adts, opus) = match s.codec {
-                CodecId::H264 | CodecId::Hevc | CodecId::Mp3 | CodecId::Mp2 | CodecId::Ac3 => (None, None),
+                CodecId::H264 | CodecId::Hevc | CodecId::Mpeg2Video | CodecId::Mp3 | CodecId::Mp2 | CodecId::Ac3 => (None, None),
                 CodecId::Aac => {
                     let [a, b, ..] = s.extradata[..] else {
                         return Err(Error::new(ErrorCode::UnsupportedFormat, "AAC in a transport stream needs the AudioSpecificConfig").hint("encode to aac, or copy from a file that carries it"));
@@ -1143,7 +1146,7 @@ impl Muxer for TsMuxer {
                     (None, Some((code, u16::from_le_bytes([s.extradata[10], s.extradata[11]]) as u32)))
                 }
                 c => {
-                    return Err(Error::new(ErrorCode::UnsupportedCodec, format!("a transport stream cannot hold {} here", c.name())).alternatives(["h264", "hevc", "aac", "mp3", "opus", "mp2", "ac3"]));
+                    return Err(Error::new(ErrorCode::UnsupportedCodec, format!("a transport stream cannot hold {} here", c.name())).alternatives(["h264", "hevc", "mpeg2video", "aac", "mp3", "opus", "mp2", "ac3"]));
                 }
             };
             // video first, so it gets 0x100 and carries the PCR
@@ -1163,7 +1166,7 @@ impl Muxer for TsMuxer {
             return Err(Error::new(ErrorCode::Internal, "a packet for a stream the header did not have"));
         };
         let pts = Rational::rescale(p.pts, s.tb, Rational::new(1, CLOCK)) + OFFSET;
-        let video = matches!(s.codec, CodecId::H264 | CodecId::Hevc);
+        let video = matches!(s.codec, CodecId::H264 | CodecId::Hevc | CodecId::Mpeg2Video);
         let (dts, key) = if video {
             let at = s.seen.partition_point(|&x| x < pts);
             s.seen.insert(at, pts);
@@ -1180,7 +1183,8 @@ impl Muxer for TsMuxer {
             // never after its presentation time, even if the stream reorders more than allowed
             let dts = dts.max(s.last_dts.saturating_add(1)).min(pts);
             s.last_dts = dts;
-            (dts, is_keyframe(s.codec, &p.data))
+            let key = if s.codec == CodecId::Mpeg2Video { crate::keyframe::is_keyframe(s.codec, &p.data) == Some(true) } else { is_keyframe(s.codec, &p.data) };
+            (dts, key)
         } else {
             (pts, true)
         };

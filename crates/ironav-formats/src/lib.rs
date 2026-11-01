@@ -94,11 +94,11 @@ pub static FORMATS: &[FormatSpec] = &[
     FormatSpec {
         name: "mp4",
         extensions: &["mp4", "m4a", "m4v"],
-        description: "MP4 (ISO BMFF) with H.264 or HEVC video (or VP9 or AV1 copied from another file, or MPEG-4 Part 2 `mp4v` video, copied or encoded by IronAV) and optionally AAC, MP2, AC-3, FLAC or ALAC audio (AAC copied or encoded, MP2 encoded or copied, AC-3 copied or encoded, with its dac3 box). Read as well as written; written with the index first (fast-start), or fragmented (moov, then a moof and mdat per fragment) when a fragment length is given; fragmented files are read too",
+        description: "MP4 (ISO BMFF) with H.264 or HEVC video (or VP9 or AV1 copied from another file, or MPEG-4 Part 2 or MPEG-2 `mp4v` video, copied or encoded by IronAV) and optionally AAC, MP2, AC-3, FLAC or ALAC audio (AAC copied or encoded, MP2 encoded or copied, AC-3 copied or encoded, with its dac3 box). Read as well as written; written with the index first (fast-start), or fragmented (moov, then a moof and mdat per fragment) when a fragment length is given; fragmented files are read too",
         media: MediaType::Video,
         demux: true,
         mux: true,
-        codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Mpeg4, CodecId::Vp9, CodecId::Av1, CodecId::Aac, CodecId::Mp2, CodecId::Ac3, CodecId::Flac, CodecId::Alac],
+        codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Mpeg4, CodecId::Mpeg2Video, CodecId::Vp9, CodecId::Av1, CodecId::Aac, CodecId::Mp2, CodecId::Ac3, CodecId::Flac, CodecId::Alac],
     },
     FormatSpec {
         name: "mov",
@@ -112,11 +112,11 @@ pub static FORMATS: &[FormatSpec] = &[
     FormatSpec {
         name: "mkv",
         extensions: &["mkv", "mka"],
-        description: "Matroska: read (also WebM, with any codec the file holds) and written with H.264, HEVC, VP8, VP9, AV1 or Motion-JPEG or MPEG-4 Part 2 video (copied; VP8, MJPEG and MPEG-4 also encoded by IronAV where it has the codec) and AAC, FLAC, MP3, MP2 (read, copied or encoded), Opus, Vorbis or PCM audio copied or encoded (PCM as integer or float, little- or big-endian); any number of tracks of each kind; no SeekHead",
+        description: "Matroska: read (also WebM, with any codec the file holds) and written with H.264, HEVC, VP8, VP9, AV1 or Motion-JPEG or MPEG-4 Part 2 or MPEG-2 video (copied; VP8, MJPEG, MPEG-4 and MPEG-2 also encoded by IronAV where it has the codec) and AAC, FLAC, MP3, MP2 (read, copied or encoded), Opus, Vorbis or PCM audio copied or encoded (PCM as integer or float, little- or big-endian); any number of tracks of each kind; no SeekHead",
         media: MediaType::Video,
         demux: true,
         mux: true,
-        codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Vp8, CodecId::Vp9, CodecId::Av1, CodecId::Mjpeg, CodecId::Mpeg4, CodecId::Aac, CodecId::Mp3, CodecId::Mp2, CodecId::Ac3, CodecId::Opus, CodecId::Vorbis, CodecId::Flac, CodecId::PcmU8, CodecId::PcmS16Le, CodecId::PcmS24Le, CodecId::PcmS32Le, CodecId::PcmF32Le, CodecId::PcmF64Le],
+        codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Vp8, CodecId::Vp9, CodecId::Av1, CodecId::Mjpeg, CodecId::Mpeg4, CodecId::Mpeg2Video, CodecId::Aac, CodecId::Mp3, CodecId::Mp2, CodecId::Ac3, CodecId::Opus, CodecId::Vorbis, CodecId::Flac, CodecId::PcmU8, CodecId::PcmS16Le, CodecId::PcmS24Le, CodecId::PcmS32Le, CodecId::PcmF32Le, CodecId::PcmF64Le],
     },
     FormatSpec {
         name: "mp3",
@@ -184,10 +184,10 @@ pub static FORMATS: &[FormatSpec] = &[
     FormatSpec {
         name: "m2v",
         extensions: &["m2v", "mpv", "m1v"],
-        description: "Raw MPEG-1 or MPEG-2 video elementary stream (4:2:0 or 4:2:2, progressive or interlaced); read at the sequence header's frame rate, one packet per frame",
+        description: "Raw MPEG-1 or MPEG-2 video elementary stream (4:2:0 or 4:2:2, progressive or interlaced); read at the sequence header's frame rate, one packet per frame; MPEG-2 video is written as well, each packet's bytes as they are (MPEG-1 is read only)",
         media: MediaType::Video,
         demux: true,
-        mux: false,
+        mux: true,
         codecs: &[CodecId::Mpeg2Video, CodecId::Mpeg1Video],
     },
     FormatSpec {
@@ -202,11 +202,11 @@ pub static FORMATS: &[FormatSpec] = &[
     FormatSpec {
         name: "mpegts",
         extensions: &["ts", "m2ts", "mts"],
-        description: "MPEG transport stream (broadcast, IPTV, HLS segments); 192-byte M2TS packets are read too; AC-3 is read (stream type 0x81, or 0x06 with the AC-3 descriptor) and written as 0x81 with the AC-3 registration descriptor",
+        description: "MPEG transport stream (broadcast, IPTV, HLS segments); 192-byte M2TS packets are read too; MPEG-2 video is read and written (stream type 0x02); AC-3 is read (stream type 0x81, or 0x06 with the AC-3 descriptor) and written as 0x81 with the AC-3 registration descriptor",
         media: MediaType::Video,
         demux: true,
         mux: true,
-        codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Aac, CodecId::Mp3, CodecId::Opus, CodecId::Mp2, CodecId::Ac3],
+        codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Mpeg2Video, CodecId::Aac, CodecId::Mp3, CodecId::Opus, CodecId::Mp2, CodecId::Ac3],
     },
 ];
 
@@ -318,6 +318,7 @@ pub fn create_muxer_with(path: &Path, format: &str, fragment_seconds: Option<f64
         "webm" => Ok(Box::new(mkvwrite::MatroskaWriter::webm(out))),
         "h264" => Ok(Box::new(annexb::AnnexBMuxer::new(out, CodecId::H264))),
         "hevc" => Ok(Box::new(annexb::AnnexBMuxer::new(out, CodecId::Hevc))),
+        "m2v" => Ok(Box::new(mpegvideo::MpegVideoMuxer::new(out))),
         "mpegts" => Ok(Box::new(ts::TsMuxer::new(out))),
         _ => Err(Error::new(ErrorCode::UnsupportedFormat, format!("format '{format}' cannot be written"))),
     }

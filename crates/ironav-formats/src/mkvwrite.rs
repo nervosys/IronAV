@@ -105,7 +105,7 @@ fn holds_aac_end(t: &Track) -> bool {
 }
 
 fn self_contained(codec: CodecId) -> bool {
-    matches!(codec, CodecId::Vp8 | CodecId::Vp9 | CodecId::Av1 | CodecId::Mjpeg | CodecId::Mpeg4)
+    matches!(codec, CodecId::Vp8 | CodecId::Vp9 | CodecId::Av1 | CodecId::Mjpeg | CodecId::Mpeg4 | CodecId::Mpeg2Video)
 }
 
 struct Cluster {
@@ -202,7 +202,7 @@ impl MatroskaWriter {
             CodecId::H264 => Some(avcc_body(&t.params, &missing)?),
             CodecId::Hevc => Some(hvcc_body(&t.params, &missing)?),
             CodecId::Vp8 | CodecId::Vp9 | CodecId::Mjpeg => None,
-            CodecId::Av1 | CodecId::Mpeg4 | CodecId::Aac | CodecId::Opus | CodecId::Vorbis => Some(t.stream.extradata.clone()),
+            CodecId::Av1 | CodecId::Mpeg4 | CodecId::Mpeg2Video | CodecId::Aac | CodecId::Opus | CodecId::Vorbis => Some(t.stream.extradata.clone()),
             CodecId::Flac => {
                 let (rate, channels, bits) = flac_audio_params(&t.stream)?;
                 let mut v = b"fLaC".to_vec();
@@ -258,6 +258,7 @@ impl MatroskaWriter {
                 CodecId::Av1 => "V_AV1",
                 CodecId::Mjpeg => "V_MJPEG",
                 CodecId::Mpeg4 => "V_MPEG4/ISO/SP",
+                CodecId::Mpeg2Video => "V_MPEG2",
                 CodecId::Aac => "A_AAC",
                 CodecId::Flac => "A_FLAC",
                 CodecId::Opus => "A_OPUS",
@@ -398,9 +399,9 @@ impl MatroskaWriter {
         } else if self.tracks[t].video && self.tracks[t].stream.codec == CodecId::Mjpeg {
             // every JPEG picture stands alone
             (p.data.clone(), true)
-        } else if self.tracks[t].video && self.tracks[t].stream.codec == CodecId::Mpeg4 {
-            // an MPEG-4 picture is stored as it is; it is a key picture when its coding type is I
-            (p.data.clone(), crate::keyframe::is_keyframe(CodecId::Mpeg4, &p.data) != Some(false))
+        } else if self.tracks[t].video && matches!(self.tracks[t].stream.codec, CodecId::Mpeg4 | CodecId::Mpeg2Video) {
+            // an MPEG-4 or MPEG-2 picture is stored as it is; it is a key picture when its coding type is I
+            (p.data.clone(), crate::keyframe::is_keyframe(self.tracks[t].stream.codec, &p.data) != Some(false))
         } else if self.tracks[t].video {
             let hevc = self.tracks[t].stream.codec == CodecId::Hevc;
             match annexb_sample(hevc, &mut self.tracks[t].params, &p.data) {
@@ -450,7 +451,7 @@ impl Muxer for MatroskaWriter {
                     }
                     true
                 }
-                (StreamParams::Video { .. }, CodecId::H264 | CodecId::Hevc | CodecId::Vp8 | CodecId::Vp9 | CodecId::Mjpeg | CodecId::Mpeg4) => true,
+                (StreamParams::Video { .. }, CodecId::H264 | CodecId::Hevc | CodecId::Vp8 | CodecId::Vp9 | CodecId::Mjpeg | CodecId::Mpeg4 | CodecId::Mpeg2Video) => true,
                 (StreamParams::Audio { .. }, CodecId::Aac | CodecId::Opus | CodecId::Vorbis) => {
                     if s.extradata.is_empty() {
                         return Err(Error::new(ErrorCode::UnsupportedFormat, format!("{} needs its codec configuration to go into Matroska", s.codec.name()))
@@ -463,9 +464,9 @@ impl Muxer for MatroskaWriter {
                 _ => {
                     return Err(Error::new(
                         ErrorCode::UnsupportedCodec,
-                        format!("this Matroska writer holds h264, hevc, vp8, vp9, av1, mjpeg, aac, flac, mp3, ac3, opus, vorbis and pcm, not {}", s.codec.name()),
+                        format!("this Matroska writer holds h264, hevc, vp8, vp9, av1, mjpeg, mpeg2video, aac, flac, mp3, ac3, opus, vorbis and pcm, not {}", s.codec.name()),
                     )
-                    .alternatives(["h264", "hevc", "vp8", "vp9", "av1", "mjpeg", "aac", "flac", "mp3", "ac3", "opus", "vorbis", "pcm_s16le"]));
+                    .alternatives(["h264", "hevc", "vp8", "vp9", "av1", "mjpeg", "mpeg2video", "aac", "flac", "mp3", "ac3", "opus", "vorbis", "pcm_s16le"]));
                 }
             };
             if s.time_base.den <= 0 || s.time_base.num <= 0 {
