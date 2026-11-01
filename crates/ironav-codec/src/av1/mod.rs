@@ -45,8 +45,6 @@ struct RefSlot {
     state: RefState,
     /// The CDFs the frame ended with, for frames that load them.
     cdfs: Arc<Cdfs>,
-    /// The grain parameters of the frame, which a show_existing_frame of it applies.
-    grain: Option<film_grain::FilmGrain>,
 }
 
 /// The frame whose tile groups are being decoded.
@@ -250,8 +248,9 @@ impl Av1Decoder {
             feature_enabled: h.feature_enabled,
             feature_data: h.feature_data,
             gm_params: h.gm_params,
+            grain: h.grain.clone(),
         };
-        let slot = RefSlot { pic: pic.clone(), state, cdfs: Arc::from(cdfs), grain: h.grain.clone() };
+        let slot = RefSlot { pic: pic.clone(), state, cdfs: Arc::from(cdfs) };
         for i in 0..8 {
             if h.refresh_frame_flags >> i & 1 == 1 {
                 self.refs[i] = Some(slot.clone());
@@ -270,7 +269,7 @@ impl Av1Decoder {
                 *r = Some(slot.clone());
             }
         }
-        self.emit(&slot.pic, slot.grain.as_ref(), pts)
+        self.emit(&slot.pic, slot.state.grain.as_ref(), pts)
     }
 
     fn emit(&mut self, p: &Picture, grain: Option<&film_grain::FilmGrain>, pts: i64) -> Result<()> {

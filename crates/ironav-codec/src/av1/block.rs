@@ -758,13 +758,11 @@ impl FrameDec {
             self.b.seg = 0;
             return;
         }
-        if !pre_skip {
-            if self.b.skip {
-                self.above_seg_pred[c..c + bw4].fill(0);
-                self.left_seg_pred[r..r + bh4].fill(0);
-                self.intra_segment_id(t);
-                return;
-            }
+        if !pre_skip && self.b.skip {
+            self.above_seg_pred[c..c + bw4].fill(0);
+            self.left_seg_pred[r..r + bh4].fill(0);
+            self.intra_segment_id(t);
+            return;
         }
         if self.h.seg_temporal_update {
             let ctx = self.left_seg_pred[r] as usize + self.above_seg_pred[c] as usize;

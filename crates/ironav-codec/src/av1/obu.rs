@@ -24,10 +24,6 @@ pub fn invalid(msg: impl Into<String>) -> Error {
     Error::new(ErrorCode::InvalidInput, format!("AV1: {}", msg.into()))
 }
 
-fn unsupported(msg: impl Into<String>) -> Error {
-    Error::new(ErrorCode::UnsupportedFormat, format!("AV1: {}", msg.into()))
-}
-
 /// MSB-first bit reader over a byte slice (the spec's f(n) and friends).
 pub struct Bits<'a> {
     data: &'a [u8],
@@ -488,7 +484,7 @@ pub const GM_IDENTITY: [i32; 6] = [0, 0, 1 << 16, 0, 0, 1 << 16];
 pub const GM_TRANSLATION: u8 = 1;
 
 /// What the frame header reads of a reference slot.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct RefState {
     pub frame_type: u8,
     pub order_hint: u32,
@@ -501,6 +497,8 @@ pub struct RefState {
     pub feature_enabled: [[bool; 8]; 8],
     pub feature_data: [[i32; 8]; 8],
     pub gm_params: [[i32; 6]; 8],
+    /// The film grain parameters, which a show_existing_frame applies and later frames may load.
+    pub grain: Option<film_grain::FilmGrain>,
 }
 
 /// The reference slots as the frame header sees them.
@@ -723,7 +721,7 @@ pub fn parse_frame_header(data: &[u8], seq: &SequenceHeader, refs: &RefInfo, tem
         global_motion_params(&mut b, &mut h, &prev_gm)?;
     }
     if seq.film_grain_params_present && (h.show_frame || h.showable_frame) {
-        h.grain = film_grain::parse(&mut b, seq, h.frame_type == INTER_FRAME)?;
+        h.grain = film_grain::parse(&mut b, seq, h.frame_type == INTER_FRAME, refs)?;
     }
     b.byte_align();
     h.header_bytes = b.byte_pos();

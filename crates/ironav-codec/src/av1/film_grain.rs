@@ -4,7 +4,7 @@
 
 use super::grain_tables::GAUSSIAN_SEQUENCE;
 use super::ipred::Plane;
-use super::obu::{Bits, SequenceHeader};
+use super::obu::{Bits, RefInfo, SequenceHeader};
 use ironav_core::{Error, ErrorCode, Result};
 
 /// The film grain parameters of a frame, with the AR coefficients and multipliers already offset.
@@ -31,13 +31,17 @@ const GH: usize = 73;
 const BLOCK: usize = 32;
 
 /// film_grain_params: None when the frame has no grain.
-pub fn parse(b: &mut Bits, seq: &SequenceHeader, inter: bool) -> Result<Option<FilmGrain>> {
+pub fn parse(b: &mut Bits, seq: &SequenceHeader, inter: bool, refs: &RefInfo) -> Result<Option<FilmGrain>> {
     if !b.flag()? {
         return Ok(None);
     }
     let mut g = FilmGrain { seed: b.f(16)?, sub: [seq.subsampling_x as usize, seq.subsampling_y as usize], ..Default::default() };
     if inter && !b.flag()? {
-        return Err(Error::new(ErrorCode::UnsupportedFormat, "AV1: film grain parameters of a reference frame are not decoded yet"));
+        // load_grain_params, keeping the new seed
+        let i = b.f(3)? as usize;
+        let r = refs.slots[i].as_ref().and_then(|s| s.grain.as_ref());
+        let r = r.ok_or_else(|| Error::new(ErrorCode::InvalidInput, "AV1: film grain loaded from a reference that has none"))?;
+        return Ok(Some(FilmGrain { seed: g.seed, ..r.clone() }));
     }
     let ny = b.f(4)? as usize;
     for _ in 0..ny {
@@ -328,4 +332,30 @@ pub fn apply(g: &FilmGrain, src: &[Plane; 3], w: usize, h: usize, bd: u32, num_p
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::obu::RefState;
+    use super::*;
+
+    #[test]
+    fn inter_frames_load_grain_from_a_reference() {
+        // apply_grain 1, grain_seed 0x1234, update_grain 0, film_grain_params_ref_idx 2
+        let bits = [(1, 1), (0x1234, 16), (0, 1), (2, 3)];
+        let (mut acc, mut n) = (0u32, 0);
+        for (v, w) in bits {
+            acc = acc << w | v;
+            n += w;
+        }
+        let data = (acc << (32 - n)).to_be_bytes();
+        let seq = SequenceHeader { subsampling_x: true, subsampling_y: true, ..Default::default() };
+        let g = FilmGrain { seed: 7, scaling_shift: 9, ar_lag: 2, overlap: true, ..Default::default() };
+        let mut refs = RefInfo { slots: Default::default() };
+        refs.slots[2] = Some(RefState { grain: Some(g), ..Default::default() });
+        let got = parse(&mut Bits::new(&data), &seq, true, &refs).unwrap().unwrap();
+        assert_eq!((got.seed, got.scaling_shift, got.ar_lag, got.overlap), (0x1234, 9, 2, true));
+        refs.slots[2] = Some(RefState::default());
+        assert!(parse(&mut Bits::new(&data), &seq, true, &refs).is_err());
+    }
 }

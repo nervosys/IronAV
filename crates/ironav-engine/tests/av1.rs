@@ -96,6 +96,15 @@ const NO_TOOLS: &str = "enable-cdef=0:enable-restoration=0:enable-obmc=0:enable-
 /// The deblocking filter on, CDEF and loop restoration off.
 const DEBLOCK: &str = "enable-cdef=0:enable-restoration=0";
 
+/// Every inter tool libaom picks by itself; intra block copy off (cpu-used 2 and below use it).
+const TOOLS: &str = "enable-cdef=0:enable-restoration=0:enable-intrabc=0";
+
+/// Every inter tool forced on, for cpu-used 1.
+const ALL_TOOLS: &str = "enable-cdef=0:enable-restoration=0:enable-intrabc=0:enable-interintra-comp=1:enable-smooth-interintra=1:enable-interintra-wedge=1:enable-interinter-wedge=1:enable-dist-wtd-comp=1:enable-dual-filter=1";
+
+const P_ONLY: &[&str] = &["-crf", "30", "-lag-in-frames", "0"];
+const ALTREF: &[&str] = &["-crf", "30"];
+
 const TESTSRC: &str = "testsrc2=size=128x72:rate=25";
 
 macro_rules! need_ffmpeg {
@@ -220,11 +229,11 @@ fn other_containers_decode_bit_exactly() {
 fn unsupported_tools_are_refused() {
     need_ffmpeg!();
     let d = scratch("refuse");
-    let cases = [("inter.webm", DEBLOCK, vec!["-g", "10"], "inter frames")];
-    for (file, params, g, want) in cases {
+    // intra block copy: libaom uses it for screen content at cpu-used 2
+    let cases = [("intrabc.webm", "tune-content=screen:enable-intrabc=1", "testsrc=size=320x180:rate=25", "2", "intra block copy")];
+    for (file, params, lavfi, cpu, want) in cases {
         let src = d.join(file);
-        let mut enc = vec!["-f", "lavfi", "-i", "testsrc2=size=320x180:rate=25", "-frames:v", "3", "-c:v", "libaom-av1", "-cpu-used", "6", "-crf", "30", "-aom-params", params];
-        enc.extend(g);
+        let mut enc = vec!["-f", "lavfi", "-i", lavfi, "-frames:v", "1", "-c:v", "libaom-av1", "-cpu-used", cpu, "-crf", "30", "-aom-params", params];
         enc.push(src.to_str().unwrap());
         assert!(ffmpeg(&enc));
         let j = Job { input: src.display().to_string(), output: d.join("out.y4m").display().to_string(), hwaccel: "off".into(), ..Job::default() };
@@ -235,30 +244,69 @@ fn unsupported_tools_are_refused() {
 }
 
 #[test]
-fn inter_dev() {
+fn p_frames_decode_bit_exactly() {
     need_ffmpeg!();
-    let name = std::env::var("AV1_CASE").unwrap_or_default();
-    if name.is_empty() {
-        return;
-    }
-    let params = std::env::var("AV1_PARAMS").unwrap_or(NO_TOOLS.into());
-    let args: Vec<String> = std::env::var("AV1_ARGS").unwrap_or("-crf 30 -lag-in-frames 0".into()).split(' ').map(String::from).collect();
-    let args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    let src = std::env::var("AV1_SRC").unwrap_or(TESTSRC.into());
-    let frames: u32 = std::env::var("AV1_FRAMES").map_or(3, |v| v.parse().unwrap());
-    let cpu = std::env::var("AV1_CPU").unwrap_or("6".into());
-    let pix_fmt = std::env::var("AV1_PIXFMT").ok().filter(|s| !s.is_empty()).unwrap_or("yuv420p".into());
-    let container = std::env::var("AV1_CONTAINER").ok().filter(|s| !s.is_empty()).unwrap_or("webm".into());
-    eprintln!("{name}: {} bytes equal", check(&Case { pix_fmt: &pix_fmt, container: &container, ..inter(&name, &src, &params, &args, frames, &cpu) }));
+    check(&inter("p-plain", TESTSRC, NO_TOOLS, P_ONLY, 8, "6"));
+    check(&inter("p-tools", TESTSRC, TOOLS, P_ONLY, 8, "6"));
 }
 
 #[test]
-fn speed_dev() {
-    let Ok(src) = std::env::var("AV1_SPEED") else { return };
-    let out = std::env::temp_dir().join("ironav-av1-speed.y4m");
-    let j = Job { input: src.clone(), output: out.display().to_string(), hwaccel: "off".into(), ..Job::default() };
-    let t = std::time::Instant::now();
-    run(&j, &mut |_| {}).unwrap();
-    eprintln!("{src}: {:?}", t.elapsed());
-    let _ = std::fs::remove_file(&out);
+fn altref_and_hidden_frames_decode_bit_exactly() {
+    need_ffmpeg!();
+    // altrefs, overlays, show_existing_frame, compound and skip mode
+    check(&inter("altref-plain", TESTSRC, NO_TOOLS, ALTREF, 10, "6"));
+    check(&inter("altref", TESTSRC, TOOLS, ALTREF, 10, "6"));
+}
+
+#[test]
+fn encoder_speeds_decode_bit_exactly() {
+    need_ffmpeg!();
+    let src = "testsrc2=size=160x90:rate=25";
+    for cpu in ["8", "4", "2"] {
+        check(&inter(&format!("cpu{cpu}"), src, TOOLS, ALTREF, 8, cpu));
+        check(&inter(&format!("cpu{cpu}-p"), src, TOOLS, P_ONLY, 6, cpu));
+    }
+}
+
+#[test]
+fn motion_tools_decode_bit_exactly() {
+    need_ffmpeg!();
+    // a zoom: global and local warp, OBMC, wedges, interintra, switchable filters
+    let zoom = "mandelbrot=size=192x108:rate=25:start_scale=3:end_scale=0.3";
+    check(&inter("zoom", zoom, ALL_TOOLS, ALTREF, 10, "1"));
+    check(&inter("life", "life=size=160x90:rate=25:mold=10:ratio=0.5", TOOLS, ALTREF, 10, "2"));
+}
+
+#[test]
+fn inter_formats_decode_bit_exactly() {
+    need_ffmpeg!();
+    for (name, pix_fmt) in [("inter-10bit", "yuv420p10le"), ("inter-12bit", "yuv420p12le"), ("inter-444", "yuv444p"), ("inter-422", "yuv422p"), ("inter-gray", "gray")] {
+        check(&Case { pix_fmt, ..inter(name, TESTSRC, TOOLS, ALTREF, 6, "6") });
+    }
+    assert_eq!(check(&inter("inter-odd", "testsrc2=size=130x74:rate=25", TOOLS, ALTREF, 6, "4")), 6 * (130 * 74 + 2 * 65 * 37));
+    for container in ["mkv", "mp4"] {
+        check(&Case { container, ..inter(container, TESTSRC, TOOLS, ALTREF, 6, "6") });
+    }
+}
+
+#[test]
+fn post_filters_on_inter_frames_decode_bit_exactly() {
+    need_ffmpeg!();
+    let src = "testsrc2=size=160x90:rate=25";
+    check(&inter("inter-cdef-lr", src, "enable-cdef=1:enable-restoration=1:enable-intrabc=0", ALTREF, 8, "4"));
+    check(&inter("inter-qm", src, "enable-intrabc=0:enable-qm=1:qm-min=4:qm-max=10", ALTREF, 6, "6"));
+    // grain on inter, hidden and shown-existing frames (libaom always resends the parameters)
+    let zoom = "mandelbrot=size=160x90:rate=25:start_scale=3:end_scale=0.3";
+    check(&inter("inter-grain", zoom, &format!("{TOOLS}:film-grain-test=1"), ALTREF, 8, "6"));
+    check(&inter("inter-grain-p", zoom, &format!("{TOOLS}:film-grain-test=3"), P_ONLY, 6, "6"));
+}
+
+#[test]
+fn inter_tiles_and_long_streams_decode_bit_exactly() {
+    need_ffmpeg!();
+    check(&inter("inter-tiles", "testsrc2=size=1280x720:rate=25", TOOLS, &["-crf", "35", "-tile-columns", "2", "-tile-rows", "1"], 4, "6"));
+    assert_eq!(check(&inter("long", TESTSRC, TOOLS, ALTREF, 32, "6")), 32 * 128 * 72 * 3 / 2);
+    // segmentation, delta q and error resilience
+    check(&inter("aq", TESTSRC, &format!("{TOOLS}:aq-mode=1:deltaq-mode=1"), ALTREF, 8, "6"));
+    check(&inter("resilient", TESTSRC, &format!("{TOOLS}:error-resilient=1"), P_ONLY, 6, "6"));
 }

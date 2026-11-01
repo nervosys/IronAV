@@ -293,7 +293,7 @@ impl FrameDec {
         if !avail {
             st.zero_ctx = 1;
         }
-        if bh4 >= 2 && bh4 < 16 && bw4 >= 2 && bw4 < 16 {
+        if (2..16).contains(&bh4) && (2..16).contains(&bw4) {
             let (v, hz) = (bh4 as isize, bw4 as isize);
             for (dr, dc) in [(v, -2), (v, hz), (v - 2, hz)] {
                 let (r, c) = ((row & 15) as isize + dr, (col & 15) as isize + dc);

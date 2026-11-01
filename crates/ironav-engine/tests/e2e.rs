@@ -437,10 +437,12 @@ fn schema_and_ontology_know_hardware_codecs() {
     let h264 = o.get("codec/h264").expect("h264 entity");
     assert_eq!(h264.status, ironav_ontology::Status::Implemented);
     assert!(o.get("codec/mpeg4").is_some_and(|e| e.status == ironav_ontology::Status::Implemented));
-    // AV1 has no software codec; it is usable only where the NVDEC provider is compiled in.
+    // AV1 is decoded and encoded in software, so it is usable without a GPU.
     let av1 = o.get("codec/av1").expect("av1 entity");
-    let gpu = cfg!(any(windows, target_os = "linux"));
-    assert_eq!(av1.status, if gpu { ironav_ontology::Status::Implemented } else { ironav_ontology::Status::Planned });
+    assert_eq!(av1.status, ironav_ontology::Status::Implemented);
+    for k in ["software_decode", "software_encode"] {
+        assert_eq!(av1.properties.get(k).and_then(|v| v.as_bool()), Some(true), "av1 {k}");
+    }
 }
 
 fn tone(n: usize) -> Vec<i16> {
@@ -1973,9 +1975,9 @@ fn vp9_and_av1_copy_between_webm_matroska_and_mp4() {
 
 // ---- AV1 -------------------------------------------------------------------------------
 
-/// AV1 is decoded on the GPU when there is one, else in software, which decodes key and
-/// intra-only frames without CDEF only (tests/av1.rs) and refuses these streams precisely. On
-/// the GPU the pictures must equal libdav1d's (AV1 decoding is exact).
+/// AV1 is decoded on the GPU when there is one, else in software (tests/av1.rs), which decodes
+/// key and inter frames and refuses superres and intra block copy by name. Either way the pictures
+/// must equal libdav1d's (AV1 decoding is exact).
 #[test]
 fn av1_decodes_on_the_gpu_to_what_dav1d_decodes_or_refuses_precisely() {
     let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
@@ -1988,9 +1990,17 @@ fn av1_decodes_on_the_gpu_to_what_dav1d_decodes_or_refuses_precisely() {
         let mut off = j.clone();
         off.hwaccel = "off".into();
         assert!(plan(&off).is_ok(), "{name}: AV1 is planned for the software decoder");
-        let e = run(&off, &mut |_| {}).unwrap_err();
-        assert_eq!(e.code, ErrorCode::UnsupportedFormat, "{name}: {}", e.message);
-        assert!(e.message.contains("not decoded yet"), "{name}: {}", e.message);
+        let want = std::fs::read(data.join(format!("av1_{name}.dav1d.yuv"))).unwrap();
+        match run(&off, &mut |_| {}) {
+            Ok(_) => {
+                assert!(y4m_frames_any(&out).concat() == want, "{name}: software pixels differ from libdav1d's");
+                std::fs::remove_file(&out).unwrap();
+            }
+            Err(e) => {
+                assert_eq!(e.code, ErrorCode::UnsupportedFormat, "{name}: {}", e.message);
+                assert!(e.message.contains("not decoded yet") && !e.message.contains("inter frames"), "{name}: {}", e.message);
+            }
+        }
 
         let report = match run(&j, &mut |_| {}) {
             Ok(r) => r,
@@ -1999,9 +2009,10 @@ fn av1_decodes_on_the_gpu_to_what_dav1d_decodes_or_refuses_precisely() {
                 continue;
             }
         };
-        assert_eq!(report.steps[0].hardware_decoder, Some("cuda"));
+        if report.steps[0].hardware_decoder != Some("cuda") {
+            continue; // no GPU: decoded in software, as above
+        }
         let got: Vec<u8> = y4m_frames_any(&out).concat();
-        let want = std::fs::read(data.join(format!("av1_{name}.dav1d.yuv"))).unwrap();
         assert_eq!(got.len(), want.len(), "{name}: size");
         assert!(got == want, "{name}: pixels differ from libdav1d's");
     }
