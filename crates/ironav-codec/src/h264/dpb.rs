@@ -180,6 +180,16 @@ impl Dpb {
         poc
     }
 
+    /// The counts after a picture with memory management operation 5 (8.2.1): the picture's own top
+    /// count is now `top` (its lesser count rebased to 0), and the picture counts after it restart from
+    /// there with frame_num 0.
+    pub fn restart_after_mmco5(&mut self, top: i32) {
+        self.prev_frame_num = 0;
+        self.prev_frame_num_offset = 0;
+        self.prev_poc_msb = 0;
+        self.prev_poc_lsb = top;
+    }
+
     fn frame_num_wrap(&self, frame_num: u32, cur: u32, max: u32) -> i64 {
         if frame_num > cur {
             frame_num as i64 - max as i64

@@ -180,3 +180,37 @@ fn h264_10_bit_annex_b_reads_its_pixel_format_and_decodes_like_ffmpeg() {
     }
     round_trip_as("h264-10bit", "libx264", "h264", "25", (25, 1), 2, "yuv420p10le", &["-preset", "ultrafast", "-profile:v", "high10"]);
 }
+
+#[test]
+fn h264_annex_b_joined_mid_gop_is_read_from_its_first_keyframe() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not on PATH; skipping");
+        return;
+    }
+    let d = scratch("h264-midgop");
+    let src = d.join("src.y4m");
+    let size = format!("testsrc2=size={W}x{H}:rate=25");
+    let n = FRAMES.to_string();
+    ffmpeg(&["-f", "lavfi", "-i", &size, "-frames:v", &n, "-pix_fmt", "yuv420p", src.to_str().unwrap()]);
+    // an IDR picture every four frames and no B pictures, so FFmpeg's output is in decoding order
+    let stream = d.join("full.h264");
+    ffmpeg(&["-i", src.to_str().unwrap(), "-c:v", "libx264", "-bf", "0", "-g", "4", "-preset", "ultrafast", "-f", "h264", stream.to_str().unwrap()]);
+    let full = std::fs::read(&stream).unwrap();
+    // the stream joined mid-way: the sequence parameter set from the start, then the P pictures after
+    // the first IDR picture (their picture parameter set is left out), then the second IDR picture with
+    // its parameter sets
+    let starts: Vec<usize> = (0..full.len() - 3).filter(|&i| full[i..i + 3] == [0, 0, 1]).collect();
+    assert_eq!(full[starts[0] + 3] & 31, 7, "the stream starts with its sequence parameter set");
+    let first_idr = starts.iter().position(|&p| full[p + 3] & 31 == 5).unwrap();
+    let mut joined = full[starts[0]..starts[1]].to_vec();
+    joined.extend_from_slice(&full[starts[first_idr + 1]..]);
+    let cut = d.join("joined.h264");
+    std::fs::write(&cut, &joined).unwrap();
+    // the pictures FFmpeg decodes from the second IDR picture on (the fifth of the eight)
+    let want = ffmpeg_decode(&stream, &d.join("ffmpeg.raw"), "yuv420p");
+    let picture = (W * H * 3 / 2) as usize;
+    let out = d.join("joined.y4m");
+    run(&job(&cut, &out), &mut |_| {}).unwrap();
+    assert_eq!(y4m_bytes(&std::fs::read(&out).unwrap()), want[4 * picture..], "a joined stream decodes from its first keyframe");
+    let _ = std::fs::remove_dir_all(&d);
+}

@@ -5,7 +5,7 @@
 
 use crate::h264::{self, ps as h264ps, Dpb};
 use crate::hevc::ps as hevcps;
-use ironav_core::{CodecId, Error, ErrorCode, Result};
+use ironav_core::CodecId;
 use std::sync::Arc;
 
 pub struct PictureOrder {
@@ -89,12 +89,12 @@ impl PictureOrder {
     }
 
     /// The picture order count of the picture whose first slice is `nal` (with its header), and
-    /// whether the picture starts a coded video sequence. `None` when the parameter sets the slice
-    /// needs have not arrived yet. A picture that resets the counts with memory management operation 5
-    /// is refused: its counts after the reset are not worked out here.
-    pub fn picture(&mut self, nal: &[u8]) -> Result<Option<(i64, bool)>> {
+    /// whether the picture starts a coded video sequence. `None` when the picture's order cannot be
+    /// worked out: its parameter sets have not arrived, or its header does not parse. An H.264 picture
+    /// with memory management operation 5 restarts the counts: it is numbered 0 and starts a sequence.
+    pub fn picture(&mut self, nal: &[u8]) -> Option<(i64, bool)> {
         if nal.len() < 2 {
-            return Err(Error::invalid_input("a slice NAL unit is too short"));
+            return None;
         }
         match &mut self.state {
             State::H264 { dpb, spss, ppss } => {
@@ -102,26 +102,30 @@ impl PictureOrder {
                 let ref_idc = (nal[0] >> 5) as u32 & 3;
                 let rbsp = h264::bits::unescape(&nal[1..]);
                 let Ok(hdr) = h264ps::parse_slice_header(&rbsp, ty, ref_idc, &spss[..], &ppss[..]) else {
-                    return Ok(None);
+                    return None;
                 };
-                let Some(pps) = ppss.get(hdr.pps_id as usize).and_then(|p| p.as_ref()) else { return Ok(None) };
-                let Some(sps) = spss.get(pps.sps_id as usize).and_then(|s| s.as_ref()) else { return Ok(None) };
-                if hdr.marking.ops.iter().any(|op| op.0 == 5) {
-                    return Err(Error::new(ErrorCode::UnsupportedCodec, "H.264 picture order resets with memory management operation 5 are not read as a raw stream"));
-                }
+                let pps = ppss.get(hdr.pps_id as usize).and_then(|p| p.as_ref())?;
+                let sps = spss.get(pps.sps_id as usize).and_then(|s| s.as_ref())?;
                 // a frame's count is the lesser of its fields'
                 let poc = dpb.compute_poc(sps, &hdr);
-                Ok(Some((poc[0].min(poc[1]) as i64, hdr.idr)))
+                let frame = poc[0].min(poc[1]);
+                if hdr.marking.ops.iter().any(|op| op.0 == 5) {
+                    // 8.2.1: the picture's counts are rebased to its own lesser count, and the counts
+                    // after it restart from that; the picture is numbered 0 and starts a sequence
+                    dpb.restart_after_mmco5(poc[0] - frame);
+                    return Some((0, true));
+                }
+                Some((frame as i64, hdr.idr))
             }
             State::Hevc { spss, ppss, first, lsb, msb, last } => {
                 let ty = (nal[0] >> 1) & 63;
                 let tid = (nal[1] & 7).saturating_sub(1);
                 let rbsp = h264::bits::unescape(&nal[2..]);
                 let Ok(hdr) = hevcps::parse_slice_header(&rbsp, ty, tid, &spss[..], &ppss[..], last.as_deref()) else {
-                    return Ok(None);
+                    return None;
                 };
-                let Some(pps) = ppss.get(hdr.pps_id).and_then(|p| p.as_ref()) else { return Ok(None) };
-                let Some(sps) = spss.get(pps.sps_id).and_then(|s| s.as_ref()) else { return Ok(None) };
+                let pps = ppss.get(hdr.pps_id).and_then(|p| p.as_ref())?;
+                let sps = spss.get(pps.sps_id).and_then(|s| s.as_ref())?;
                 let max_lsb = 1i64 << sps.log2_max_poc_lsb;
                 let irap = (16..=23).contains(&ty);
                 // NoRaslOutputFlag: an IDR or BLA picture, or the first picture of the stream
@@ -146,7 +150,7 @@ impl PictureOrder {
                 }
                 *first = false;
                 *last = Some(Box::new(hdr));
-                Ok(Some((msb_now + cur, boundary)))
+                Some((msb_now + cur, boundary))
             }
         }
     }

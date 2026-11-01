@@ -549,9 +549,9 @@ impl AnnexBStream {
     }
 
     /// One whole NAL unit (header first, no start code).
-    fn nal(&mut self, nal: &[u8]) -> Result<()> {
+    fn nal(&mut self, nal: &[u8]) {
         if nal.is_empty() {
-            return Ok(());
+            return;
         }
         let (vcl, first_slice, key, sps, starts_au) = if self.hevc() {
             let ty = (nal[0] >> 1) & 63;
@@ -564,7 +564,7 @@ impl AnnexBStream {
             (vcl, vcl && nal.get(1).is_some_and(|b| b & 0x80 != 0), ty == 5, ty == 7, matches!(ty, 6..=9 | 14..=18))
         };
         if self.au_vcl && (starts_au || first_slice) {
-            self.finish_au()?;
+            self.finish_au();
         }
         let ty = if self.hevc() { (nal[0] >> 1) & 63 } else { nal[0] & 31 };
         let is_params = if self.hevc() { ty == 33 || ty == 34 } else { ty == 7 || ty == 8 };
@@ -575,7 +575,7 @@ impl AnnexBStream {
             self.order.end_of_sequence();
         }
         if vcl && first_slice {
-            self.au_pic = self.order.picture(nal)?;
+            self.au_pic = self.order.picture(nal);
         }
         if sps && self.streams.is_empty() {
             if let Some((w, h)) = ironav_codec::sps_picture_size(self.codec, nal) {
@@ -600,23 +600,35 @@ impl AnnexBStream {
         self.au.extend_from_slice(nal);
         self.au_vcl |= vcl;
         self.au_key |= key;
-        Ok(())
     }
 
-    fn finish_au(&mut self) -> Result<()> {
+    /// Ends the access unit being gathered. Pictures before the first keyframe (or before the sequence
+    /// parameter set) are dropped, as a stream joined mid-way is read from its first keyframe on. A
+    /// picture whose order cannot be worked out (its slices or parameter sets have not parsed) is not
+    /// an error: it goes out in decoding order.
+    fn finish_au(&mut self) {
         let data = std::mem::take(&mut self.au);
         let (vcl, key) = (self.au_vcl, self.au_key);
         let pic = self.au_pic.take();
         (self.au_vcl, self.au_key) = (false, false);
         if !vcl || self.streams.is_empty() || !(self.started || key) {
-            return Ok(());
+            return;
         }
-        let Some((poc, boundary)) = pic else {
-            return Err(Error::invalid_input("a picture whose slices do not parse, or whose parameter sets have not arrived"));
-        };
         self.started = true;
-        self.push(poc, boundary, data, key);
-        Ok(())
+        match pic {
+            Some((poc, boundary)) => self.push(poc, boundary, data, key),
+            None => self.push_unordered(data, key),
+        }
+    }
+
+    /// Queues a picture whose order is unknown: everything before it is numbered first, and it takes
+    /// the next number, so it goes out after the pictures before it and before those after it.
+    fn push_unordered(&mut self, data: Vec<u8>, key: bool) {
+        self.settle_all();
+        self.next_seq += 1;
+        self.queue.push_back(Queued { data, key, out: Some(self.next_out) });
+        self.next_out += 1;
+        self.release();
     }
 
     /// Queues a picture in decoding order. Presentation times come from picture order: the window
@@ -666,11 +678,10 @@ impl AnnexBStream {
     }
 
     /// The end of the input: the access unit in progress and the window come out.
-    fn close(&mut self) -> Result<()> {
-        self.finish_au()?;
+    fn close(&mut self) {
+        self.finish_au();
         self.settle_all();
         self.release();
-        Ok(())
     }
 }
 
@@ -705,7 +716,7 @@ impl StreamDemuxer for AnnexBStream {
                 self.pending.skip(n);
                 if self.ended {
                     self.pending.skip(keep);
-                    self.close()?;
+                    self.close();
                     return Ok(self.ready.pop_front());
                 }
                 return Ok(None);
@@ -720,14 +731,14 @@ impl StreamDemuxer for AnnexBStream {
                     }
                     let nal = nal.to_vec();
                     self.pending.skip(body + len);
-                    self.nal(&nal)?;
+                    self.nal(&nal);
                 }
                 None if self.ended => {
                     let nal = d[body..].to_vec();
                     let n = d.len();
                     self.pending.skip(n);
-                    self.nal(&nal)?;
-                    self.finish_au()?;
+                    self.nal(&nal);
+                    self.finish_au();
                 }
                 None => {
                     self.pending.skip(s0);
