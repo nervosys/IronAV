@@ -37,7 +37,7 @@ pub fn plane_block(b: usize, ssx: usize, ssy: usize) -> usize {
     block_of(MI_W_LOG2[b] as i32 - ssx as i32, MI_H_LOG2[b] as i32 - ssy as i32)
 }
 
-fn partition_subsize(p: usize, b: usize) -> usize {
+pub(crate) fn partition_subsize(p: usize, b: usize) -> usize {
     let (wl, hl) = (MI_W_LOG2[b] as i32, MI_H_LOG2[b] as i32);
     match p {
         0 => b,
@@ -49,7 +49,7 @@ fn partition_subsize(p: usize, b: usize) -> usize {
     }
 }
 
-const INTRA_MODE_CONTEXT: [usize; 13] = [0, 1, 2, 3, 4, 4, 4, 4, 3, 0, 1, 2, 0];
+pub(crate) const INTRA_MODE_CONTEXT: [usize; 13] = [0, 1, 2, 3, 4, 4, 4, 4, 3, 0, 1, 2, 0];
 const FILTER_INTRA_DIR: [u8; 5] = [0, 1, 2, 6, 0];
 const COEFF_BASE_POS_CTX_OFFSET: [usize; 3] = [26, 31, 36];
 
@@ -1376,7 +1376,7 @@ fn neg_deinterleave(diff: i32, r: i32, max: i32) -> i32 {
 
 /// The coefficient context of a non-final coefficient (get_coeff_base_ctx).
 #[inline]
-fn base_ctx(q: &[u32], tx: usize, class: u8, bwl: usize, txh: usize, pos: usize) -> usize {
+pub(crate) fn base_ctx(q: &[u32], tx: usize, class: u8, bwl: usize, txh: usize, pos: usize) -> usize {
     let row = pos >> bwl;
     let col = pos - (row << bwl);
     let mut mag = 0;
@@ -1402,7 +1402,7 @@ fn base_ctx(q: &[u32], tx: usize, class: u8, bwl: usize, txh: usize, pos: usize)
 
 /// The context of the coefficient's base range symbols (get_br_ctx).
 #[inline]
-fn br_ctx(q: &[u32], class: u8, bwl: usize, txh: usize, pos: usize) -> usize {
+pub(crate) fn br_ctx(q: &[u32], class: u8, bwl: usize, txh: usize, pos: usize) -> usize {
     let row = pos >> bwl;
     let col = pos - (row << bwl);
     let mut mag = 0;
@@ -1425,7 +1425,7 @@ fn br_ctx(q: &[u32], class: u8, bwl: usize, txh: usize, pos: usize) -> usize {
 }
 
 /// get_scan.
-fn scan_for(tx: usize, tt: u8) -> &'static [u16] {
+pub(crate) fn scan_for(tx: usize, tt: u8) -> &'static [u16] {
     if tx == TX_16X64 {
         return &DEFAULT_16X32;
     }

@@ -113,7 +113,7 @@ impl<'a> SymbolDecoder<'a> {
 }
 
 /// The adaptation of a CDF after symbol `sym` was read.
-fn update_cdf(cdf: &mut [u16], sym: usize) {
+pub(crate) fn update_cdf(cdf: &mut [u16], sym: usize) {
     let n = cdf.len();
     let count = cdf[n - 1];
     let rate = 3 + (count >> 4) as u32 + (n >> 1).min(2) as u32;

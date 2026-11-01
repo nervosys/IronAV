@@ -248,7 +248,9 @@ fn ontology_answers_conversion_questions() {
     let r = call_tool("ontology_explain_conversion", &json!({ "from": "pcm_s16le", "to": "pcm_f32le" })).unwrap();
     assert_eq!(r["feasible_in_this_build"], true);
     let r = call_tool("ontology_explain_conversion", &json!({ "from": "h264", "to": "av1" })).unwrap();
-    assert_eq!(r["feasible_in_this_build"], false);
+    // AV1 has a software encoder (key frames), so the only blocker that used to apply is gone
+    assert_eq!(r["feasible_in_this_build"], true, "{r}");
+    assert!(r["blockers"].as_array().unwrap().is_empty(), "{r}");
     let e = call_tool("ontology_describe", &json!({ "id": "h265x" })).unwrap_err();
     assert_eq!(e.code, ErrorCode::NotFound);
 }

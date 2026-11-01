@@ -1,0 +1,207 @@
+//! The OBUs of the encoder's stream: temporal delimiter, sequence header and the frame OBU of a
+//! key frame (spec 5.3 to 5.9), and the av1C record that carries the sequence header in a container.
+
+/// seq_level_idx: level 5.1, which covers every size this encoder takes.
+const SEQ_LEVEL: u32 = 13;
+
+pub const OBU_SEQUENCE_HEADER: u8 = 1;
+pub const OBU_TEMPORAL_DELIMITER: u8 = 2;
+pub const OBU_FRAME: u8 = 6;
+
+/// MSB-first bit writer.
+#[derive(Default)]
+pub struct BitWriter {
+    pub buf: Vec<u8>,
+    nbits: usize,
+}
+
+impl BitWriter {
+    fn bit(&mut self, b: u32) {
+        if self.nbits.is_multiple_of(8) {
+            self.buf.push(0);
+        }
+        if b != 0 {
+            *self.buf.last_mut().unwrap() |= 0x80 >> (self.nbits % 8);
+        }
+        self.nbits += 1;
+    }
+
+    /// f(n): the low `n` bits of `v`, most significant first.
+    fn put(&mut self, v: u32, n: u32) {
+        for i in (0..n).rev() {
+            self.bit((v >> i) & 1);
+        }
+    }
+
+    fn byte_align(&mut self) {
+        while !self.nbits.is_multiple_of(8) {
+            self.bit(0);
+        }
+    }
+
+    fn trailing_bits(&mut self) {
+        self.bit(1);
+        self.byte_align();
+    }
+}
+
+/// The number of bits that code `v` (at least one).
+fn bits_for(v: u32) -> u32 {
+    (32 - v.leading_zeros()).max(1)
+}
+
+fn leb128(mut v: usize, out: &mut Vec<u8>) {
+    loop {
+        let b = (v & 0x7F) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(b);
+            return;
+        }
+        out.push(b | 0x80);
+    }
+}
+
+/// One OBU with its size field.
+pub fn obu(kind: u8, payload: &[u8]) -> Vec<u8> {
+    let mut out = vec![(kind << 3) | 0x02];
+    leb128(payload.len(), &mut out);
+    out.extend_from_slice(payload);
+    out
+}
+
+/// The sequence header payload for 8-bit 4:2:0 profile 0 pictures of `width` x `height`: one
+/// operating point, no reduced still picture header, no order hints, screen content tools off,
+/// CDEF and loop restoration off, no superres, no film grain.
+pub fn sequence_header(width: u32, height: u32) -> Vec<u8> {
+    let mut b = BitWriter::default();
+    b.put(0, 3); // seq_profile
+    b.put(0, 1); // still_picture
+    b.put(0, 1); // reduced_still_picture_header
+    b.put(0, 1); // timing_info_present_flag
+    b.put(0, 1); // initial_display_delay_present_flag
+    b.put(0, 5); // operating_points_cnt_minus_1
+    b.put(0, 12); // operating_point_idc[0]
+    b.put(SEQ_LEVEL, 5); // seq_level_idx[0]
+    b.put(0, 1); // seq_tier[0] (levels above 7 carry it)
+    let (wb, hb) = (bits_for(width - 1), bits_for(height - 1));
+    b.put(wb - 1, 4);
+    b.put(hb - 1, 4);
+    b.put(width - 1, wb);
+    b.put(height - 1, hb);
+    b.put(0, 1); // frame_id_numbers_present_flag
+    b.put(0, 1); // use_128x128_superblock
+    b.put(0, 1); // enable_filter_intra
+    b.put(1, 1); // enable_intra_edge_filter
+    b.put(0, 1); // enable_interintra_compound
+    b.put(0, 1); // enable_masked_compound
+    b.put(0, 1); // enable_warped_motion
+    b.put(0, 1); // enable_dual_filter
+    b.put(0, 1); // enable_order_hint
+    b.put(0, 1); // seq_choose_screen_content_tools
+    b.put(0, 1); // seq_force_screen_content_tools (no integer MV syntax follows)
+    b.put(0, 1); // enable_superres
+    b.put(0, 1); // enable_cdef
+    b.put(0, 1); // enable_restoration
+    // color_config: 8 bits, not monochrome, no colour description, limited range, 4:2:0
+    b.put(0, 1); // high_bitdepth
+    b.put(0, 1); // mono_chrome
+    b.put(0, 1); // color_description_present_flag
+    b.put(0, 1); // color_range
+    b.put(0, 2); // chroma_sample_position
+    b.put(0, 1); // separate_uv_delta_q
+    b.put(0, 1); // film_grain_params_present
+    b.trailing_bits();
+    b.buf
+}
+
+/// The tile layout of a single tile: the uniform spacing syntax with every increment left at zero.
+/// Frames the encoder cannot code in one tile (more superblocks than the minimum tile count allows)
+/// are rejected by the caller, so the minimum log2 tile counts are zero here.
+fn tile_info(b: &mut BitWriter, mi_cols: usize, mi_rows: usize) {
+    let sb_cols = mi_cols.div_ceil(16);
+    let sb_rows = mi_rows.div_ceil(16);
+    let tile_log2 = |blk: usize, target: usize| {
+        let mut k = 0;
+        while (blk << k) < target {
+            k += 1;
+        }
+        k
+    };
+    b.put(1, 1); // uniform_tile_spacing_flag
+    if tile_log2(1, sb_cols.min(64)) > 0 {
+        b.put(0, 1); // increment_tile_cols_log2
+    }
+    if tile_log2(1, sb_rows.min(64)) > 0 {
+        b.put(0, 1); // increment_tile_rows_log2
+    }
+}
+
+/// The uncompressed header of a shown key frame of the given size and base quantiser index,
+/// byte aligned, as the frame OBU starts with it.
+pub fn key_frame_header(width: u32, height: u32, base_q_idx: u32) -> Vec<u8> {
+    let (mi_cols, mi_rows) = (2 * (width as usize).div_ceil(8), 2 * (height as usize).div_ceil(8));
+    let mut b = BitWriter::default();
+    b.put(0, 1); // show_existing_frame
+    b.put(0, 2); // frame_type: KEY_FRAME
+    b.put(1, 1); // show_frame
+    b.put(0, 1); // disable_cdf_update
+    b.put(0, 1); // frame_size_override_flag
+    b.put(0, 1); // render_and_frame_size_different
+    b.put(1, 1); // disable_frame_end_update_cdf (nothing follows a single key frame)
+    tile_info(&mut b, mi_cols, mi_rows);
+    b.put(base_q_idx, 8);
+    b.put(0, 1); // DeltaQYDc: delta_coded
+    b.put(0, 1); // DeltaQUDc
+    b.put(0, 1); // DeltaQUAc
+    b.put(0, 1); // using_qmatrix
+    b.put(0, 1); // segmentation_enabled
+    b.put(0, 1); // delta_q_present (base_q_idx is above zero)
+    b.put(0, 6); // loop_filter_level[0]: deblocking off
+    b.put(0, 6); // loop_filter_level[1]
+    b.put(0, 3); // loop_filter_sharpness
+    b.put(0, 1); // loop_filter_delta_enabled
+    b.put(0, 1); // tx_mode_select: TX_MODE_LARGEST
+    b.put(0, 1); // reduced_tx_set
+    b.byte_align();
+    b.buf
+}
+
+/// The av1C configuration record for a stream of this encoder: the sequence header as its config OBU.
+pub fn config_record(width: u32, height: u32) -> Vec<u8> {
+    let mut out = vec![
+        0x81,                 // marker and version 1
+        SEQ_LEVEL as u8,      // seq_profile 0, seq_level_idx_0
+        0x0C,                 // seq_tier 0, 8 bits, 4:2:0 (subsampling x and y set), no chroma position
+        0x00,                 // no initial presentation delay
+    ];
+    out.extend(obu(OBU_SEQUENCE_HEADER, &sequence_header(width, height)));
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::av1::obu::{parse_sequence_header, split_obus, Bits};
+
+    #[test]
+    fn sequence_header_parses_back() {
+        let payload = sequence_header(177, 99);
+        let s = parse_sequence_header(&payload).unwrap();
+        assert_eq!((s.max_frame_width, s.max_frame_height), (177, 99));
+        assert_eq!((s.bit_depth, s.subsampling_x, s.subsampling_y), (8, true, true));
+        assert!(!s.reduced_still_picture_header && !s.enable_cdef && !s.enable_restoration);
+    }
+
+    #[test]
+    fn key_frame_header_reads_back() {
+        let hdr = key_frame_header(352, 288, 115);
+        let mut b = Bits::new(&hdr);
+        assert_eq!(b.f(1).unwrap(), 0); // show_existing_frame
+        assert_eq!(b.f(2).unwrap(), 0); // KEY_FRAME
+        assert_eq!(b.f(1).unwrap(), 1); // show_frame
+        let record = config_record(352, 288);
+        let obus = split_obus(&record[4..]).unwrap();
+        assert_eq!(obus[0].kind, OBU_SEQUENCE_HEADER);
+    }
+}

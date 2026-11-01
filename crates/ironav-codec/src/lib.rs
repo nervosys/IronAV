@@ -82,7 +82,7 @@ pub fn implemented() -> Vec<CodecImpl> {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-hevc" });
             }
             if c == CodecId::Av1 {
-                return Some(CodecImpl { codec: c, decode: true, encode: false, implementation: "ironav-av1" });
+                return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-av1" });
             }
             if c == CodecId::Vp8 {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-vp8" });
@@ -374,6 +374,7 @@ pub fn new_encoder_with_opts(codec: CodecId, params: &StreamParams, bits: Option
         (CodecId::Hevc, StreamParams::Video { .. }) => Ok(Box::new(hevc::HevcEncoder::new(params, None, bitrate_kbps.map(|k| k.saturating_mul(1000)))?)),
         (CodecId::Vp8, StreamParams::Video { .. }) => Ok(Box::new(vp8::Vp8Encoder::new(params, None, bitrate_kbps.map(|k| k.saturating_mul(1000)))?)),
         (CodecId::Vp9, StreamParams::Video { .. }) => Ok(Box::new(vp9::Vp9Encoder::new(params, None)?)),
+        (CodecId::Av1, StreamParams::Video { .. }) => Ok(Box::new(av1::enc::Av1Encoder::new(params, None)?)),
         (c, p) if c.media_type() != p.media_type() => Err(Error::invalid_arg(format!(
             "codec {} is {:?} but the stream is {:?}",
             c.name(),
@@ -405,6 +406,7 @@ pub fn encoder_extradata(codec: CodecId, params: &StreamParams) -> Vec<u8> {
         (CodecId::Vorbis, StreamParams::Audio { sample_rate, channels }) => vorbis::encoder_headers(*sample_rate, *channels as usize),
         (CodecId::Aac, StreamParams::Audio { sample_rate, channels }) => aac::audio_specific_config(*sample_rate, *channels as usize),
         (CodecId::ProRes, _) => prores::Profile::Hq.fourcc().to_vec(),
+        (CodecId::Av1, StreamParams::Video { width, height, .. }) => av1::enc::config_record(*width, *height),
         _ => Vec::new(),
     }
 }
