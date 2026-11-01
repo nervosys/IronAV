@@ -14,9 +14,15 @@ use super::quant_tables::*;
 use super::scan_tables::*;
 use super::symbol::{Cdfs, SymbolDecoder};
 use super::tables::*;
-use ironav_core::{Error, ErrorCode, Result};
+use ironav_core::Result;
 
 pub(crate) const DC_PRED: u8 = 0;
+/// interp_filter BILINEAR, the filter of intra block copy.
+pub(crate) const BILINEAR: u8 = 3;
+/// INTRABC_DELAY_PIXELS: how far the default intra block copy vector reaches left of its superblock.
+const INTRABC_DELAY_PIXELS: i32 = 256;
+/// MvCtx of intra block copy vectors, which keep their own MV CDFs.
+const MV_INTRABC_CONTEXT: usize = 1;
 pub(crate) const SMOOTH_PRED: u8 = 9;
 const SMOOTH_H_PRED: u8 = 11;
 const UV_CFL_PRED: u8 = 13;
@@ -72,6 +78,8 @@ pub struct Mi {
     pub pal: [u8; 2],
     /// RefFrames: -1 none, 0 intra, 1 to 7 LAST_FRAME to ALTREF_FRAME.
     pub ref_frame: [i8; 2],
+    /// IsInters: an inter block, or an intra block copy block (RefFrame 0 in an intra frame).
+    pub is_inter: bool,
     pub mv: [Mv; 2],
     pub skip_mode: bool,
     /// InterpFilters by direction (0 vertical, 1 horizontal).
@@ -165,10 +173,6 @@ pub struct Picture {
 pub struct Tile<'a> {
     pub sd: SymbolDecoder<'a>,
     pub cdf: Box<Cdfs>,
-}
-
-fn unsupported(msg: &str) -> Error {
-    Error::new(ErrorCode::UnsupportedFormat, format!("AV1: {msg}"))
 }
 
 /// decode_signed_subexp_with_ref_bool: a value in [`low`, `high`) coded against `r`.
@@ -657,10 +661,34 @@ impl FrameDec {
         self.read_delta_lf(t);
         self.read_deltas = false;
         if self.h.allow_intrabc && t.sd.symbol(&mut t.cdf.intrabc) == 1 {
-            return Err(unsupported("intra block copy is not decoded yet"));
+            self.intrabc_mode_info(t);
+        } else {
+            self.intra_block_mode_info(t, true);
         }
-        self.intra_block_mode_info(t, true);
         Ok(())
+    }
+
+    /// The mode info of an intra block copy block (use_intrabc): an integer displacement into the
+    /// current frame, predicted from the stack of the frame's other intra block copy vectors.
+    fn intrabc_mode_info(&mut self, t: &mut Tile) {
+        let r = self.b.row;
+        self.b.is_inter = true;
+        self.b.y_mode = DC_PRED;
+        self.b.uv_mode = DC_PRED;
+        self.b.interp = [BILINEAR, BILINEAR];
+        self.b.compound_type = COMPOUND_AVERAGE;
+        let st = self.find_mv_stack();
+        // assign_mv: the first non-zero of the two nearest vectors, else a default that points
+        // a superblock up (or, on the tile's top row, a superblock and the delay to the left)
+        let mut pred = st.mv[0][0];
+        if pred == [0, 0] {
+            pred = st.mv[1][0];
+        }
+        if pred == [0, 0] {
+            let sb4 = self.sb4 as i32;
+            pred = if r as i32 - sb4 < self.tile[0] as i32 { [0, -(sb4 * 4 + INTRABC_DELAY_PIXELS) * 8] } else { [-(sb4 * 4 * 8), 0] };
+        }
+        self.b.mv[0] = self.read_mv(t, pred, MV_INTRABC_CONTEXT);
     }
 
     fn inter_frame_mode_info(&mut self, t: &mut Tile) -> Result<()> {
@@ -1075,13 +1103,13 @@ impl FrameDec {
             let (r, c) = (self.b.row, self.b.col);
             let above_w = if self.b.avail_u {
                 let m = self.mi_at(r - 1, c);
-                if m.ref_frame[0] > 0 { 4usize << MI_W_LOG2[m.size as usize] } else { 1usize << TX_W_LOG2[m.tx as usize] }
+                if m.is_inter { 4usize << MI_W_LOG2[m.size as usize] } else { 1usize << TX_W_LOG2[m.tx as usize] }
             } else {
                 0
             };
             let left_h = if self.b.avail_l {
                 let m = self.mi_at(r, c - 1);
-                if m.ref_frame[0] > 0 { 4usize << MI_H_LOG2[m.size as usize] } else { 1usize << TX_H_LOG2[m.tx as usize] }
+                if m.is_inter { 4usize << MI_H_LOG2[m.size as usize] } else { 1usize << TX_H_LOG2[m.tx as usize] }
             } else {
                 0
             };
@@ -1136,6 +1164,7 @@ impl FrameDec {
                 }
                 m.pal = [b.pal_size[0] as u8, b.pal_size[1] as u8];
                 m.ref_frame = b.ref_frame;
+                m.is_inter = b.is_inter;
                 m.mv = b.mv;
                 m.skip_mode = b.skip_mode;
                 m.interp = b.interp;

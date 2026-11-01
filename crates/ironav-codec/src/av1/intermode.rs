@@ -293,7 +293,7 @@ impl FrameDec {
                 let pos = if cm == NEARESTMV || (cm == NEWMV && st.num <= 1) { 0 } else { idx };
                 st.mv[pos][l]
             };
-            self.b.mv[l] = if cm == NEWMV { self.read_mv(t, pred) } else { pred };
+            self.b.mv[l] = if cm == NEWMV { self.read_mv(t, pred, 0) } else { pred };
         }
         let c = &mut t.cdf;
         let sd = &mut t.sd;
@@ -443,21 +443,22 @@ impl FrameDec {
         self.refs[rf as usize].as_ref().is_some_and(|p| p.width != self.h.upscaled_width as usize || p.height != self.h.height as usize)
     }
 
-    fn read_mv(&mut self, t: &mut Tile, pred: Mv) -> Mv {
-        let joint = t.sd.symbol(&mut t.cdf.mv[0].joint);
+    /// read_mv: the difference from `pred`, with the MV CDFs of MvCtx `ctx` (1 for intra block copy).
+    pub(crate) fn read_mv(&mut self, t: &mut Tile, pred: Mv, ctx: usize) -> Mv {
+        let joint = t.sd.symbol(&mut t.cdf.mv[ctx].joint);
         let mut d = [0; 2];
         if joint == 2 || joint == 3 {
-            d[0] = self.read_mv_component(t, 0);
+            d[0] = self.read_mv_component(t, ctx, 0);
         }
         if joint == 1 || joint == 3 {
-            d[1] = self.read_mv_component(t, 1);
+            d[1] = self.read_mv_component(t, ctx, 1);
         }
         [pred[0] + d[0], pred[1] + d[1]]
     }
 
-    fn read_mv_component(&self, t: &mut Tile, comp: usize) -> i32 {
+    fn read_mv_component(&self, t: &mut Tile, ctx: usize, comp: usize) -> i32 {
         let (hp, int) = (self.h.allow_high_precision_mv, self.h.force_integer_mv);
-        let c = &mut t.cdf.mv[0].comp[comp];
+        let c = &mut t.cdf.mv[ctx].comp[comp];
         let sd = &mut t.sd;
         let sign = sd.symbol(&mut c.sign) == 1;
         let class = sd.symbol(&mut c.class);
@@ -506,7 +507,7 @@ impl FrameDec {
                 return 64;
             }
             let m = self.mi_at(row - 1, col);
-            if m.skip && m.ref_frame[0] > 0 {
+            if m.skip && m.is_inter {
                 return 4 << MI_W_LOG2[m.size as usize];
             }
         }
@@ -519,7 +520,7 @@ impl FrameDec {
                 return 64;
             }
             let m = self.mi_at(row, col - 1);
-            if m.skip && m.ref_frame[0] > 0 {
+            if m.skip && m.is_inter {
                 return 4 << MI_H_LOG2[m.size as usize];
             }
         }

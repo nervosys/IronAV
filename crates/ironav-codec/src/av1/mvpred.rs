@@ -130,7 +130,7 @@ impl FrameDec {
     }
 
     fn add_ref_mv_candidate(&self, st: &mut MvStack, m: &Mi, weight: u32) {
-        if m.ref_frame[0] <= 0 {
+        if !m.is_inter {
             return;
         }
         let rf = self.b.ref_frame;

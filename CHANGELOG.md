@@ -31,7 +31,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - **Codecs (AV1, stages 1 to 3):** software decoder for key and intra-only frames: every intra prediction tool, palettes,
   all transforms, lossless coding, tiles, the deblocking filter, CDEF, loop restoration (Wiener, self-guided and
   switchable), quantiser matrices and film grain, at 8, 10 and 12 bits in every chroma layout. It matches libaom bit for
-  bit and is used when no NVIDIA GPU decodes AV1; superres and intra block copy are still refused by name.
+  bit, intra block copy included, and is used when no NVIDIA GPU decodes AV1; superres is still refused by name.
 - **Codecs (AV1, inter frames):** the software decoder decodes inter frames: compound and skip-mode prediction, the
   motion vector stack and projected motion field, dual filters, global and local warped motion, OBMC, wedge, difference-
   and distance-weighted compound, interintra, variable inter transforms, hidden frames, `show_existing_frame` and film
@@ -95,7 +95,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Known limitations
 
-- The software AV1 decoder refuses superres and intra block copy; such AV1 needs an NVIDIA GPU. The AV1 encoder writes key frames only.
+- The software AV1 decoder refuses superres; such AV1 needs an NVIDIA GPU. The AV1 encoder writes key frames only.
 - The software HEVC encoder is Main profile, 8-bit 4:2:0 only, with no sign data hiding or B pictures (its SAO is per-CTB band or edge offsets); wider HEVC encoding needs an NVIDIA GPU.
 - Sound output through a real device has been built but not verified by listening or measurement.
 - IronAV is not yet a drop-in replacement for FFmpeg or HandBrake.

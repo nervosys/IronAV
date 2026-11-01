@@ -1,8 +1,8 @@
 //! A software AV1 decoder: key, intra-only and inter frames at 8, 10 and 12 bits, every
 //! subsampling, tiles, palettes, intra block filters, lossless coding, every inter tool (compound
 //! modes, masks, inter-intra, OBMC, warped and global motion, reference scaling, temporal motion
-//! vectors), the deblocking filter, CDEF, loop restoration, quantiser matrices and film grain.
-//! Superres and intra block copy are refused with an error rather than decoded wrongly.
+//! vectors), intra block copy, the deblocking filter, CDEF, loop restoration, quantiser matrices
+//! and film grain. Superres is refused with an error rather than decoded wrongly.
 
 pub mod block;
 pub mod cdef;
@@ -342,5 +342,20 @@ impl Decoder for Av1Decoder {
     fn decode(&mut self, packet: &Packet) -> Result<Vec<Frame>> {
         self.temporal_unit(&packet.data, packet.pts)?;
         Ok(std::mem::take(&mut self.out))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// FFmpeg's libaom cannot turn superres on, so the refusal is checked on a hand-built header.
+    #[test]
+    fn superres_frames_are_refused() {
+        let mut h = FrameHeader { superres_denom: 8, ..FrameHeader::default() };
+        assert!(check_supported(&h).is_ok());
+        h.superres_denom = 16;
+        let e = check_supported(&h).unwrap_err();
+        assert!(e.to_string().contains("superres"), "{e}");
     }
 }

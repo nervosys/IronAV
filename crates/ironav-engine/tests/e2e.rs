@@ -1976,7 +1976,8 @@ fn vp9_and_av1_copy_between_webm_matroska_and_mp4() {
 // ---- AV1 -------------------------------------------------------------------------------
 
 /// AV1 is decoded on the GPU when there is one, else in software (tests/av1.rs), which decodes
-/// key and inter frames and refuses superres and intra block copy by name. Either way the pictures
+/// key, intra-only and inter frames, intra block copy included, and refuses superres by name.
+/// Either way the pictures
 /// must equal libdav1d's (AV1 decoding is exact).
 #[test]
 fn av1_decodes_on_the_gpu_to_what_dav1d_decodes_or_refuses_precisely() {

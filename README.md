@@ -8,7 +8,7 @@ A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so 
 > Audio codecs, each decoded and encoded: **PCM, FLAC, ALAC, AAC-LC (plus HE-AAC v1 decode), MP3, Opus and Vorbis.**
 > Video: **software decoders for H.264, HEVC (including 4:2:2 and 4:4:4), VP8 and VP9; a software H.264 encoder (High profile: CABAC and the 8x8 transform), a software HEVC encoder (Main profile, 8-bit 4:2:0, merge and skip, SAO), a software VP8 encoder, and a software VP9 encoder (key and inter frames), and a software AV1 encoder (key frames, profile 0, 8-bit 4:2:0); JPEG/Motion-JPEG and Apple ProRes decoded and encoded in software; MPEG-4 Part 2 (Simple and Advanced Simple profiles) decoded in software.**
 > NVIDIA GPUs encode H.264 and HEVC (NVENC, preferred when usable) and decode H.264, HEVC and AV1 (NVDEC).
-> AV1 is decoded on NVIDIA GPUs (NVDEC); the software decoder handles key and inter frames but not yet superres or intra block copy. The software AV1 encoder writes key frames only. VP9 and AV1 copy between WebM, Matroska and MP4.
+> AV1 is decoded on NVIDIA GPUs (NVDEC); the software decoder handles key, intra-only and inter frames, intra block copy included, but not yet superres. The software AV1 encoder writes key frames only. VP9 and AV1 copy between WebM, Matroska and MP4.
 > IronAV is not yet a drop-in replacement for FFmpeg or HandBrake.
 
 ## Interfaces
@@ -902,10 +902,9 @@ every intra tool (partitions to 128x128, directional, smooth, Paeth, CFL, palett
 (single and compound references, skip mode, the motion vector stack and the projected motion field, eight-tap and dual filters, global and local warped
 motion, OBMC, wedge, difference-weighted and distance-weighted compound, smooth and wedge interintra, variable inter transform sizes, segmentation and
 delta q), hidden frames, overlays and `show_existing_frame`, tiles, the deblocking filter, CDEF, loop restoration (Wiener, self-guided and switchable),
-quantiser matrices, film grain (added to the output only), 8, 10 and 12 bits, 4:2:0, 4:2:2, 4:4:4 (RGB as `rgb24`) and monochrome. Superres and intra
-block copy are refused with an error naming the tool. On libaom's output (`ffmpeg -c:v libaom-av1`) the pictures equal libaom's bit for bit: key-frame-only,
+quantiser matrices, film grain (added to the output only), 8, 10 and 12 bits, 4:2:0, 4:2:2, 4:4:4 (RGB as `rgb24`) and monochrome, with intra block copy (IntraBC, for screen content). Superres is refused with an error naming the tool. On libaom's output (`ffmpeg -c:v libaom-av1`) the pictures equal libaom's bit for bit: key-frame-only,
 P-only and alt-ref streams, `-cpu-used` 1 to 8, 128x72 to 1280x720, odd sizes, crf 0 to 63, 4x2 tiles, 32-frame streams, the bit depths and samplings
-above, palettes, lossless coding, CDEF, loop restoration, quantiser matrices and film grain, in WebM, Matroska and MP4 (tests/av1.rs). Reference scaling
+above, palettes, intra block copy (`tune-content=screen`, `enable-intrabc=1`), lossless coding, CDEF, loop restoration, quantiser matrices and film grain, in WebM, Matroska and MP4 (tests/av1.rs). Reference scaling
 and switch frames are implemented but untested (FFmpeg's libaom wrapper cannot make them). About 30 frames a second at 720p with CDEF and loop
 restoration off, about 9 with CDEF, quantiser matrices and film grain on (release build, `convert` to Y4M). AV1 is not encoded
 (consumer NVENC before the RTX 40 series cannot encode it), but it can be copied between WebM, Matroska and MP4 with no GPU (see "Matroska output").

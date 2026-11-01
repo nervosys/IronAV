@@ -225,22 +225,20 @@ fn other_containers_decode_bit_exactly() {
     }
 }
 
+/// Intra block copy: libaom's screen content tools with intrabc on, at cpu-used 2 (the speed that
+/// uses it). Every frame is a key frame in the first test; the second adds inter frames after one.
+const INTRABC: &str = "enable-cdef=0:enable-restoration=0:tune-content=screen:enable-intrabc=1";
+
 #[test]
-fn unsupported_tools_are_refused() {
+fn intra_block_copy_decodes_bit_exactly() {
     need_ffmpeg!();
-    let d = scratch("refuse");
-    // intra block copy: libaom uses it for screen content at cpu-used 2
-    let cases = [("intrabc.webm", "tune-content=screen:enable-intrabc=1", "testsrc=size=320x180:rate=25", "2", "intra block copy")];
-    for (file, params, lavfi, cpu, want) in cases {
-        let src = d.join(file);
-        let mut enc = vec!["-f", "lavfi", "-i", lavfi, "-frames:v", "1", "-c:v", "libaom-av1", "-cpu-used", cpu, "-crf", "30", "-aom-params", params];
-        enc.push(src.to_str().unwrap());
-        assert!(ffmpeg(&enc));
-        let j = Job { input: src.display().to_string(), output: d.join("out.y4m").display().to_string(), hwaccel: "off".into(), ..Job::default() };
-        let e = run(&j, &mut |_| {}).err().unwrap_or_else(|| panic!("{file} decoded"));
-        assert!(e.to_string().contains(want), "{file}: {e}");
-    }
-    let _ = std::fs::remove_dir_all(&d);
+    let screen = "testsrc=size=320x180:rate=25";
+    check(&Case { cpu: "2", ..case("ibc", screen, INTRABC, &["-crf", "30"]) });
+    check(&Case { cpu: "2", pix_fmt: "yuv420p10le", ..case("ibc-10bit", screen, INTRABC, &["-crf", "30"]) });
+    check(&Case { cpu: "2", pix_fmt: "yuv444p", ..case("ibc-444", screen, INTRABC, &["-crf", "30"]) });
+    check(&Case { cpu: "2", ..case("ibc-odd", "testsrc2=size=130x74:rate=25", INTRABC, &["-crf", "30"]) });
+    check(&inter("ibc-inter", screen, INTRABC, P_ONLY, 6, "2"));
+    check(&Case { pix_fmt: "yuv444p10le", ..inter("ibc-inter-444-10bit", screen, INTRABC, ALTREF, 6, "2") });
 }
 
 #[test]

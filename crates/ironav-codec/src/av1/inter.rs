@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 
 use super::block::*;
 use super::inter_tables::*;
-use super::ipred::{predict_intra, Edges};
+use super::ipred::{predict_intra, Edges, Plane};
 use super::mvpred::*;
 use super::obu::{rel_dist, GM_TRANSLATION};
 use super::tables::*;
@@ -232,7 +232,17 @@ impl FrameDec {
         let compound = m.ref_frame[1] > 0;
         let (r0, r1) = self.rounding(compound);
         let mode = self.b.y_mode;
+        // intra block copy (RefFrame INTRA_FRAME of an inter block): the current frame, which the
+        // frame's filters never touch, so it is predicted from the plane being decoded
+        let intrabc = m.is_inter && m.ref_frame[0] == 0;
         for l in 0..1 + compound as usize {
+            if intrabc {
+                let cur = std::mem::replace(&mut self.planes[plane], Plane::new(0, 0));
+                let (w_, h_) = (self.h.upscaled_width as usize, self.h.height as usize);
+                self.block_inter(&cur, (w_, h_), l, plane, x, y, w, h, m.mv[l], m.interp, r0, r1);
+                self.planes[plane] = cur;
+                continue;
+            }
             let rf = m.ref_frame[l] as usize;
             let Some(refp) = self.refs[rf].clone() else { continue };
             let warp = if w < 8 || h < 8 || self.h.force_integer_mv {
@@ -246,7 +256,7 @@ impl FrameDec {
             };
             match warp {
                 Some((p, s)) => self.block_warp(&refp, l, plane, x, y, w, h, &p, &s, r0, r1),
-                None => self.block_inter(&refp, l, plane, x, y, w, h, m.mv[l], m.interp, r0, r1),
+                None => self.block_inter(&refp.planes[plane], (refp.width, refp.height), l, plane, x, y, w, h, m.mv[l], m.interp, r0, r1),
             }
         }
         let (ssx, ssy) = self.sub_of(plane);
@@ -358,14 +368,13 @@ impl FrameDec {
 
     /// motion_vector_scaling and block_inter_prediction into `pred[l]` (stride `w`).
     #[allow(clippy::too_many_arguments)]
-    fn block_inter(&mut self, refp: &Picture, l: usize, plane: usize, x: usize, y: usize, w: usize, h: usize, mv: Mv, filt: [u8; 2], r0: u32, r1: u32) {
+    fn block_inter(&mut self, rp: &Plane, (ref_w, ref_h): (usize, usize), l: usize, plane: usize, x: usize, y: usize, w: usize, h: usize, mv: Mv, filt: [u8; 2], r0: u32, r1: u32) {
         let (ssx, ssy) = self.sub_of(plane);
-        let rp = &refp.planes[plane];
-        let last_x = ((refp.width + ssx) >> ssx) as i32 - 1;
-        let last_y = ((refp.height + ssy) >> ssy) as i32 - 1;
+        let last_x = ((ref_w + ssx) >> ssx) as i32 - 1;
+        let last_y = ((ref_h + ssy) >> ssy) as i32 - 1;
         let (fw, fh) = (self.h.width as i64, self.h.height as i64);
-        let x_scale = (((refp.width as i64) << 14) + fw / 2) / fw;
-        let y_scale = (((refp.height as i64) << 14) + fh / 2) / fh;
+        let x_scale = (((ref_w as i64) << 14) + fw / 2) / fw;
+        let y_scale = (((ref_h as i64) << 14) + fh / 2) / fh;
         let fx = &SUBPEL_FILTERS[filter_idx(filt[1], w)];
         let fy = &SUBPEL_FILTERS[filter_idx(filt[0], h)];
         let (tmp, out) = (&mut self.tmp, &mut self.pred[l]);
@@ -530,7 +539,7 @@ impl FrameDec {
         let (px, py) = ((x4 * 4) >> ssx, (y4 * 4) >> ssy);
         let Some(refp) = self.refs[cm.ref_frame[0] as usize].clone() else { return };
         let (r0, r1) = self.rounding(false);
-        self.block_inter(&refp, 0, plane, px, py, pw, ph, cm.mv[0], cm.interp, r0, r1);
+        self.block_inter(&refp.planes[plane], (refp.width, refp.height), 0, plane, px, py, pw, ph, cm.mv[0], cm.interp, r0, r1);
         let mask = obmc_mask(if left { pw } else { ph });
         let max = (1i32 << self.bd) - 1;
         let dst = &mut self.planes[plane];
