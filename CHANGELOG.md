@@ -11,7 +11,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 - **Codecs (decoders):** multichannel Opus (channel-mapping families 1 and 255: several mono and coupled-stereo streams in one packet, self-delimited as RFC 6716 Appendix B, routed by the mapping table; family 1 in WAV and FFmpeg channel order), read from Ogg, Matroska, WebM and MP4 (`dOps`); software decoders for H.264 (8- and 10-bit, 4:2:0, 4:2:2, 4:4:4 and monochrome,
   CAVLC and CABAC P and B slices, lossless, interlaced MBAFF frames, several pictures decoded at once), HEVC (Main, Main 10, 4:2:2, 4:4:4, 12-bit), VP8, VP9
-  (profiles 0-3, tile columns and a multi-threaded loop filter), baseline and progressive JPEG and
+  (profiles 0-3, tile columns and a multi-threaded loop filter), baseline, progressive and lossless JPEG and
   Motion-JPEG, AAC-LC with HE-AAC v1, MP3 (MPEG-1/2/2.5 Layer III), MP2 (MPEG-1/2 Layer II, as the `mp2` codec), Vorbis, Opus (SILK, CELT and hybrid)
   FLAC (4 to 32 bits) and ALAC (16, 20 and 24 bits, and 32-bit mono; one to eight channels).
 - **Codecs (encoders):** software HEVC (Main profile, 8-bit 4:2:0: 64x64 coding tree units, CABAC, intra and P pictures with merge and skip, AMVP motion, quarter-sample search, deblocking, rate control by QP or bit rate, and B pictures as an option (`HevcEncoder::with_bframes`, off by default, with a quantiser cascade); MP4 and Matroska), software H.264 (Constrained Baseline, then Main with CABAC and High with the 8x8
@@ -153,7 +153,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   and family 255 streams, are refused by the encoder (the decoder reads both families). Vorbis floor type 0 and
   streams over eight channels are refused, and the Vorbis encoder writes at most two channels.
 - **MP3, MP2, JPEG, ProRes:** MPEG audio Layer I is refused (no encoder makes a test stream); MP2 joint-stereo (intensity) streams
-  decode but have no FFmpeg reference; MP2 is not encoded; JPEG arithmetic-coded, 12-bit and lossless files are refused;
+  decode but have no FFmpeg reference; MP2 is not encoded; JPEG arithmetic-coded and 12-bit files are refused (lossless JPEG decodes, but not with restart intervals);
   ProRes interlaced pictures are refused.
 - **Containers:** Matroska tracks with encryption, bzip2 or lzo content encodings are refused (header stripping and zlib are read;
   the live reader refuses any content encoding); MPEG-TS does not carry Opus,

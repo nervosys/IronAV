@@ -2295,6 +2295,225 @@ fn jpeg_reencode_stays_close() {
     assert!(psnr > 35.0, "PSNR {psnr}");
 }
 
+/// The first picture of a JPEG, read and decoded the way the engine reads it.
+fn jpeg_frame(path: &std::path::Path) -> ironav_core::VideoFrame {
+    use ironav_core::Frame;
+    let mut d = ironav_formats::open_demuxer(path).unwrap();
+    let info = d.streams()[0].clone();
+    let mut dec = ironav_codec::new_decoder_for(&info).unwrap();
+    let p = d.read_packet().unwrap().unwrap();
+    match dec.decode(&p).unwrap().remove(0) {
+        Frame::Video(v) => v,
+        _ => panic!("the JPEG did not decode to a picture"),
+    }
+}
+
+/// A lossless JPEG decodes to exactly what FFmpeg decodes: a lossless file has no tolerance.
+/// RGB references are FFmpeg's rgb24 output (`bgr24` files are decorrelated; FFmpeg's own decode
+/// of them is the source picture).
+fn lossless_matches_ffmpeg(name: &str, rgb: bool) {
+    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    let got = jpeg_frame(&data.join(format!("{name}.jpg"))).planes.concat();
+    let want = std::fs::read(data.join(format!("{name}.ffmpeg.{}", if rgb { "rgb" } else { "yuv" }))).unwrap();
+    assert_eq!(got.len(), want.len(), "{name}");
+    let differing = got.iter().zip(&want).filter(|(a, b)| a != b).count();
+    assert_eq!(differing, 0, "{name}: {differing} samples differ from FFmpeg's");
+}
+
+/// Lossless JPEGs (SOF3) from FFmpeg's encoder: predictors 1 to 3 on 4:2:0, 4:2:2 and 4:4:4, and
+/// RGB (9-bit, with FFmpeg's colour transform).
+#[test]
+fn lossless_jpeg_decodes_to_what_ffmpeg_decodes() {
+    for name in ["jpeg_lossless_420_p1", "jpeg_lossless_420_p3", "jpeg_lossless_422_p2", "jpeg_lossless_444_p2"] {
+        lossless_matches_ffmpeg(name, false);
+    }
+    for name in ["jpeg_lossless_rgb_p1", "jpeg_lossless_rgb_p3"] {
+        lossless_matches_ffmpeg(name, true);
+    }
+}
+
+/// A lossless JPEG written by a small test encoder that follows T.81 H.1.2 on its own. FFmpeg's
+/// encoder writes predictors 1 to 3 only, so this covers 4 to 7 and the point transform. The
+/// samples of `planes[c]` cover whole MCUs (`mcux * h` samples a row, `mcuy * v` rows).
+fn lossless_jpeg(w: usize, h: usize, sampling: &[(usize, usize)], planes: &[Vec<u8>], mcux: usize, mcuy: usize, pred: u8, pt: u32) -> Vec<u8> {
+    struct BitOut {
+        bytes: Vec<u8>,
+        acc: u32,
+        n: u32,
+    }
+    impl BitOut {
+        fn put(&mut self, v: u32, len: u32) {
+            for i in (0..len).rev() {
+                self.acc = (self.acc << 1) | ((v >> i) & 1);
+                self.n += 1;
+                if self.n == 8 {
+                    let b = self.acc as u8;
+                    self.bytes.push(b);
+                    if b == 0xFF {
+                        self.bytes.push(0);
+                    }
+                    self.acc = 0;
+                    self.n = 0;
+                }
+            }
+        }
+    }
+    let n = sampling.len();
+    let mut out = vec![0xFF, 0xD8, 0xFF, 0xC3];
+    out.extend(((8 + 3 * n) as u16).to_be_bytes());
+    out.push(8);
+    out.extend((h as u16).to_be_bytes());
+    out.extend((w as u16).to_be_bytes());
+    out.push(n as u8);
+    for (c, &(hs, vs)) in sampling.iter().enumerate() {
+        out.extend([c as u8 + 1, ((hs << 4) | vs) as u8, 0]);
+    }
+    // one DC table: nine codes of length four, for the categories 0 to 8
+    let mut counts = [0u8; 16];
+    counts[3] = 9;
+    out.extend([0xFF, 0xC4]);
+    out.extend((28u16).to_be_bytes());
+    out.push(0x00);
+    out.extend(counts);
+    out.extend(0..9u8);
+    out.extend([0xFF, 0xDA]);
+    out.extend((6 + 2 * n as u16).to_be_bytes());
+    out.push(n as u8);
+    for c in 0..n {
+        out.extend([c as u8 + 1, 0]);
+    }
+    out.extend([pred, 0, pt as u8]);
+
+    let mut bw = BitOut { bytes: Vec::new(), acc: 0, n: 0 };
+    let stride: Vec<usize> = sampling.iter().map(|&(hs, _)| mcux * hs).collect();
+    let mut recon: Vec<Vec<i32>> = planes.iter().map(|p| vec![0; p.len()]).collect();
+    for my in 0..mcuy {
+        for mx in 0..mcux {
+            for (c, &(hs, vs)) in sampling.iter().enumerate() {
+                for v in 0..vs {
+                    for hh in 0..hs {
+                        let (x, y) = (mx * hs + hh, my * vs + v);
+                        let (s, i) = (stride[c], y * stride[c] + x);
+                        let rec = &mut recon[c];
+                        let p = if x == 0 && y == 0 {
+                            128
+                        } else if y == 0 {
+                            rec[i - 1]
+                        } else if x == 0 {
+                            rec[i - s]
+                        } else {
+                            let (ra, rb, rc) = (rec[i - 1], rec[i - s], rec[i - s - 1]);
+                            match pred {
+                                1 => ra,
+                                2 => rb,
+                                3 => rc,
+                                4 => ra + rb - rc,
+                                5 => ra + ((rb - rc) >> 1),
+                                6 => rb + ((ra - rc) >> 1),
+                                _ => (ra + rb) >> 1,
+                            }
+                        };
+                        // the prediction is taken on the reduced samples, so its low `pt` bits are dropped
+                        let p = p & !((1 << pt) - 1);
+                        let xrec = ((planes[c][i] as i32) >> pt) << pt;
+                        let d = (xrec - p).rem_euclid(256);
+                        let d = if d >= 128 { d - 256 } else { d };
+                        let coded = d >> pt;
+                        let t = 32 - coded.unsigned_abs().leading_zeros();
+                        bw.put(t, 4);
+                        if t > 0 {
+                            bw.put((if coded < 0 { coded + (1 << t) - 1 } else { coded }) as u32, t);
+                        }
+                        rec[i] = xrec;
+                    }
+                }
+            }
+        }
+    }
+    while bw.n != 0 {
+        bw.put(1, 1);
+    }
+    out.extend(bw.bytes);
+    out.extend([0xFF, 0xD9]);
+    out
+}
+
+/// Deterministic test samples: a gradient with noise, so that the differences use every category.
+fn lossless_sample(c: usize, x: usize, y: usize) -> u8 {
+    let mut h = (c as u32).wrapping_mul(0x9E37_79B1) ^ (x as u32).wrapping_mul(0x85EB_CA77) ^ (y as u32).wrapping_mul(0xC2B2_AE3D);
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x2C1B_3C6D);
+    ((3 * x + 2 * y + 40 * c) as u8).wrapping_add((h >> 24) as u8)
+}
+
+/// Every predictor and point transform, on gray, RGB and 4:2:0 pictures of sizes that leave
+/// padding in the last MCUs, decodes to the samples the test encoder started from.
+#[test]
+fn lossless_jpeg_every_predictor_and_point_transform_is_exact() {
+    let dir = scratch("jpeg-lossless-pred");
+    let formats: [(&str, usize, usize, &[(usize, usize)]); 3] = [("gray", 33, 17, &[(1, 1)]), ("rgb", 17, 9, &[(1, 1), (1, 1), (1, 1)]), ("yuv420", 37, 21, &[(2, 2), (1, 1), (1, 1)])];
+    for (name, w, h, sampling) in formats {
+        let hmax = sampling.iter().map(|s| s.0).max().unwrap();
+        let vmax = sampling.iter().map(|s| s.1).max().unwrap();
+        let (mcux, mcuy) = (w.div_ceil(hmax), h.div_ceil(vmax));
+        let planes: Vec<Vec<u8>> = sampling
+            .iter()
+            .enumerate()
+            .map(|(c, &(hs, vs))| {
+                let pw = mcux * hs;
+                (0..pw * mcuy * vs).map(|i| lossless_sample(c, i % pw, i / pw)).collect()
+            })
+            .collect();
+        for pred in 1..=7u8 {
+            for pt in [0u32, 2] {
+                let path = dir.join(format!("{name}_p{pred}_t{pt}.jpg"));
+                std::fs::write(&path, lossless_jpeg(w, h, sampling, &planes, mcux, mcuy, pred, pt)).unwrap();
+                let got = jpeg_frame(&path);
+                assert_eq!((got.width as usize, got.height as usize), (w, h), "{name}");
+                // the point transform drops the low bits of every sample; the rest is exact
+                let mask = !((1u8 << pt) - 1);
+                let flat: Vec<Vec<u8>> = sampling
+                    .iter()
+                    .enumerate()
+                    .map(|(c, &(hs, vs))| {
+                        let (cw, ch, pw) = ((w * hs).div_ceil(hmax), (h * vs).div_ceil(vmax), mcux * hs);
+                        (0..ch).flat_map(|y| (0..cw).map(move |x| (y, x))).map(|(y, x)| planes[c][y * pw + x] & mask).collect()
+                    })
+                    .collect();
+                let want: Vec<u8> = if name == "rgb" { (0..w * h).flat_map(|i| flat.iter().map(move |p| p[i])).collect() } else { flat.concat() };
+                let differing = got.planes.concat().iter().zip(&want).filter(|(a, b)| a != b).count();
+                assert_eq!(differing, 0, "{name}, predictor {pred}, point transform {pt}: samples differ");
+            }
+        }
+    }
+}
+
+/// Arithmetic-coded (SOF9) and 12-bit JPEGs are refused by name, not read as garbage.
+#[test]
+fn jpeg_arithmetic_and_12_bit_are_refused_by_name() {
+    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    let base = std::fs::read(data.join("jpeg_420.jpg")).unwrap();
+    let sof = base.windows(2).position(|w| w == [0xFF, 0xC0]).unwrap();
+    let dir = scratch("jpeg-refused");
+    let mut arith = base.clone();
+    arith[sof + 1] = 0xC9;
+    std::fs::write(dir.join("arith.jpg"), &arith).unwrap();
+    let mut twelve = base.clone();
+    twelve[sof + 4] = 12;
+    std::fs::write(dir.join("twelve.jpg"), &twelve).unwrap();
+    for (file, words) in [("arith.jpg", "arithmetic"), ("twelve.jpg", "precision")] {
+        let err = ironav_formats::open_demuxer(&dir.join(file)).and_then(|mut d| {
+            let info = d.streams()[0].clone();
+            let mut dec = ironav_codec::new_decoder_for(&info)?;
+            let p = d.read_packet()?.unwrap();
+            dec.decode(&p)
+        });
+        let err = err.unwrap_err();
+        assert_eq!(err.code, ErrorCode::UnsupportedFormat, "{file}");
+        assert!(err.to_string().contains(words), "{file}: {err}");
+    }
+}
+
 #[test]
 fn low_latency_re_encodes_without_reordering() {
     let dir = scratch("low-latency");

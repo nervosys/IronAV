@@ -1,5 +1,7 @@
 //! JPEG (ITU T.81, Huffman, 8-bit): a decoder for gray, 4:2:0, 4:2:2 and 4:4:4 images, sequential
-//! or progressive, with restart intervals, and a baseline encoder for the same layouts. Arithmetic-coded, 12-bit and lossless files are refused by name.
+//! or progressive, with restart intervals, and a baseline encoder for the same layouts. Lossless
+//! (SOF3) files decode too: predictors 1 to 7 and the point transform, 8-bit gray or YUV, and 8 or
+//! 9-bit RGB, but not with restart intervals. Arithmetic-coded and 12-bit files are refused by name.
 
 mod tables;
 
@@ -283,6 +285,53 @@ fn extend(v: i32, t: u32) -> i32 {
     }
 }
 
+/// The next marker at or after `p`, skipping stuffed zero bytes and restart markers: its code and
+/// the offset just after it.
+fn next_marker(d: &[u8], mut p: usize) -> Option<(u8, usize)> {
+    while p + 1 < d.len() {
+        if d[p] == 0xFF && d[p + 1] != 0 && d[p + 1] != 0xFF && !(0xD0..=0xD7).contains(&d[p + 1]) {
+            return Some((d[p + 1], p + 2));
+        }
+        p += 1;
+    }
+    None
+}
+
+/// Decodes the lossless sample at (x, y) of a plane, predicted from its decoded neighbours. The
+/// first row is predicted from the left neighbour and the first column from the one above; the
+/// first sample starts at half scale.
+#[allow(clippy::too_many_arguments)]
+fn lossless_sample(bs: &mut Bits, dct: &Huff, plane: &mut [u16], stride: usize, x: usize, y: usize, predictor: u8, al: u32, mask: u32, bits: u32) -> Result<()> {
+    let i = y * stride + x;
+    let pred = if x == 0 && y == 0 {
+        1i32 << (bits - 1)
+    } else if y == 0 {
+        plane[i - 1] as i32
+    } else if x == 0 {
+        plane[i - stride] as i32
+    } else {
+        let (ra, rb, rc) = (plane[i - 1] as i32, plane[i - stride] as i32, plane[i - stride - 1] as i32);
+        match predictor {
+            1 => ra,
+            2 => rb,
+            3 => rc,
+            4 => ra + rb - rc,
+            5 => ra + ((rb - rc) >> 1),
+            6 => rb + ((ra - rc) >> 1),
+            _ => (ra + rb) >> 1,
+        }
+    };
+    // the prediction is taken on the reduced samples, so its low `al` bits are dropped
+    let pred = pred & !((1i32 << al) - 1);
+    let t = bs.symbol(dct)? as u32;
+    if t > 16 {
+        return Err(Error::invalid_input("JPEG DC category is out of range"));
+    }
+    let diff = extend(bs.bits(t), t);
+    plane[i] = (pred.wrapping_add(diff.wrapping_shl(al)) as u32 & mask) as u16;
+    Ok(())
+}
+
 // ---- decoder ----------------------------------------------------------------------------------
 
 #[derive(Clone, Default)]
@@ -303,6 +352,9 @@ struct Frame0 {
     height: usize,
     comps: Vec<Comp>,
     progressive: bool,
+    lossless: bool,
+    /// Sample precision: 8, or 9 for the RGB frames FFmpeg writes with its colour transform.
+    bits: u32,
 }
 
 impl Frame0 {
@@ -314,6 +366,10 @@ impl Frame0 {
     }
     fn pix_fmt(&self) -> Result<PixelFormat> {
         let s: Vec<(usize, usize)> = self.comps.iter().map(|c| (c.h, c.v)).collect();
+        // a lossless frame of three unsubsampled components is RGB, as FFmpeg reads it
+        if self.lossless && s.len() == 3 && s.iter().all(|&f| f == (1, 1)) {
+            return Ok(PixelFormat::Rgb24);
+        }
         let (hm, vm) = (self.hmax(), self.vmax());
         // luma carries the highest factors; the two chroma components match each other and divide them
         let ok = s.len() == 1 || (s[0] == (hm, vm) && s[1] == s[2] && hm % s[1].0 == 0 && vm % s[1].1 == 0);
@@ -423,9 +479,10 @@ fn parse_headers(d: &[u8]) -> Result<Headers> {
             0xDB => read_dqt(seg, &mut qt)?,
             0xC4 => read_dht(seg, &mut dc, &mut ac)?,
             0xDD => restart = be16(seg, 0)?,
-            0xC0..=0xC2 => {
-                if seg.len() < 6 || seg[0] != 8 {
-                    return Err(unsupported(format!("JPEG sample precision {} is not supported (8 bit is)", seg.first().copied().unwrap_or(0))));
+            0xC0..=0xC3 => {
+                let bits = seg.first().copied().unwrap_or(0) as u32;
+                if seg.len() < 6 || !(bits == 8 || (bits == 9 && m == 0xC3)) {
+                    return Err(unsupported(format!("JPEG sample precision {bits} is not supported (8 bit is; 9 bit is for lossless RGB)")));
                 }
                 let (h, w, n) = (be16(seg, 1)?, be16(seg, 3)?, seg[5] as usize);
                 if w == 0 || h == 0 || !(n == 1 || n == 3) || seg.len() < 6 + 3 * n {
@@ -443,9 +500,9 @@ fn parse_headers(d: &[u8]) -> Result<Headers> {
                 if comps.iter().any(|c| c.h == 0 || c.v == 0 || c.h > 4 || c.v > 4) {
                     return Err(Error::invalid_input("JPEG sampling factor is out of range"));
                 }
-                frame = Some(Frame0 { width: w, height: h, comps, progressive: m == 0xC2 });
+                frame = Some(Frame0 { width: w, height: h, comps, progressive: m == 0xC2, lossless: m == 0xC3, bits });
             }
-            0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF => return Err(unsupported(format!("JPEG coding process SOF{} (lossless, hierarchical or arithmetic) is not supported", m - 0xC0))),
+            0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF => return Err(unsupported(format!("JPEG coding process SOF{} (hierarchical or arithmetic) is not supported", m - 0xC0))),
             0xDA => {
                 let f = frame.ok_or_else(|| Error::invalid_input("JPEG scan comes before its frame header"))?;
                 return Ok((f, qt, dc, ac, restart, pos));
@@ -483,6 +540,9 @@ impl JpegDecoder {
 
     fn decode_image(&self, d: &[u8], pts: i64) -> Result<VideoFrame> {
         let (mut f, qt, dc, ac, mut restart, mut sos) = parse_headers(d)?;
+        if f.lossless {
+            return self.decode_lossless(d, f, dc, restart, sos, pts);
+        }
         let pix_fmt = f.pix_fmt()?;
         if f.progressive {
             return self.decode_progressive(d, f, pix_fmt, pts);
@@ -642,6 +702,151 @@ impl JpegDecoder {
             return Err(Error::invalid_input("JPEG ends before every component was coded"));
         }
         Ok(finish(&f, pix_fmt, pts))
+    }
+
+    /// Lossless (SOF3) decoding, T.81 H.1.2: each sample is predicted from its decoded neighbours
+    /// (predictors 1 to 7, with the first row and column predicted as the spec says) and the
+    /// difference is coded as a DC-style Huffman category. The point transform shifts each
+    /// difference, so the planes hold full-scale values. A frame of three unsubsampled components
+    /// is RGB, as FFmpeg reads it; its 9-bit form is decorrelated by FFmpeg's reversible colour
+    /// transform. Restart intervals are refused.
+    fn decode_lossless(&self, d: &[u8], f: Frame0, mut dcs: [Option<Huff>; 4], restart: usize, mut pos: usize, pts: i64) -> Result<VideoFrame> {
+        if restart != 0 {
+            return Err(unsupported("lossless JPEG with restart intervals is not supported".into()));
+        }
+        let pix_fmt = f.pix_fmt()?;
+        let rgb = pix_fmt == PixelFormat::Rgb24;
+        let bits = f.bits;
+        if bits == 9 && !rgb {
+            return Err(unsupported("lossless JPEG with 9-bit samples is supported only for RGB".into()));
+        }
+        if f.width * f.height > 1 << 26 {
+            return Err(unsupported(format!("lossless JPEG of {}x{} is larger than the 67 megapixels this decoder accepts", f.width, f.height)));
+        }
+        let (hmax, vmax) = (f.hmax(), f.vmax());
+        let (mcux, mcuy) = (f.width.div_ceil(hmax), f.height.div_ceil(vmax));
+        // planes hold whole MCUs; `u16` holds the 9-bit samples too
+        let stride: Vec<usize> = f.comps.iter().map(|c| mcux * c.h).collect();
+        let mut planes: Vec<Vec<u16>> = f.comps.iter().map(|c| vec![0u16; mcux * c.h * mcuy * c.v]).collect();
+        let mask = (1u32 << bits) - 1;
+        let mut done = vec![false; f.comps.len()];
+        loop {
+            // the scan header at `pos` (just after the SOS marker)
+            let len = be16(d, pos)?;
+            let seg = d.get(pos + 2..pos + len).ok_or_else(|| Error::invalid_input("JPEG scan header is truncated"))?;
+            let ns = *seg.first().ok_or_else(|| Error::invalid_input("JPEG scan header is empty"))? as usize;
+            if ns == 0 || ns > f.comps.len() || seg.len() < 1 + 2 * ns + 3 {
+                return Err(Error::invalid_input("JPEG scan header is inconsistent"));
+            }
+            let predictor = seg[1 + 2 * ns];
+            let al = (seg[3 + 2 * ns] & 15) as u32;
+            if !(1..=7).contains(&predictor) {
+                return Err(Error::invalid_input("JPEG lossless predictor is out of range (1 to 7)"));
+            }
+            if al >= bits {
+                return Err(Error::invalid_input("JPEG point transform is out of range"));
+            }
+            let mut order = Vec::new();
+            for i in 0..ns {
+                let (cid, t) = (seg[1 + 2 * i], seg[2 + 2 * i]);
+                let ci = f.comps.iter().position(|c| c.id == cid).ok_or_else(|| Error::invalid_input("JPEG scan names an unknown component"))?;
+                order.push((ci, (t >> 4) as usize & 3));
+                done[ci] = true;
+            }
+            let mut bs = Bits::new(d, pos + len);
+            if ns == 1 {
+                // a single component is coded sample by sample over its own grid
+                let (ci, td) = order[0];
+                let c = &f.comps[ci];
+                let dct = dcs[td].as_ref().ok_or_else(|| Error::invalid_input("JPEG uses a DC Huffman table it never defined"))?;
+                let (cw, ch) = ((f.width * c.h).div_ceil(hmax), (f.height * c.v).div_ceil(vmax));
+                for y in 0..ch {
+                    for x in 0..cw {
+                        lossless_sample(&mut bs, dct, &mut planes[ci], stride[ci], x, y, predictor, al, mask, bits)?;
+                    }
+                }
+            } else {
+                // interleaved: each MCU holds h x v samples of every component in the scan
+                for my in 0..mcuy {
+                    for mx in 0..mcux {
+                        for &(ci, td) in &order {
+                            let c = &f.comps[ci];
+                            let dct = dcs[td].as_ref().ok_or_else(|| Error::invalid_input("JPEG uses a DC Huffman table it never defined"))?;
+                            for v in 0..c.v {
+                                for h in 0..c.h {
+                                    lossless_sample(&mut bs, dct, &mut planes[ci], stride[ci], mx * c.h + h, my * c.v + v, predictor, al, mask, bits)?;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // the next marker: tables may be redefined between scans
+            let mut p = bs.pos;
+            let mut next_scan = None;
+            loop {
+                let (m, at) = next_marker(d, p).ok_or_else(|| Error::invalid_input("JPEG ends before its last scan"))?;
+                match m {
+                    0xDA => {
+                        next_scan = Some(at);
+                        break;
+                    }
+                    0xD9 => break,
+                    0xC4 => {
+                        let seg = d.get(at + 2..at + be16(d, at)?).ok_or_else(|| Error::invalid_input("JPEG marker segment is truncated"))?;
+                        read_dht(seg, &mut dcs, &mut Default::default())?;
+                        p = at + be16(d, at)?;
+                    }
+                    0xDD => {
+                        if be16(d, at + 2)? != 0 {
+                            return Err(unsupported("lossless JPEG with restart intervals is not supported".into()));
+                        }
+                        p = at + be16(d, at)?;
+                    }
+                    _ => p = at + be16(d, at)?,
+                }
+            }
+            match next_scan {
+                Some(at) => pos = at,
+                None => break,
+            }
+        }
+        if done.iter().any(|d| !d) {
+            return Err(Error::invalid_input("JPEG ends before every component was coded"));
+        }
+        let (w, h) = (f.width, f.height);
+        let planes_out: Vec<Vec<u8>> = if rgb {
+            let mut out = vec![0u8; w * h * 3];
+            for y in 0..h {
+                for x in 0..w {
+                    let i = y * stride[0] + x;
+                    let (r, g, b) = if bits == 9 {
+                        // FFmpeg's reversible colour transform: planes 0, 1 and 2 hold Y-like, B-like and R-like values
+                        let (v0, v1, v2) = (planes[0][i] as i32, planes[1][i] as i32, planes[2][i] as i32);
+                        let g = v0 - ((v1 + v2 - 0x200) >> 2);
+                        (v2 + g, g, v1 + g)
+                    } else {
+                        (planes[0][i] as i32, planes[1][i] as i32, planes[2][i] as i32)
+                    };
+                    out[(y * w + x) * 3..(y * w + x) * 3 + 3].copy_from_slice(&[r as u8, g as u8, b as u8]);
+                }
+            }
+            vec![out]
+        } else {
+            pix_fmt
+                .planes(w, h)
+                .iter()
+                .enumerate()
+                .map(|(ci, &(pw, ph, _))| {
+                    let mut out = Vec::with_capacity(pw * ph);
+                    for r in 0..ph {
+                        out.extend(planes[ci][r * stride[ci]..r * stride[ci] + pw].iter().map(|&s| s as u8));
+                    }
+                    out
+                })
+                .collect()
+        };
+        Ok(VideoFrame { width: w as u32, height: h as u32, pix_fmt, pts, planes: planes_out })
     }
 
     /// Progressive (SOF2) decoding: every scan adds bits to coefficient buffers kept in zigzag
