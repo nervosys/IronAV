@@ -32,8 +32,9 @@ use syntax::{put_nal, Rps, LOG2_CTB};
 
 /// Pictures between IDR pictures.
 const KEYINT: u64 = 250;
-/// B pictures between anchor pictures by default. None: on the 720p clips measured (see `with_bframes`),
-/// flat B pictures cost more bits at the same quantiser than P pictures alone, so B pictures are an option.
+/// B pictures between anchor pictures by default. None: with the QP cascade, B pictures save about 12 %
+/// on the mandelbrot clip at equal PSNR, but on FFmpeg's testsrc2 they save about 3 % on average, too
+/// little to be the default (see `with_bframes`).
 pub const DEFAULT_BFRAMES: usize = 0;
 /// Bits per pixel at quantiser 26, roughly, for the rate control's first guess.
 const BPP: f64 = 0.1;
@@ -42,6 +43,9 @@ pub const DEFAULT_QP: u8 = 27;
 /// Quantiser offsets of IDR, P and B pictures: IDR pictures are a little finer, since later pictures
 /// inherit their quality.
 const QP_OFFSET: [i32; 3] = [-3, 0, 0];
+/// The same with B pictures: anchors a little finer, B pictures (which later pictures never refer to)
+/// coarser. Without this cascade B pictures at the anchors' quantiser save little or nothing.
+const QP_OFFSET_BFRAMES: [i32; 3] = [-3, -2, 2];
 /// The pictures of reordering a stream with `bframes` B pictures between anchors declares.
 fn reorder_of(bframes: usize) -> u32 {
     u32::from(bframes > 0)
@@ -72,6 +76,8 @@ pub struct HevcEncoder {
     level: u8,
     /// B pictures between anchor pictures.
     bframes: usize,
+    /// The quantiser offsets of the picture kinds (IDR, P, B) for the stream's B pictures.
+    qp_offsets: [i32; 3],
     /// Frames waiting for the anchor picture they are coded with: source, time stamp and display index.
     pending: Vec<(Source, i64, u64)>,
     /// The last two anchor pictures as the decoder reconstructs them: `refs` the last, which the
@@ -99,8 +105,11 @@ impl HevcEncoder {
 
     /// `n` B pictures between anchor pictures (0 for none, up to 3), in place of the default. Without
     /// B pictures each picture is sent as soon as it is coded, and the stream declares no reordering.
+    /// With B pictures the anchors take a finer quantiser than P pictures would, and the B pictures a
+    /// coarser one (`QP_OFFSET_BFRAMES`).
     pub fn with_bframes(mut self, n: usize) -> Self {
         self.bframes = n.min(3);
+        self.qp_offsets = if self.bframes > 0 { QP_OFFSET_BFRAMES } else { QP_OFFSET };
         let reorder = reorder_of(self.bframes);
         let (pw, ph) = (self.sps.width, self.sps.height);
         let crop = [0, pw - self.width, 0, ph - self.height];
@@ -165,6 +174,7 @@ impl HevcEncoder {
             pps_rbsp,
             level,
             bframes: DEFAULT_BFRAMES,
+            qp_offsets: QP_OFFSET,
             pending: Vec::new(),
             refs: None,
             prev: None,
@@ -185,7 +195,7 @@ impl HevcEncoder {
 
     /// The quantiser for the next picture (0 IDR, 1 P).
     fn next_qp(&self, kind: usize) -> i32 {
-        let off = QP_OFFSET[kind];
+        let off = self.qp_offsets[kind];
         match self.qp {
             Some(q) => (q as i32 + off).clamp(0, 51),
             None => (self.rc_qp.round() as i32 + off).clamp(1, 51),
@@ -203,7 +213,7 @@ impl HevcEncoder {
         let window = rate as f64;
         let budget = 6.0 * ((self.spent + window) / (self.allowed + window).max(1.0)).log2();
         let expected = per_frame * if kind == 0 { 4.0 } else { 1.0 };
-        let wanted = (qp - QP_OFFSET[kind]) as f64 + 6.0 * (bits as f64 / expected).max(1e-3).log2();
+        let wanted = (qp - self.qp_offsets[kind]) as f64 + 6.0 * (bits as f64 / expected).max(1e-3).log2();
         let next = 0.5 * self.rc_qp + 0.5 * wanted + budget;
         self.rc_qp = next.clamp(self.rc_qp - 4.0, self.rc_qp + 4.0).clamp(1.0, 51.0);
     }

@@ -92,6 +92,10 @@ struct Saved {
 /// A rate term: the bits a candidate costs, weighted by lambda into the distortion's units.
 const SIDE_INTRA: f64 = 10.0;
 const SIDE_INTER: f64 = 6.0;
+/// The motion search: whole-sample offsets in [-SEARCH_RANGE, SEARCH_RANGE] on a grid of SEARCH_STEP
+/// around zero (pictures four frames apart move further than the one before), then refinement.
+const SEARCH_RANGE: i16 = 48;
+const SEARCH_STEP: i16 = 4;
 /// Scales HM's lambda (for squared error) up: the decisions measure absolute differences, and the
 /// bits are estimates, so a stronger rate weight measures smaller at equal PSNR.
 const LAMBDA_SCALE: f64 = 2.0;
@@ -768,6 +772,13 @@ impl<'a> SliceCoder<'a> {
             }
             if best == centre {
                 break;
+            }
+        }
+        // a coarse full search of the window around zero, then the refinements below
+        let (sr, ss) = (SEARCH_RANGE, SEARCH_STEP);
+        for dy in (-sr..=sr).step_by(ss as usize) {
+            for dx in (-sr..=sr).step_by(ss as usize) {
+                try_mv([dx * 4, dy * 4], &mut best, &mut bc);
             }
         }
         for step in [2i16, 1] {

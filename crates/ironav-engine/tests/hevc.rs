@@ -172,8 +172,7 @@ fn video_frame(f: &[u8], w: u32, h: u32, pts: i64) -> Frame {
 }
 
 /// B pictures (three between anchors) decode to the same pictures in FFmpeg and in IronAV, in display
-/// order. They are off by default, since on the 720p clips they cost more bits than P pictures alone at
-/// the same quantiser (see the report).
+/// order. They are off by default (see the report).
 #[test]
 fn hevc_b_pictures_decode_identically_in_ironav_and_ffmpeg() {
     if !ffmpeg_available() {
@@ -278,8 +277,9 @@ fn hevc_b_pictures_have_display_time_stamps_in_mp4_and_matroska() {
 }
 
 /// The report behind the HEVC B-picture numbers: 720p, 60 frames, four quantisers, P pictures only and
-/// with three B pictures between anchors, through the encoder directly. Bytes, mean Y PSNR over the
-/// pictures in display order (IronAV's decoder, which FFmpeg matches), and encode speed. Run with
+/// with three B pictures between anchors (the QP cascade of `QP_OFFSET_BFRAMES`), through the encoder
+/// directly, on FFmpeg's testsrc2 and mandelbrot. Bytes, mean Y PSNR over the pictures in display order
+/// (IronAV's decoder, which FFmpeg matches), and encode speed. Run with
 /// `cargo test --release -p ironav-engine --test hevc -- --ignored --nocapture`.
 #[test]
 #[ignore]
@@ -291,7 +291,7 @@ fn report_720p_hevc_p_only_against_b_pictures() {
     let d = scratch("report");
     for (name, src_spec) in [
         ("testsrc2", "testsrc2=size=1280x720:rate=25".to_string()),
-        ("gradients", "gradients=s=1280x720:d=2.4:speed=0.01:rate=25,noise=alls=3:allf=t".to_string()),
+        ("mandelbrot", "mandelbrot=s=1280x720:r=25".to_string()),
     ] {
         let src = d.join(format!("{name}.y4m"));
         ffmpeg(&["-f", "lavfi", "-i", &src_spec, "-frames:v", "60", "-pix_fmt", "yuv420p", src.to_str().unwrap()]);
