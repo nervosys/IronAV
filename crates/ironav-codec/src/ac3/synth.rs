@@ -56,7 +56,7 @@ pub(super) fn fmul_window(dst: &mut [f32], src0: &[f32], src1: &[f32], win: &[f3
 }
 
 /// The Kaiser-Bessel-derived window of `n` points (FFmpeg's `kbd_window_init`).
-fn kbd_window(alpha: f64, n: usize) -> [f32; BLOCK] {
+pub(super) fn kbd_window(alpha: f64, n: usize) -> [f32; BLOCK] {
     assert_eq!(n, BLOCK);
     let alpha2 = 4.0 * (alpha * PI / n as f64) * (alpha * PI / n as f64);
     let mut temp = vec![0.0f64; n / 2 + 1];

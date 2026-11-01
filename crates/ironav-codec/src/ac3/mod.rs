@@ -11,10 +11,12 @@
 mod alloc;
 mod bits;
 mod block;
+mod enc;
 mod header;
 mod synth;
 mod tables;
 
+pub use enc::{default_bitrate, mode_for_channels, snap_bitrate, Ac3Encoder, FRAME_SAMPLES, LEAD_IN};
 use bits::BitReader;
 use std::borrow::Cow;
 use ironav_core::{AudioFrame, Decoder, Error, ErrorCode, Frame, Packet, Result};
