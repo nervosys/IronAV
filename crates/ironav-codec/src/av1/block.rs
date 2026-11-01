@@ -1138,7 +1138,7 @@ impl FrameDec {
         }
     }
 
-    fn store_mi(&mut self) {
+    pub(crate) fn store_mi(&mut self) {
         let b = &self.b;
         let (r, c) = (b.row, b.col);
         let rows = b.bh4.min(self.h.mi_rows - r);

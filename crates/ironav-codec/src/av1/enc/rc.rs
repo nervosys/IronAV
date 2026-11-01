@@ -10,6 +10,15 @@ use crate::av1::symbol::update_cdf;
 const EC_PROB_SHIFT: u64 = 6;
 const EC_MIN_PROB: u64 = 4;
 
+/// The cost in bits of coding symbol `s` with the CDF `icdf` as it stands (the probability of `s`
+/// is its share of the interval, as `SymbolEncoder::encode` splits it). Used by the mode decisions.
+pub fn sym_bits(icdf: &[u16], s: usize) -> f64 {
+    let n = icdf.len();
+    let fl = if s > 0 { icdf[s - 1] as f64 } else { 32768.0 };
+    let fh = if s + 1 < n { icdf[s] as f64 } else { 0.0 };
+    -((fl - fh).max(1.0) / 32768.0).log2()
+}
+
 pub struct SymbolEncoder {
     low: u64,
     rng: u32,

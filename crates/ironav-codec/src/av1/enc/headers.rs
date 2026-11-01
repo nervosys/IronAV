@@ -1,5 +1,6 @@
 //! The OBUs of the encoder's stream: temporal delimiter, sequence header and the frame OBU of a
-//! key frame (spec 5.3 to 5.9), and the av1C record that carries the sequence header in a container.
+//! key or inter frame (spec 5.3 to 5.9), and the av1C record that carries the sequence header in a
+//! container.
 
 /// seq_level_idx: level 5.1, which covers every size this encoder takes.
 const SEQ_LEVEL: u32 = 13;
@@ -71,8 +72,9 @@ pub fn obu(kind: u8, payload: &[u8]) -> Vec<u8> {
 }
 
 /// The sequence header payload for 8-bit 4:2:0 profile 0 pictures of `width` x `height`: one
-/// operating point, no reduced still picture header, no order hints, screen content tools off,
-/// CDEF and loop restoration off, no superres, no film grain.
+/// operating point, no reduced still picture header, no order hints (so no skip mode, compound
+/// prediction or temporal motion), screen content tools off, CDEF on, loop restoration off, no
+/// superres, no film grain.
 pub fn sequence_header(width: u32, height: u32) -> Vec<u8> {
     let mut b = BitWriter::default();
     b.put(0, 3); // seq_profile
@@ -101,7 +103,7 @@ pub fn sequence_header(width: u32, height: u32) -> Vec<u8> {
     b.put(0, 1); // seq_choose_screen_content_tools
     b.put(0, 1); // seq_force_screen_content_tools (no integer MV syntax follows)
     b.put(0, 1); // enable_superres
-    b.put(0, 1); // enable_cdef
+    b.put(1, 1); // enable_cdef
     b.put(0, 1); // enable_restoration
     // color_config: 8 bits, not monochrome, no colour description, limited range, 4:2:0
     b.put(0, 1); // high_bitdepth
@@ -137,32 +139,90 @@ fn tile_info(b: &mut BitWriter, mi_cols: usize, mi_rows: usize) {
     }
 }
 
-/// The uncompressed header of a shown key frame of the given size and base quantiser index,
-/// byte aligned, as the frame OBU starts with it.
-pub fn key_frame_header(width: u32, height: u32, base_q_idx: u32) -> Vec<u8> {
-    let (mi_cols, mi_rows) = (2 * (width as usize).div_ceil(8), 2 * (height as usize).div_ceil(8));
+/// What a frame's header says about the frame: its type, size, quantiser and filter strengths.
+/// Every frame has one tile, default CDFs (primary_ref_frame NONE), TX_MODE_LARGEST, the regular
+/// 8-tap interpolation filter, and a single reference, LAST_FRAME, which is slot 0.
+#[derive(Clone, Copy, Debug)]
+pub struct FrameParams {
+    pub key: bool,
+    pub width: u32,
+    pub height: u32,
+    pub base_q_idx: u32,
+    /// The deblocking level of the luma edges (chroma takes the same level).
+    pub lf_level: u8,
+    /// The CDEF strengths of the one CDEF strength set: primary and secondary, luma and chroma.
+    pub cdef: [u8; 4],
+}
+
+/// The uncompressed header of a shown frame, byte aligned, as the frame OBU starts with it. A key
+/// frame refreshes every slot; an inter frame refreshes slot 0 (LAST_FRAME), so LAST_FRAME is the
+/// frame before it.
+pub fn frame_header(p: &FrameParams) -> Vec<u8> {
+    let (mi_cols, mi_rows) = (2 * (p.width as usize).div_ceil(8), 2 * (p.height as usize).div_ceil(8));
     let mut b = BitWriter::default();
     b.put(0, 1); // show_existing_frame
-    b.put(0, 2); // frame_type: KEY_FRAME
+    b.put(if p.key { 0 } else { 1 }, 2); // frame_type: KEY_FRAME or INTER_FRAME
     b.put(1, 1); // show_frame
+    if !p.key {
+        b.put(0, 1); // error_resilient_mode
+    }
     b.put(0, 1); // disable_cdf_update
     b.put(0, 1); // frame_size_override_flag
+    if !p.key {
+        b.put(7, 3); // primary_ref_frame: none, so the CDFs are the defaults
+        b.put(0x01, 8); // refresh_frame_flags: slot 0
+        for _ in 0..7 {
+            b.put(0, 3); // ref_frame_idx: slot 0 for every reference
+        }
+    }
     b.put(0, 1); // render_and_frame_size_different
-    b.put(1, 1); // disable_frame_end_update_cdf (nothing follows a single key frame)
+    if !p.key {
+        b.put(0, 1); // allow_high_precision_mv: quarter-sample motion
+        b.put(0, 1); // is_filter_switchable
+        b.put(0, 2); // interpolation_filter: EIGHTTAP (regular)
+        b.put(0, 1); // is_motion_mode_switchable
+    }
+    b.put(1, 1); // disable_frame_end_update_cdf
     tile_info(&mut b, mi_cols, mi_rows);
-    b.put(base_q_idx, 8);
+    b.put(p.base_q_idx, 8);
     b.put(0, 1); // DeltaQYDc: delta_coded
     b.put(0, 1); // DeltaQUDc
     b.put(0, 1); // DeltaQUAc
     b.put(0, 1); // using_qmatrix
     b.put(0, 1); // segmentation_enabled
     b.put(0, 1); // delta_q_present (base_q_idx is above zero)
-    b.put(0, 6); // loop_filter_level[0]: deblocking off
-    b.put(0, 6); // loop_filter_level[1]
+    let lf = p.lf_level as u32;
+    b.put(lf, 6); // loop_filter_level[0]
+    b.put(lf, 6); // loop_filter_level[1]
+    if lf != 0 {
+        b.put(lf, 6); // loop_filter_level[2]: U takes the luma level
+        b.put(lf, 6); // loop_filter_level[3]: V takes the luma level
+    }
     b.put(0, 3); // loop_filter_sharpness
-    b.put(0, 1); // loop_filter_delta_enabled
-    b.put(0, 1); // tx_mode_select: TX_MODE_LARGEST
+    b.put(0, 1); // loop_filter_delta_enabled: the levels are not adjusted per reference
+    // cdef_params: one strength set, so cdef_idx is never coded (cdef_bits 0)
+    b.put(0, 2); // cdef_damping_minus_3
+    b.put(0, 2); // cdef_bits
+    let sec = |s: u8| -> u32 {
+        match s {
+            4 => 3,
+            s => s as u32,
+        }
+    };
+    b.put(p.cdef[0] as u32, 4); // cdef_y_pri_strength[0]
+    b.put(sec(p.cdef[1]), 2); // cdef_y_sec_strength[0]
+    b.put(p.cdef[2] as u32, 4); // cdef_uv_pri_strength[0]
+    b.put(sec(p.cdef[3]), 2); // cdef_uv_sec_strength[0]
+    b.put(0, 1); // read_tx_mode: TX_MODE_LARGEST
+    if !p.key {
+        b.put(0, 1); // reference_select: single reference
+    }
     b.put(0, 1); // reduced_tx_set
+    if !p.key {
+        for _ in 0..7 {
+            b.put(0, 1); // is_global: identity motion
+        }
+    }
     b.byte_align();
     b.buf
 }
@@ -170,10 +230,10 @@ pub fn key_frame_header(width: u32, height: u32, base_q_idx: u32) -> Vec<u8> {
 /// The av1C configuration record for a stream of this encoder: the sequence header as its config OBU.
 pub fn config_record(width: u32, height: u32) -> Vec<u8> {
     let mut out = vec![
-        0x81,                 // marker and version 1
-        SEQ_LEVEL as u8,      // seq_profile 0, seq_level_idx_0
-        0x0C,                 // seq_tier 0, 8 bits, 4:2:0 (subsampling x and y set), no chroma position
-        0x00,                 // no initial presentation delay
+        0x81,            // marker and version 1
+        SEQ_LEVEL as u8, // seq_profile 0, seq_level_idx_0
+        0x0C,            // seq_tier 0, 8 bits, 4:2:0 (subsampling x and y set), no chroma position
+        0x00,            // no initial presentation delay
     ];
     out.extend(obu(OBU_SEQUENCE_HEADER, &sequence_header(width, height)));
     out
@@ -190,12 +250,13 @@ mod tests {
         let s = parse_sequence_header(&payload).unwrap();
         assert_eq!((s.max_frame_width, s.max_frame_height), (177, 99));
         assert_eq!((s.bit_depth, s.subsampling_x, s.subsampling_y), (8, true, true));
-        assert!(!s.reduced_still_picture_header && !s.enable_cdef && !s.enable_restoration);
+        assert!(!s.reduced_still_picture_header && s.enable_cdef && !s.enable_restoration);
     }
 
     #[test]
-    fn key_frame_header_reads_back() {
-        let hdr = key_frame_header(352, 288, 115);
+    fn frame_headers_read_back() {
+        let p = FrameParams { key: true, width: 352, height: 288, base_q_idx: 115, lf_level: 10, cdef: [3, 1, 1, 0] };
+        let hdr = frame_header(&p);
         let mut b = Bits::new(&hdr);
         assert_eq!(b.f(1).unwrap(), 0); // show_existing_frame
         assert_eq!(b.f(2).unwrap(), 0); // KEY_FRAME
