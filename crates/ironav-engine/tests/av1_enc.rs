@@ -3,6 +3,9 @@
 //! FFmpeg's testsrc2; odd sizes are cropped from an even testsrc2 (FFmpeg rounds odd sizes down). The
 //! tests skip when `ffmpeg` is not on the PATH.
 
+use ironav_codec::av1::enc::Av1Encoder;
+use ironav_codec::av1::Av1Decoder;
+use ironav_core::{Decoder, Encoder, Frame, Packet, PixelFormat, Rational, StreamParams, VideoFrame};
 use ironav_engine::{run, Job};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -247,5 +250,88 @@ fn bit_rate_is_followed_and_quality_rises_with_it() {
         assert!((rate / target - 1.0).abs() <= 0.10, "{kbps} kbit/s: {rate:.0} bit/s achieved, more than 10% off");
         assert!(y > last_psnr, "{kbps} kbit/s: luma PSNR {y:.2} dB does not rise from {last_psnr:.2} dB");
         last_psnr = y;
+    }
+}
+
+/// An IVF file of the packets, one temporal unit each, with each packet's time as its frame time.
+fn ivf_file(w: usize, h: usize, packets: &[Packet]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"DKIF");
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&32u16.to_le_bytes());
+    out.extend_from_slice(b"AV01");
+    out.extend_from_slice(&(w as u16).to_le_bytes());
+    out.extend_from_slice(&(h as u16).to_le_bytes());
+    out.extend_from_slice(&25u32.to_le_bytes());
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&(packets.len() as u32).to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    for p in packets {
+        out.extend_from_slice(&(p.data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(p.pts as u64).to_le_bytes());
+        out.extend_from_slice(&p.data);
+    }
+    out
+}
+
+/// The frame times of a video file, as ffprobe reads them, in order.
+fn ffprobe_pts(path: &Path) -> Vec<i64> {
+    let out = Command::new("ffprobe").args(["-v", "error", "-select_streams", "v", "-show_entries", "frame=pts", "-of", "csv=p=0"]).arg(path).output().expect("ffprobe runs");
+    String::from_utf8_lossy(&out.stdout).lines().map(|l| l.trim().parse().expect("a frame time")).collect()
+}
+
+/// With `with_altref(4)` the encoder codes hidden ALTREF frames, shown later by show_existing_frame
+/// headers. The stream, as IVF with one temporal unit per packet, decodes in libaom to the same pictures
+/// as in IronAV, one per source frame in display order; its frames have the times 0 to n - 1 in ffprobe;
+/// and the pictures are good. The second clip is at an odd size (177x99), so the partial superblocks and
+/// 8x8s of the hidden frames and their predictions are exercised too.
+#[test]
+fn altref_streams_decode_identically_with_libaom_and_ironav() {
+    need_ffmpeg!();
+    for (name, w, h) in [("altref", 176usize, 144usize), ("altref_odd", 177, 99)] {
+        let dir = scratch(name);
+        let n = 9;
+        let clip = source(&dir, w, h, n);
+        let (cw, ch) = clip.chroma();
+        let mut enc = Av1Encoder::new(&StreamParams::Video { width: w as u32, height: h as u32, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational { num: 25, den: 1 } }, Some(30), None)
+            .unwrap_or_else(|e| panic!("{name}: {e}"))
+            .with_altref(4);
+        let mut packets = Vec::new();
+        for (t, f) in clip.frames.iter().enumerate() {
+            let planes = vec![f[..w * h].to_vec(), f[w * h..w * h + cw * ch].to_vec(), f[w * h + cw * ch..].to_vec()];
+            let v = VideoFrame { width: w as u32, height: h as u32, pix_fmt: PixelFormat::Yuv420p, pts: t as i64, planes };
+            packets.extend(enc.encode(&Frame::Video(v)).unwrap_or_else(|e| panic!("{name}: {e}")));
+        }
+        packets.extend(enc.flush().unwrap_or_else(|e| panic!("{name}: {e}")));
+        assert_eq!(packets.len(), n, "{name}: one packet per frame");
+
+        let path = dir.join(format!("{name}.ivf"));
+        std::fs::write(&path, ivf_file(w, h, &packets)).unwrap();
+        assert_eq!(ffprobe_pts(&path), (0..n as i64).collect::<Vec<_>>(), "{name}: frame times");
+        let raw = dir.join(format!("{name}.libaom.raw"));
+        assert!(ffmpeg(&["-c:v", "libaom-av1", "-i", path.to_str().unwrap(), "-f", "rawvideo", "-pix_fmt", "yuv420p", raw.to_str().unwrap()]), "{name}: libaom could not decode");
+        let want = std::fs::read(&raw).unwrap();
+
+        let mut dec = Av1Decoder::new(&[]);
+        let mut pictures = Vec::new();
+        for p in &packets {
+            pictures.extend(dec.decode(p).unwrap_or_else(|e| panic!("{name}: {e}")));
+        }
+        pictures.extend(dec.flush().unwrap_or_else(|e| panic!("{name}: {e}")));
+        let mut got = Vec::new();
+        for f in pictures {
+            let Frame::Video(v) = f else { panic!("{name}: no picture") };
+            for pl in &v.planes {
+                got.extend_from_slice(pl);
+            }
+        }
+        if got != want {
+            let i = got.iter().zip(&want).position(|(a, b)| a != b).unwrap_or(got.len().min(want.len()));
+            panic!("{name}: IronAV decodes the stream differently from libaom ({} bytes, libaom {}; first difference at byte {i})", got.len(), want.len());
+        }
+        let (y, _) = psnr(&clip, &got);
+        eprintln!("{name}: {w}x{h} with ALTREF (lag 4): {} bytes, luma {y:.2} dB", std::fs::metadata(&path).unwrap().len());
+        assert!(y > 30.0, "{name}: luma PSNR {y:.2} dB");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

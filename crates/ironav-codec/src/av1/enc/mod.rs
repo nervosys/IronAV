@@ -7,7 +7,15 @@
 //! (LAST_FRAME, LAST2_FRAME and LAST3_FRAME, held in reference slots that each frame refreshes in
 //! turn; `with_refs(1)` limits it to LAST_FRAME), with the regular 8-tap filter, quarter-sample motion
 //! vectors (searched to half samples) and the reference MV stack's candidates. LAST_FRAME is searched
-//! fully and the others from its vector. Superblocks
+//! fully and the others from its vector.
+//!
+//! With `with_altref(lag)` the encoder looks `lag` frames ahead: the last of each group of frames is
+//! coded first as a hidden ALTREF_FRAME (`show_frame` 0, in a reference slot of its own), and the frames
+//! before it predict from it as well, singly or bidirectionally with LAST_FRAME (compound, one forward
+//! and one backward reference). The ALTREF is then shown by a show_existing_frame header, in the
+//! temporal unit of its display time. The hidden frame shares the temporal unit of the first frame
+//! shown after it, so every packet has the display time of its shown frame and the packets are in
+//! display order. Every frame carries its display index as an order hint (7 bits). Superblocks
 //! are 64x64, split by an open-loop search on the source down to 8x8 (never larger than 32x32, so
 //! every block is coded with one transform of its size). Each block is coded as intra or inter by
 //! rate-distortion cost, and intra blocks take the best of the 13 intra modes with angle deltas.
@@ -30,6 +38,7 @@ mod tile;
 
 pub use headers::config_record;
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use ironav_core::{Encoder, Error, ErrorCode, Frame, Packet, PixelFormat, Result, StreamParams, VideoFrame};
@@ -46,6 +55,16 @@ const DEFAULT_QP: u8 = 23;
 
 /// The key frame interval when none is set (the VP9 and HEVC encoders' default).
 const DEFAULT_KEYINT: u64 = 250;
+
+/// The reference slot of ALTREF_FRAME: the hidden frames are stored there, and no shown frame
+/// refreshes it. The slots 0 to 2 hold LAST_FRAME, LAST2_FRAME and LAST3_FRAME in turn.
+const ALTREF_SLOT: usize = 3;
+
+/// The largest lag `with_altref` takes: the frames an ALTREF group may span.
+const MAX_LAG: usize = 16;
+
+/// How much finer (in the 0 to 51 quantiser) a hidden ALTREF is coded than the frames before it.
+const ALT_QP_OFFSET: f64 = 4.0;
 
 /// Bits per pixel at quantiser 26, roughly, for the rate control's first guess (as the H.264 encoder's).
 const BPP: f64 = 0.1;
@@ -91,13 +110,19 @@ pub struct Av1Encoder {
     spent: f64,
     allowed: f64,
     keyint: u64,
-    /// Frames since the last key frame (1 right after one).
-    since_key: u64,
+    /// The display index of the last key frame, and of the next frame to code (the first pending one).
+    last_key: u64,
+    next_idx: u64,
+    /// The frames waiting to be coded, in display order (only with `with_altref`: an ALTREF group
+    /// is coded once its last frame has arrived), and the group's lag: 1 codes every frame as it comes.
+    pending: VecDeque<VideoFrame>,
+    lag: usize,
     seq: SequenceHeader,
-    /// The last three frames as references, in reference slots 0 to 2, with what the frame headers
-    /// read of them. The newest is in `head`; each inter frame refreshes the slot after it, which
-    /// holds the oldest, so the slots are LAST (`head`), LAST2 (the one before) and LAST3.
-    dpb: [Option<(Arc<Picture>, RefState)>; 3],
+    /// The last three shown frames as references, in reference slots 0 to 2, and the hidden ALTREF
+    /// in slot `ALTREF_SLOT`, each with what the frame headers read of it. The newest is in `head`;
+    /// each shown inter frame refreshes the slot after it, which holds the oldest, so the slots are
+    /// LAST (`head`), LAST2 (the one before) and LAST3.
+    dpb: [Option<(Arc<Picture>, RefState)>; 4],
     head: usize,
     /// How many references a block may use: 1 (LAST_FRAME alone) or 3 (see `with_refs`).
     nrefs: usize,
@@ -145,9 +170,12 @@ impl Av1Encoder {
             spent: 0.0,
             allowed: 0.0,
             keyint: DEFAULT_KEYINT,
-            since_key: 0,
+            last_key: 0,
+            next_idx: 0,
+            pending: VecDeque::new(),
+            lag: 1,
             seq,
-            dpb: [None, None, None],
+            dpb: [None, None, None, None],
             head: 0,
             nrefs: 3,
             compound: true,
@@ -178,6 +206,18 @@ impl Av1Encoder {
     /// possible. `with_compound(false)` codes every block with one reference.
     pub fn with_compound(mut self, on: bool) -> Self {
         self.compound = on;
+        self
+    }
+
+    /// Codes hidden ALTREF frames: every `lag` frames (2 to 16), the last of each group is coded
+    /// first, from the source `lag - 1` frames ahead, and is shown by a show_existing_frame header at
+    /// its display time. The frames between predict from it as well as from LAST_FRAME (single, and
+    /// bidirectional with LAST_FRAME). The encoder then holds `lag` frames before it can code a group,
+    /// so its packets come `lag - 1` frames late, and `flush` codes the rest. A lag of 1 (the default)
+    /// codes every frame as it comes. Key frames still start every key frame interval, and a group
+    /// never spans one.
+    pub fn with_altref(mut self, lag: usize) -> Self {
+        self.lag = lag.clamp(1, MAX_LAG);
         self
     }
 
@@ -243,8 +283,19 @@ impl Av1Encoder {
         self.rc_qp = next.clamp(self.rc_qp - 4.0, self.rc_qp + 4.0).clamp(1.0, 51.0);
     }
 
-    /// The temporal unit of one picture.
+    /// The temporal unit of one shown frame, with no lookahead (every frame is coded as it comes, as
+    /// with the default lag of 1): what `Encoder::encode` returns for it.
     pub fn encode_frame(&mut self, v: &VideoFrame) -> Result<Vec<u8>> {
+        self.pending.push_back(v.clone());
+        let packets = self.drain(false)?;
+        Ok(packets.into_iter().flat_map(|p| p.data).collect())
+    }
+
+    /// The frame OBU's payload (the frame header and the tile) of one frame at display index `order_hint`,
+    /// and its quantiser. A key frame refreshes every reference; a shown inter frame refreshes the
+    /// oldest LAST slot; a hidden frame is an ALTREF, stored in its own slot. `dists` are the display
+    /// distances of LAST_FRAME and of ALTREF_FRAME (`None` when the frame may not use it).
+    fn code_frame(&mut self, v: &VideoFrame, key: bool, shown: bool, order_hint: u32, dists: (i32, Option<i32>)) -> Result<(Vec<u8>, f64)> {
         let (w, h) = (self.width, self.height);
         if v.pix_fmt != PixelFormat::Yuv420p || v.width as usize != w || v.height as usize != h || v.planes.len() < 3 {
             return Err(Error::invalid_input(format!("the AV1 encoder was set up for {w}x{h} yuv420p frames")));
@@ -253,13 +304,23 @@ impl Av1Encoder {
         if v.planes[0].len() < w * h || v.planes[1].len() < cw * ch || v.planes[2].len() < cw * ch {
             return Err(Error::invalid_input("a video frame plane is shorter than its dimensions"));
         }
-        let key = self.dpb[self.head].is_none() || self.since_key >= self.keyint;
-        let qp = self.next_qp(key);
+        // a hidden ALTREF is coded finer than the frames that predict from it
+        let qp = (self.next_qp(key) - if key || shown { 0.0 } else { ALT_QP_OFFSET }).clamp(0.0, 51.0);
         let q = base_q(qp);
-        // LAST_FRAME is the newest slot, LAST2_FRAME the one before it and LAST3_FRAME the oldest; the
-        // frame is then stored in the oldest slot, which becomes the newest
+        // LAST_FRAME is the newest slot, LAST2_FRAME the one before it and LAST3_FRAME the oldest; a shown
+        // frame is then stored in the oldest slot, which becomes the newest. The other references name
+        // LAST_FRAME (GOLDEN) or ALTREF_SLOT (BWDREF, ALTREF2 and ALTREF).
         let ref_slots = [self.head, (self.head + 2) % 3, (self.head + 1) % 3];
         let new_slot = (self.head + 1) % 3;
+        let ref_idx = [ref_slots[0], ref_slots[1], ref_slots[2], ref_slots[0], ALTREF_SLOT, ALTREF_SLOT, ALTREF_SLOT].map(|s| s as u8);
+        let ref_hints: [u32; 7] = std::array::from_fn(|i| self.dpb[ref_idx[i] as usize].as_ref().map_or(0, |(_, s)| s.order_hint));
+        let refresh = if key {
+            0xff
+        } else if shown {
+            1 << new_slot
+        } else {
+            1 << ALTREF_SLOT
+        };
         let params = FrameParams {
             key,
             width: w as u32,
@@ -269,14 +330,17 @@ impl Av1Encoder {
             cdef: cdef_strengths(q),
             superres: self.superres,
             restoration: self.restoration,
-            ref_slots: ref_slots.map(|s| s as u8),
-            refresh: if key { 0xff } else { 1 << new_slot },
+            order_hint,
+            shown,
+            ref_idx,
+            ref_hints,
+            refresh,
             reference_select: self.compound,
         };
         let hdr = headers::frame_header(&params);
 
         // the frame's header as the decoder reads it, with the reference slots holding the frames' states
-        let refs = RefInfo { slots: std::array::from_fn(|i| self.dpb[i % 3].as_ref().map(|(_, s)| s.clone())) };
+        let refs = RefInfo { slots: std::array::from_fn(|i| self.dpb.get(i).and_then(|s| s.as_ref().map(|(_, s)| s.clone()))) };
         let fh = parse_frame_header(&hdr, &self.seq, &refs, 0, 0)?;
         // with superres the frame is coded at its downscaled width, from the resampled source
         let coded_w = self.superres.map_or(w, |d| downscaled_width(w as u32, d) as usize);
@@ -287,13 +351,12 @@ impl Av1Encoder {
         };
         let mut f = FrameDec::new(self.seq.clone(), fh);
         if !key {
-            // each reference frame names its slot as the header does; the references past LAST3 name LAST's
+            // each reference frame names its slot as the header does
             for rf in 1..8 {
-                let slot = if rf <= 3 { ref_slots[rf - 1] } else { ref_slots[0] };
-                f.refs[rf] = self.dpb[slot].as_ref().map(|(pic, _)| pic.clone());
+                f.refs[rf] = self.dpb[ref_idx[rf - 1] as usize].as_ref().map(|(pic, _)| pic.clone());
             }
         }
-        let enc = tile::FrameEnc::new(f, planes[0], planes[1], planes[2], (coded_w, h), self.prev_src.clone(), std::mem::take(&mut self.bases), self.nrefs, self.compound);
+        let enc = tile::FrameEnc::new(f, planes[0], planes[1], planes[2], (coded_w, h), self.prev_src.clone(), std::mem::take(&mut self.bases), self.nrefs, self.compound, dists);
         let (tile_bytes, mut f, src_luma, bases) = enc.encode();
         self.bases = bases;
 
@@ -321,32 +384,109 @@ impl Av1Encoder {
             mono: false,
             rgb: false,
             frame_type: f.h.frame_type,
-            order_hint: 0,
-            saved_hints: [0; 8],
+            order_hint: f.h.order_hint,
+            saved_hints: f.h.order_hints,
             mi_rows: f.h.mi_rows,
             mi_cols: f.h.mi_cols,
             mvs: std::mem::take(&mut f.saved_mvs),
             seg_ids: Vec::new(),
             planes: std::mem::replace(&mut f.planes, [Plane::new(0, 0), Plane::new(0, 0), Plane::new(0, 0)]),
         };
+        let entry = (Arc::new(pic), state);
         if key {
-            let entry = (Arc::new(pic), state);
-            self.dpb = [Some(entry.clone()), Some(entry.clone()), Some(entry)];
+            self.dpb = [Some(entry.clone()), Some(entry.clone()), Some(entry.clone()), Some(entry)];
             self.head = 0;
-        } else {
-            self.dpb[new_slot] = Some((Arc::new(pic), state));
+        } else if shown {
+            self.dpb[new_slot] = Some(entry);
             self.head = new_slot;
+        } else {
+            self.dpb[ALTREF_SLOT] = Some(entry);
         }
-        self.prev_src = Some(src_luma);
-        self.since_key = if key { 1 } else { self.since_key + 1 };
+        if shown {
+            self.prev_src = Some(src_luma);
+        }
 
         let mut frame = hdr;
         frame.extend_from_slice(&tile_bytes);
+        Ok((frame, qp))
+    }
+
+    /// The start of a temporal unit: the temporal delimiter and the sequence header.
+    fn temporal_unit_start(&self) -> Vec<u8> {
         let mut out = headers::obu(headers::OBU_TEMPORAL_DELIMITER, &[]);
-        out.extend(headers::obu(headers::OBU_SEQUENCE_HEADER, &headers::sequence_header_with(w as u32, h as u32, self.superres.is_some(), self.restoration)));
-        out.extend(headers::obu(headers::OBU_FRAME, &frame));
-        self.rate_update(out.len() * 8, qp, key);
+        out.extend(headers::obu(headers::OBU_SEQUENCE_HEADER, &headers::sequence_header_with(self.width as u32, self.height as u32, self.superres.is_some(), self.restoration)));
+        out
+    }
+
+    /// Codes the frames that are ready, in display order, and returns their packets. A key frame is
+    /// coded as soon as it is at the front. An inter group of `lag` frames (cut short at the next key
+    /// frame) is coded when all its frames are here, or at `flush` with what there is: its last frame
+    /// is coded first as a hidden ALTREF, in the temporal unit of the group's first frame, then the
+    /// frames before it, then the ALTREF's show_existing_frame in its own temporal unit.
+    fn drain(&mut self, flush: bool) -> Result<Vec<Packet>> {
+        let mut out = Vec::new();
+        while !self.pending.is_empty() {
+            let idx = self.next_idx;
+            if self.dpb[self.head].is_none() || idx - self.last_key >= self.keyint {
+                let v = self.pending.pop_front().expect("a pending frame");
+                let (frame, qp) = self.code_frame(&v, true, true, idx as u32, (0, None))?;
+                let mut tu = self.temporal_unit_start();
+                tu.extend(headers::obu(headers::OBU_FRAME, &frame));
+                self.rate_update(tu.len() * 8, qp, true);
+                self.last_key = idx;
+                self.next_idx += 1;
+                out.push(Packet { stream: 0, pts: v.pts, duration: 1, data: tu });
+                continue;
+            }
+            // the frames before the next key frame
+            let until_key = (self.keyint - (idx - self.last_key)) as usize;
+            let len = self.lag.min(until_key);
+            if self.pending.len() < len && !flush {
+                break;
+            }
+            let len = len.min(self.pending.len());
+            if len <= 1 {
+                let v = self.pending.pop_front().expect("a pending frame");
+                let (frame, qp) = self.code_frame(&v, false, true, idx as u32, (1, None))?;
+                let mut tu = self.temporal_unit_start();
+                tu.extend(headers::obu(headers::OBU_FRAME, &frame));
+                self.rate_update(tu.len() * 8, qp, false);
+                self.next_idx += 1;
+                out.push(Packet { stream: 0, pts: v.pts, duration: 1, data: tu });
+                continue;
+            }
+            // the group's ALTREF: the last of its frames, `len - 1` frames ahead of LAST_FRAME's frame
+            let alt_idx = idx + len as u64 - 1;
+            let alt = self.pending[len - 1].clone();
+            let (hidden, _) = self.code_frame(&alt, false, false, alt_idx as u32, (len as i32, None))?;
+            for k in 0..len - 1 {
+                let v = self.pending.pop_front().expect("a pending frame");
+                let dist = (len - 1 - k) as i32;
+                let (frame, qp) = self.code_frame(&v, false, true, (idx + k as u64) as u32, (1, Some(dist)))?;
+                let mut tu = self.temporal_unit_start();
+                if k == 0 {
+                    tu.extend(headers::obu(headers::OBU_FRAME, &hidden));
+                }
+                tu.extend(headers::obu(headers::OBU_FRAME, &frame));
+                self.rate_update(tu.len() * 8, qp, false);
+                self.next_idx += 1;
+                out.push(Packet { stream: 0, pts: v.pts, duration: 1, data: tu });
+            }
+            let shown = self.pending.pop_front().expect("the ALTREF's frame");
+            let mut tu = self.temporal_unit_start();
+            tu.extend(headers::obu(headers::OBU_FRAME_HEADER, &headers::show_existing_header(ALTREF_SLOT as u8)));
+            self.rate_pass();
+            self.next_idx += 1;
+            out.push(Packet { stream: 0, pts: shown.pts, duration: 1, data: tu });
+        }
         Ok(out)
+    }
+
+    /// Passes a frame that codes no bits (a show_existing_frame) in the rate control's budget.
+    fn rate_pass(&mut self) {
+        if let Some(rate) = self.bitrate {
+            self.allowed += rate as f64 / self.fps;
+        }
     }
 }
 
@@ -384,8 +524,13 @@ impl Encoder for Av1Encoder {
         let Frame::Video(v) = frame else {
             return Err(Error::invalid_input("the AV1 encoder received an audio frame"));
         };
-        let data = self.encode_frame(v)?;
-        Ok(vec![Packet { stream: 0, pts: v.pts, duration: 1, data }])
+        self.pending.push_back(v.clone());
+        self.drain(false)
+    }
+
+    /// Codes the frames still waiting for their ALTREF group (see `with_altref`).
+    fn flush(&mut self) -> Result<Vec<Packet>> {
+        self.drain(true)
     }
 }
 
@@ -502,6 +647,122 @@ mod tests {
                     assert!(p > 20.0, "1/{denom} {w}x{h} frame {t}: luma PSNR {p:.1} dB");
                 }
             }
+        }
+    }
+
+    /// With `with_altref`, the packets come one per frame, in display order with each frame's time, and
+    /// decode to the source's frames in order: the hidden ALTREFs are shown by show_existing_frame
+    /// headers, and the frames between predict from them.
+    #[test]
+    fn altref_groups_decode_in_display_order() {
+        let (w, h) = (96usize, 64usize);
+        for &lag in &[2usize, 4, 6] {
+            let mut enc = Av1Encoder::new(&params(w, h), Some(24), None).unwrap().with_keyint(9).with_altref(lag);
+            let mut packets = Vec::new();
+            for t in 0..11 {
+                let mut src = picture_shifted(w, h, 2 * t);
+                src.pts = t as i64;
+                packets.extend(enc.encode(&CoreFrame::Video(src)).unwrap());
+            }
+            packets.extend(enc.flush().unwrap());
+            assert_eq!(packets.len(), 11, "lag {lag}: one packet per frame");
+            for (t, p) in packets.iter().enumerate() {
+                assert_eq!(p.pts, t as i64, "lag {lag}: packet {t} has its frame's time");
+            }
+            let mut dec = Av1Decoder::new(&[]);
+            let mut got = Vec::new();
+            for p in &packets {
+                got.extend(dec.decode(p).unwrap());
+            }
+            got.extend(dec.flush().unwrap());
+            assert_eq!(got.len(), 11, "lag {lag}: one picture per frame");
+            for (t, f) in got.into_iter().enumerate() {
+                let p = psnr(&picture_shifted(w, h, 2 * t).planes[0], &luma_of(f));
+                assert!(p > 30.0, "lag {lag} frame {t}: luma PSNR {p:.1} dB");
+            }
+        }
+    }
+
+    /// A measurement, not a test (run with `--ignored --release`): encodes the raw yuv420p file named by
+    /// IRONAV_BENCH_YUV (IRONAV_BENCH_SIZE "WxH", IRONAV_BENCH_QP, IRONAV_BENCH_LAG: 1 for no ALTREF) and
+    /// prints the bytes, the mean luma PSNR of the decoded frames against the source in display order,
+    /// and the encode and decode times. IRONAV_BENCH_OUT, when set, is a path prefix: the stream is written
+    /// there as `.ivf` and the decoded frames as `.yuv`, for FFmpeg's libaom to check against.
+    #[test]
+    #[ignore]
+    fn bench_altref() {
+        let Ok(path) = std::env::var("IRONAV_BENCH_YUV") else {
+            return;
+        };
+        let size = std::env::var("IRONAV_BENCH_SIZE").unwrap_or("1280x720".into());
+        let (w, h) = size.split_once('x').map(|(a, b)| (a.parse::<usize>().unwrap(), b.parse::<usize>().unwrap())).unwrap();
+        let qp: u8 = std::env::var("IRONAV_BENCH_QP").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
+        let lag: usize = std::env::var("IRONAV_BENCH_LAG").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+        let raw = std::fs::read(&path).unwrap();
+        let fsize = w * h + 2 * w.div_ceil(2) * h.div_ceil(2);
+        let frames: Vec<VideoFrame> = raw
+            .chunks_exact(fsize)
+            .enumerate()
+            .map(|(t, c)| {
+                let (y, rest) = c.split_at(w * h);
+                let (u, v) = rest.split_at(w.div_ceil(2) * h.div_ceil(2));
+                VideoFrame { width: w as u32, height: h as u32, pix_fmt: PixelFormat::Yuv420p, pts: t as i64, planes: vec![y.to_vec(), u.to_vec(), v.to_vec()] }
+            })
+            .collect();
+        let mut enc = Av1Encoder::new(&params(w, h), Some(qp), None).unwrap().with_altref(lag);
+        let t0 = std::time::Instant::now();
+        let mut packets = Vec::new();
+        for f in &frames {
+            packets.extend(enc.encode(&CoreFrame::Video(f.clone())).unwrap());
+        }
+        packets.extend(enc.flush().unwrap());
+        let enc_s = t0.elapsed().as_secs_f64();
+        let bytes: usize = packets.iter().map(|p| p.data.len()).sum();
+        let t1 = std::time::Instant::now();
+        let mut dec = Av1Decoder::new(&[]);
+        let mut got = Vec::new();
+        for p in &packets {
+            got.extend(dec.decode(p).unwrap());
+        }
+        got.extend(dec.flush().unwrap());
+        let dec_s = t1.elapsed().as_secs_f64();
+        assert_eq!(got.len(), frames.len(), "one decoded picture per source frame");
+        let mut sum = 0.0;
+        let mut decoded = Vec::new();
+        for (f, src) in got.into_iter().zip(&frames) {
+            let CoreFrame::Video(out) = f else { panic!("no picture") };
+            sum += psnr(&src.planes[0], &out.planes[0][..w * h]);
+            for pl in &out.planes {
+                decoded.extend_from_slice(pl);
+            }
+        }
+        let n = frames.len() as f64;
+        println!(
+            "IRONAV_BENCH {size} qp={qp} lag={lag} frames={} bytes={bytes} luma_psnr={:.3} enc_fps={:.2} dec_fps={:.2}",
+            frames.len(),
+            sum / n,
+            n / enc_s,
+            n / dec_s
+        );
+        if let Ok(prefix) = std::env::var("IRONAV_BENCH_OUT") {
+            let mut ivf = Vec::new();
+            ivf.extend_from_slice(b"DKIF");
+            ivf.extend_from_slice(&0u16.to_le_bytes());
+            ivf.extend_from_slice(&32u16.to_le_bytes());
+            ivf.extend_from_slice(b"AV01");
+            ivf.extend_from_slice(&(w as u16).to_le_bytes());
+            ivf.extend_from_slice(&(h as u16).to_le_bytes());
+            ivf.extend_from_slice(&25u32.to_le_bytes());
+            ivf.extend_from_slice(&1u32.to_le_bytes());
+            ivf.extend_from_slice(&(packets.len() as u32).to_le_bytes());
+            ivf.extend_from_slice(&0u32.to_le_bytes());
+            for p in &packets {
+                ivf.extend_from_slice(&(p.data.len() as u32).to_le_bytes());
+                ivf.extend_from_slice(&(p.pts as u64).to_le_bytes());
+                ivf.extend_from_slice(&p.data);
+            }
+            std::fs::write(format!("{prefix}.ivf"), ivf).unwrap();
+            std::fs::write(format!("{prefix}.yuv"), decoded).unwrap();
         }
     }
 }

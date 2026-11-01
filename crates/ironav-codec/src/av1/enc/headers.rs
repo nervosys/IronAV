@@ -9,7 +9,11 @@ const SEQ_LEVEL: u32 = 13;
 
 pub const OBU_SEQUENCE_HEADER: u8 = 1;
 pub const OBU_TEMPORAL_DELIMITER: u8 = 2;
+pub const OBU_FRAME_HEADER: u8 = 3;
 pub const OBU_FRAME: u8 = 6;
+
+/// The bits of an order hint: the frame's display index modulo 2^7.
+pub const ORDER_HINT_BITS: u32 = 7;
 
 /// MSB-first bit writer.
 #[derive(Default)]
@@ -74,9 +78,9 @@ pub fn obu(kind: u8, payload: &[u8]) -> Vec<u8> {
 }
 
 /// The sequence header payload for 8-bit 4:2:0 profile 0 pictures of `width` x `height`: one
-/// operating point, no reduced still picture header, no order hints (so no skip mode, compound
-/// prediction or temporal motion), screen content tools off, CDEF on, loop restoration off, no
-/// superres, no film grain.
+/// operating point, no reduced still picture header, order hints of 7 bits (so frames carry their
+/// display order and compound blocks may be bidirectional; no compound distance and no temporal
+/// motion), screen content tools off, CDEF on, loop restoration off, no superres, no film grain.
 pub fn sequence_header(width: u32, height: u32) -> Vec<u8> {
     sequence_header_with(width, height, false, false)
 }
@@ -107,9 +111,12 @@ pub fn sequence_header_with(width: u32, height: u32, superres: bool, restoration
     b.put(0, 1); // enable_masked_compound
     b.put(0, 1); // enable_warped_motion
     b.put(0, 1); // enable_dual_filter
-    b.put(0, 1); // enable_order_hint
+    b.put(1, 1); // enable_order_hint
+    b.put(0, 1); // enable_jnt_comp (COMPOUND_DISTANCE is not coded)
+    b.put(0, 1); // enable_ref_frame_mvs (no motion field projection)
     b.put(0, 1); // seq_choose_screen_content_tools
     b.put(0, 1); // seq_force_screen_content_tools (no integer MV syntax follows)
+    b.put(ORDER_HINT_BITS - 1, 3); // order_hint_bits_minus_1
     b.put(superres as u32, 1); // enable_superres
     b.put(1, 1); // enable_cdef
     b.put(restoration as u32, 1); // enable_restoration
@@ -166,17 +173,60 @@ pub struct FrameParams {
     /// Whether the sequence header allows loop restoration, and then whether the frame uses it: the
     /// Wiener filter on every plane, with 64-sample luma units and 32-sample chroma units.
     pub restoration: bool,
-    /// The reference slots of LAST_FRAME, LAST2_FRAME and LAST3_FRAME (the other four references
-    /// name the slot of LAST_FRAME), and the slots the frame refreshes (inter frames only).
-    pub ref_slots: [u8; 3],
+    /// The display index of the frame, as its order hint (the low 7 bits are written).
+    pub order_hint: u32,
+    /// Whether the frame is shown (a hidden frame is an ALTREF, shown later by a show_existing_frame).
+    pub shown: bool,
+    /// The reference slot of each of the seven references (LAST_FRAME to ALTREF_FRAME), inter frames only.
+    pub ref_idx: [u8; 7],
+    /// The order hints of those seven references (the low 7 bits), which decide whether the
+    /// skip mode flag is coded.
+    pub ref_hints: [u32; 7],
+    /// The slots the frame refreshes (inter frames only).
     pub refresh: u8,
     /// Whether inter frames may code compound blocks (reference_select).
     pub reference_select: bool,
 }
 
+/// The order hint difference of `a` from `b` in 7-bit order hints (get_relative_dist).
+fn rel_dist(a: u32, b: u32) -> i32 {
+    let diff = (a as i32 & 127) - (b as i32 & 127);
+    (diff & 63) - (diff & 64)
+}
+
+/// Whether skip mode is allowed for a frame with order hint `cur` predicting from references with
+/// order hints `hints` (skip_mode_params): a forward and a backward reference, or two forward
+/// references with different hints. When it is, the frame header codes a skip_mode_present flag.
+fn skip_mode_allowed(cur: u32, hints: &[u32; 7]) -> bool {
+    // the latest forward reference, as the decoder's skip_mode_params finds it
+    let mut fwd: Option<u32> = None;
+    for &h in hints {
+        if rel_dist(h, cur) < 0 && fwd.is_none_or(|f| rel_dist(h, f) > 0) {
+            fwd = Some(h);
+        }
+    }
+    let Some(fwd_hint) = fwd else {
+        return false;
+    };
+    if hints.iter().any(|&h| rel_dist(h, cur) > 0) {
+        return true;
+    }
+    hints.iter().any(|&h| rel_dist(h, fwd_hint) < 0)
+}
+
+/// The OBU payload of a show_existing_frame header: the slot of the frame shown, then the trailing
+/// bits (the frame's header is one bit and three, byte aligned).
+pub fn show_existing_header(slot: u8) -> Vec<u8> {
+    let mut b = BitWriter::default();
+    b.put(1, 1); // show_existing_frame
+    b.put(slot as u32, 3); // frame_to_show_map_idx
+    b.trailing_bits();
+    b.buf
+}
+
 /// The uncompressed header of a shown frame, byte aligned, as the frame OBU starts with it. A key
 /// frame refreshes every slot; an inter frame refreshes the slots `p.refresh` names, and reads its
-/// LAST, LAST2 and LAST3 references from `p.ref_slots`. `p.width` is the upscaled width: with superres
+/// references from `p.ref_idx`. `p.width` is the upscaled width: with superres
 /// the frame is coded at the downscaled width that `superres_params` derives from it.
 pub fn frame_header(p: &FrameParams) -> Vec<u8> {
     let coded_width = match p.superres {
@@ -187,18 +237,21 @@ pub fn frame_header(p: &FrameParams) -> Vec<u8> {
     let mut b = BitWriter::default();
     b.put(0, 1); // show_existing_frame
     b.put(if p.key { 0 } else { 1 }, 2); // frame_type: KEY_FRAME or INTER_FRAME
-    b.put(1, 1); // show_frame
+    b.put(p.shown as u32, 1); // show_frame
+    if !p.shown {
+        b.put(1, 1); // showable_frame (an inter frame: it may be shown by show_existing_frame)
+    }
     if !p.key {
         b.put(0, 1); // error_resilient_mode
     }
     b.put(0, 1); // disable_cdf_update
     b.put(0, 1); // frame_size_override_flag: the size is the sequence's maximum
+    b.put(p.order_hint & 127, ORDER_HINT_BITS); // order_hint
     if !p.key {
         b.put(7, 3); // primary_ref_frame: none, so the CDFs are the defaults
         b.put(p.refresh as u32, 8); // refresh_frame_flags
-        for i in 0..7 {
-            // LAST_FRAME, LAST2_FRAME and LAST3_FRAME from their slots; the other references name LAST_FRAME's
-            let slot = if i < 3 { p.ref_slots[i] } else { p.ref_slots[0] };
+        b.put(0, 1); // frame_refs_short_signaling
+        for &slot in &p.ref_idx {
             b.put(slot as u32, 3); // ref_frame_idx
         }
     }
@@ -259,6 +312,9 @@ pub fn frame_header(p: &FrameParams) -> Vec<u8> {
     b.put(0, 1); // read_tx_mode: TX_MODE_LARGEST
     if !p.key {
         b.put(p.reference_select as u32, 1); // reference_select
+        if p.reference_select && skip_mode_allowed(p.order_hint & 127, &p.ref_hints) {
+            b.put(0, 1); // skip_mode_present: no block codes skip mode
+        }
     }
     b.put(0, 1); // reduced_tx_set
     if !p.key {
@@ -298,7 +354,7 @@ mod tests {
 
     #[test]
     fn frame_headers_read_back() {
-        let p = FrameParams { key: true, width: 352, height: 288, base_q_idx: 115, lf_level: 10, cdef: [3, 1, 1, 0], superres: None, restoration: false, ref_slots: [0; 3], refresh: 0xff, reference_select: false };
+        let p = FrameParams { key: true, width: 352, height: 288, base_q_idx: 115, lf_level: 10, cdef: [3, 1, 1, 0], superres: None, restoration: false, order_hint: 0, shown: true, ref_idx: [0; 7], ref_hints: [0; 7], refresh: 0xff, reference_select: false };
         let hdr = frame_header(&p);
         let mut b = Bits::new(&hdr);
         assert_eq!(b.f(1).unwrap(), 0); // show_existing_frame

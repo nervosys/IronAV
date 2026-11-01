@@ -53,6 +53,15 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   the three references alone (60 frames, 720p, qp 20/30/40): testsrc2 is 4.4, 10.6 and 17.6 % smaller at 0.04, 0.20 and 0.34 dB
   higher PSNR; mandelbrot is 8.6, 16.7 and 33.3 % smaller at 0.13, 0.34 and 0.76 dB higher. Encoding is about half the speed
   (about 1 to 2 frames a second).
+- **Codecs (AV1 encoder, hidden ALTREF):** `with_altref(lag)` is an encoder option (not a command-line option), off by default.
+  Every `lag` frames the last of a group is coded first as a hidden frame (`show_frame` 0, in a reference slot of its own), the
+  frames before it predict from it singly or bidirectionally with LAST_FRAME (compound, one forward and one backward
+  reference), and it is shown later by a show_existing_frame header in its own temporal unit. Frames carry order hints (7 bits),
+  which the default stream now has too: about one byte a frame. Against no ALTREF (60 frames, 720p, qp 20/30/40): testsrc2 is
+  6.6, 8.8 and 15.1 % larger at lag 8 (14.3, 17.8 and 31.0 % at lag 4) for 0.23, 0.30 and 0.38 dB more PSNR; mandelbrot is 0.3,
+  3.3 and 12.2 % larger at lag 8 (1.1, 7.3 and 22.3 % at lag 4) for 0.39, 0.54 and 0.49 dB more. That is not a gain at equal
+  PSNR, so it stays an option. libaom decodes the streams to IronAV's pictures, in display order with the frames' times
+  (`altref_streams_decode_identically_with_libaom_and_ironav` in `crates/ironav-engine/tests/av1_enc.rs`).
 - **Containers:** WAV, FLAC, Y4M, MP4, QuickTime MOV, Matroska and WebM (read and write), Ogg (Opus, Vorbis and FLAC),
   ADTS, MP3, JPEG, and MPEG transport streams (read and write), and raw H.264 and HEVC (Annex B, write only).
 - **Containers (MP4):** fragmented MP4 is read as it arrives, and written with `fragment_seconds` in a job (`--fragment-seconds S`
@@ -140,8 +149,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 - **Hardware:** only NVIDIA is driven: NVENC for H.264 and HEVC, NVDEC for H.264, HEVC and AV1. The other backends
   (VA-API, Quick Sync, VideoToolbox, D3D11VA, AMF, Vulkan Video, MediaCodec and OpenCL) are planned.
-- **AV1 encoder:** no backward references (no hidden ALTREF) and no joint or masked compound, 8-bit 4:2:0 and one tile; the
-  motion search stops at half samples. Rate control is an average bit rate only: no maximum rate or buffer size (`--maxrate`,
+- **AV1 encoder:** no joint compound (COMPOUND_DISTANCE), no motion field projection and no skip mode; hidden ALTREF frames are an
+  encoder option (`with_altref`), off by default; 8-bit 4:2:0 and one tile; the motion search stops at half samples. Rate control is an average bit rate only: no maximum rate or buffer size (`--maxrate`,
   `--bufsize` are not options of any encoder).
 - **HEVC encoder:** Main profile, 8-bit 4:2:0 only, with no sign data hiding; B pictures are an option (`with_bframes`), off by default: with a quantiser cascade they save about 12 % on the mandelbrot clip at equal PSNR, but only about 3 % on `testsrc2` (see the HEVC section of the README); wider HEVC encoding needs
   an NVIDIA GPU.

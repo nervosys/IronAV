@@ -119,6 +119,25 @@ pub struct FrameEnc {
     nrefs: usize,
     /// Whether blocks may code compound predictions (the frame's reference_select).
     compound: bool,
+    /// The display distance of LAST_FRAME from this frame (the open-loop motion is per frame, so the
+    /// searches start from it scaled by this).
+    last_dist: i32,
+    /// The display distance of ALTREF_FRAME, a future frame, when the frame may predict from it
+    /// (single or bidirectional compound blocks); `None` for a frame that may not.
+    alt_dist: Option<i32>,
+}
+
+/// A reference symbol: which CDF family it is coded with (see `RefCdf`), its context, the index
+/// within the context's CDFs, and the bit.
+type RefSym = (RefCdf, usize, usize, usize);
+
+/// The CDF families of the reference frame symbols.
+#[derive(Clone, Copy)]
+enum RefCdf {
+    Single,
+    Uni,
+    CompRef,
+    CompBwd,
 }
 
 fn bitlen(v: u32) -> usize {
@@ -285,7 +304,11 @@ fn round8(m: Mv) -> Mv {
 impl FrameEnc {
     /// An encoder state for `f`, a frame of the decoder's state, with the source `y`, `u`, `v`
     /// planes (`pic` wide, tightly packed) and the previous picture's source luma.
-    pub fn new(f: FrameDec, y: &[u8], u: &[u8], v: &[u8], pic: (usize, usize), prev: Option<Plane>, bases: Bases, nrefs: usize, compound: bool) -> FrameEnc {
+    ///
+    /// `dists` is the display distance of LAST_FRAME and, for a frame that may predict from ALTREF_FRAME,
+    /// the distance of ALTREF_FRAME (see `last_dist`, `alt_dist`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(f: FrameDec, y: &[u8], u: &[u8], v: &[u8], pic: (usize, usize), prev: Option<Plane>, bases: Bases, nrefs: usize, compound: bool, dists: (i32, Option<i32>)) -> FrameEnc {
         let (mi_cols, mi_rows) = (f.h.mi_cols, f.h.mi_rows);
         let qidx = f.h.base_q_idx as usize;
         let (aw, ah) = ((mi_cols * 4).div_ceil(64) * 64, (mi_rows * 4).div_ceil(64) * 64);
@@ -331,6 +354,8 @@ impl FrameEnc {
             plan: HashMap::new(),
             nrefs,
             compound,
+            last_dist: dists.0,
+            alt_dist: dists.1,
         }
     }
 
@@ -1018,13 +1043,32 @@ impl FrameEnc {
 
     /// The uni_comp_ref symbols of a unidirectional pair `rf` (LAST_FRAME with LAST2_FRAME or LAST3_FRAME),
     /// as (CDF context, CDF index, bit) (read_ref_frames in the decoder): forward, then LAST3 or LAST2.
-    fn uni_syms(&self, rf: [i8; 2]) -> Vec<(usize, usize, usize)> {
+    fn uni_syms(&self, rf: [i8; 2]) -> Vec<RefSym> {
         let n = self.ref_counts();
         let fwd_bwd = count_ctx(n[1] + n[2] + n[3] + n[4], n[5] + n[6] + n[7]);
-        let mut s = vec![(fwd_bwd, 0, 0), (count_ctx(n[2], n[3] + n[4]), 1, (rf[1] == 3) as usize)];
+        let mut s = vec![(RefCdf::Uni, fwd_bwd, 0, 0), (RefCdf::Uni, count_ctx(n[2], n[3] + n[4]), 1, (rf[1] == 3) as usize)];
         if rf[1] == 3 {
-            s.push((count_ctx(n[3], n[4]), 2, 0));
+            s.push((RefCdf::Uni, count_ctx(n[3], n[4]), 2, 0));
         }
+        s
+    }
+
+    /// The reference symbols of a compound pair after its compound reference type (read_ref_frames):
+    /// the unidirectional pairs of `uni_syms`, or a bidirectional pair of a forward reference (LAST,
+    /// LAST2 or LAST3) with ALTREF_FRAME, coded as comp_ref (LAST or LAST2 by comp_ref_p1, LAST3 by
+    /// comp_ref_p2) then comp_bwdref (ALTREF_FRAME).
+    fn comp_syms(&self, rf: [i8; 2]) -> Vec<RefSym> {
+        if !backward(rf[1]) {
+            return self.uni_syms(rf);
+        }
+        let n = self.ref_counts();
+        let mut s = vec![(RefCdf::CompRef, count_ctx(n[1] + n[2], n[3] + n[4]), 0, (rf[0] == 3) as usize)];
+        if rf[0] == 3 {
+            s.push((RefCdf::CompRef, count_ctx(n[3], n[4]), 2, 0));
+        } else {
+            s.push((RefCdf::CompRef, count_ctx(n[1], n[2]), 1, (rf[0] == 2) as usize));
+        }
+        s.push((RefCdf::CompBwd, count_ctx(n[5] + n[6], n[7]), 0, (rf[1] == 7) as usize));
         s
     }
 
@@ -1037,35 +1081,63 @@ impl FrameEnc {
             bits += sym_bits(&self.cdf.comp_mode[self.comp_mode_ctx()], (rf[1] > 0) as usize);
         }
         if rf[1] > 0 {
-            bits += sym_bits(&self.cdf.comp_ref_type[self.comp_ref_type_ctx()], 0);
-            for (ctx, idx, bit) in self.uni_syms(rf) {
-                bits += sym_bits(&self.cdf.uni_comp_ref[ctx][idx], bit);
-            }
+            bits += sym_bits(&self.cdf.comp_ref_type[self.comp_ref_type_ctx()], backward(rf[1]) as usize);
+            bits += self.comp_syms(rf).into_iter().map(|s| self.sym_bits_of(s)).sum::<f64>();
         } else {
             bits += self.ref_bits(rf[0] as usize);
         }
         bits
     }
 
-    /// The single reference symbols of LAST_FRAME, LAST2_FRAME or LAST3_FRAME (`rf` 1 to 3), as
-    /// (CDF context, CDF index, bit): forward (single_ref_p1), then LAST3 against GOLDEN (p3, then p5),
-    /// or LAST2 against LAST (p3, then p4). The contexts are the counts of the reference frames above
-    /// and to the left (read_ref_frames).
-    fn ref_syms(&self, rf: usize) -> Vec<(usize, usize, usize)> {
+    /// The single reference symbols of an inter block predicting from `rf` (read_ref_frames): for
+    /// LAST_FRAME, LAST2_FRAME or LAST3_FRAME (1 to 3), forward (single_ref_p1), then LAST3 against
+    /// GOLDEN (p3, then p5) or LAST2 against LAST (p3, then p4); for ALTREF_FRAME (7), backward
+    /// (single_ref_p1) then ALTREF against the other backward references (p2). The contexts are the
+    /// counts of the reference frames above and to the left.
+    fn ref_syms(&self, rf: usize) -> Vec<RefSym> {
         let n = self.ref_counts();
-        let mut s = vec![(count_ctx(n[1] + n[2] + n[3] + n[4], n[5] + n[6] + n[7]), 0, 0)];
-        s.push((count_ctx(n[1] + n[2], n[3] + n[4]), 2, (rf == 3) as usize));
+        if backward(rf as i8) {
+            debug_assert_eq!(rf, 7, "only ALTREF_FRAME is a backward reference");
+            return vec![
+                (RefCdf::Single, count_ctx(n[1] + n[2] + n[3] + n[4], n[5] + n[6] + n[7]), 0, 1),
+                (RefCdf::Single, count_ctx(n[5] + n[6], n[7]), 1, 1),
+            ];
+        }
+        let mut s = vec![(RefCdf::Single, count_ctx(n[1] + n[2] + n[3] + n[4], n[5] + n[6] + n[7]), 0, 0)];
+        s.push((RefCdf::Single, count_ctx(n[1] + n[2], n[3] + n[4]), 2, (rf == 3) as usize));
         if rf == 3 {
-            s.push((count_ctx(n[3], n[4]), 4, 0));
+            s.push((RefCdf::Single, count_ctx(n[3], n[4]), 4, 0));
         } else {
-            s.push((count_ctx(n[1], n[2]), 3, (rf == 2) as usize));
+            s.push((RefCdf::Single, count_ctx(n[1], n[2]), 3, (rf == 2) as usize));
         }
         s
     }
 
+    /// The bits of one reference symbol under the current CDFs.
+    fn sym_bits_of(&self, (fam, ctx, idx, bit): RefSym) -> f64 {
+        let cdf = match fam {
+            RefCdf::Single => &self.cdf.single_ref[ctx][idx],
+            RefCdf::Uni => &self.cdf.uni_comp_ref[ctx][idx],
+            RefCdf::CompRef => &self.cdf.comp_ref[ctx][idx],
+            RefCdf::CompBwd => &self.cdf.comp_bwdref[ctx][idx],
+        };
+        sym_bits(cdf, bit)
+    }
+
+    /// Codes one reference symbol.
+    fn put_ref(&mut self, (fam, ctx, idx, bit): RefSym) {
+        let cdf = match fam {
+            RefCdf::Single => &mut self.cdf.single_ref[ctx][idx],
+            RefCdf::Uni => &mut self.cdf.uni_comp_ref[ctx][idx],
+            RefCdf::CompRef => &mut self.cdf.comp_ref[ctx][idx],
+            RefCdf::CompBwd => &mut self.cdf.comp_bwdref[ctx][idx],
+        };
+        self.se.symbol(bit, cdf);
+    }
+
     /// The bits of the reference frame symbols of an inter block predicting from `rf`.
     fn ref_bits(&self, rf: usize) -> f64 {
-        self.ref_syms(rf).iter().map(|&(ctx, idx, bit)| sym_bits(&self.cdf.single_ref[ctx][idx], bit)).sum()
+        self.ref_syms(rf).into_iter().map(|s| self.sym_bits_of(s)).sum()
     }
 
     /// The bits of the inter mode, the drl index and the motion vectors of an inter block.
@@ -1266,16 +1338,29 @@ impl FrameEnc {
 
         // LAST_FRAME is searched from the open-loop motion; LAST2 and LAST3 from LAST's motion, as
         // the frames are alike and the vector that LAST found is the best start for the others
+        // the open-loop motion is per frame: LAST_FRAME lies last_dist frames back, and ALTREF_FRAME
+        // alt_dist frames ahead, where the motion runs the other way
+        let last_start = [open[0] * self.last_dist, open[1] * self.last_dist];
+        let alt_start = self.alt_dist.map(|d| [-open[0] * d, -open[1] * d]);
+
         let mut best: Option<InterChoice> = None;
-        let mut last_mv = open;
-        let mut single: [Mv; 4] = [[0, 0]; 4];
-        for rf in 1..=self.nrefs {
+        let mut last_mv = last_start;
+        let mut single: [Mv; 8] = [[0, 0]; 8];
+        let mut refs: Vec<usize> = (1..=self.nrefs).collect();
+        if alt_start.is_some() {
+            refs.push(7);
+        }
+        for rf in refs {
             self.f.b = self.base_block(r, c, bs);
             self.f.b.is_inter = true;
             self.f.b.ref_frame = [rf as i8, -1];
             self.f.b.y_mode = NEWMV;
             let st = self.f.find_mv_stack();
-            let start = if rf == 1 { open } else { last_mv };
+            let start = match alt_start {
+                Some(a) if rf == 7 => a,
+                _ if rf == 1 => last_start,
+                _ => last_mv,
+            };
 
             // the NEWMV's stack index is the candidate nearest the start
             let mut nidx = 0;
@@ -1317,8 +1402,13 @@ impl FrameEnc {
 
         // compound: LAST_FRAME with each later reference, the vector pair searched from the single
         // references' vectors
-        if self.nrefs >= 2 && self.comp_allowed(bs) {
-            for b2 in 2..=self.nrefs {
+        // pairs: LAST_FRAME with each later forward reference, and with ALTREF_FRAME (bidirectional)
+        let mut pairs: Vec<usize> = (2..=self.nrefs).collect();
+        if alt_start.is_some() {
+            pairs.push(7);
+        }
+        if self.comp_allowed(bs) {
+            for b2 in pairs {
                 let rf = [1i8, b2 as i8];
                 self.f.b = self.base_block(r, c, bs);
                 self.f.b.is_inter = true;
@@ -1361,13 +1451,13 @@ impl FrameEnc {
             }
             if ic.rf[1] > 0 {
                 let ctx = self.comp_ref_type_ctx();
-                self.se.symbol(0, &mut self.cdf.comp_ref_type[ctx]);
-                for (ctx, idx, bit) in self.uni_syms(ic.rf) {
-                    self.se.symbol(bit, &mut self.cdf.uni_comp_ref[ctx][idx]);
+                self.se.symbol(backward(ic.rf[1]) as usize, &mut self.cdf.comp_ref_type[ctx]);
+                for sym in self.comp_syms(ic.rf) {
+                    self.put_ref(sym);
                 }
             } else {
-                for (ctx, idx, bit) in self.ref_syms(ic.rf[0] as usize) {
-                    self.se.symbol(bit, &mut self.cdf.single_ref[ctx][idx]);
+                for sym in self.ref_syms(ic.rf[0] as usize) {
+                    self.put_ref(sym);
                 }
             }
             let st = self.f.find_mv_stack();
