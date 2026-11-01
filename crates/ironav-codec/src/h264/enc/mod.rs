@@ -365,7 +365,7 @@ impl H264Encoder {
             if self.bd == 8 {
                 p.iter().map(|&b| b as u16).collect()
             } else {
-                p.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
+                p.as_chunks::<2>().0.iter().map(|&c| u16::from_le_bytes(c)).collect()
             }
         };
         let pad = |p: &[u16], w: usize, h: usize, pw: usize, ph: usize| -> Result<Vec<u16>> {
@@ -727,7 +727,7 @@ mod tests {
                 out.extend(dec.flush().unwrap());
                 assert_eq!(out.len(), 6, "{w}x{h} qp {qp}");
                 let s = enc.mb_w * 16;
-                let samples = |p: &[u8]| -> Vec<u16> { p.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect() };
+                let samples = |p: &[u8]| -> Vec<u16> { p.as_chunks::<2>().0.iter().map(|&c| u16::from_le_bytes(c)).collect() };
                 for f in out {
                     let Frame::Video(d) = f else { unreachable!() };
                     assert_eq!(d.pix_fmt, PixelFormat::Yuv420p10);
