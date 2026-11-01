@@ -4,7 +4,7 @@
 //! Each frame is a temporal unit: a temporal delimiter, the sequence header, and a frame OBU with
 //! the frame's header and its tile. An inter frame predicts from LAST_FRAME alone, the frame before
 //! it (every reference slot holds the last frame, and each frame refreshes slot 0), with the
-//! regular 8-tap filter, quarter-sample motion and the reference MV stack's candidates. Superblocks
+//! regular 8-tap filter, quarter-sample motion vectors (searched to half samples) and the reference MV stack's candidates. Superblocks
 //! are 64x64, split by an open-loop search on the source down to 8x8 (never larger than 32x32, so
 //! every block is coded with one transform of its size). Each block is coded as intra or inter by
 //! rate-distortion cost, and intra blocks take the best of the 13 intra modes with angle deltas.
@@ -78,6 +78,8 @@ pub struct Av1Encoder {
     last: Option<(Arc<Picture>, RefState)>,
     /// The source luma of the last frame, which the next frame's motion field reads.
     prev_src: Option<Plane>,
+    /// The forward transform bases, built on first use and kept across frames.
+    bases: fwd::Bases,
 }
 
 impl Av1Encoder {
@@ -105,6 +107,7 @@ impl Av1Encoder {
             seq,
             last: None,
             prev_src: None,
+            bases: fwd::Bases::default(),
         })
     }
 
@@ -144,8 +147,9 @@ impl Av1Encoder {
                 *slot = Some(pic.clone());
             }
         }
-        let enc = tile::FrameEnc::new(f, &v.planes[0], &v.planes[1], &v.planes[2], (w, h), self.prev_src.clone());
-        let (tile_bytes, mut f, src_luma) = enc.encode();
+        let enc = tile::FrameEnc::new(f, &v.planes[0], &v.planes[1], &v.planes[2], (w, h), self.prev_src.clone(), std::mem::take(&mut self.bases));
+        let (tile_bytes, mut f, src_luma, bases) = enc.encode();
+        self.bases = bases;
 
         // the loop filters, as the decoder runs them on the frame
         if f.h.lf_level[0] != 0 || f.h.lf_level[1] != 0 {

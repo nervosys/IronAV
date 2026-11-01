@@ -11,6 +11,17 @@ const RANGE: i32 = 4;
 #[allow(clippy::too_many_arguments)]
 pub fn sad(cur: &Plane, prev: &Plane, x: usize, y: usize, w: usize, h: usize, dx: i32, dy: i32) -> u64 {
     let (pw, ph) = (prev.stride as i64, (prev.data.len() / prev.stride) as i64);
+    let (x0, y0) = (x as i64 + dx as i64, y as i64 + dy as i64);
+    if x0 >= 0 && y0 >= 0 && x0 + w as i64 <= pw && y0 + h as i64 <= ph {
+        // the displaced block lies in the plane: no sample is clamped
+        let mut s = 0u64;
+        for j in 0..h {
+            let a = &cur.data[(y + j) * cur.stride + x..][..w];
+            let b = &prev.data[(y0 as usize + j) * prev.stride + x0 as usize..][..w];
+            s += a.iter().zip(b).map(|(&p, &q)| (p as i64 - q as i64).unsigned_abs()).sum::<u64>();
+        }
+        return s;
+    }
     let mut s = 0u64;
     for j in 0..h {
         let py = (y as i64 + j as i64 + dy as i64).clamp(0, ph - 1) as usize;

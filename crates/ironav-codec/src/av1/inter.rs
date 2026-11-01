@@ -179,8 +179,14 @@ impl FrameDec {
 
     /// compute_prediction for an inter block.
     pub(crate) fn predict_inter_block(&mut self) {
+        self.predict_inter_planes(0..1 + 2 * self.b.has_chroma as usize);
+    }
+
+    /// The prediction of the current block into the planes in `planes` (the encoder's motion search
+    /// reads luma alone).
+    pub(crate) fn predict_inter_planes(&mut self, planes: std::ops::Range<usize>) {
         let (row, col, bs) = (self.b.row, self.b.col, self.b.size);
-        for plane in 0..1 + 2 * self.b.has_chroma as usize {
+        for plane in planes {
             let (ssx, ssy) = self.sub_of(plane);
             let psz = plane_block(bs, ssx, ssy);
             let (n4w, n4h) = (NUM_4X4_W[psz] as usize, NUM_4X4_H[psz] as usize);

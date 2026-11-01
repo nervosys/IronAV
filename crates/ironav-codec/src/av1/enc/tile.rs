@@ -26,7 +26,7 @@ use crate::av1::inter_tables::{TX_TYPE_INTER_INV_SET1, TX_TYPE_INTER_INV_SET2, T
 use crate::av1::ipred::{predict_intra, Edges, Plane};
 use crate::av1::itx::inverse_transform;
 use crate::av1::mvpred::{Mv, MvStack, GLOBALMV, NEARESTMV, NEARMV, NEWMV};
-use crate::av1::quant_tables::{AC_QLOOKUP_8, DC_QLOOKUP_8};
+use crate::av1::quant_tables::{AC_QLOOKUP_8, DC_QLOOKUP_8, SM_WEIGHTS};
 use crate::av1::symbol::Cdfs;
 use crate::av1::tables::*;
 
@@ -145,6 +145,118 @@ fn mv_bits(d: Mv) -> f64 {
     1.5 + comp(d[0]) + comp(d[1])
 }
 
+/// The neighbours of a block on the source that the open-loop intra prediction reads: the row above
+/// (`w` samples), the column to the left (`h`), and the corner, with intra prediction's defaults
+/// where a neighbour lies outside the picture.
+struct OpenEdges {
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    above: [i32; 32],
+    left: [i32; 32],
+    corner: i32,
+    have_above: bool,
+    have_left: bool,
+}
+
+impl OpenEdges {
+    fn of(s: &Plane, x: usize, y: usize, w: usize, h: usize) -> Self {
+        let (have_above, have_left) = (y > 0, x > 0);
+        let mut above = [0i32; 32];
+        let mut left = [0i32; 32];
+        for (i, a) in above[..w].iter_mut().enumerate() {
+            *a = if have_above {
+                s.at(x + i, y - 1)
+            } else if have_left {
+                s.at(x - 1, y)
+            } else {
+                127
+            };
+        }
+        for (j, l) in left[..h].iter_mut().enumerate() {
+            *l = if have_left {
+                s.at(x - 1, y + j)
+            } else if have_above {
+                s.at(x, y - 1)
+            } else {
+                129
+            };
+        }
+        let corner = match (have_above, have_left) {
+            (true, true) => s.at(x - 1, y - 1),
+            (true, false) => s.at(x, y - 1),
+            (false, true) => s.at(x - 1, y),
+            _ => 128,
+        };
+        OpenEdges { x, y, w, h, above, left, corner, have_above, have_left }
+    }
+
+    /// The sum of absolute differences of the block on `s` from its prediction in `mode` (one of
+    /// `OPEN_MODES`: DC, V, H, SMOOTH or PAETH).
+    fn sad(&self, s: &Plane, mode: u8) -> u64 {
+        let (x, y, w, h) = (self.x, self.y, self.w, self.h);
+        let rows = (0..h).map(|j| &s.data[(y + j) * s.stride + x..][..w]);
+        let mut total = 0u64;
+        match mode {
+            0 => {
+                let sa: i32 = if self.have_above { self.above[..w].iter().sum() } else { 0 };
+                let sl: i32 = if self.have_left { self.left[..h].iter().sum() } else { 0 };
+                let dc = match (self.have_above, self.have_left) {
+                    (true, true) => (sa + sl + ((w + h) >> 1) as i32) / (w + h) as i32,
+                    (true, false) => (sa + (w >> 1) as i32) / w as i32,
+                    (false, true) => (sl + (h >> 1) as i32) / h as i32,
+                    _ => 128,
+                };
+                for row in rows {
+                    total += row.iter().map(|&p| (p as i32 - dc).unsigned_abs() as u64).sum::<u64>();
+                }
+            }
+            1 => {
+                for row in rows {
+                    total += row.iter().zip(&self.above[..w]).map(|(&p, &a)| (p as i32 - a).unsigned_abs() as u64).sum::<u64>();
+                }
+            }
+            2 => {
+                for (row, &l) in rows.zip(&self.left[..h]) {
+                    total += row.iter().map(|&p| (p as i32 - l).unsigned_abs() as u64).sum::<u64>();
+                }
+            }
+            9 => {
+                // SMOOTH: the vertical and horizontal weighted averages of the edges
+                let (wy, wx) = (&SM_WEIGHTS[h..2 * h], &SM_WEIGHTS[w..2 * w]);
+                let (bl, tr) = (self.left[h - 1], self.above[w - 1]);
+                for (i, row) in rows.enumerate() {
+                    for (j, &p) in row.iter().enumerate() {
+                        let (wyi, wxj) = (wy[i] as i32, wx[j] as i32);
+                        let pred = (wyi * self.above[j] + (256 - wyi) * bl + wxj * self.left[i] + (256 - wxj) * tr + 256) >> 9;
+                        total += (p as i32 - pred).unsigned_abs() as u64;
+                    }
+                }
+            }
+            _ => {
+                // PAETH: whichever of the left, above and corner samples is nearest to their gradient
+                for (i, row) in rows.enumerate() {
+                    for (j, &p) in row.iter().enumerate() {
+                        let (l, t, tl) = (self.left[i], self.above[j], self.corner);
+                        let base = t + l - tl;
+                        let (pl, pt, ptl) = ((base - l).abs(), (base - t).abs(), (base - tl).abs());
+                        let pred = if pl <= pt && pl <= ptl {
+                            l
+                        } else if pt <= ptl {
+                            t
+                        } else {
+                            tl
+                        };
+                        total += (p as i32 - pred).unsigned_abs() as u64;
+                    }
+                }
+            }
+        }
+        total
+    }
+}
+
 /// The full-pel block nearest to a motion vector, in 1/8 sample units.
 fn round8(m: Mv) -> Mv {
     let r = |v: i32| ((v as f64) / 8.0).round() as i32 * 8;
@@ -154,7 +266,7 @@ fn round8(m: Mv) -> Mv {
 impl FrameEnc {
     /// An encoder state for `f`, a frame of the decoder's state, with the source `y`, `u`, `v`
     /// planes (`pic` wide, tightly packed) and the previous picture's source luma.
-    pub fn new(f: FrameDec, y: &[u8], u: &[u8], v: &[u8], pic: (usize, usize), prev: Option<Plane>) -> FrameEnc {
+    pub fn new(f: FrameDec, y: &[u8], u: &[u8], v: &[u8], pic: (usize, usize), prev: Option<Plane>, bases: Bases) -> FrameEnc {
         let (mi_cols, mi_rows) = (f.h.mi_cols, f.h.mi_rows);
         let qidx = f.h.base_q_idx as usize;
         let (aw, ah) = ((mi_cols * 4).div_ceil(64) * 64, (mi_rows * 4).div_ceil(64) * 64);
@@ -192,7 +304,7 @@ impl FrameEnc {
             decoded,
             cdf: Cdfs::new(qidx as i32),
             se: SymbolEncoder::new(true),
-            bases: Bases::default(),
+            bases,
             dcq: DC_QLOOKUP_8[qidx] as u32,
             acq,
             lambda: lambda_for(acq),
@@ -203,7 +315,7 @@ impl FrameEnc {
 
     /// Codes the tile: every superblock in raster order. Returns the tile's bytes, the frame's
     /// decoder state (reconstructed, not yet filtered) and the source luma for the next frame.
-    pub fn encode(mut self) -> (Vec<u8>, FrameDec, Plane) {
+    pub fn encode(mut self) -> (Vec<u8>, FrameDec, Plane, Bases) {
         self.f.tile = [0, self.mi_rows, 0, self.mi_cols];
         for r in (0..self.mi_rows).step_by(16) {
             for c in (0..self.mi_cols).step_by(16) {
@@ -219,9 +331,9 @@ impl FrameEnc {
                 self.partition(r, c, BLOCK_64X64);
             }
         }
-        let FrameEnc { f, se, src, .. } = self;
+        let FrameEnc { f, se, src, bases, .. } = self;
         let [luma, _, _] = src;
-        (se.finish(), f, luma)
+        (se.finish(), f, luma, bases)
     }
 
     fn mi_at(&self, r: usize, c: usize) -> Mi {
@@ -517,44 +629,18 @@ impl FrameEnc {
     /// the best intra mode (predicted from the source around it), or of the open-loop motion
     /// compensated block in an inter frame, with a penalty per block so that splitting is not free.
     fn open_cost(&self, x: usize, y: usize, w: usize, h: usize) -> u64 {
-        let (log2w, log2h) = (w.trailing_zeros(), h.trailing_zeros());
+        let s = &self.src[0];
+        let e = OpenEdges::of(s, x, y, w, h);
         let mut best = u64::MAX;
         for mode in OPEN_MODES {
-            let pred = self.open_pred(x, y, log2w, log2h, mode);
-            let mut sad = 0u64;
-            for j in 0..h {
-                for i in 0..w {
-                    sad += (self.src[0].at(x + i, y + j) - pred[j * w + i]).unsigned_abs() as u64;
-                }
-            }
-            best = best.min(sad);
+            best = best.min(e.sad(s, mode));
         }
         if let (false, Some(prev)) = (self.key, &self.prev) {
             let (rows, cols) = (self.mi_rows / 2, self.mi_cols / 2);
             let (dy, dx) = self.field[(y / 8).min(rows - 1) * cols + (x / 8).min(cols - 1)];
-            best = best.min(motion::sad(&self.src[0], prev, x, y, w, h, dx, dy) + 4);
+            best = best.min(motion::sad(s, prev, x, y, w, h, dx, dy) + 4);
         }
         best + 2 * self.acq as u64
-    }
-
-    /// The prediction of a block from the source around it, built in a scratch plane so that the
-    /// source itself is untouched.
-    fn open_pred(&self, x: usize, y: usize, log2w: u32, log2h: u32, mode: u8) -> Vec<i32> {
-        let (w, h) = (1usize << log2w, 1usize << log2h);
-        let (lw, lh) = (2 * w + 2, 2 * h + 2);
-        let s = &self.src[0];
-        let mut data = vec![0u16; lw * lh];
-        for j in 0..lh {
-            let sy = (y + j).saturating_sub(1).min(s.data.len() / s.stride - 1);
-            for i in 0..lw {
-                let sx = (x + i).saturating_sub(1).min(s.stride - 1);
-                data[j * lw + i] = s.data[sy * s.stride + sx];
-            }
-        }
-        let mut lp = Plane { data, stride: lw };
-        let e = Edges { have_left: x > 0, have_above: y > 0, have_above_right: y > 0, have_below_left: false, max_x: lw as i32 - 1, max_y: lh as i32 - 1 };
-        predict_intra(&mut lp, 1, 1, log2w, log2h, mode, 0, None, &e, false, true, 8);
-        (0..h).flat_map(|j| (0..w).map(move |i| (j, i))).map(|(j, i)| lp.data[(1 + j) * lw + 1 + i] as i32).collect()
     }
 
     /// Codes the partition of the block at (`r`, `c`) of size `bs`, and the blocks it holds.
@@ -844,7 +930,7 @@ impl FrameEnc {
     fn luma_sad_at(&mut self, x: usize, y: usize, w: usize, h: usize, mv: Mv) -> u64 {
         self.f.b.mv = [mv, [0, 0]];
         self.f.store_mi();
-        self.f.predict_inter_block();
+        self.f.predict_inter_planes(0..1);
         let (p, s) = (&self.f.planes[0], &self.src[0]);
         let mut total = 0u64;
         for j in 0..h {
@@ -855,25 +941,37 @@ impl FrameEnc {
         total
     }
 
+    /// `luma_sad_at`, remembered in `seen`.
+    fn memo_sad(&mut self, seen: &mut HashMap<Mv, u64>, x: usize, y: usize, w: usize, h: usize, mv: Mv) -> u64 {
+        if let Some(&s) = seen.get(&mv) {
+            return s;
+        }
+        let s = self.luma_sad_at(x, y, w, h, mv);
+        seen.insert(mv, s);
+        s
+    }
+
     /// A NEWMV search: from the best of the candidates (the open-loop motion, the predictor and
     /// zero), by the sum of absolute differences with a penalty on the difference from the
-    /// predictor, down through whole, half and quarter samples.
+    /// predictor, down through whole and half samples (a cross of neighbours at each step).
     fn search(&mut self, x: usize, y: usize, w: usize, h: usize, pred: Mv, start: Mv) -> Mv {
         let pen = |m: Mv| -> u64 { 2 * ((m[0] - pred[0]).unsigned_abs() + (m[1] - pred[1]).unsigned_abs()) as u64 };
+        // a vector's SAD is the same whenever it is tried, so each is predicted once
+        let mut seen: HashMap<Mv, u64> = HashMap::new();
         let mut best = (u64::MAX, pred);
         for m in [round8(start), round8(pred), [0, 0]] {
-            let c = self.luma_sad_at(x, y, w, h, m) + pen(m);
+            let c = self.memo_sad(&mut seen, x, y, w, h, m) + pen(m);
             if c < best.0 {
                 best = (c, m);
             }
         }
-        for step in [8, 4, 2] {
+        for step in [8, 4] {
             for _ in 0..16 {
                 let centre = best.1;
                 let mut moved = false;
-                for (dy, dx) in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)] {
+                for (dy, dx) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
                     let m = [centre[0] + dy * step, centre[1] + dx * step];
-                    let c = self.luma_sad_at(x, y, w, h, m) + pen(m);
+                    let c = self.memo_sad(&mut seen, x, y, w, h, m) + pen(m);
                     if c < best.0 {
                         best = (c, m);
                         moved = true;
