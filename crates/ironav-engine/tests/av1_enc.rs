@@ -58,9 +58,10 @@ impl Clip {
 fn source(dir: &Path, w: usize, h: usize, frames: usize) -> Clip {
     let raw = dir.join("src444.raw");
     let n = frames.to_string();
-    // testsrc2 comes out at even sizes (177x99 is 176x98), so an odd picture is cropped from one
+    // testsrc2 is 4:2:0, so a crop of an odd picture in 4:2:0 comes out rounded down (177x99 as 176x98),
+    // and the frames would be read at the wrong stride; the crop is taken in 4:4:4, where it is exact
     let size = format!("testsrc2=size={}x{}:rate=25", w.next_multiple_of(2), h.next_multiple_of(2));
-    let crop = format!("crop={w}:{h}:0:0");
+    let crop = format!("format=yuv444p,crop={w}:{h}:0:0");
     assert!(ffmpeg(&["-f", "lavfi", "-i", &size, "-vf", &crop, "-frames:v", &n, "-f", "rawvideo", "-pix_fmt", "yuv444p", raw.to_str().unwrap()]), "ffmpeg could not make testsrc2");
     let data = std::fs::read(&raw).unwrap();
     let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
@@ -193,18 +194,15 @@ fn the_file_gets_smaller_as_the_quantiser_rises() {
 
 /// Inter frames: a key frame every 10 of 12 moving pictures (one run of nine inter frames), decoded
 /// identically by libaom and IronAV, at a useful quality and smaller than the same clip with every
-/// frame a key frame. The odd size checks the partial superblocks and 8x8s of inter prediction; its
-/// inter frames save little (about 0.3% at qp 30), a known gap, so only its decode and quality are
-/// checked.
+/// frame a key frame. The odd size checks the partial superblocks and 8x8s of inter prediction, and
+/// its inter frames must save as much as the even size's do (about 30% at qp 30).
 #[test]
 fn inter_frames_decode_identically_and_are_smaller_than_key_frames() {
     need_ffmpeg!();
-    for (name, w, h, smaller) in [("inter", 352usize, 288usize, true), ("inter_odd", 177, 99, false)] {
+    for (name, w, h) in [("inter", 352usize, 288usize), ("inter_odd", 177, 99)] {
         let (inter, y) = round_trip_keyint(name, w, h, 12, 30, Some(10));
         assert!(y > 30.0, "{name}: luma PSNR {y:.2} dB");
-        if smaller {
-            let (key_only, _) = round_trip_keyint(&format!("{name}_keys"), w, h, 12, 30, Some(1));
-            assert!(inter * 10 < key_only * 9, "{name}: inter frames {inter} bytes, key frames only {key_only} bytes");
-        }
+        let (key_only, _) = round_trip_keyint(&format!("{name}_keys"), w, h, 12, 30, Some(1));
+        assert!(inter * 100 < key_only * 85, "{name}: inter frames {inter} bytes, key frames only {key_only} bytes");
     }
 }
