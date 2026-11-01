@@ -113,6 +113,18 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - **Build and test:** a workspace test suite, and a GitHub Actions workflow for Linux, macOS and Windows
   (not yet run on hosted runners).
 
+### Changed
+
+- **Opus SILK and hybrid decoding** brings SILK's 8, 12 and 16 kHz output to 48 kHz with libopus's own resampler (16-bit
+  fixed point, translated from libopus's `silk/resampler*.c`), so SILK and hybrid frames line up with libopus's decode sample
+  for sample. The float filter it replaces ran one or two samples early and differed from libopus by 25 to 35 dB. Mono SILK
+  and hybrid now differ from libopus by a mean of 1 to 7 LSB on speech; stereo SILK by 1.5 to 4.6 LSB on speech, and by up to
+  3267 LSB on two tones of different pitch (wide band, 40 and 60 ms); stereo hybrid is still off on speech because of CELT's
+  stereo output (see the README). The SILK pre-skip the encoder writes follows the new delay: SILK files IronAV wrote
+  before this change decode one sample later than their source now.
+- **Opus SILK tests** compare with libopus (`ffmpeg -c:a libopus`), not FFmpeg's native decoder, which is itself a few
+  samples late of libopus in SILK; a multichannel SILK test (4, 6 and 8 channels) is added.
+
 ### Known limitations
 
 - **Hardware:** only NVIDIA is driven: NVENC for H.264 and HEVC, NVDEC for H.264, HEVC and AV1. The other backends

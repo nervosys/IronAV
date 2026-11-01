@@ -143,19 +143,27 @@ fn ironav_decode(path: &Path, dir: &Path) -> (usize, Vec<i16>) {
 /// channels of any 3 to 8 channel stream from Vorbis order, which RFC 7845 does not ask of family
 /// 255 (unassigned channels, in table order), so its channels are not compared one to one here.
 fn ffmpeg_file_decodes(channels: usize, family: u8, name: &str) {
+    ffmpeg_file_decodes_as(channels, family, name, "lowdelay");
+}
+
+/// As `ffmpeg_file_decodes`, with FFmpeg's libopus in `application` mode: `lowdelay` is CELT only,
+/// `voip` is SILK (and hybrid at the higher rates, which are then in the stream too).
+fn ffmpeg_file_decodes_as(channels: usize, family: u8, name: &str, application: &str) {
+    let silk = application == "voip";
     let dir = scratch(name);
     let wav = dir.join("tones.wav");
     let source = tones_wav(&wav, channels, 1.5);
     let src = wav.to_str().unwrap();
     let enc = dir.join(format!("ff.{name}"));
     let mapping = family.to_string();
-    let bitrate = format!("{}k", 48 * channels);
+    // CELT at 48 kb/s a channel; SILK at 16 kb/s, which stays in wideband (the packets are SILK)
+    let bitrate = format!("{}k", if silk { 16 * channels } else { 48 * channels });
     // four channels of a WAV are read as 4.0, which libopus refuses at family 1: they are quad
     // (the same order of samples, relabelled)
     let quad = ["-ch_layout", "quad"];
     let layout: &[&str] = if channels == 4 { &quad } else { &[] };
     let mut args: Vec<&str> = layout.to_vec();
-    args.extend(["-i", src, "-c:a", "libopus", "-application", "lowdelay", "-mapping_family", &mapping, "-b:a", &bitrate, enc.to_str().unwrap()]);
+    args.extend(["-i", src, "-c:a", "libopus", "-application", application, "-mapping_family", &mapping, "-b:a", &bitrate, enc.to_str().unwrap()]);
     ffmpeg(&args);
     assert_eq!(ffprobe_channels(&enc), channels, "FFmpeg's {name} file");
     let (got_ch, got) = ironav_decode(&enc, &dir);
@@ -170,8 +178,11 @@ fn ffmpeg_file_decodes(channels: usize, family: u8, name: &str) {
             let snr = snr_db(&a, &b);
             let worst = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max);
             eprintln!("{name}, channel {c}: {snr:.1} dB against FFmpeg's libopus, worst {worst} LSB");
-            assert!(snr > 50.0, "{name} channel {c}: {snr:.1} dB against FFmpeg's libopus decode");
-            assert!(worst <= 8.0, "{name} channel {c}: {worst} LSB from FFmpeg's libopus decode");
+            // SILK's synthesis differs from libopus's fixed-point arithmetic by a few LSB, and by
+            // more in loud passages (see the README); CELT matches to a few LSB
+            let (min_snr, max_worst) = if silk { (SILK_SNR_DB, SILK_WORST_LSB) } else { (50.0, 8.0) };
+            assert!(snr > min_snr, "{name} channel {c}: {snr:.1} dB against FFmpeg's libopus decode");
+            assert!(worst <= max_worst, "{name} channel {c}: {worst} LSB from FFmpeg's libopus decode");
         }
     } else {
         let s = to_f64(&source);
@@ -182,6 +193,24 @@ fn ffmpeg_file_decodes(channels: usize, family: u8, name: &str) {
             eprintln!("{name}, channel {c}: {snr:.1} dB against its tone");
             assert!(snr > 40.0, "{name} channel {c}: {snr:.1} dB against its tone");
         }
+    }
+}
+
+/// SILK's floor against libopus, multichannel: the SNR and the worst difference (measured: 53 dB and 59 LSB, with
+/// margin).
+const SILK_SNR_DB: f64 = 40.0;
+const SILK_WORST_LSB: f64 = 80.0;
+
+/// SILK (and hybrid) frames in multistream: FFmpeg's libopus in `voip` mode writes 4, 6 and 8
+/// channels with family 1, and IronAV's decode of each channel is close to libopus's.
+#[test]
+fn ffmpeg_silk_surround_opus_decodes_like_libopus() {
+    if !ffmpeg_available() {
+        eprintln!("skipped: ffmpeg is not on PATH");
+        return;
+    }
+    for channels in [4, 6, 8] {
+        ffmpeg_file_decodes_as(channels, 1, &format!("silk{channels}ch1.ogg"), "voip");
     }
 }
 

@@ -552,26 +552,39 @@ Opus **decoder** (RFC 6716): SILK, CELT and hybrid frames, every frame size from
 all four framing codes, CELT redundancy frames, SILK in-band FEC (LBRR) copies, and the output gain and pre-skip from the `OpusHead` (the pre-skip is
 dropped, so a file starts where its audio does). The band-energy, bit-allocation, pulse-vector, inverse-MDCT, linear-prediction
 and excitation stages follow FFmpeg's native Opus decoder, with its tables (`tools/gen_opus_tables.py` reads them from
-`libavcodec/opus/tab.c`, so none were typed in). The 8/12/16 kHz SILK output is brought to 48 kHz by a polyphase
-windowed-sinc filter of our own, with the same delay (4, 8 and 11 input samples) as the reference decoder. Each SILK
-frame is put out one sample late, mono or stereo, as libopus does (FFmpeg's native decoder keeps two samples back in mono,
-so its mono SILK output runs a 16 kHz sample behind libopus's and ours; the tests allow for that).
+`libavcodec/opus/tab.c`, so none were typed in). The 8/12/16 kHz SILK output is brought to 48 kHz by libopus's own
+resampler (`silk_resampler`, translated from libopus's `silk/resampler*.c`: 16-bit fixed-point arithmetic, the up2 allpass
+pair and a 12-phase interpolation filter), with the delay that lines its output up with libopus's decode (0, 4 and 7 input
+samples at 8, 12 and 16 kHz).
 
 **Checked against FFmpeg's native Opus decoder** (through PyAV) on fifteen streams made by libopus, plus a pure sine in CELT
 and in SILK: SILK narrow band at 20 ms, medium band at 10 ms and wide band at 20, 40 and 60 ms (mono and stereo); hybrid at 10
 and 20 ms; CELT at 2.5, 5, 10, 20 and 40 ms, mono and stereo. **CELT frames match to float rounding (about 138 dB SNR).**
-SILK and hybrid frames match at 42-48 dB for wide and medium band and **only 24 dB for narrow band**. That difference comes
-from our upsampling filter (FFmpeg's resampler is longer than a filter with a fixed delay of 8 taps per phase can be), though
-I did not isolate it further. Three of those streams are committed with FFmpeg's decode as regression tests (CELT to within 3
-LSB, SILK and hybrid above 35 dB).
+Those SILK figures are from before the resampler was libopus's, and FFmpeg's native decoder is itself a few samples late of
+libopus in SILK, so the libopus comparison below is the one to read.
+
+**SILK and hybrid against libopus** (`ffmpeg -c:a libopus`, the reference implementation), on 64 streams made by libopus from a
+speech-like signal: narrow, medium and wide band SILK at 10 to 60 ms, hybrid at 10 and 20 ms (longer packets hold several frames), mono and stereo, at 8 to 64 kb/s.
+The output lines up with libopus's sample for sample in every mode. Mono SILK and hybrid differ from libopus by a mean of 1 to
+7 LSB (SNR 45 to 63 dB), with the largest differences, up to 90 LSB, in loud voiced passages: SILK's synthesis is done in
+floating point here and in fixed point in libopus, and those passages are where the difference shows. In quiet passages of the 8 kHz
+stream about two thirds of the samples are exact. Stereo SILK has a mean of 1.5 to 4.6 LSB. **Stereo hybrid does not meet this yet**: its
+peaks reach 3681 LSB, and CELT-only stereo streams made the same way peak at 478 LSB (mono CELT is exact to 1 LSB), so the
+stereo difference is in CELT rather than in the SILK resampler; it is not isolated yet. On a harmonic-tone signal, where
+each channel has its own pitch (`opus_silk_and_hybrid_in_every_bandwidth_decode_like_libopus`, which runs every mode), tones are
+harder for SILK: mono SILK is 38 to 50 dB against libopus, and stereo SILK 27 to 53 dB, with peaks of 3267 LSB at wide band
+and 40 or 60 ms; the stereo hybrid is exact there (about 100 dB, worst 1 LSB). The stereo SILK case is not isolated (the
+stereo prediction is the suspect). Every mode lines up with libopus at lag 0. The regression tests are FFmpeg's decode of the
+CELT streams (within 3 LSB) and libopus's decode of the SILK and hybrid ones (above 35 dB, 25 dB for stereo).
 **Multichannel Opus** (channel-mapping families 1 and 255, in Ogg, Matroska, WebM and MP4 `dOps`): each stream is decoded as
 above and routed by the mapping table; family 1 comes out in WAV and FFmpeg channel order, as the Vorbis decoder does. FFmpeg's
 libopus files of 4, 6 and 8 channels (family 1) decode to within one LSB of libopus where their streams are CELT. A family 255 file
 (6 channels) matches its source tones at about 40 dB; FFmpeg's libopus wrapper reorders family 255 channels, which RFC 7845 does
-not ask for, so its decode is not the reference there. Its SILK and hybrid streams run as the mono ones do (see above).
+not ask for, so its decode is not the reference there. Its SILK streams (voip mode, 4 to 8 channels) decode to libopus's within 60 LSB at worst, above 50 dB on every channel
+(`ffmpeg_silk_surround_opus_decodes_like_libopus`).
 
-Not covered: the way the reference decoder flushes its resampler when the stream switches between SILK
-and CELT, which our fixed-delay filter does not reproduce, so the few samples at such a switch can differ. The libopus encoder
+Not covered: the way libopus clears its SILK state and resampler when a stream switches from CELT to SILK; ours starts
+from cleared state, so the few samples at such a switch can differ. The libopus encoder
 only produced streams in one mode at a time; mode switches and their redundant CELT frames are covered by IronAV's own
 automatic-mode streams instead, which this decoder and libopus both decode (see the encoder's automatic mode below).
 Opus is read from Matroska/WebM (`.mka`, `.webm`) and from Ogg (`.opus`, `.ogg`); for writing see "Opus encoder" below. The Ogg reader (pages are checksummed; the file is read into memory, up to 1 GiB) reads every logical stream: multiplexed Opus, Vorbis or FLAC streams are separate tracks, and chained Vorbis or FLAC links with the same setup are one track (the timeline carries on); chained Opus links are separate tracks, each with its own pre-skip. Speex and Theora in Ogg are refused with a message naming the codec when a file holds nothing else, and passed over otherwise. The final page's granule position shortens the last packet, so the output ends where the file says (for Opus the length is the granule minus the pre-skip). Tested on libopus files remuxed to Ogg (identical samples to the Matroska copies); multi-page packets are covered by a synthetic unit test only. FLAC in Ogg (the native-FLAC mapping, as FFmpeg's muxer writes it) decodes bit for bit to the PCM it was made from.

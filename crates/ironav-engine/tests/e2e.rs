@@ -766,12 +766,13 @@ fn aac_matches_ffmpeg(scratch_name: &str, file: &str) {
     assert!(worst <= 2, "largest difference from FFmpeg's decode is {worst} LSB");
 }
 
-/// Decode an Opus file and compare it with FFmpeg's native decoder (pre-skip removed in both; ours
-/// keeps the encoder's trailing padding, which FFmpeg trims). Returns the SNR in dB and the worst
-/// difference in LSB.
-/// `late` is how many samples (interleaved) FFmpeg's output runs behind ours: 3 for mono SILK,
-/// where its native decoder keeps a 16 kHz sample more than libopus (and its own stereo path).
-fn opus_vs_ffmpeg(file: &str, ext: &str, late: usize) -> (f64, i32) {
+/// Decode an Opus file and compare it with a reference decode of the same packets (pre-skip removed
+/// in both; ours keeps the encoder's trailing padding, which the reference trims). Returns the SNR
+/// in dB and the worst difference in LSB. `reference` is the file in tests/data holding the
+/// reference decode as 16-bit samples: libopus's (`ffmpeg -c:a libopus`) for SILK and hybrid, and
+/// FFmpeg's native decoder's for CELT, which agrees with libopus.
+/// `late` is how many samples (interleaved) the reference runs behind ours.
+fn opus_vs_reference(file: &str, ext: &str, late: usize, reference: &str) -> (f64, i32) {
     let dir = scratch(&format!("opus-{file}-{ext}"));
     let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
     let out = dir.join("out.wav");
@@ -780,7 +781,7 @@ fn opus_vs_ffmpeg(file: &str, ext: &str, late: usize) -> (f64, i32) {
     run(&j, &mut |_| {}).unwrap();
     let s16 = |b: Vec<u8>| -> Vec<i32> { b.as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes([b[0], b[1]]) as i32).collect() };
     let got = s16(pcm(&out));
-    let want = s16(std::fs::read(data.join(format!("{file}.ffmpeg.s16"))).unwrap());
+    let want = s16(std::fs::read(data.join(reference)).unwrap());
     assert!(got.len() >= want.len() && got.len() < want.len() + 4 * 2000, "{} samples against {}", got.len(), want.len());
     let want = &want[late..];
     let (mut sig, mut err, mut worst) = (0f64, 0f64, 0);
@@ -835,25 +836,92 @@ fn mp3_decodes_to_what_ffmpeg_decodes() {
 /// The same packets in an Ogg file decode to the same samples as in Matroska.
 #[test]
 fn ogg_opus_decodes_like_the_same_packets_in_matroska() {
-    let (snr, worst) = opus_vs_ffmpeg("opus_celt_stereo", "opus", 0);
+    let (snr, worst) = opus_vs_reference("opus_celt_stereo", "opus", 0, "opus_celt_stereo.ffmpeg.s16");
     assert!(worst <= 3, "largest difference from FFmpeg is {worst} LSB (SNR {snr:.1} dB)");
-    let (snr, _) = opus_vs_ffmpeg("opus_silk_mono", "opus", 3);
-    assert!(snr > 35.0, "SNR against FFmpeg is only {snr:.1} dB");
+    let (snr, _) = opus_vs_reference("opus_silk_mono", "opus", 0, "opus_silk_mono.libopus.s16");
+    assert!(snr > 35.0, "SNR against libopus is only {snr:.1} dB");
 }
 
 #[test]
 fn celt_opus_decodes_to_what_ffmpeg_decodes() {
-    let (snr, worst) = opus_vs_ffmpeg("opus_celt_stereo", "mka", 0);
+    let (snr, worst) = opus_vs_reference("opus_celt_stereo", "mka", 0, "opus_celt_stereo.ffmpeg.s16");
     assert!(worst <= 3, "largest difference from FFmpeg is {worst} LSB (SNR {snr:.1} dB)");
 }
 
-/// SILK and hybrid frames are upsampled by our own filter, so they agree with FFmpeg's resampler to
-/// about 40 dB rather than to the bit.
+/// SILK and hybrid frames decode to what libopus decodes, to a few LSB: the resampler is libopus's,
+/// and the SILK synthesis differs from libopus's fixed-point arithmetic by rounding (see the README).
 #[test]
-fn silk_and_hybrid_opus_decode_close_to_what_ffmpeg_decodes() {
-    for (file, late) in [("opus_silk_mono", 3), ("opus_hybrid_stereo", 0)] {
-        let (snr, _) = opus_vs_ffmpeg(file, "mka", late);
-        assert!(snr > 35.0, "{file}: SNR against FFmpeg is only {snr:.1} dB");
+fn silk_and_hybrid_opus_decode_close_to_what_libopus_decodes() {
+    for file in ["opus_silk_mono", "opus_hybrid_stereo"] {
+        let (snr, worst) = opus_vs_reference(file, "mka", 0, &format!("{file}.libopus.s16"));
+        eprintln!("{file}: SNR {snr:.1} dB, worst {worst} LSB");
+        assert!(snr > 35.0, "{file}: SNR against libopus is only {snr:.1} dB");
+    }
+}
+
+/// SILK in each bandwidth and frame size, and hybrid, mono and stereo: FFmpeg's libopus encodes a
+/// harmonic tone mix in each mode, and IronAV's decode of each file is compared with libopus's
+/// decode of the same file. Narrow band is coded from 8 kHz input and medium band from 12 kHz, which
+/// is how libopus picks the bandwidth. The output must be in step with libopus's (least mean
+/// difference at lag 0) and above 35 dB SNR; the stereo hybrid streams above 25 dB, as their CELT
+/// stereo differs from libopus's (see the README). The differences on this tonal signal are larger
+/// than on speech (SILK's own synthesis, see the README).
+#[test]
+fn opus_silk_and_hybrid_in_every_bandwidth_decode_like_libopus() {
+    if !ffmpeg_available() {
+        eprintln!("skipped: ffmpeg is not on PATH");
+        return;
+    }
+    let dir = scratch("opus-silk-modes");
+    // (mode, input rate, application, bit rate per channel in kb/s)
+    let modes = [("nb", 8000, "voip", 8), ("mb", 12000, "voip", 12), ("wb", 48000, "voip", 12), ("swb-hybrid", 48000, "audio", 24), ("fb-hybrid", 48000, "audio", 40)];
+    let s16 = |b: &[u8]| -> Vec<i32> { b.as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes([b[0], b[1]]) as i32).collect() };
+    for channels in [1usize, 2] {
+        for (mode, rate, application, kbps) in modes {
+            for ms in [10, 20, 40, 60] {
+                let name = format!("{mode}-{channels}ch-{ms}ms");
+                let enc = dir.join(format!("{name}.opus"));
+                // a voice-like tone mix, a different pitch in each channel, with a slow swell
+                let tone = |f: u32| format!("0.25*(sin(2*PI*{f}*t)+0.5*sin(4*PI*{f}*t)+0.25*sin(6*PI*{f}*t))*(0.6+0.4*sin(2*PI*2*t))");
+                let expr = if channels == 1 { tone(150) } else { format!("{}|{}", tone(150), tone(170)) };
+                let source = format!("aevalsrc={expr}:s={rate}:d=1.5");
+                let bitrate = format!("{}k", kbps * channels as u32);
+                let st = std::process::Command::new("ffmpeg")
+                    .args(["-v", "error", "-y", "-f", "lavfi", "-i", &source, "-c:a", "libopus", "-application", application, "-b:a", &bitrate, "-frame_duration", &ms.to_string()])
+                    .arg(&enc)
+                    .status()
+                    .unwrap();
+                assert!(st.success(), "ffmpeg could not encode {name}");
+                let reference = std::process::Command::new("ffmpeg").args(["-v", "error", "-c:a", "libopus", "-i"]).arg(&enc).args(["-f", "s16le", "-"]).output().unwrap();
+                assert!(reference.status.success(), "libopus could not decode {name}");
+                let want = s16(&reference.stdout);
+                let out = dir.join(format!("{name}.wav"));
+                let mut j = job(&enc, &out);
+                j.audio.codec = Some("pcm_s16le".into());
+                run(&j, &mut |_| {}).unwrap();
+                let got = s16(&pcm(&out));
+                let n = got.len().min(want.len());
+                assert!(n > 40_000 * channels, "{name}: {n} samples to compare");
+                let (mut sig, mut err, mut worst) = (0f64, 0f64, 0);
+                for (a, b) in got[..n].iter().zip(&want[..n]) {
+                    sig += (*b as f64).powi(2);
+                    err += ((a - b) as f64).powi(2);
+                    worst = worst.max((a - b).abs());
+                }
+                let snr = 10.0 * (sig / err.max(1e-9)).log10();
+                // the alignment: the mean difference is least at lag 0 (SNR alone barely notices a
+                // sample's shift in a low tone)
+                let lag_error = |lag: isize| -> f64 {
+                    let range = 9600..n - 9600;
+                    range.clone().map(|i| (got[(i as isize + lag) as usize] - want[i]).abs() as f64).sum::<f64>() / range.len() as f64
+                };
+                let best = (-3isize..=3).min_by(|a, b| lag_error(*a).total_cmp(&lag_error(*b))).unwrap();
+                eprintln!("{name}: SNR {snr:.1} dB against libopus, worst {worst} LSB, best lag {best}");
+                let min_snr = if channels == 2 { 25.0 } else { 35.0 };
+                assert_eq!(best, 0, "{name}: the output is out of step with libopus's");
+                assert!(snr > min_snr, "{name}: SNR against libopus is only {snr:.1} dB (worst {worst} LSB)");
+            }
+        }
     }
 }
 
