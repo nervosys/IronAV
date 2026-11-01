@@ -173,7 +173,7 @@ pub fn plan(job: &Job) -> Result<Plan> {
             warnings.push(format!("{at} ({media:?}) dropped: '{}' cannot hold {media:?}", spec.name));
             continue;
         }
-        if taken.contains(&media) {
+        if taken.contains(&media) && !spec.holds_several() {
             warnings.push(format!("{at} ({media:?}) dropped: '{}' holds one {media:?} stream here and an earlier one was used", spec.name));
             continue;
         }

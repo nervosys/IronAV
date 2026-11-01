@@ -1018,7 +1018,7 @@ becomes 160 kb/s MP3 in about 2 s. Converting an MP3 to MP3 is a copy unless a b
 ## Matroska output
 
 `.mkv` and `.mka` can be written: H.264 or HEVC video (from the software or hardware encoder, or copied), MPEG-4 Part 2 video (copied, or encoded by IronAV), or VP8, VP9, AV1 or Motion-JPEG video (copied, or encoded by IronAV for VP8, VP9, AV1 and Motion-JPEG), with AAC, FLAC, MP3, Opus, Vorbis or PCM
-audio, copied or encoded, at most one stream of each kind. Timestamps are in milliseconds; clusters are gathered in memory and
+audio, copied or encoded, and any number of tracks of each kind (two audio tracks, or two video tracks). Timestamps are in milliseconds; clusters are gathered in memory and
 written whole, so there are no unknown-size elements, and the file ends with Cues for the video key frames (or the clusters, for
 audio only). The header is held back until every stream has delivered a packet and the video's SPS/PPS have been seen.
 
@@ -1026,6 +1026,10 @@ Checked with FFmpeg (through PyAV) on AAC, Opus, Vorbis, FLAC and MP3 copied int
 encoder, with and without the AAC audio in `.mkv`: FFmpeg opens every file, the audio packet counts equal the sources', and
 FFmpeg decodes all 50 frames of each video. IronAV's own tests copy audio through and compare every packet's bytes and the codec
 configuration, and decode FLAC through Matroska to the PCM it was made from.
+
+Several tracks of one kind are written as separate tracks, in input order: ffprobe lists them all, and IronAV's reader returns each
+track's packets. Other formats keep the first stream of each kind. The `mkv_multi` test copies a file with two audio tracks and one
+video track, and one with two video tracks, and checks the result with ffprobe and with IronAV's reader.
 
 `.webm` is written with VP8, VP9 or AV1 video and Opus or Vorbis audio (document type `webm`; FFmpeg opens the files and decodes them).
 VP8, VP9 and AV1 video can be encoded by IronAV (see "VP8", "VP9" and "AV1"); otherwise the video is copied, from WebM, Matroska or (VP9 and AV1) MP4. Key frames come from

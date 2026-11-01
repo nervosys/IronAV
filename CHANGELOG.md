@@ -173,7 +173,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   ProRes interlaced pictures are refused.
 - **Containers:** Matroska tracks with encryption, bzip2 or lzo content encodings are refused (header stripping and zlib are read;
   the live reader refuses any content encoding); MPEG-TS does not carry Opus,
-  AC-3 or MPEG-2 video; raw H.264 and HEVC are write-only as files (the live reader reads them); Matroska output holds one stream of each kind; Ogg refuses files
+  AC-3 or MPEG-2 video; raw H.264 and HEVC are write-only as files (the live reader reads them); Ogg refuses files
   holding only Speex or Theora (other streams in a file are passed over).
 - **Live:** servers that speak only TLS 1.2 cannot be reached; cameras and microphones are read on Windows and Linux
   only (no AVFoundation).

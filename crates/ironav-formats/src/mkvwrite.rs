@@ -1,5 +1,5 @@
 //! Matroska writer (`.mkv`, `.mka`, and `.webm` for VP8, VP9 or AV1 video and Opus or Vorbis audio): H.264, HEVC, VP8, VP9,
-//! AV1 or Motion-JPEG video and AAC, FLAC, MP3, Opus, Vorbis or PCM audio, at most one stream of each kind.
+//! AV1 or Motion-JPEG video and AAC, FLAC, MP3, Opus, Vorbis or PCM audio, any number of tracks of each kind.
 //! PCM is written as `A_PCM/INT/LIT` (or `A_PCM/FLOAT/IEEE`) with its sample size as BitDepth.
 //!
 //! Layout: EBML header, Segment (its size patched at the end), Info, Tracks, Clusters, Cues. The
@@ -120,13 +120,14 @@ pub struct MatroskaWriter {
     out: Box<dyn WriteSeek>,
     tracks: Vec<Track>,
     held: Vec<Packet>,
-    /// The last Opus packet, written at the end so it can carry its padding.
-    opus_last: Option<Packet>,
+    /// Per track, the last Opus or AAC packet, written at the end so it can carry its padding.
+    tails: Vec<Option<Packet>>,
     started: bool,
     segment_data: u64,
     segment_size_at: u64,
     duration_at: u64,
-    flac_info_at: Option<u64>,
+    /// Per FLAC track (its index), the offset of its STREAMINFO in the file, patched when the stream ends.
+    flac_info_at: Vec<(usize, u64)>,
     cluster: Option<Cluster>,
     /// (time ms, track number, cluster offset from the segment data)
     cues: Vec<(i64, usize, u64)>,
@@ -150,12 +151,12 @@ impl MatroskaWriter {
             out,
             tracks: Vec::new(),
             held: Vec::new(),
-            opus_last: None,
+            tails: Vec::new(),
             started: false,
             segment_data: 0,
             segment_size_at: 0,
             duration_at: 0,
-            flac_info_at: None,
+            flac_info_at: Vec::new(),
             cluster: None,
             cues: Vec::new(),
             end_ms: 0,
@@ -227,6 +228,8 @@ impl MatroskaWriter {
         self.out.write_all(&el(0x1549_A966, &info))?;
 
         let mut entries = Vec::new();
+        // each FLAC track's STREAMINFO, as an offset from the start of the Tracks body
+        let mut flac_rel = Vec::new();
         for (i, t) in self.tracks.iter().enumerate() {
             let s = &t.stream;
             let mut e = uint(0xD7, i as u64 + 1);
@@ -251,7 +254,12 @@ impl MatroskaWriter {
                 _ => "A_MPEG/L3",
             };
             e.extend(string(0x86, id));
+            let mut flac_at = None;
             if let Some(private) = Self::codec_private(t)? {
+                if s.codec == CodecId::Flac {
+                    // the STREAMINFO follows "fLaC" and its block header (8 bytes)
+                    flac_at = Some(e.len() + id_bytes(0x63A2).len() + size_bytes(private.len() as u64).len() + 8);
+                }
                 e.extend(el(0x63A2, &private));
             }
             match &s.params {
@@ -292,17 +300,17 @@ impl MatroskaWriter {
                     e.extend(el(0xE1, &a));
                 }
             }
+            if let Some(at) = flac_at {
+                flac_rel.push((i, entries.len() + id_bytes(0xAE).len() + size_bytes(e.len() as u64).len() + at));
+            }
             entries.extend(el(0xAE, &e));
         }
         let tracks = el(0x1654_AE6B, &entries);
         let tracks_at = self.pos()?;
         self.out.write_all(&tracks)?;
-        // the FLAC STREAMINFO follows "fLaC" and its block header inside CodecPrivate
-        if self.tracks.iter().any(|t| t.stream.codec == CodecId::Flac) {
-            if let Some(i) = tracks.windows(8).position(|w| w[..4] == *b"fLaC" && w[4..] == [0x80, 0, 0, 34]) {
-                self.flac_info_at = Some(tracks_at + i as u64 + 8);
-            }
-        }
+        // the Tracks body starts after its own ID and size
+        let body_at = tracks_at + (id_bytes(0x1654_AE6B).len() + size_bytes(entries.len() as u64).len()) as u64;
+        self.flac_info_at = flac_rel.into_iter().map(|(i, rel)| (i, body_at + rel as u64)).collect();
         self.started = true;
         Ok(())
     }
@@ -338,7 +346,8 @@ impl MatroskaWriter {
             self.cluster = Some(Cluster { tc: ms, body: Vec::new(), cues: Vec::new() });
         }
         let c = self.cluster.as_mut().expect("a cluster is open");
-        if c.cues.is_empty() && key && (video || !any_video) {
+        // one cue per track in each cluster: the first key frame of each video track, or each audio track's first packet
+        if key && (video || !any_video) && !c.cues.iter().any(|&(_, track)| track == t + 1) {
             c.cues.push((ms, t + 1));
         }
         let mut b = vec![0x80 | (t as u8 + 1)];
@@ -389,8 +398,8 @@ impl MatroskaWriter {
             self.tracks[t].flac.record(p);
         }
         if !self.tracks[t].video && (self.tracks[t].stream.codec == CodecId::Opus || holds_aac_end(&self.tracks[t])) {
-            // the last packet is held back: it may carry the end padding
-            if let Some(prev) = self.opus_last.replace(p.clone()) {
+            // the track's last packet is held back: it may carry the end padding
+            if let Some(prev) = self.tails[t].replace(p.clone()) {
                 return self.write_block(&prev, prev.data.clone(), true, None);
             }
             return Ok(());
@@ -408,14 +417,10 @@ impl MatroskaWriter {
 
 impl Muxer for MatroskaWriter {
     fn write_header(&mut self, streams: &[StreamInfo]) -> Result<()> {
-        if streams.is_empty() || streams.len() > 2 {
-            return Err(Error::invalid_arg("this Matroska writer holds one video stream, one audio stream, or both"));
+        if streams.is_empty() {
+            return Err(Error::invalid_arg("this Matroska writer needs at least one stream"));
         }
-        for (i, s) in streams.iter().enumerate() {
-            let media = s.params.media_type();
-            if streams[..i].iter().any(|o| o.params.media_type() == media) {
-                return Err(Error::invalid_arg(format!("this Matroska writer holds at most one {media:?} stream")));
-            }
+        for s in streams {
             if self.webm && !matches!(s.codec, CodecId::Opus | CodecId::Vorbis | CodecId::Vp8 | CodecId::Vp9 | CodecId::Av1) {
                 return Err(Error::new(ErrorCode::UnsupportedCodec, format!("WebM holds VP8, VP9, AV1, Opus and Vorbis, not {}", s.codec.name()))
                     .hint("write .mkv for other codecs")
@@ -456,6 +461,7 @@ impl Muxer for MatroskaWriter {
                 let _ = av1_sample(&s.extradata[4..], &mut av1_still);
             }
             self.tracks.push(Track { stream: s.clone(), video, params: ParamSets::default(), flac: FlacStats::new(), seen: 0, first_duration: 0, duration_sum: 0, av1_still });
+            self.tails.push(None);
         }
         Ok(())
     }
@@ -496,7 +502,7 @@ impl Muxer for MatroskaWriter {
             self.start()?;
             self.flush_held()?;
         }
-        if let Some(last) = self.opus_last.take() {
+        for last in self.tails.iter_mut().filter_map(Option::take).collect::<Vec<_>>() {
             let t = last.stream;
             let d = if self.tracks[t].stream.codec == CodecId::Aac {
                 // the packets hold more samples than the stream's length and priming leave: the rest is padding
@@ -537,10 +543,11 @@ impl Muxer for MatroskaWriter {
         self.out.write_all(&size)?;
         self.out.seek(SeekFrom::Start(self.duration_at))?;
         self.out.write_all(&(self.end_ms as f64).to_be_bytes())?;
-        if let (Some(at), Some(t)) = (self.flac_info_at, self.tracks.iter().find(|t| t.stream.codec == CodecId::Flac)) {
-            let (rate, channels, bits) = flac_audio_params(&t.stream)?;
+        for &(t, at) in &self.flac_info_at {
+            let (rate, channels, bits) = flac_audio_params(&self.tracks[t].stream)?;
+            let info = self.tracks[t].flac.streaminfo(rate, channels, bits);
             self.out.seek(SeekFrom::Start(at))?;
-            self.out.write_all(&t.flac.streaminfo(rate, channels, bits))?;
+            self.out.write_all(&info)?;
         }
         self.out.seek(SeekFrom::Start(end))?;
         self.out.flush()?;
@@ -637,6 +644,67 @@ mod tests {
         assert_eq!(a[7].data, vec![7; 10]);
         let t = a[7].pts as f64 * s[1].time_base.as_f64();
         assert!((t - 7.0 * 1024.0 / 44100.0).abs() < 0.001, "{t}");
+    }
+
+    /// Two video tracks and two audio tracks come back out of our reader as four tracks, each with its own packets.
+    #[test]
+    fn several_tracks_of_each_kind_round_trip_through_the_reader() {
+        let sink = Arc::new(Mutex::new(Cursor::new(Vec::new())));
+        let mut m = MatroskaWriter::new(Box::new(Shared(sink.clone())));
+        let video = |index| StreamInfo {
+            index,
+            codec: CodecId::H264,
+            time_base: Rational::new(1, 25),
+            duration: None,
+            bits: None,
+            extradata: Vec::new(),
+            lead_in: 0,
+            params: StreamParams::Video { width: 64, height: 48, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational::new(25, 1) },
+        };
+        let pcm = |index| StreamInfo {
+            index,
+            codec: CodecId::PcmS16Le,
+            time_base: Rational::new(1, 8000),
+            duration: None,
+            bits: Some(16),
+            extradata: Vec::new(),
+            lead_in: 0,
+            params: StreamParams::Audio { sample_rate: 8000, channels: 1 },
+        };
+        m.write_header(&[video(0), video(1), pcm(2), pcm(3)]).unwrap();
+        let sc = [0, 0, 0, 1];
+        let idr = [&sc[..], &[0x67, 0x42, 0, 0x1E, 0xAA], &sc, &[0x68, 0xCE], &sc, &[0x65, 0x88, 1, 2, 3]].concat();
+        let p = [&sc[..], &[0x41, 0x9A, 4, 5]].concat();
+        for track in 0..2 {
+            m.write_packet(&Packet { stream: track, pts: 0, duration: 1, data: idr.clone() }).unwrap();
+        }
+        for i in 1..25 {
+            for track in 0..2 {
+                m.write_packet(&Packet { stream: track, pts: i, duration: 1, data: p.clone() }).unwrap();
+            }
+        }
+        for i in 0..40i64 {
+            for track in 2..4usize {
+                m.write_packet(&Packet { stream: track, pts: i * 200, duration: 200, data: vec![(track as i64 * 10 + i) as u8; 400] }).unwrap();
+            }
+        }
+        m.finish().unwrap();
+        let bytes = sink.lock().unwrap().get_ref().clone();
+
+        let mut d = crate::mkv::open(Cursor::new(bytes)).unwrap();
+        let s = d.streams().to_vec();
+        let codecs: Vec<CodecId> = s.iter().map(|x| x.codec).collect();
+        assert_eq!(codecs, vec![CodecId::H264, CodecId::H264, CodecId::PcmS16Le, CodecId::PcmS16Le]);
+        let mut got: Vec<Vec<Packet>> = vec![Vec::new(); 4];
+        while let Some(p) = d.read_packet().unwrap() {
+            got[p.stream].push(p);
+        }
+        assert_eq!(got.iter().map(Vec::len).collect::<Vec<_>>(), vec![25, 25, 40, 40]);
+        // the second audio track's payloads are its own
+        for (i, pk) in got[3].iter().enumerate() {
+            assert_eq!(pk.data, vec![(30 + i) as u8; 400], "audio track 3, packet {i}");
+        }
+        assert!(got[0][0].data.windows(5).any(|w| w == [0x65, 0x88, 1, 2, 3]), "the first video track keeps its key frame");
     }
 
     #[test]

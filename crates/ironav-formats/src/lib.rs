@@ -44,6 +44,12 @@ impl FormatSpec {
     pub fn holds(&self, media: MediaType) -> bool {
         self.codecs.iter().any(|c| c.media_type() == media)
     }
+
+    /// True if the format can hold any number of streams of one media type (Matroska and WebM can;
+    /// the other formats hold one stream of each kind).
+    pub fn holds_several(&self) -> bool {
+        matches!(self.name, "mkv" | "webm")
+    }
 }
 
 pub static FORMATS: &[FormatSpec] = &[
@@ -104,7 +110,7 @@ pub static FORMATS: &[FormatSpec] = &[
     FormatSpec {
         name: "mkv",
         extensions: &["mkv", "mka"],
-        description: "Matroska: read (also WebM, with any codec the file holds) and written with H.264, HEVC, VP8, VP9, AV1 or Motion-JPEG or MPEG-4 Part 2 video (copied; VP8, MJPEG and MPEG-4 also encoded by IronAV where it has the codec) and AAC, FLAC, MP3, MP2 (read and copied), Opus, Vorbis or PCM audio copied or encoded (PCM as integer or float, little- or big-endian); one stream of each kind; no SeekHead",
+        description: "Matroska: read (also WebM, with any codec the file holds) and written with H.264, HEVC, VP8, VP9, AV1 or Motion-JPEG or MPEG-4 Part 2 video (copied; VP8, MJPEG and MPEG-4 also encoded by IronAV where it has the codec) and AAC, FLAC, MP3, MP2 (read and copied), Opus, Vorbis or PCM audio copied or encoded (PCM as integer or float, little- or big-endian); any number of tracks of each kind; no SeekHead",
         media: MediaType::Video,
         demux: true,
         mux: true,
