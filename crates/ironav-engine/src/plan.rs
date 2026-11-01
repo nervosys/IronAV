@@ -334,8 +334,8 @@ pub fn plan(job: &Job) -> Result<Plan> {
             if k == 0 {
                 return Err(Error::invalid_arg("keyint must be at least 1 frame"));
             }
-            if !matches!(to, CodecId::H264 | CodecId::Hevc | CodecId::Vp8 | CodecId::Vp9 | CodecId::Av1 | CodecId::Mpeg4) {
-                return Err(Error::invalid_arg(format!("keyint applies to the h264, hevc, vp8, vp9, av1 and mpeg4 encoders, and this video is written as {}", to.name()))
+            if !matches!(to, CodecId::H264 | CodecId::Hevc | CodecId::Vp8 | CodecId::Vp9 | CodecId::Av1 | CodecId::Mpeg4 | CodecId::Mpeg2Video) {
+                return Err(Error::invalid_arg(format!("keyint applies to the h264, hevc, vp8, vp9, av1, mpeg4 and mpeg2 encoders, and this video is written as {}", to.name()))
                     .hint("set the video codec to one of them, or leave keyint out"));
             }
         }
@@ -358,10 +358,10 @@ pub fn plan(job: &Job) -> Result<Plan> {
             if n > 3 {
                 return Err(Error::invalid_arg(format!("bframes must be from 0 to 3, not {n}")));
             }
-            if !matches!(to, CodecId::Hevc | CodecId::Mpeg4) {
-                return Err(Error::invalid_arg(format!("bframes applies to the hevc and mpeg4 encoders, and this video is written as {}", to.name()))
-                    .hint("set the video codec to hevc or mpeg4, or leave bframes out")
-                    .alternatives(["hevc", "mpeg4"]));
+            if !matches!(to, CodecId::Hevc | CodecId::Mpeg4 | CodecId::Mpeg2Video) {
+                return Err(Error::invalid_arg(format!("bframes applies to the hevc, mpeg4 and mpeg2 encoders, and this video is written as {}", to.name()))
+                    .hint("set the video codec to hevc, mpeg4 or mpeg2, or leave bframes out")
+                    .alternatives(["hevc", "mpeg4", "mpeg2video"]));
             }
             if n > 0 && low {
                 return Err(Error::invalid_arg("bframes conflicts with latency low, which codes no B pictures").hint("leave latency at normal, or set bframes to 0"));
@@ -436,9 +436,9 @@ pub fn plan(job: &Job) -> Result<Plan> {
         }
         if media == MediaType::Video && action == Action::Transcode {
             rate_control(opts)?;
-            if to == CodecId::Mpeg4 && opts.qp.is_some_and(|q| !(1..=31).contains(&q)) {
-                return Err(Error::invalid_arg(format!("qp for mpeg4 must be 1-31, got {}", opts.qp.unwrap_or(0)))
-                    .hint("the MPEG-4 quantiser scale runs from 1 (best) to 31; use bitrate_kbps for a size target"));
+            if matches!(to, CodecId::Mpeg4 | CodecId::Mpeg2Video) && opts.qp.is_some_and(|q| !(1..=31).contains(&q)) {
+                return Err(Error::invalid_arg(format!("qp for {} must be 1-31, got {}", to.name(), opts.qp.unwrap_or(0)))
+                    .hint("the MPEG-4 and MPEG-2 quantiser scales run from 1 (best) to 31; use bitrate_kbps for a size target"));
             }
         } else if media == MediaType::Video && (opts.bitrate_kbps.is_some() || opts.qp.is_some()) {
             return Err(Error::invalid_arg("bitrate_kbps and qp have no effect when the stream is copied")

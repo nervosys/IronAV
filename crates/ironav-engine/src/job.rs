@@ -60,7 +60,7 @@ pub struct StreamOpts {
     /// Opus encoder settings, for audio written as `opus`: mode, signal, packet length, FEC and DTX.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opus: Option<OpusJob>,
-    /// Video only: frames between key frames, for the h264, hevc, vp8, vp9, av1 and mpeg4 encoders. Default 250
+    /// Video only: frames between key frames, for the h264, hevc, vp8, vp9, av1, mpeg4 and mpeg2 encoders. Default 250
     /// (one a second with `latency: low`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keyint: Option<u32>,

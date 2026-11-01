@@ -3,6 +3,7 @@ use crate::plan::{plan, rate_control, Action, Plan};
 use ironav_codec::h264::H264Encoder;
 use ironav_codec::hevc::HevcEncoder;
 use ironav_codec::jpeg::JpegEncoder;
+use ironav_codec::mpeg2::enc::Mpeg2Encoder;
 use ironav_codec::mpeg4::enc::Mpeg4Encoder;
 use ironav_codec::vp8::Vp8Encoder;
 use ironav_codec::vp9::Vp9Encoder;
@@ -256,6 +257,18 @@ fn execute(
                         RateControl::Bitrate(b) => (None, Some(b)),
                     };
                     let e = video.apply_mpeg4(Mpeg4Encoder::new(&dst.params, qp, bitrate)?);
+                    Box::new(match st.keyint {
+                        Some(k) => e.with_keyint(k.into()),
+                        None => e,
+                    })
+                }
+                _ if dst.codec == CodecId::Mpeg2Video && dst.params.media_type() == MediaType::Video => {
+                    // for MPEG-2 too a constant quality is the quantiser code itself, 1 to 31 (the scale is twice it)
+                    let (qp, bitrate) = match rate {
+                        RateControl::ConstQp(q) => (Some(q), None),
+                        RateControl::Bitrate(b) => (None, Some(b)),
+                    };
+                    let e = video.apply_mpeg2(Mpeg2Encoder::new(&dst.params, qp, bitrate)?);
                     Box::new(match st.keyint {
                         Some(k) => e.with_keyint(k.into()),
                         None => e,

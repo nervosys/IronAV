@@ -68,7 +68,7 @@ fn bad_encoder_options_fail_with_a_message() {
     let out = dir.join("x.mp4");
     let cases: [(&[&str], &str); 6] = [
         (&["--vcodec", "hevc", "--bframes", "4"], "--bframes must be a number of B pictures from 0 to 3"),
-        (&["--vcodec", "h264", "--bframes", "2"], "bframes applies to the hevc and mpeg4 encoders"),
+        (&["--vcodec", "h264", "--bframes", "2"], "bframes applies to the hevc, mpeg4 and mpeg2 encoders"),
         (&["--vcodec", "av1", "--tiles", "3x1"], "--tiles must be COLSxROWS"),
         (&["--vcodec", "av1", "--altref", "1"], "--altref must be a lag from 2 to 16 frames"),
         (&["--vcodec", "hevc", "--quarter-mv"], "quarter_mv applies to the av1 encoder"),

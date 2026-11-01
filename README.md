@@ -6,7 +6,7 @@ A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so 
 > **Status: foundation (v0.1).** The architecture, agent interface, ontology, hardware model, CLI, MCP server
 > and both GUIs are working and tested. Containers: **WAV, FLAC, Y4M, MP4, QuickTime MOV (read and write), Matroska/WebM (read and write), Ogg, ADTS, MP3, JPEG and MPEG transport streams (read and write); raw H.264 and HEVC (Annex B: read and written as files, and read as live sources).**
 > Audio codecs, each decoded and encoded: **PCM, FLAC, ALAC, AAC-LC (plus HE-AAC v1 decode), MP3, MP2, AC-3, Opus and Vorbis.**
-> Video: **software decoders for H.264, HEVC (including 4:2:2 and 4:4:4), VP8 and VP9; a software H.264 encoder (High profile: CABAC and the 8x8 transform), a software HEVC encoder (Main profile, 8-bit 4:2:0, merge and skip, SAO), a software VP8 encoder, and a software VP9 encoder (key and inter frames), and a software AV1 encoder (key and inter frames, profile 0, 8-bit 4:2:0); JPEG/Motion-JPEG and Apple ProRes decoded and encoded in software; MPEG-4 Part 2 (Simple and Advanced Simple profiles) decoded in software, and Simple profile I and P pictures encoded in software, with Advanced Simple B pictures as an option (MP4 and Matroska); MPEG-1 and MPEG-2 video (frame and field pictures, 4:2:0 and 4:2:2) decoded in software.**
+> Video: **software decoders for H.264, HEVC (including 4:2:2 and 4:4:4), VP8 and VP9; a software H.264 encoder (High profile: CABAC and the 8x8 transform), a software HEVC encoder (Main profile, 8-bit 4:2:0, merge and skip, SAO), a software VP8 encoder, and a software VP9 encoder (key and inter frames), and a software AV1 encoder (key and inter frames, profile 0, 8-bit 4:2:0); JPEG/Motion-JPEG and Apple ProRes decoded and encoded in software; MPEG-4 Part 2 (Simple and Advanced Simple profiles) decoded in software, and Simple profile I and P pictures encoded in software, with Advanced Simple B pictures as an option (MP4 and Matroska); MPEG-1 and MPEG-2 video (frame and field pictures, 4:2:0 and 4:2:2) decoded in software, and MPEG-2 video (Main profile, 4:2:0, progressive frames, optional B pictures) encoded in software.**
 > NVIDIA GPUs encode H.264 and HEVC (NVENC, preferred when usable) and decode H.264, HEVC and AV1 (NVDEC).
 > AV1 is decoded on NVIDIA GPUs (NVDEC) or in software (key, intra-only and inter frames, superres included). VP9 and AV1 copy between WebM, Matroska and MP4.
 > IronAV is not yet a drop-in replacement for FFmpeg or HandBrake.
@@ -989,7 +989,37 @@ What is verified: the output is FFmpeg's, byte for byte, frame for frame (`-flag
 
 Speed, release build, one thread, 250 frames written to a Y4M file: 720x576 interlaced at 6 Mbit/s decodes in 1.6 s (157 frames/s), 1920x1080 progressive at 20 Mbit/s in 3.0 s (83 frames/s). FFmpeg's decoder, one thread, discarding the frames, takes 0.67 s and 2.6 s.
 
-Refused or not done: 4:4:4 (the High profile), the scalable profiles (SNR, spatial, temporal), data partitioning; concealment vectors are parsed and ignored (FFmpeg ignores them too); damaged streams are not concealed beyond skipping the slice, so a stream with errors can differ from FFmpeg's decode; a B picture before the first anchor of an open GOP is skipped as FFmpeg skips it (not tested against FFmpeg); in program streams, DTS, subpictures and DVD-Audio are skipped and a stream that first appears late in the file is not read; there is no MPEG-1/2 video in MPEG-TS or Matroska output.
+Refused or not done: 4:4:4 (the High profile), the scalable profiles (SNR, spatial, temporal), data partitioning; concealment vectors are parsed and ignored (FFmpeg ignores them too); damaged streams are not concealed beyond skipping the slice, so a stream with errors can differ from FFmpeg's decode; a B picture before the first anchor of an open GOP is skipped as FFmpeg skips it (not tested against FFmpeg); in program streams, DTS, subpictures and DVD-Audio are skipped and a stream that first appears late in the file is not read; there is no MPEG-1 video encoder or output, and no MPEG-2 field-picture or 4:2:2 encoder.
+
+**MPEG-2 video encoder.** `mpeg2video` is encoded in software as Main profile, 4:2:0, progressive frame pictures: I and P pictures, with B pictures between anchors when `--bframes N` is set (off by default), `--qp` 1 to 31 for a fixed quantiser scale, `--vbitrate` for rate control, and `--keyint` for the key-picture interval. It writes raw `.m2v`, MPEG-TS (stream type 0x02), Matroska (`V_MPEG2`) and MP4 (object type 0x61). Field pictures, 4:2:2 and interlaced output are not encoded. FFmpeg decodes IronAV's stream to exactly IronAV's reconstruction (`-flags +bitexact -idct simple -cpuflags 0`), and IronAV decodes it the same way; `crates/ironav-engine/tests/mpeg2_enc.rs` checks both (skipped without ffmpeg). The encoder never chooses a motion vector whose block reads outside the picture, because FFmpeg and IronAV disagree on those reads (FFmpeg does not clamp them to the edge). The table compares 60 frames of each source at `--qp` against FFmpeg's `-c:v mpeg2video -qscale:v N` (with `-bf 2` for the B rows), by IronAV's file size and luma PSNR per frame index:
+
+| source | size | qscale | B pictures | IronAV bytes | IronAV luma PSNR (dB) | FFmpeg bytes | FFmpeg luma PSNR (dB) |
+|---|---|---|---|---|---|---|---|
+| testsrc2 | 352x288 | 3 | 0 | 525378 | 49.35 | 502204 | 48.48 |
+| testsrc2 | 352x288 | 5 | 0 | 375881 | 45.07 | 343599 | 44.05 |
+| testsrc2 | 352x288 | 10 | 0 | 228728 | 39.23 | 187408 | 38.54 |
+| testsrc2 | 352x288 | 3 | 2 | 440681 | 47.31 | 506667 | 48.55 |
+| testsrc2 | 352x288 | 5 | 2 | 315854 | 43.17 | 351486 | 44.14 |
+| testsrc2 | 352x288 | 10 | 2 | 197522 | 38.33 | 197378 | 38.68 |
+| mandelbrot | 352x288 | 3 | 0 | 953795 | 45.83 | 880765 | 44.88 |
+| mandelbrot | 352x288 | 5 | 0 | 643986 | 42.16 | 568634 | 41.14 |
+| mandelbrot | 352x288 | 10 | 0 | 368761 | 36.94 | 284565 | 35.92 |
+| mandelbrot | 352x288 | 3 | 2 | 707600 | 43.75 | 838229 | 44.82 |
+| mandelbrot | 352x288 | 5 | 2 | 472425 | 40.15 | 536368 | 41.10 |
+| mandelbrot | 352x288 | 10 | 2 | 271283 | 35.72 | 268818 | 35.96 |
+| testsrc2 | 720x576 | 3 | 0 | 1591611 | 51.26 | 1479213 | 50.55 |
+| testsrc2 | 720x576 | 5 | 0 | 1125099 | 46.98 | 1001833 | 46.20 |
+| testsrc2 | 720x576 | 10 | 0 | 666991 | 41.47 | 530788 | 40.72 |
+| testsrc2 | 720x576 | 3 | 2 | 1341894 | 49.04 | 1510014 | 50.58 |
+| testsrc2 | 720x576 | 5 | 2 | 954555 | 44.99 | 1028409 | 46.26 |
+| testsrc2 | 720x576 | 10 | 2 | 592704 | 40.32 | 562758 | 40.83 |
+| mandelbrot | 720x576 | 3 | 0 | 2714541 | 47.46 | 2534236 | 46.43 |
+| mandelbrot | 720x576 | 5 | 0 | 1842925 | 43.87 | 1649790 | 42.77 |
+| mandelbrot | 720x576 | 10 | 0 | 1064491 | 38.69 | 852421 | 37.57 |
+| mandelbrot | 720x576 | 3 | 2 | 2042322 | 45.41 | 2421593 | 46.42 |
+| mandelbrot | 720x576 | 5 | 2 | 1380274 | 41.89 | 1572981 | 42.77 |
+| mandelbrot | 720x576 | 10 | 2 | 814674 | 37.44 | 812831 | 37.65 |
+
 
 ## MP3
 

@@ -201,7 +201,7 @@ fn bad_encoder_options_are_refused_by_name() {
     let mut j = job(&src, &dir, "b", "h264", "mp4");
     j.video.bframes = Some(2);
     let e = refusal(&j);
-    assert!(e.contains("bframes applies to the hevc and mpeg4 encoders"), "{e}");
+    assert!(e.contains("bframes applies to the hevc, mpeg4 and mpeg2 encoders"), "{e}");
 
     let mut j = job(&src, &dir, "c", "hevc", "mp4");
     j.video.bframes = Some(2);
