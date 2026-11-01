@@ -707,11 +707,15 @@ mod tests {
 
     #[test]
     fn ten_bit_pictures_decode_to_the_encoders_reference() {
-        for (w, h, slices) in [(64, 48, 1), (200, 120, 3)] {
+        // CABAC with B pictures and the 8x8 transform (High 10), and CAVLC (High 10 without them)
+        for (w, h, slices, cabac) in [(64, 48, 1, true), (200, 120, 3, true), (64, 48, 1, false), (200, 120, 3, false)] {
             for qp in [4, 20, 36] {
                 let params = StreamParams::Video { width: w as u32, height: h as u32, pix_fmt: PixelFormat::Yuv420p10, frame_rate: Rational::new(25, 1) };
                 let mut enc = H264Encoder::new(&params, Some(qp), None).unwrap();
                 enc.slices = slices;
+                enc.cabac = cabac;
+                enc.transform8 = cabac;
+                enc.bframes = if cabac { BFRAMES } else { 0 };
                 let (mut src, mut pkts) = (Vec::new(), Vec::new());
                 for t in 0..6 {
                     let f = scene10(w, h, t);
