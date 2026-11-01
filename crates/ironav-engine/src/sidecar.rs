@@ -278,6 +278,8 @@ fn reap(mut c: Child, deadline: Instant) -> Option<std::process::ExitStatus> {
 struct Running {
     stdin: Option<ChildStdin>,
     stderr: Arc<Mutex<VecDeque<String>>>,
+    /// Disconnects when the child's error output has ended.
+    eof: Receiver<()>,
     gen: u32,
 }
 
@@ -285,6 +287,12 @@ impl Running {
     /// Writes one line; false when the child is gone.
     fn send(&mut self, line: &str) -> bool {
         self.stdin.as_mut().is_some_and(|w| writeln!(w, "{line}").and_then(|_| w.flush()).is_ok())
+    }
+
+    /// Waits, up to `t`, for the child's error output to end (it ends when the child exits), so
+    /// that its last words are in [`tail`](Self::tail).
+    fn await_stderr(&self, t: Duration) {
+        let _ = self.eof.recv_timeout(t);
     }
 
     fn tail(&self) -> String {
@@ -316,7 +324,10 @@ fn spawn(name: &str, cfg: &SidecarConfig, start: Option<&Value>, gen: u32, share
     let stderr_pipe = child.stderr.take().unwrap();
     let stderr = Arc::new(Mutex::new(VecDeque::new()));
     let tail = stderr.clone();
+    let (eof_tx, eof) = std::sync::mpsc::channel::<()>();
     std::thread::spawn(move || {
+        // dropped when this ends, which tells whoever waits for the end
+        let _eof = eof_tx;
         // read to the end, whatever it holds, so the child never blocks on a full pipe
         let mut r = BufReader::new(stderr_pipe);
         loop {
@@ -340,20 +351,18 @@ fn spawn(name: &str, cfg: &SidecarConfig, start: Option<&Value>, gen: u32, share
     let (sup, events) = (sup.clone(), events.clone());
     std::thread::spawn(move || read_child(stdout, hello_tx, events, sup, gen));
     *shared.child.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
-    let mut running = Running { stdin, stderr, gen };
+    let mut running = Running { stdin, stderr, eof, gen };
     let fail = |running: &Running, msg: String| {
         shared.kill();
+        // its last words are waited for, not timed: they are all in once its error output ends
+        running.await_stderr(Duration::from_secs(2));
         let tail = running.tail();
         let e = Error::new(ErrorCode::Io, format!("sidecar '{name}' {msg}"));
         if tail.is_empty() { e } else { e.hint(format!("its error output ended with: {tail}")) }
     };
     let hello = match hello_rx.recv_timeout(Duration::from_secs_f64(cfg.start_seconds)) {
         Ok(Ok(v)) => v,
-        Ok(Err(m)) => {
-            // give its error output a moment to arrive
-            std::thread::sleep(Duration::from_millis(100));
-            return Err(fail(&running, m));
-        }
+        Ok(Err(m)) => return Err(fail(&running, m)),
         Err(_) => return Err(fail(&running, format!("did not say hello within {} s", cfg.start_seconds))),
     };
     let wants = Wants::parse(&hello).map_err(|m| fail(&running, format!("sent a hello IronAV cannot use: {m}")))?;
@@ -444,8 +453,8 @@ fn supervise(name: &'static str, cfg: SidecarConfig, wants: Wants, start: Value,
             // a child that ends after the input did is done, whatever its exit status
             break;
         }
-        // its last words may still be on their way
-        std::thread::sleep(Duration::from_millis(50));
+        // its last words may still be on their way: wait for its error output to end
+        r.await_stderr(Duration::from_secs(2));
         let tail = r.tail();
         let mut message = match status {
             Some(s) => format!("sidecar '{name}' stopped ({s})"),

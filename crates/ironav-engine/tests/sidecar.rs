@@ -3,6 +3,7 @@
 use ironav_core::ErrorCode;
 use ironav_engine::call_tool;
 use serde_json::{json, Value};
+use std::io::Write;
 use std::f64::consts::PI;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -30,7 +31,7 @@ fn configure() -> &'static Path {
             "absent": { "command": ["ironav-no-such-sidecar-program"], "media": "video" },
             "liar": { "command": [exe, "dtmf"], "media": "video" },
             "missing": { "command": ["ironav-no-such-sidecar-program"] },
-            "slow": { "command": [exe, "slow", "1", dir.join("slow.pid").to_str().unwrap()] },
+            "slow": { "command": [exe, "slow", "20", dir.join("slow.pid").to_str().unwrap()] },
         });
         let path = dir.join("sidecars.json");
         std::fs::write(&path, list.to_string()).unwrap();
@@ -39,11 +40,14 @@ fn configure() -> &'static Path {
     })
 }
 
-fn write_wav(path: &Path, samples: &[f64], channels: u16, rate: u32) {
-    let data: Vec<u8> = samples.iter().flat_map(|s| ((s.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes()).collect();
+fn pcm16(samples: &[f64]) -> Vec<u8> {
+    samples.iter().flat_map(|s| ((s.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes()).collect()
+}
+
+fn wav_header(channels: u16, rate: u32, data_len: u32) -> Vec<u8> {
     let mut f = Vec::new();
     f.extend_from_slice(b"RIFF");
-    f.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+    f.extend_from_slice(&(36 + data_len).to_le_bytes());
     f.extend_from_slice(b"WAVEfmt ");
     f.extend_from_slice(&16u32.to_le_bytes());
     f.extend_from_slice(&1u16.to_le_bytes());
@@ -53,9 +57,68 @@ fn write_wav(path: &Path, samples: &[f64], channels: u16, rate: u32) {
     f.extend_from_slice(&(channels * 2).to_le_bytes());
     f.extend_from_slice(&16u16.to_le_bytes());
     f.extend_from_slice(b"data");
-    f.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    f.extend_from_slice(&data_len.to_le_bytes());
+    f
+}
+
+fn write_wav(path: &Path, samples: &[f64], channels: u16, rate: u32) {
+    let data = pcm16(samples);
+    let mut f = wav_header(channels, rate, data.len() as u32);
     f.extend_from_slice(&data);
     std::fs::write(path, f).unwrap();
+}
+
+/// A WAV file that grows while the test writes to it. Followed by a session it gives packets for as
+/// long as the test writes them, so the test decides when media flows, not a clock.
+struct Growing {
+    file: std::fs::File,
+    rate: u32,
+    channels: u16,
+}
+
+impl Growing {
+    fn create(path: &Path, rate: u32, channels: u16) -> Growing {
+        let mut file = std::fs::File::create(path).unwrap();
+        // the header declares far more audio than will ever be written: the reader waits for more
+        file.write_all(&wav_header(channels, rate, rate * channels as u32 * 2 * 3600)).unwrap();
+        Growing { file, rate, channels }
+    }
+
+    fn push(&mut self, samples: &[f64]) {
+        self.file.write_all(&pcm16(samples)).unwrap();
+        self.file.flush().unwrap();
+    }
+
+    fn silence(&mut self, secs: f64) {
+        let n = (secs * self.rate as f64) as usize * self.channels as usize;
+        self.push(&vec![0.0; n]);
+    }
+}
+
+/// Polls `done` until it holds, feeding `feed` silence meanwhile: a session takes a sidecar's hello,
+/// and its removals, between packets, so the packets are supplied rather than waited for.
+fn pump(feed: &mut Growing, what: &str, mut done: impl FnMut() -> bool) {
+    let t0 = std::time::Instant::now();
+    while !done() {
+        assert!(t0.elapsed().as_secs() < 60, "gave up waiting for {what}");
+        feed.silence(0.02);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn status(id: &str) -> Value {
+    call_tool("stream_status", &json!({ "session": id })).unwrap()
+}
+
+/// Whether the session's status names analyzer `name` as running on a stream.
+fn joined(st: &Value, name: &str) -> bool {
+    st["analyzed"].as_array().is_some_and(|streams| streams.iter().any(|s| s["analyzers"].as_array().is_some_and(|a| a.contains(&json!(name)))))
+}
+
+/// Asks for a change until the session reports it applied. A change waits for the session's next
+/// step, so asking again (harmless for a removal) is how to wait for it, not a fixed time.
+fn configure_until_applied(feed: &mut Growing, args: Value) {
+    pump(feed, "the change to apply", || call_tool("stream_configure", &args).unwrap()["applied"] == true);
 }
 
 #[test]
@@ -63,40 +126,39 @@ fn a_sidecar_is_added_to_a_running_session_and_removed() {
     configure();
     let dir = scratch("added");
     let wav = dir.join("late-keys.wav");
-    // the keys come late enough for the sidecar to join first, even on a loaded machine
-    dtmf_wav_at(&wav, 4.0, 6.0);
-    let s = call_tool("stream_open", &json!({ "source": format!("{}?pace=realtime", wav.display()), "analyzers": ["levels"] })).unwrap();
+    // a growing file, followed: the keys are sent only once the sidecar has joined
+    let mut feed = Growing::create(&wav, 48000, 2);
+    feed.silence(0.5);
+    let s = call_tool("stream_open", &json!({ "source": format!("{}?follow", wav.display()), "analyzers": ["levels"] })).unwrap();
     let id = s["session"].as_str().unwrap().to_string();
     let e = call_tool("stream_configure", &json!({ "session": id, "add": ["nope"] })).unwrap_err();
     assert!(e.alternatives.iter().any(|a| a == "dtmf") && e.alternatives.iter().any(|a| a == "silence"), "{e:?}");
     // one that wants video is not started for audio alone; one that cannot start says so in the log
-    let c = call_tool("stream_configure", &json!({ "session": id, "add": ["dtmf", "absent", "missing"] })).unwrap();
-    assert_eq!(c["applied"], true, "{c}");
-    assert!(c["warnings"].to_string().contains("sidecar 'absent' not run"), "{c}");
-    let mut digits = Vec::new();
+    call_tool("stream_configure", &json!({ "session": id, "add": ["dtmf", "absent", "missing"] })).unwrap();
+    pump(&mut feed, "the change to apply", || status(&id)["warnings"].to_string().contains("sidecar 'absent' not run"));
+    pump(&mut feed, "dtmf to join", || joined(&status(&id), "dtmf"));
+    feed.push(&keypad(0.2, 2.0));
+    let mut digits: Vec<String> = Vec::new();
     let mut after = 0;
-    let mut joined = false;
-    for _ in 0..40 {
-        let ev = call_tool("stream_events", &json!({ "session": id, "after": after, "kinds": ["dtmf"], "wait_ms": 500 })).unwrap();
+    pump(&mut feed, "the three keys", || {
+        let ev = call_tool("stream_events", &json!({ "session": id, "after": after, "kinds": ["dtmf"], "wait_ms": 100 })).unwrap();
         for o in ev["events"].as_array().unwrap() {
             digits.push(o["data"]["digit"].as_str().unwrap().to_string());
         }
         after = ev["next_after"].as_u64().unwrap();
-        let st = call_tool("stream_status", &json!({ "session": id })).unwrap();
-        joined |= st["analyzed"][0]["analyzers"].as_array().unwrap().contains(&json!("dtmf"));
-        if digits.len() == 3 {
-            break;
-        }
-    }
+        digits.len() == 3
+    });
     assert_eq!(digits, ["1", "5", "#"]);
-    assert!(joined, "the status names the sidecar once it has joined");
-    let failed = call_tool("stream_query", &json!({ "session": id, "kinds": ["analyzer_failed"] })).unwrap();
-    assert_eq!(failed["matched"], 1, "{failed}");
+    assert!(joined(&status(&id), "dtmf"), "the status names the sidecar once it has joined");
+    let mut failed = Value::Null;
+    pump(&mut feed, "the failure to start", || {
+        failed = call_tool("stream_query", &json!({ "session": id, "kinds": ["analyzer_failed"] })).unwrap();
+        failed["matched"] == 1
+    });
     assert_eq!(failed["events"][0]["analyzer"], "missing", "{failed}");
     assert!(failed["events"][0].get("stream").is_none_or(|s| s.is_null()), "a failure to start belongs to no stream: {failed}");
-    let c = call_tool("stream_configure", &json!({ "session": id, "remove": ["dtmf"] })).unwrap();
-    assert_eq!(c["applied"], true, "{c}");
-    assert!(!c["analyzed"][0]["analyzers"].as_array().unwrap().contains(&json!("dtmf")), "{c}");
+    configure_until_applied(&mut feed, json!({ "session": id, "remove": ["dtmf"] }));
+    pump(&mut feed, "dtmf to leave", || !joined(&status(&id), "dtmf"));
     let _ = call_tool("stream_close", &json!({ "session": id }));
 }
 
@@ -118,34 +180,35 @@ fn alive(pid: u32) -> bool {
 fn a_sidecar_removed_while_starting_is_stopped_and_never_joins() {
     let dir = configure();
     let pidfile = dir.join("slow.pid");
+    let go = dir.join("slow.pid.go");
     let _ = std::fs::remove_file(&pidfile);
-    let wav = scratch("slow").join("tone.wav");
-    let x: Vec<f64> = (0..48000 * 6).map(|i| 0.3 * (2.0 * PI * 440.0 * i as f64 / 48000.0).sin()).collect();
-    write_wav(&wav, &x, 1, 48000);
-    let s = call_tool("stream_open", &json!({ "source": format!("{}?pace=realtime", wav.display()), "analyzers": ["levels"] })).unwrap();
+    let _ = std::fs::remove_file(&go);
+    let wav = scratch("slow").join("silence.wav");
+    let mut feed = Growing::create(&wav, 48000, 1);
+    feed.silence(0.5);
+    let s = call_tool("stream_open", &json!({ "source": format!("{}?follow", wav.display()), "analyzers": ["levels"] })).unwrap();
     let id = s["session"].as_str().unwrap().to_string();
     call_tool("stream_configure", &json!({ "session": id, "add": ["slow"] })).unwrap();
-    // it has started, and is waiting before its hello
-    let t0 = std::time::Instant::now();
-    let pid = loop {
-        if let Some(p) = std::fs::read_to_string(&pidfile).ok().and_then(|t| t.trim().parse::<u32>().ok()) {
-            break p;
+    // it has started, and waits for its go-ahead before its hello
+    let mut pid = 0;
+    pump(&mut feed, "the sidecar to start", || match std::fs::read_to_string(&pidfile).ok().and_then(|t| t.trim().parse::<u32>().ok()) {
+        Some(p) => {
+            pid = p;
+            true
         }
-        assert!(t0.elapsed().as_secs() < 10, "the sidecar never started");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    };
-    assert!(alive(pid), "the sidecar waits a second before its hello");
-    let c = call_tool("stream_configure", &json!({ "session": id, "remove": ["slow"] })).unwrap();
-    assert_eq!(c["applied"], true, "{c}");
-    // once its start ends (after its hello) it is stopped rather than attached
+        None => false,
+    });
+    assert!(alive(pid), "the sidecar waits for its go-ahead before its hello");
+    configure_until_applied(&mut feed, json!({ "session": id, "remove": ["slow"] }));
+    // only once the removal is applied may it say hello: then it is stopped rather than attached
+    std::fs::write(&go, b"").unwrap();
     let t0 = std::time::Instant::now();
     while alive(pid) {
         assert!(t0.elapsed().as_secs() < 10, "the removed sidecar is still running");
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    let st = call_tool("stream_status", &json!({ "session": id })).unwrap();
-    assert!(!st["analyzed"][0]["analyzers"].as_array().unwrap().contains(&json!("slow")), "{st}");
+    let st = status(&id);
+    assert!(!joined(&st, "slow"), "{st}");
     let failed = call_tool("stream_query", &json!({ "session": id, "kinds": ["analyzer_failed"] })).unwrap();
     assert_eq!(failed["matched"], 0, "a removal is not a failure: {failed}");
     let _ = call_tool("stream_close", &json!({ "session": id }));
@@ -156,11 +219,11 @@ fn dtmf_wav(path: &Path) {
     dtmf_wav_at(path, 0.5, 1.5);
 }
 
-/// The same keys from `start` seconds, in `secs` of audio.
-fn dtmf_wav_at(path: &Path, start: f64, secs: f64) {
+/// Keys 1, 5 and # for 120 ms each, 120 ms apart, from `start` seconds, in `secs` of 48 kHz stereo.
+fn keypad(start: f64, secs: f64) -> Vec<f64> {
     let rate = 48000.0;
     let tones = [(697.0, 1209.0), (770.0, 1336.0), (941.0, 1477.0)];
-    let x: Vec<f64> = (0..(rate * secs) as usize)
+    (0..(rate * secs) as usize)
         .flat_map(|i| {
             let t = i as f64 / rate;
             let k = ((t - start) / 0.24).floor();
@@ -173,8 +236,12 @@ fn dtmf_wav_at(path: &Path, start: f64, secs: f64) {
             };
             [v, v]
         })
-        .collect();
-    write_wav(path, &x, 2, rate as u32);
+        .collect()
+}
+
+/// The same keys from `start` seconds, in `secs` of audio.
+fn dtmf_wav_at(path: &Path, start: f64, secs: f64) {
+    write_wav(path, &keypad(start, secs), 2, 48000);
 }
 
 /// A voiced sound (harmonics of 120 Hz under a 4 Hz syllable envelope) from 1 s to 4 s of 6.

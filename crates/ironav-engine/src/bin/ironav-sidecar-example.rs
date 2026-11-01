@@ -7,8 +7,8 @@
 //! - `crash N MARKER`: like `echo` without the gate, but exits after N chunks unless MARKER exists
 //!   (which it then creates), so a restart behaves.
 //! - `mute`: exits before its hello, complaining on stderr.
-//! - `slow SECONDS PIDFILE`: writes its process id to PIDFILE and waits SECONDS before its hello,
-//!   then behaves as `echo`.
+//! - `slow SECONDS PIDFILE`: writes its process id to PIDFILE, then waits before its hello until the
+//!   file PIDFILE.go exists (at most SECONDS), then behaves as `echo`.
 
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
@@ -20,7 +20,12 @@ fn main() {
         "dtmf" => json!({ "audio": { "rate": 8000, "format": "s16", "chunk_seconds": 0.5 } }),
         "slow" => {
             let _ = std::fs::write(&args[2], std::process::id().to_string());
-            std::thread::sleep(std::time::Duration::from_secs_f64(args[1].parse().unwrap_or(1.0)));
+            let go = format!("{}.go", args[2]);
+            let limit = std::time::Duration::from_secs_f64(args[1].parse().unwrap_or(1.0));
+            let t0 = std::time::Instant::now();
+            while !std::path::Path::new(&go).exists() && t0.elapsed() < limit {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
             json!({ "audio": { "rate": 16000, "format": "s16", "chunk_seconds": 1.0, "gate": "speech" } })
         }
         "echo" => json!({ "audio": { "rate": 16000, "format": "s16", "chunk_seconds": 1.0, "gate": "speech" } }),
