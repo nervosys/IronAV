@@ -733,7 +733,7 @@ fn build_track(t: &MkTrack, index: usize, frames: &[&Frame], scale: u64, samples
             }
             CodecId::Mpeg4 | CodecId::Mpeg2Video | CodecId::Mpeg1Video => {
                 extradata = t.private.clone();
-                Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma: 1 }
+                Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma: crate::mpegvideo::chroma_of(codec, &t.private) }
             }
             CodecId::Av1 if !t.private.is_empty() => {
                 extradata = t.private.clone();
@@ -874,7 +874,15 @@ pub fn open<R: Read + Seek + Send>(mut r: R) -> Result<Mp4Demuxer<BufReader<R>>>
                 }
             }
         }
-        if let Some(info) = build_track(t, tracks.len(), &frames, scan.scale, &mut samples, vp9)? {
+        if let Some(mut info) = build_track(t, tracks.len(), &frames, scan.scale, &mut samples, vp9)? {
+            // MPEG-2 whose codec configuration has no sequence header: the first picture has one
+            if let (Some(f), Some(CodecId::Mpeg2Video)) = (frames.iter().find(|f| f.key), video_codec(&t.codec)) {
+                let mut head = vec![0u8; (f.size as usize).min(1024)];
+                if scan.r.seek(SeekFrom::Start(f.offset)).is_ok() {
+                    let n = scan.r.read(&mut head).unwrap_or(0);
+                    crate::mp4demux::mpeg2_chroma_from_picture(&mut info, &head[..n]);
+                }
+            }
             tracks.push(info);
         }
     }

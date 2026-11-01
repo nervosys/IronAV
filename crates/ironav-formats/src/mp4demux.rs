@@ -112,7 +112,7 @@ pub(crate) struct Config {
     pub nal_length: usize,
     /// Bits per sample of the video: 8, or 10 for 4:2:0 high-bit-depth profiles.
     pub bits: u8,
-    /// chroma_format_idc of the video: 0 monochrome, 1 4:2:0, 2 4:2:2 (8-bit H.264 only).
+    /// chroma_format_idc of the video: 0 monochrome, 1 4:2:0, 2 4:2:2 (8-bit H.264 and MPEG-2 only).
     pub chroma: u8,
 }
 
@@ -127,6 +127,19 @@ impl Config {
             _ => PixelFormat::Yuv420p,
         };
         layout.with_depth(self.bits).unwrap_or(layout)
+    }
+}
+
+/// Sets an MPEG-2 track's pixel format from the sequence header and extension of its first picture, for
+/// a container whose codec configuration has none (FFmpeg writes MPEG-2 tracks that way, so the
+/// configuration cannot say 4:2:2). `first` is the start of the track's first sample.
+pub(crate) fn mpeg2_chroma_from_picture(t: &mut TrackInfo, first: &[u8]) {
+    if t.stream.codec != CodecId::Mpeg2Video || t.config.chroma == 2 {
+        return;
+    }
+    t.config.chroma = crate::mpegvideo::chroma_of(CodecId::Mpeg2Video, first);
+    if let StreamParams::Video { pix_fmt, .. } = &mut t.stream.params {
+        *pix_fmt = t.config.pix_fmt();
     }
 }
 
@@ -310,6 +323,16 @@ impl<R: Read + Seek + Send> Mp4Demuxer<R> {
                     t.stream.codec = h.codec();
                 }
             }
+        }
+        for (i, t) in tracks.iter_mut().enumerate() {
+            if t.stream.codec != CodecId::Mpeg2Video {
+                continue;
+            }
+            let Some(first) = samples.iter().find(|s| s.stream as usize == i) else { continue };
+            let mut head = vec![0u8; (first.size as usize).min(1024)];
+            r.seek(SeekFrom::Start(first.offset))?;
+            let n = r.read(&mut head)?;
+            mpeg2_chroma_from_picture(t, &head[..n]);
         }
         if tracks.is_empty() {
             return Err(Error::new(ErrorCode::UnsupportedCodec, "the MP4 has no audio or video track IronAV recognises"));
@@ -598,7 +621,7 @@ fn parse_trak(trak: &[u8], index: usize, samples: &mut Vec<Sample>, movie_ts: u3
             CodecId::Mpeg2Video | CodecId::Mpeg1Video => {
                 // the decoder-specific info, if there is any, holds the sequence header
                 extradata = esds_parts(need(kids, b"esds", "the mp4v entry")?)?.1.unwrap_or_default();
-                Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma: 1 }
+                Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma: crate::mpegvideo::chroma_of(codec, &extradata) }
             }
             _ => Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma: 1 },
         };

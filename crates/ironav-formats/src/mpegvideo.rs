@@ -158,6 +158,19 @@ impl Framer {
     }
 }
 
+/// The chroma format an MPEG-2 video track's codec configuration declares (the sequence header and
+/// its extension, in the extradata of an MP4 or Matroska track): 2 for 4:2:2, otherwise 1. MPEG-1 and
+/// MPEG-4 are 4:2:0 here.
+pub(crate) fn chroma_of(codec: CodecId, extradata: &[u8]) -> u8 {
+    if codec != CodecId::Mpeg2Video {
+        return 1;
+    }
+    match ironav_codec::mpeg2::sequence_info(extradata) {
+        Some(s) if s.chroma_format == 2 => 2,
+        _ => 1,
+    }
+}
+
 /// The stream a framer has found, once it has found its first sequence header.
 fn stream_of(info: &ironav_codec::mpeg2::SequenceInfo) -> StreamInfo {
     let (n, d) = info.frame_rate;

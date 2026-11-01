@@ -140,6 +140,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Changed
 
+- **MPEG-2 in MP4 and Matroska:** a 4:2:2 stream is declared `yuv422p` (it was declared 4:2:0; the decoded frames were already right). FFmpeg writes no sequence header into those containers, so the chroma format is read from the first picture's sequence header and extension.
 - **Opus stereo CELT** decodes to within 1 LSB of libopus at 2.5 to 20 ms and 32 to 256 kb/s, as mono does. The decoder drew
   the anti-collapse noise channel by channel; libopus draws it band by band, both channels in turn (FFmpeg's native decoder
   still draws it channel by channel, so it differs from libopus on such streams). The stereo hybrid's CELT part follows.
