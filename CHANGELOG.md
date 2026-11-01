@@ -15,10 +15,10 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   Motion-JPEG, AAC-LC with HE-AAC v1, MP3 (MPEG-1/2/2.5 Layer III), Vorbis, Opus (SILK, CELT and hybrid)
   FLAC (4 to 32 bits) and ALAC (16 to 24 bits, one to eight channels).
 - **Codecs (encoders):** software HEVC (Main profile, 8-bit 4:2:0: 64x64 coding tree units, CABAC, intra and P pictures with merge and skip, AMVP motion, quarter-sample search, deblocking, rate control by QP or bit rate; MP4 and Matroska), software H.264 (Constrained Baseline, then Main with CABAC and High with the 8x8
-  transform, B pictures, rate-distortion mode decisions), VP8 (key and inter frames, quarter-pixel motion, rate control), VP9 (key and inter frames with coefficient probability updates, profile 0, WebM, Matroska and MP4), AV1 (key frames, profile 0, 8-bit 4:2:0, WebM, Matroska and MP4), AAC-LC with an ADTS writer, MP3 Layer III with
+  transform, B pictures, rate-distortion mode decisions), VP8 (key and inter frames, quarter-pixel motion, rate control), VP9 (key and inter frames with coefficient probability updates, profile 0, WebM, Matroska and MP4), AV1 (key and inter frames, profile 0, 8-bit 4:2:0, WebM, Matroska and MP4), AAC-LC with an ADTS writer, MP3 Layer III with
   an MP3 writer, Vorbis, Opus (CELT, wideband SILK, hybrid, DTX, in-band FEC, automatic mode switching,
   2.5 to 60 ms frames; the CLI and job JSON select the mode, signal, frame size, FEC and DTX), JPEG and Motion-JPEG, FLAC, and
-  ALAC (16 and 24 bits, one to eight channels). `--keyint N` (or `keyint` in a job) sets the key frame interval of H.264, HEVC, VP8 and VP9.
+  ALAC (16 and 24 bits, one to eight channels). `--keyint N` (or `keyint` in a job) sets the key frame interval of H.264, HEVC, VP8, VP9 and AV1.
 - **Codecs (voice link):** a playout buffer, a streaming resampler, speech detection with push-to-talk
   trimming, automatic gain control, noise suppression, and Opus packet-loss concealment.
 - **Codecs (ProRes):** Apple ProRes decoder and encoder in MOV: 4:2:2 at 10 bits (Proxy, LT, Standard, HQ) and 4:4:4 at
@@ -36,6 +36,11 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   motion vector stack and projected motion field, dual filters, global and local warped motion, OBMC, wedge, difference-
   and distance-weighted compound, interintra, variable inter transforms, hidden frames, `show_existing_frame` and film
   grain loaded from a reference. It matches libaom bit for bit on P-only and alt-ref streams at every speed.
+- **Codecs (AV1 encoder, inter frames):** the software encoder writes inter frames after each key frame (every 250 frames by
+  default, `--keyint`): LAST_FRAME prediction with quarter-sample motion, the reference MV stack's modes, skip and intra blocks
+  inside inter frames, deblocking and CDEF on every frame, and rate-distortion mode decisions from the CDF bit costs. It runs
+  the decoder's own reconstruction, so the decoder's pictures equal the encoder's references bit for bit, and libaom decodes the
+  same pictures.
 - **Containers:** WAV, FLAC, Y4M, MP4, QuickTime MOV, Matroska and WebM (read and write), Ogg (Opus, Vorbis and FLAC),
   ADTS, MP3, JPEG, and MPEG transport streams (read and write), and raw H.264 and HEVC (Annex B, write only).
 - **Containers (MP4):** fragmented MP4 is read as it arrives; the writer is constant-frame-rate and
@@ -95,7 +100,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Known limitations
 
-- The software AV1 decoder refuses superres; such AV1 needs an NVIDIA GPU. The AV1 encoder writes key frames only.
+- The software AV1 decoder refuses superres; such AV1 needs an NVIDIA GPU. The AV1 encoder predicts from the previous frame only, with no compound prediction and no rate control by bit rate.
 - The software HEVC encoder is Main profile, 8-bit 4:2:0 only, with no sign data hiding or B pictures (its SAO is per-CTB band or edge offsets); wider HEVC encoding needs an NVIDIA GPU.
 - Sound output through a real device has been built but not verified by listening or measurement.
 - IronAV is not yet a drop-in replacement for FFmpeg or HandBrake.

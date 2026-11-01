@@ -6,9 +6,9 @@ A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so 
 > **Status: foundation (v0.1).** The architecture, agent interface, ontology, hardware model, CLI, MCP server
 > and both GUIs are working and tested. Containers: **WAV, FLAC, Y4M, MP4, QuickTime MOV (read and write), Matroska/WebM (read and write), Ogg, ADTS, MP3, JPEG and MPEG transport streams (read and write); raw H.264 and HEVC (Annex B, write only).**
 > Audio codecs, each decoded and encoded: **PCM, FLAC, ALAC, AAC-LC (plus HE-AAC v1 decode), MP3, Opus and Vorbis.**
-> Video: **software decoders for H.264, HEVC (including 4:2:2 and 4:4:4), VP8 and VP9; a software H.264 encoder (High profile: CABAC and the 8x8 transform), a software HEVC encoder (Main profile, 8-bit 4:2:0, merge and skip, SAO), a software VP8 encoder, and a software VP9 encoder (key and inter frames), and a software AV1 encoder (key frames, profile 0, 8-bit 4:2:0); JPEG/Motion-JPEG and Apple ProRes decoded and encoded in software; MPEG-4 Part 2 (Simple and Advanced Simple profiles) decoded in software.**
+> Video: **software decoders for H.264, HEVC (including 4:2:2 and 4:4:4), VP8 and VP9; a software H.264 encoder (High profile: CABAC and the 8x8 transform), a software HEVC encoder (Main profile, 8-bit 4:2:0, merge and skip, SAO), a software VP8 encoder, and a software VP9 encoder (key and inter frames), and a software AV1 encoder (key and inter frames, profile 0, 8-bit 4:2:0); JPEG/Motion-JPEG and Apple ProRes decoded and encoded in software; MPEG-4 Part 2 (Simple and Advanced Simple profiles) decoded in software.**
 > NVIDIA GPUs encode H.264 and HEVC (NVENC, preferred when usable) and decode H.264, HEVC and AV1 (NVDEC).
-> AV1 is decoded on NVIDIA GPUs (NVDEC); the software decoder handles key, intra-only and inter frames, intra block copy included, but not yet superres. The software AV1 encoder writes key frames only. VP9 and AV1 copy between WebM, Matroska and MP4.
+> AV1 is decoded on NVIDIA GPUs (NVDEC); the software decoder handles key, intra-only and inter frames, intra block copy included, but not yet superres. The software AV1 encoder writes key and inter frames. VP9 and AV1 copy between WebM, Matroska and MP4.
 > IronAV is not yet a drop-in replacement for FFmpeg or HandBrake.
 
 ## Interfaces
@@ -801,7 +801,7 @@ is cut into slices of about eight macroblock rows, coded on separate threads (up
 filtered as a whole. Reconstruction reuses the decoder's prediction, inverse transform and loop filter, so the
 reference the encoder keeps is the one every decoder builds (a unit test decodes each picture and compares). `--qp N`
 holds a quantiser (23 by default; IDR pictures get 3 less, as in x264, and B pictures 5 more); `--vbitrate KBPS` steers the quantiser picture by picture to an average rate.
-An IDR picture with SPS and PPS starts every 250 pictures (`--keyint N`, or `keyint` in a job's `video`, sets the interval for H.264, HEVC, VP8 and VP9 alike, and NVENC uses it too), and at a scene cut: a picture that a quarter-size motion search predicts from the last one little better than from its own block means (this saves 1.9 % on a clip of three 20-picture scenes). NVENC is still chosen when a usable GPU is present;
+An IDR picture with SPS and PPS starts every 250 pictures (`--keyint N`, or `keyint` in a job's `video`, sets the interval for H.264, HEVC, VP8, VP9 and AV1 alike, and NVENC uses it too), and at a scene cut: a picture that a quarter-size motion search predicts from the last one little better than from its own block means (this saves 1.9 % on a clip of three 20-picture scenes). NVENC is still chosen when a usable GPU is present;
 `--hwaccel off` selects the software encoder. `--latency low` (`"latency": "low"` in a job's `video`) sets either encoder up for live delivery: no B pictures, so every picture leaves as soon as it is coded and decoders show it at once; an IDR picture every second; and a bit rate held to a quarter of a second's bits (NVENC uses its low-latency tuning, and with a bit rate CBR and a one-frame buffer). MJPEG and raw video send each picture at once either way.
 
 Checked by decoding with FFmpeg (through PyAV): 24 cases from 16x16 to 1280x720, QP 0 to 51 and four bit rates all decode
@@ -906,8 +906,17 @@ quantiser matrices, film grain (added to the output only), 8, 10 and 12 bits, 4:
 P-only and alt-ref streams, `-cpu-used` 1 to 8, 128x72 to 1280x720, odd sizes, crf 0 to 63, 4x2 tiles, 32-frame streams, the bit depths and samplings
 above, palettes, intra block copy (`tune-content=screen`, `enable-intrabc=1`), lossless coding, CDEF, loop restoration, quantiser matrices and film grain, in WebM, Matroska and MP4 (tests/av1.rs). Reference scaling
 and switch frames are implemented but untested (FFmpeg's libaom wrapper cannot make them). About 30 frames a second at 720p with CDEF and loop
-restoration off, about 9 with CDEF, quantiser matrices and film grain on (release build, `convert` to Y4M). AV1 is not encoded
-(consumer NVENC before the RTX 40 series cannot encode it), but it can be copied between WebM, Matroska and MP4 with no GPU (see "Matroska output").
+restoration off, about 9 with CDEF, quantiser matrices and film grain on (release build, `convert` to Y4M). The software encoder is below;
+consumer NVENC before the RTX 40 series cannot encode AV1, and AV1 can be copied between WebM, Matroska and MP4 with no GPU (see "Matroska output").
+
+The software encoder writes key frames every 250 frames by default (`--keyint N` changes it) and inter frames between them. An inter frame
+predicts from the frame before it only (LAST_FRAME), with quarter-sample motion: a full-pel search on the source picks the partitions, and a sub-pel
+search on the reconstructed reference refines each NEWMV, which competes with NEARESTMV, NEARMV and GLOBALMV from the reference MV stack. Each
+block is intra or inter by squared error plus lambda times the bits its syntax costs under the current CDFs, and intra blocks choose among the 13
+modes and their angle deltas the same way. Deblocking and CDEF run on every frame, at levels that follow the quantiser. The encoder reconstructs
+through the decoder's own state, so every picture it keeps as a reference is the one the decoder makes: the decoder's output equals the encoder's
+reconstruction bit for bit, and libaom decodes the same pictures (`inter_frames_decode_identically_and_are_smaller_than_key_frames` in
+`tests/av1_enc.rs`). Not yet: compound prediction, more than one reference, rate control by bit rate, and tuning the search for speed.
 
 Checked bit for bit against FFmpeg's libdav1d (through PyAV) on SVT-AV1 output: 27 clips from 128x128 to 3840x2160, including odd sizes, 10-bit, film grain
 (8-bit and 10-bit; the grain is applied, and matches libdav1d's), several key frames, hierarchical prediction with overlay frames, screen-content tools,
