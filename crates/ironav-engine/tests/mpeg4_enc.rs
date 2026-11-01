@@ -308,8 +308,9 @@ fn b_pictures_decode_to_what_ffmpeg_decodes() {
     }
 }
 
-/// The B-picture table: IronAV at qscale 5, 10 and 20 with 0, 1 and 2 B pictures between anchors, and
-/// FFmpeg's `-c:v mpeg4 -bf 1 -qscale:v N` (and with `-g 250`, the key picture interval IronAV uses).
+/// The B-picture table: IronAV at qscale 3 to 28 with no B pictures (for the equal-PSNR curve), and at
+/// qscale 5, 10 and 20 with 1 and 2 B pictures between anchors, and FFmpeg's `-c:v mpeg4 -bf 1 -g 250
+/// -qscale:v N` (250 is the key picture interval IronAV uses).
 /// Each file's size and PSNR (decoded, against the source) for testsrc2 and mandelbrot at 352x288,
 /// 60 frames. Run it with `--ignored --nocapture`; it is not a pass/fail test.
 #[test]
@@ -326,24 +327,24 @@ fn report_bframes_table() {
     for filter in ["testsrc2", "mandelbrot"] {
         let src = lavfi_source(&dir, filter, w, h, n);
         let frames = y4m_frames(&src);
-        for qp in [5u8, 10, 20] {
-            for bframes in 0..=2usize {
+        // no-B points at extra qscales bracket the B points' PSNR, for the equal-PSNR comparison
+        for qp in [3u8, 5, 7, 10, 14, 20, 28] {
+            let bframes_list: &[usize] = if [5u8, 10, 20].contains(&qp) { &[0, 1, 2] } else { &[0] };
+            for &bframes in bframes_list {
                 let enc = dir.join(format!("ours-{filter}-{qp}-{bframes}.mp4"));
                 let size = encode_with_bframes(&src, &enc, qp, bframes);
                 let p = mean_psnr(&decode_ironav(&enc, &dir), &frames, w * h);
                 println!("| {filter} | {qp} | IronAV, {bframes} B pictures | {size} | {p:.2} |");
             }
-            for (label, extra) in [("FFmpeg `-bf 1`", &[][..]), ("FFmpeg `-bf 1 -g 250`", &["-g", "250"][..])] {
-                let theirs = dir.join(format!("ff-{filter}-{qp}-{}.mp4", extra.len()));
+            if [5u8, 10, 20].contains(&qp) {
+                let theirs = dir.join(format!("ff-{filter}-{qp}.mp4"));
                 let q = qp.to_string();
-                let mut args = vec!["-i", src.to_str().unwrap(), "-c:v", "mpeg4", "-bf", "1", "-qscale:v", &q, "-pix_fmt", "yuv420p"];
-                args.extend_from_slice(extra);
-                args.push(theirs.to_str().unwrap());
+                let args = ["-i", src.to_str().unwrap(), "-c:v", "mpeg4", "-bf", "1", "-g", "250", "-qscale:v", &q, "-pix_fmt", "yuv420p", theirs.to_str().unwrap()];
                 let size = if ffmpeg(&args) { std::fs::metadata(&theirs).unwrap().len() } else { 0 };
                 let raw = decode_ffmpeg(&theirs, &dir);
                 let fframes: Vec<Vec<u8>> = raw.chunks(w * h * 3 / 2).map(|c| c.to_vec()).collect();
                 let p = mean_psnr(&fframes, &frames, w * h);
-                println!("| {filter} | {qp} | {label} | {size} | {p:.2} |");
+                println!("| {filter} | {qp} | FFmpeg `-bf 1 -g 250` | {size} | {p:.2} |");
             }
         }
     }

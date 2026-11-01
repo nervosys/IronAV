@@ -148,6 +148,13 @@ fn layer_config(width: u32, height: u32, num: i64, advanced: bool) -> Vec<u8> {
     out
 }
 
+/// The quantiser of a B picture from the anchors': FFmpeg's default B quantiser factor and offset (1.25
+/// each). FFmpeg applies them only when rate-controlled; a fixed quantiser gives B pictures none. Here
+/// they apply in both modes, which measures smaller at equal PSNR. B pictures are never referred to.
+fn b_quant(q: i32) -> i32 {
+    ((q as f64 * 1.25 + 1.25 + 0.5) as i32).clamp(1, 31)
+}
+
 /// Where a picture sits in the stream: its kind; its time, `modulo` whole seconds after the anchor it
 /// is timed from and `inc` ticks past the second; and, for B pictures, the ticks between their anchors
 /// (`pp`) and from the past anchor to the picture (`pb`), which the decoder scales direct vectors by.
@@ -401,7 +408,7 @@ impl Mpeg4Encoder {
             pb: t - self.prev_anchor_t,
         };
         #[cfg_attr(not(test), allow(unused_variables))]
-        let (body, pic) = self.code_picture(src, slot, self.quant(), [Some(fwd), Some(bwd)]);
+        let (body, pic) = self.code_picture(src, slot, b_quant(self.quant()), [Some(fwd), Some(bwd)]);
         self.adapt(body.len() as f64 * 8.0, false);
         #[cfg(test)]
         self.recon.push((pts, Arc::new(pic)));
