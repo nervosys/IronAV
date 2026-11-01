@@ -1,5 +1,6 @@
 //! Matroska writer (`.mkv`, `.mka`, and `.webm` for VP8, VP9 or AV1 video and Opus or Vorbis audio): H.264, HEVC, VP8, VP9,
-//! AV1 or Motion-JPEG video and AAC, FLAC, MP3, Opus or Vorbis audio, at most one stream of each kind.
+//! AV1 or Motion-JPEG video and AAC, FLAC, MP3, Opus, Vorbis or PCM audio, at most one stream of each kind.
+//! PCM is written as `A_PCM/INT/LIT` (or `A_PCM/FLOAT/IEEE`) with its sample size as BitDepth.
 //!
 //! Layout: EBML header, Segment (its size patched at the end), Info, Tracks, Clusters, Cues. The
 //! timestamp scale is one millisecond. Nothing is written until every stream has delivered a
@@ -77,6 +78,18 @@ struct Track {
 }
 
 /// Video that goes in as it comes, with no parameter sets to collect first.
+/// The sample size in bits of a PCM codec (`None` for other codecs).
+fn pcm_depth(codec: CodecId) -> Option<u8> {
+    Some(match codec {
+        CodecId::PcmU8 => 8,
+        CodecId::PcmS16Le => 16,
+        CodecId::PcmS24Le => 24,
+        CodecId::PcmS32Le | CodecId::PcmF32Le => 32,
+        CodecId::PcmF64Le => 64,
+        _ => return None,
+    })
+}
+
 fn self_contained(codec: CodecId) -> bool {
     matches!(codec, CodecId::Vp8 | CodecId::Vp9 | CodecId::Av1 | CodecId::Mjpeg)
 }
@@ -217,6 +230,8 @@ impl MatroskaWriter {
                 CodecId::Flac => "A_FLAC",
                 CodecId::Opus => "A_OPUS",
                 CodecId::Vorbis => "A_VORBIS",
+                CodecId::PcmF32Le | CodecId::PcmF64Le => "A_PCM/FLOAT/IEEE",
+                c if c.sample_format().is_some() => "A_PCM/INT/LIT",
                 _ => "A_MPEG/L3",
             };
             e.extend(string(0x86, id));
@@ -250,6 +265,9 @@ impl MatroskaWriter {
                         if let Some(bits) = s.bits {
                             a.extend(uint(0x6264, bits as u64));
                         }
+                    }
+                    if let Some(bits) = pcm_depth(s.codec) {
+                        a.extend(uint(0x6264, bits as u64)); // BitDepth: the sample size
                     }
                     e.extend(el(0xE1, &a));
                 }
@@ -397,12 +415,13 @@ impl Muxer for MatroskaWriter {
                     false
                 }
                 (StreamParams::Audio { .. }, CodecId::Flac | CodecId::Mp3) => false,
+                (StreamParams::Audio { .. }, c) if c.sample_format().is_some() => false,
                 _ => {
                     return Err(Error::new(
                         ErrorCode::UnsupportedCodec,
-                        format!("this Matroska writer holds h264, hevc, vp8, vp9, av1, mjpeg, aac, flac, mp3, opus and vorbis, not {}", s.codec.name()),
+                        format!("this Matroska writer holds h264, hevc, vp8, vp9, av1, mjpeg, aac, flac, mp3, opus, vorbis and pcm, not {}", s.codec.name()),
                     )
-                    .alternatives(["h264", "hevc", "vp8", "vp9", "av1", "mjpeg", "aac", "flac", "mp3", "opus", "vorbis"]));
+                    .alternatives(["h264", "hevc", "vp8", "vp9", "av1", "mjpeg", "aac", "flac", "mp3", "opus", "vorbis", "pcm_s16le"]));
                 }
             };
             if s.time_base.den <= 0 || s.time_base.num <= 0 {

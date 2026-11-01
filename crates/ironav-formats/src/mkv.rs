@@ -591,13 +591,45 @@ fn vp9_format(d: &[u8]) -> Option<(u8, u8)> {
     Some((k.bits, match (k.ssx, k.ssy) { (true, true) => 1, (true, false) => 2, (false, false) => 3, _ => return None }))
 }
 
+/// A Matroska PCM track's format: its codec, its sample width in bytes, and whether its samples are big-endian.
+struct MkPcm {
+    codec: CodecId,
+    width: usize,
+    big: bool,
+}
+
+/// The PCM format of an audio track by its CodecID (`None` for other codecs). Integer samples of 8 bits are
+/// unsigned, as WAV has them; the bit depth defaults to 16 for integers and 32 for floats.
+fn pcm_format(id: &str, bits: Option<u8>) -> Result<Option<MkPcm>> {
+    let (float, big) = match id {
+        "A_PCM/INT/LIT" => (false, false),
+        "A_PCM/INT/BIG" => (false, true),
+        "A_PCM/FLOAT/IEEE" => (true, false),
+        _ => return Ok(None),
+    };
+    let depth = bits.unwrap_or(if float { 32 } else { 16 });
+    let (codec, width) = match (float, depth) {
+        (false, 8) => (CodecId::PcmU8, 1),
+        (false, 16) => (CodecId::PcmS16Le, 2),
+        (false, 24) => (CodecId::PcmS24Le, 3),
+        (false, 32) => (CodecId::PcmS32Le, 4),
+        (true, 32) => (CodecId::PcmF32Le, 4),
+        (true, 64) => (CodecId::PcmF64Le, 8),
+        _ => return Err(Error::new(ErrorCode::UnsupportedCodec, format!("Matroska {id} at {depth} bits is not supported"))),
+    };
+    Ok(Some(MkPcm { codec, width, big }))
+}
+
 fn build_track(t: &MkTrack, index: usize, frames: &[&Frame], scale: u64, samples: &mut Vec<Sample>, vp9: Option<(u8, u8)>) -> Result<Option<TrackInfo>> {
     let video = match t.kind {
         1 => true,
         2 => false,
         _ => return Ok(None),
     };
-    let codec = if video { video_codec(&t.codec) } else { audio_codec(&t.codec) };
+    let pcm = if video { None } else { pcm_format(&t.codec, t.bits)? };
+    let codec = if video { video_codec(&t.codec) } else { pcm.as_ref().map(|p| p.codec).or_else(|| audio_codec(&t.codec)) };
+    // big-endian samples are turned little-endian by the reader, a sample at a time
+    let swap = pcm.as_ref().map_or(0, |p| if p.big { p.width } else { 0 });
     let Some(codec) = codec else { return Ok(None) };
     if t.encoded {
         return Err(Error::new(ErrorCode::UnsupportedFormat, format!("track {} uses a Matroska content encoding (header stripping, compression or encryption)", t.number)));
@@ -662,10 +694,14 @@ fn build_track(t: &MkTrack, index: usize, frames: &[&Frame], scale: u64, samples
             extradata = t.private.clone();
             bits = None;
         }
+        if let Some(p) = &pcm {
+            bits = Some(p.width as u8 * 8);
+        }
         // Opus always counts in 48 kHz samples, whatever rate the file says it came from.
         let opus = codec == CodecId::Opus;
         let rate = if opus { 48_000 } else { rate };
-        let fixed = audio_frame_len(t, codec);
+        // PCM blocks are whole sample frames of whatever length they hold, so each one's length comes from its size
+        let fixed = if pcm.is_some() { Some(0) } else { audio_frame_len(t, codec) };
         match fixed.filter(|_| rate > 0).or(if opus { Some(0) } else { None }) {
             Some(len) => {
                 time_base = Rational::new(1, rate as i64);
@@ -677,6 +713,8 @@ fn build_track(t: &MkTrack, index: usize, frames: &[&Frame], scale: u64, samples
                         let n = ironav_codec::opus::packet_samples(&f.head[..f.size.min(2) as usize]).unwrap_or(960);
                         let n = if f.size == 0 { 960 } else { n as u32 };
                         n.saturating_sub((f.discard as i128 * 48_000 / 1_000_000_000) as u32)
+                    } else if let Some(p) = &pcm {
+                        f.size / (p.width * t.channels.max(1) as usize) as u32
                     } else {
                         len
                     };
@@ -706,7 +744,7 @@ fn build_track(t: &MkTrack, index: usize, frames: &[&Frame], scale: u64, samples
     }
     let duration: i64 = samples[first..].iter().map(|s| s.duration as i64).sum();
     let stream = StreamInfo { index, codec, time_base, duration: Some(duration), bits, extradata, lead_in: 0, params };
-    Ok(Some(TrackInfo { stream, config, convert, swap: 0 }))
+    Ok(Some(TrackInfo { stream, config, convert, swap }))
 }
 
 /// Open a Matroska or WebM file for reading.

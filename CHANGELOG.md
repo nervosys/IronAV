@@ -56,6 +56,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   atoms, and PCM in `twos`, `sowt`, `in24`, `in32`, `fl32`, `fl64`, `raw ` and `lpcm` form) and files with no `ftyp`;
   written with a `qt  ` brand, H.264, HEVC, ProRes, Motion-JPEG, AAC, ALAC and PCM. FFmpeg decodes the PCM bit-exact and reads the copied
   packets the same as IronAV does.
+- **Containers (Matroska PCM):** PCM is read and written in Matroska (`A_PCM/INT/LIT`, `A_PCM/INT/BIG` and `A_PCM/FLOAT/IEEE`, 8 to 64 bits):
+  FFmpeg's files decode to the same bytes IronAV reads, and FFmpeg reads IronAV's copies to the same bytes.
 - **Containers (copy):** VP9 and AV1 are copied between WebM, Matroska and MP4; AAC keeps its encoder
   delay in MP4; Opus ends where the source did in Matroska (DiscardPadding) and Ogg.
 - **Live input and streaming (HTTP authentication):** Digest (MD5, MD5-sess, SHA-256 and SHA-256-sess, RFC 7616, and RFC 2069 forms; SHA-256 is preferred) and
@@ -129,7 +131,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   streams over eight channels are refused, and the Vorbis encoder writes at most two channels.
 - **MP3, JPEG, ProRes:** MP3 layers I and II are refused; JPEG arithmetic-coded, 12-bit and lossless files are refused;
   ProRes interlaced pictures are refused.
-- **Containers:** Matroska tracks with a content encoding and PCM in Matroska are refused; MPEG-TS does not carry Opus,
+- **Containers:** Matroska tracks with a content encoding are refused; MPEG-TS does not carry Opus,
   AC-3 or MPEG-2 video; raw H.264 and HEVC are write-only; Ogg reads only the
   first Opus, Vorbis or FLAC stream (Speex and Theora are refused).
 - **Live:** servers that speak only TLS 1.2 cannot be reached; cameras and microphones are read on Windows and Linux
