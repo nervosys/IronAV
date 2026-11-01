@@ -18,7 +18,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   transform, B pictures, rate-distortion mode decisions), VP8 (key and inter frames, quarter-pixel motion, rate control), VP9 (key and inter frames with coefficient probability updates, profile 0, WebM, Matroska and MP4), AAC-LC with an ADTS writer (one to six and eight channels, 5.1 and 7.1 included), MP3 Layer III with
   an MP3 writer, Vorbis, Opus (CELT, wideband SILK, hybrid, DTX, in-band FEC, automatic mode switching,
   2.5 to 60 ms frames, and 3 to 8 channels in channel-mapping family 1 with the RFC 7845 stream layouts; the CLI and job JSON select the mode, signal, frame size, FEC and DTX), JPEG and Motion-JPEG, FLAC, and
-  ALAC (16 and 24 bits, one to eight channels). `--keyint N` (or `keyint` in a job) sets the key frame interval of H.264, HEVC, VP8, VP9 and AV1.
+  ALAC (16 and 24 bits, one to eight channels). `--keyint N` (or `keyint` in a job) sets the key frame interval of H.264, HEVC, VP8, VP9, AV1 and MPEG-4.
 - **Codecs (voice link):** a playout buffer, a streaming resampler, speech detection with push-to-talk
   trimming, automatic gain control, noise suppression, and Opus packet-loss concealment.
 - **Codecs (ProRes):** Apple ProRes decoder and encoder in MOV: 4:2:2 at 10 bits (Proxy, LT, Standard, HQ) and 4:4:4 at
@@ -28,6 +28,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   Matroska (`V_MPEG4/*`): I, P and B pictures, half- and quarter-sample motion, four vectors, direct mode, H.263 and
   MPEG quantisation with custom matrices, resync markers. Decoding matches FFmpeg's bit for bit. Interlaced, sprite
   and global-motion streams, and data partitioning, are refused with a clear error. About 90 frames a second at 720p.
+- **Codecs (MPEG-4 Part 2 encoder):** software Simple profile encoder for I and P pictures, with half-sample motion search, four vectors per macroblock, intra DC and AC prediction, H.263 quantisation and the escape codes, at a fixed quantiser (1 to 31) or a bit rate, and `--keyint` for the key picture interval. Written to MP4 (`mp4v`) and Matroska (`V_MPEG4/ISO/SP`), and decoded by FFmpeg to exactly what IronAV decodes. B pictures, quarter-sample motion, and interlaced or Advanced Simple video are not encoded. The decoder's motion-vector predictor now takes the above-right candidate for the first block as FFmpeg does, which corrects decoding of some streams.
 - **Codecs (AV1 decoder):** software decoder for key, intra-only and inter frames, at 8, 10 and 12 bits in every chroma
   layout (4:2:0, 4:2:2, 4:4:4 and monochrome). It covers every intra prediction tool, palettes, all transforms, lossless
   coding, tiles, intra block copy, the deblocking filter, CDEF, loop restoration (Wiener, self-guided and switchable),

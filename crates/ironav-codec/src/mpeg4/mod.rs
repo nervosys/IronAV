@@ -15,6 +15,8 @@ mod mb;
 mod mc;
 mod tables;
 
+pub mod enc;
+
 use bits::{Bits, Rl, Vlc};
 use ironav_core::{Decoder, Error, ErrorCode, Frame, Packet, PixelFormat, Result, VideoFrame};
 use std::sync::Arc;

@@ -64,7 +64,7 @@ pub fn implemented() -> Vec<CodecImpl> {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-alac" });
             }
             if c == CodecId::Mpeg4 {
-                return Some(CodecImpl { codec: c, decode: true, encode: false, implementation: "ironav-mpeg4" });
+                return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-mpeg4" });
             }
             if c == CodecId::ProRes {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-prores" });
@@ -399,6 +399,7 @@ pub fn new_encoder_with_opts(codec: CodecId, params: &StreamParams, bits: Option
         (CodecId::Hevc, StreamParams::Video { .. }) => Ok(Box::new(hevc::HevcEncoder::new(params, None, bitrate_kbps.map(|k| k.saturating_mul(1000)))?)),
         (CodecId::Vp8, StreamParams::Video { .. }) => Ok(Box::new(vp8::Vp8Encoder::new(params, None, bitrate_kbps.map(|k| k.saturating_mul(1000)))?)),
         (CodecId::Vp9, StreamParams::Video { .. }) => Ok(Box::new(vp9::Vp9Encoder::new(params, None)?)),
+        (CodecId::Mpeg4, StreamParams::Video { .. }) => Ok(Box::new(mpeg4::enc::Mpeg4Encoder::new(params, None, bitrate_kbps.map(|k| k.saturating_mul(1000)))?)),
         (CodecId::Av1, StreamParams::Video { .. }) => Ok(Box::new(av1::enc::Av1Encoder::new(params, None, bitrate_kbps.map(|k| k.saturating_mul(1000)))?)),
         (c, p) if c.media_type() != p.media_type() => Err(Error::invalid_arg(format!(
             "codec {} is {:?} but the stream is {:?}",
@@ -436,6 +437,7 @@ pub fn encoder_extradata(codec: CodecId, params: &StreamParams) -> Vec<u8> {
         (CodecId::Aac, StreamParams::Audio { sample_rate, channels }) => aac::audio_specific_config(*sample_rate, *channels as usize),
         (CodecId::ProRes, _) => prores::Profile::Hq.fourcc().to_vec(),
         (CodecId::Av1, StreamParams::Video { width, height, .. }) => av1::enc::config_record(*width, *height),
+        (CodecId::Mpeg4, StreamParams::Video { width, height, frame_rate, .. }) => mpeg4::enc::config(*width, *height, if frame_rate.num > 0 { frame_rate.num } else { 25 }),
         _ => Vec::new(),
     }
 }

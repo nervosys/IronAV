@@ -86,11 +86,11 @@ pub static FORMATS: &[FormatSpec] = &[
     FormatSpec {
         name: "mp4",
         extensions: &["mp4", "m4a", "m4v"],
-        description: "MP4 (ISO BMFF) with H.264 or HEVC video (or VP9 or AV1 copied from another file) and optionally AAC, FLAC or ALAC audio (AAC copied or encoded). Read as well as written; written with the index first (fast-start), or fragmented (moov, then a moof and mdat per fragment) when a fragment length is given; fragmented files are read too",
+        description: "MP4 (ISO BMFF) with H.264 or HEVC video (or VP9 or AV1 copied from another file, or MPEG-4 Part 2 `mp4v` video, copied or encoded by IronAV) and optionally AAC, FLAC or ALAC audio (AAC copied or encoded). Read as well as written; written with the index first (fast-start), or fragmented (moov, then a moof and mdat per fragment) when a fragment length is given; fragmented files are read too",
         media: MediaType::Video,
         demux: true,
         mux: true,
-        codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Vp9, CodecId::Av1, CodecId::Aac, CodecId::Flac, CodecId::Alac],
+        codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Mpeg4, CodecId::Vp9, CodecId::Av1, CodecId::Aac, CodecId::Flac, CodecId::Alac],
     },
     FormatSpec {
         name: "mov",
@@ -104,11 +104,11 @@ pub static FORMATS: &[FormatSpec] = &[
     FormatSpec {
         name: "mkv",
         extensions: &["mkv", "mka"],
-        description: "Matroska: read (also WebM, with any codec the file holds) and written with H.264, HEVC, VP8, VP9, AV1 or Motion-JPEG video (copied; VP8 and MJPEG also encoded by IronAV where it has the codec) and AAC, FLAC, MP3, MP2 (read and copied), Opus, Vorbis or PCM audio copied or encoded (PCM as integer or float, little- or big-endian); one stream of each kind; no SeekHead",
+        description: "Matroska: read (also WebM, with any codec the file holds) and written with H.264, HEVC, VP8, VP9, AV1 or Motion-JPEG or MPEG-4 Part 2 video (copied; VP8, MJPEG and MPEG-4 also encoded by IronAV where it has the codec) and AAC, FLAC, MP3, MP2 (read and copied), Opus, Vorbis or PCM audio copied or encoded (PCM as integer or float, little- or big-endian); one stream of each kind; no SeekHead",
         media: MediaType::Video,
         demux: true,
         mux: true,
-        codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Vp8, CodecId::Vp9, CodecId::Av1, CodecId::Mjpeg, CodecId::Aac, CodecId::Mp3, CodecId::Mp2, CodecId::Opus, CodecId::Vorbis, CodecId::Flac, CodecId::PcmU8, CodecId::PcmS16Le, CodecId::PcmS24Le, CodecId::PcmS32Le, CodecId::PcmF32Le, CodecId::PcmF64Le],
+        codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Vp8, CodecId::Vp9, CodecId::Av1, CodecId::Mjpeg, CodecId::Mpeg4, CodecId::Aac, CodecId::Mp3, CodecId::Mp2, CodecId::Opus, CodecId::Vorbis, CodecId::Flac, CodecId::PcmU8, CodecId::PcmS16Le, CodecId::PcmS24Le, CodecId::PcmS32Le, CodecId::PcmF32Le, CodecId::PcmF64Le],
     },
     FormatSpec {
         name: "mp3",

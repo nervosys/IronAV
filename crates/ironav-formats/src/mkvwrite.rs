@@ -105,7 +105,7 @@ fn holds_aac_end(t: &Track) -> bool {
 }
 
 fn self_contained(codec: CodecId) -> bool {
-    matches!(codec, CodecId::Vp8 | CodecId::Vp9 | CodecId::Av1 | CodecId::Mjpeg)
+    matches!(codec, CodecId::Vp8 | CodecId::Vp9 | CodecId::Av1 | CodecId::Mjpeg | CodecId::Mpeg4)
 }
 
 struct Cluster {
@@ -187,7 +187,7 @@ impl MatroskaWriter {
             CodecId::H264 => Some(avcc_body(&t.params, &missing)?),
             CodecId::Hevc => Some(hvcc_body(&t.params, &missing)?),
             CodecId::Vp8 | CodecId::Vp9 | CodecId::Mjpeg => None,
-            CodecId::Av1 | CodecId::Aac | CodecId::Opus | CodecId::Vorbis => Some(t.stream.extradata.clone()),
+            CodecId::Av1 | CodecId::Mpeg4 | CodecId::Aac | CodecId::Opus | CodecId::Vorbis => Some(t.stream.extradata.clone()),
             CodecId::Flac => {
                 let (rate, channels, bits) = flac_audio_params(&t.stream)?;
                 let mut v = b"fLaC".to_vec();
@@ -240,6 +240,7 @@ impl MatroskaWriter {
                 CodecId::Vp9 => "V_VP9",
                 CodecId::Av1 => "V_AV1",
                 CodecId::Mjpeg => "V_MJPEG",
+                CodecId::Mpeg4 => "V_MPEG4/ISO/SP",
                 CodecId::Aac => "A_AAC",
                 CodecId::Flac => "A_FLAC",
                 CodecId::Opus => "A_OPUS",
@@ -372,6 +373,9 @@ impl MatroskaWriter {
         } else if self.tracks[t].video && self.tracks[t].stream.codec == CodecId::Mjpeg {
             // every JPEG picture stands alone
             (p.data.clone(), true)
+        } else if self.tracks[t].video && self.tracks[t].stream.codec == CodecId::Mpeg4 {
+            // an MPEG-4 picture is stored as it is; it is a key picture when its coding type is I
+            (p.data.clone(), crate::keyframe::is_keyframe(CodecId::Mpeg4, &p.data) != Some(false))
         } else if self.tracks[t].video {
             let hevc = self.tracks[t].stream.codec == CodecId::Hevc;
             match annexb_sample(hevc, &mut self.tracks[t].params, &p.data) {
@@ -425,7 +429,7 @@ impl Muxer for MatroskaWriter {
                     }
                     true
                 }
-                (StreamParams::Video { .. }, CodecId::H264 | CodecId::Hevc | CodecId::Vp8 | CodecId::Vp9 | CodecId::Mjpeg) => true,
+                (StreamParams::Video { .. }, CodecId::H264 | CodecId::Hevc | CodecId::Vp8 | CodecId::Vp9 | CodecId::Mjpeg | CodecId::Mpeg4) => true,
                 (StreamParams::Audio { .. }, CodecId::Aac | CodecId::Opus | CodecId::Vorbis) => {
                     if s.extradata.is_empty() {
                         return Err(Error::new(ErrorCode::UnsupportedFormat, format!("{} needs its codec configuration to go into Matroska", s.codec.name()))

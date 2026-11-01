@@ -310,8 +310,8 @@ pub fn plan(job: &Job) -> Result<Plan> {
             if k == 0 {
                 return Err(Error::invalid_arg("keyint must be at least 1 frame"));
             }
-            if !matches!(to, CodecId::H264 | CodecId::Hevc | CodecId::Vp8 | CodecId::Vp9 | CodecId::Av1) {
-                return Err(Error::invalid_arg(format!("keyint applies to the h264, hevc, vp8, vp9 and av1 encoders, and this video is written as {}", to.name()))
+            if !matches!(to, CodecId::H264 | CodecId::Hevc | CodecId::Vp8 | CodecId::Vp9 | CodecId::Av1 | CodecId::Mpeg4) {
+                return Err(Error::invalid_arg(format!("keyint applies to the h264, hevc, vp8, vp9, av1 and mpeg4 encoders, and this video is written as {}", to.name()))
                     .hint("set the video codec to one of them, or leave keyint out"));
             }
         }

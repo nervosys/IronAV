@@ -289,7 +289,13 @@ impl<'a> Vop<'a> {
             return (a[0], a[1]);
         }
         let b = self.mv_at(bx, by - 1);
-        let c = if i == 3 { self.mv_at(bx - 1, by - 1) } else { self.mv_at(bx + 1, by - 1) };
+        // the above-right candidate: the above-right macroblock's bottom-left block for block 0 and 1
+        // (FFmpeg's ff_h263_pred_motion, off = {2, 1, 1, -1})
+        let c = match i {
+            3 => self.mv_at(bx - 1, by - 1),
+            0 => self.mv_at(bx + 2, by - 1),
+            _ => self.mv_at(bx + 1, by - 1),
+        };
         (median(a[0], b[0], c[0]), median(a[1], b[1], c[1]))
     }
 
