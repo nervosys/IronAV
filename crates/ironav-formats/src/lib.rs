@@ -193,11 +193,11 @@ pub static FORMATS: &[FormatSpec] = &[
     FormatSpec {
         name: "mpegps",
         extensions: &["mpg", "mpeg", "vob", "ps"],
-        description: "MPEG program stream (DVD VOB, MPEG-1 system streams, .mpg files): the MPEG-1 or MPEG-2 video is read; audio and other streams in it are not",
+        description: "MPEG program stream (DVD VOB, MPEG-1 system streams, .mpg files): every MPEG-1 or MPEG-2 video stream, MP2/MP3 audio, AC-3 and DVD LPCM are read; DTS, subpictures and DVD-Audio are skipped",
         media: MediaType::Video,
         demux: true,
         mux: false,
-        codecs: &[CodecId::Mpeg2Video, CodecId::Mpeg1Video],
+        codecs: &[CodecId::Mpeg2Video, CodecId::Mpeg1Video, CodecId::Mp2, CodecId::Mp3, CodecId::Ac3, CodecId::PcmS16Le, CodecId::PcmS24Le, CodecId::PcmS32Le],
     },
     FormatSpec {
         name: "mpegts",
