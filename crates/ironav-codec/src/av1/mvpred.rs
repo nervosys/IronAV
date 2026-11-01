@@ -2,6 +2,8 @@
 //! temporal neighbours, the warp samples (7.10.4), and the motion field estimation (7.9) that the
 //! temporal candidates come from.
 
+use std::sync::Arc;
+
 use super::block::{FrameDec, Mi};
 use super::inter_tables::DIV_MULT;
 use super::obu::{rel_dist, GM_TRANSLATION, INTRA_ONLY_FRAME, KEY_FRAME};
@@ -616,7 +618,7 @@ impl FrameDec {
     /// The motion field estimation (7.9): projects the saved motion vectors of the references onto
     /// this frame, as libaom's av1_setup_motion_field.
     pub(crate) fn setup_motion_field(&mut self) {
-        self.tpl.iter_mut().for_each(|t| t.mv[0] = INVALID_MV);
+        Arc::make_mut(&mut self.tpl).iter_mut().for_each(|t| t.mv[0] = INVALID_MV);
         if !self.seq.enable_order_hint {
             return;
         }
@@ -661,6 +663,7 @@ impl FrameDec {
         }
         let (rows, cols) = ((self.h.mi_rows + 1) >> 1, (self.h.mi_cols + 1) >> 1);
         let (max_r, max_c) = ((self.h.mi_rows >> 1) as i32, (self.h.mi_cols >> 1) as i32);
+        let tpl = Arc::make_mut(&mut self.tpl);
         for br in 0..rows {
             for bc in 0..cols {
                 let s = r.mvs[br * cols + bc];
@@ -679,7 +682,7 @@ impl FrameDec {
                 if row < 0 || row >= max_r || col < 0 || col >= max_c || row < base_r || row >= base_r + 8 || col < base_c - 8 || col >= base_c + 16 {
                     continue;
                 }
-                let t = &mut self.tpl[row as usize * self.tpl_stride + col as usize];
+                let t = &mut tpl[row as usize * self.tpl_stride + col as usize];
                 t.mv = s.mv;
                 t.offset = off;
             }
@@ -690,7 +693,7 @@ impl FrameDec {
     /// Saves the block's motion for later frames (av1_copy_frame_mvs).
     pub(crate) fn save_mvs(&mut self) {
         let b = &self.b;
-        let cols = (self.h.mi_cols + 1) >> 1;
+        let (cols, r0, c0) = (self.mvs_stride, self.org[0] >> 1, self.org[1] >> 1);
         let (x_mis, y_mis) = (b.bw4.min(self.h.mi_cols - b.col), b.bh4.min(self.h.mi_rows - b.row));
         let mut s = SavedMv { rf: -1, mv: [0, 0] };
         for l in 0..2 {
@@ -707,7 +710,7 @@ impl FrameDec {
         }
         for y in (b.row >> 1)..(b.row >> 1) + y_mis.div_ceil(2) {
             for x in (b.col >> 1)..(b.col >> 1) + x_mis.div_ceil(2) {
-                self.saved_mvs[y * cols + x] = s;
+                self.saved_mvs[(y - r0) * cols + x - c0] = s;
             }
         }
     }

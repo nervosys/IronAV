@@ -211,12 +211,29 @@ fn inverse_recenter(r: i32, v: i32) -> i32 {
 }
 
 /// The decoding state of one frame: its pictures, the per-4x4 mode info and the tile contexts.
+///
+/// Its fields fall in three groups:
+/// - frame-wide state that tile decoding only reads: the headers, the reference pictures, the
+///   previous segment ids and the motion field (`tpl`);
+/// - the frame's outputs, which tile decoding writes and reads within the tile's rectangle only:
+///   the planes, the mode info grid and the palette colours, transform types, delta LF values,
+///   CDEF indices, loop filter transform sizes, saved motion vectors and restoration units;
+/// - the scratch state of the tile being decoded: the above and left contexts, the block, the
+///   coefficient buffers and the prediction buffers.
+///
+/// The frame's own `FrameDec` holds the whole frame's outputs. A `FrameDec` may instead hold a
+/// window of them over one tile's rectangle (`org` is the window's first 4x4 row and column):
+/// tile decoding addresses the outputs by frame position through `mi_idx` and `pix_org`.
 pub struct FrameDec {
     pub seq: SequenceHeader,
     pub h: FrameHeader,
+    /// The output planes: the frame's, or a tile worker's window (from its `pix_org`).
     pub planes: [Plane; 3],
+    /// Mode info per 4x4 of the window, `mi_stride` apart (see `mi_idx`).
     pub mi: Vec<Mi>,
     pub mi_stride: usize,
+    /// The 4x4 row and column of the output window's top-left: 0, 0 but in a tile worker.
+    pub(crate) org: [usize; 2],
     pal_colors: Vec<[u16; 16]>,
     /// cdef_idx per 64x64 block (-1 where none was read).
     pub cdef_idx: Vec<i8>,
@@ -255,10 +272,14 @@ pub struct FrameDec {
     pub refs: [Option<Arc<Picture>>; 8],
     /// PrevSegmentIds, when the primary reference frame has them.
     pub prev_seg: Option<Arc<Picture>>,
-    pub(crate) tpl: Vec<Tpl>,
+    /// The motion field, shared with the tile workers.
+    pub(crate) tpl: Arc<Vec<Tpl>>,
     pub(crate) tpl_stride: usize,
+    /// SavedMvs per 8x8 of the window, `mvs_stride` apart.
     pub saved_mvs: Vec<SavedMv>,
-    /// TxTypes of the luma 4x4s, for the chroma transform types of inter blocks.
+    pub(crate) mvs_stride: usize,
+    /// TxTypes of the luma 4x4s of the window, for the chroma transform types of inter blocks
+    /// (read within the block only, so never merged into the frame).
     tx_types: Vec<u8>,
     /// Shear parameters of each global motion model, when it can warp.
     pub(crate) gm_shear: [Option<[i32; 4]>; 8],
@@ -271,17 +292,30 @@ const DEC_STRIDE: usize = 35;
 
 impl FrameDec {
     pub fn new(seq: SequenceHeader, h: FrameHeader) -> FrameDec {
+        let win = [0, h.mi_rows, 0, h.mi_cols];
+        let mut f = FrameDec::with_window(seq, h, win);
+        f.tpl = Arc::new(vec![Tpl { mv: [INVALID_MV, 0], offset: 0 }; f.h.mi_rows.div_ceil(2) * f.h.mi_cols.div_ceil(2)]);
+        f
+    }
+
+    /// A `FrameDec` whose outputs cover the 4x4 rows `win[0]..win[1]` and columns `win[2]..win[3]`
+    /// (the whole frame, or a tile); its planes and loop filter sizes reach the superblocks' ends.
+    fn with_window(seq: SequenceHeader, h: FrameHeader, win: [usize; 4]) -> FrameDec {
         let sb = if seq.use_128x128_superblock { 128 } else { 64 };
         let ss = [seq.subsampling_x as usize, seq.subsampling_y as usize];
-        let (aw, ah) = ((h.mi_cols * 4).div_ceil(sb) * sb, (h.mi_rows * 4).div_ceil(sb) * sb);
+        let [r0, r1, c0, c1] = win;
+        let (aw, ah) = ((c1 * 4).div_ceil(sb) * sb - c0 * 4, (r1 * 4).div_ceil(sb) * sb - r0 * 4);
         let num_planes = seq.num_planes();
         let planes = [Plane::new(aw, ah), Plane::new(aw >> ss[0], ah >> ss[1]), Plane::new(aw >> ss[0], ah >> ss[1])];
-        let mi_n = h.mi_cols * h.mi_rows;
-        let cdef_stride = h.mi_cols.div_ceil(16);
+        let mi_n = (c1 - c0) * (r1 - r0);
+        let cdef_stride = c1.div_ceil(16) - c0 / 16;
         let lf_stride = [aw / 4, (aw >> ss[0]) / 4, (aw >> ss[0]) / 4];
         let lf_tx = [vec![0; lf_stride[0] * ah / 4], vec![0; lf_stride[1] * (ah >> ss[1]) / 4], vec![0; lf_stride[2] * (ah >> ss[1]) / 4]];
-        let actx = || vec![0u8; aw / 4 + 32];
-        let lctx = || vec![0u8; ah / 4 + 32];
+        let mvs_stride = c1.div_ceil(2) - c0 / 2;
+        // the contexts are indexed by frame position
+        let (fw, fh) = ((h.mi_cols * 4).div_ceil(sb) * sb, (h.mi_rows * 4).div_ceil(sb) * sb);
+        let actx = || vec![0u8; fw / 4 + 32];
+        let lctx = || vec![0u8; fh / 4 + 32];
         let lr_units: [lr::Units; 3] = std::array::from_fn(|p| {
             if p >= num_planes || h.lr_type[p] == lr::RESTORE_NONE {
                 return lr::Units::default();
@@ -297,11 +331,12 @@ impl FrameDec {
             ref_wiener: [[lr::WIENER_TAPS_MID; 2]; 3],
             ref_sgr: [lr::SGRPROJ_XQD_MID; 3],
             pal_colors: if h.allow_screen_content_tools { vec![[0; 16]; mi_n] } else { Vec::new() },
-            cdef_idx: vec![-1; cdef_stride * h.mi_rows.div_ceil(16)],
+            cdef_idx: vec![-1; cdef_stride * (r1.div_ceil(16) - r0 / 16)],
             cdef_stride,
             delta_lf: if h.delta_lf_present { vec![[0; 4]; mi_n] } else { Vec::new() },
             mi: vec![Mi::default(); mi_n],
-            mi_stride: h.mi_cols,
+            mi_stride: c1 - c0,
+            org: [r0, c0],
             lf_tx,
             lf_stride,
             planes,
@@ -323,13 +358,14 @@ impl FrameDec {
             quant: vec![0; 1024],
             dq: vec![0; 1024],
             res: vec![0; 4096],
-            above_seg_pred: vec![0; aw / 4 + 32],
-            left_seg_pred: vec![0; ah / 4 + 32],
+            above_seg_pred: vec![0; fw / 4 + 32],
+            left_seg_pred: vec![0; fh / 4 + 32],
             refs: Default::default(),
             prev_seg: None,
-            tpl: vec![Tpl { mv: [INVALID_MV, 0], offset: 0 }; h.mi_rows.div_ceil(2) * h.mi_cols.div_ceil(2)],
+            tpl: Arc::default(),
             tpl_stride: h.mi_cols.div_ceil(2),
-            saved_mvs: vec![SavedMv { rf: -1, mv: [0, 0] }; h.mi_rows.div_ceil(2) * h.mi_cols.div_ceil(2)],
+            saved_mvs: vec![SavedMv { rf: -1, mv: [0, 0] }; (r1.div_ceil(2) - r0 / 2) * mvs_stride],
+            mvs_stride,
             tx_types: vec![0; mi_n],
             gm_shear: std::array::from_fn(|i| super::inter::setup_shear(&h.gm_params[i])),
             pred: [vec![0; 128 * 128], vec![0; 128 * 128]],
@@ -340,9 +376,25 @@ impl FrameDec {
         }
     }
 
+    /// The index of the 4x4 at frame row `r` and column `c` in the window's mode info grids (`mi`,
+    /// `pal_colors`, `delta_lf`, `tx_types`); it must lie in the window.
+    #[inline]
+    pub(crate) fn mi_idx(&self, r: usize, c: usize) -> usize {
+        debug_assert!(r >= self.org[0] && c >= self.org[1] && c - self.org[1] < self.mi_stride, "4x4 ({r}, {c}) outside the window at {:?}", self.org);
+        (r - self.org[0]) * self.mi_stride + c - self.org[1]
+    }
+
     #[inline]
     pub(crate) fn mi_at(&self, r: usize, c: usize) -> &Mi {
-        &self.mi[r * self.mi_stride + c]
+        &self.mi[self.mi_idx(r, c)]
+    }
+
+    /// The frame position of the first sample of the window's `plane`: tile decoding writes the
+    /// sample at frame (x, y) at (x - x0, y - y0) of the plane.
+    #[inline]
+    pub(crate) fn pix_org(&self, plane: usize) -> (usize, usize) {
+        let (sx, sy) = self.sub(plane);
+        ((self.org[1] * 4) >> sx, (self.org[0] * 4) >> sy)
     }
 
     #[inline]
@@ -466,11 +518,19 @@ impl FrameDec {
         self.lr[plane].u[idx] = u;
     }
 
+    /// The index of the 64x64 block at frame row `y` and column `x` (in 64x64 units) in the
+    /// window's `cdef_idx`.
+    #[inline]
+    fn cdef_at(&self, y: usize, x: usize) -> usize {
+        (y - (self.org[0] >> 4)) * self.cdef_stride + x - (self.org[1] >> 4)
+    }
+
     fn clear_cdef(&mut self, r: usize, c: usize) {
         let n = if self.sb4 == 32 { 2 } else { 1 };
         for y in (r >> 4)..((r >> 4) + n).min(self.h.mi_rows.div_ceil(16)) {
-            for x in (c >> 4)..((c >> 4) + n).min(self.cdef_stride) {
-                self.cdef_idx[y * self.cdef_stride + x] = -1;
+            for x in (c >> 4)..((c >> 4) + n).min(self.h.mi_cols.div_ceil(16)) {
+                let i = self.cdef_at(y, x);
+                self.cdef_idx[i] = -1;
             }
         }
     }
@@ -782,7 +842,7 @@ impl FrameDec {
                 let mut s = 7;
                 for y in r..(r + bh4).min(self.h.mi_rows) {
                     for x in c..(c + bw4).min(self.h.mi_cols) {
-                        s = s.min(p.seg_ids[y * self.mi_stride + x]);
+                        s = s.min(p.seg_ids[y * self.h.mi_cols + x]);
                     }
                 }
                 s as usize
@@ -859,14 +919,15 @@ impl FrameDec {
             return;
         }
         let (r, c) = (self.b.row, self.b.col);
-        let i = (r >> 4) * self.cdef_stride + (c >> 4);
+        let i = self.cdef_at(r >> 4, c >> 4);
         if self.cdef_idx[i] == -1 {
             let v = t.sd.literal(self.h.cdef_bits) as i8;
             self.cdef_idx[i] = v;
             let (bw4, bh4) = (self.b.bw4, self.b.bh4);
             for y in (r..r + bh4).step_by(16).filter(|&y| y < self.h.mi_rows) {
                 for x in (c..c + bw4).step_by(16).filter(|&x| x < self.h.mi_cols) {
-                    self.cdef_idx[(y >> 4) * self.cdef_stride + (x >> 4)] = v;
+                    let j = self.cdef_at(y >> 4, x >> 4);
+                    self.cdef_idx[j] = v;
                 }
             }
         }
@@ -916,8 +977,8 @@ impl FrameDec {
         let (r, c) = (self.b.row, self.b.col);
         let above_n = if (r * 4) % 64 != 0 && self.b.avail_u { self.mi_at(r - 1, c).pal[plane] as usize } else { 0 };
         let left_n = if self.b.avail_l { self.mi_at(r, c - 1).pal[plane] as usize } else { 0 };
-        let above = if above_n > 0 { &self.pal_colors[(r - 1) * self.mi_stride + c][plane * 8..] } else { &[][..] };
-        let left = if left_n > 0 { &self.pal_colors[r * self.mi_stride + c - 1][plane * 8..] } else { &[][..] };
+        let above = if above_n > 0 { &self.pal_colors[self.mi_idx(r - 1, c)][plane * 8..] } else { &[][..] };
+        let left = if left_n > 0 { &self.pal_colors[self.mi_idx(r, c - 1)][plane * 8..] } else { &[][..] };
         let (mut ai, mut li, mut n) = (0, 0, 0);
         let mut push = |v: u16, n: &mut usize| {
             if *n == 0 || v != cache[*n - 1] {
@@ -1159,9 +1220,10 @@ impl FrameDec {
         colors[..8].copy_from_slice(&b.pal[0]);
         colors[8..].copy_from_slice(&b.pal[1]);
         let dlf = [self.dlf[0] as i8, self.dlf[1] as i8, self.dlf[2] as i8, self.dlf[3] as i8];
-        for y in r..r + rows {
-            for x in c..c + cols {
-                let i = y * self.mi_stride + x;
+        let i0 = self.mi_idx(r, c);
+        for y in 0..rows {
+            for x in 0..cols {
+                let i = i0 + y * self.mi_stride + x;
                 let m = &mut self.mi[i];
                 m.size = b.size as u8;
                 m.y_mode = b.y_mode;
@@ -1320,6 +1382,9 @@ impl FrameDec {
         let (log2w, log2h) = (TX_W_LOG2[tx] as u32, TX_H_LOG2[tx] as u32);
         let (step_x, step_y) = (1usize << (log2w - 2), 1usize << (log2h - 2));
         let pt = (plane > 0) as usize;
+        // the block's position in the window's plane
+        let (x0, y0) = self.pix_org(plane);
+        let (px, py) = (sx - x0, sy - y0);
         if self.b.is_inter {
         } else if self.b.pal_size[pt] > 0 {
             let (w, h) = (1usize << log2w, 1usize << log2h);
@@ -1327,7 +1392,7 @@ impl FrameDec {
             let pal = &self.b.pal[plane];
             let p = &mut self.planes[plane];
             for i in 0..h {
-                let row = (sy + i) * p.stride + sx;
+                let row = (py + i) * p.stride + px;
                 for j in 0..w {
                     p.data[row + j] = pal[map[(y * 4 + i) * 64 + x * 4 + j] as usize];
                 }
@@ -1346,17 +1411,21 @@ impl FrameDec {
                 have_above: (if plane == 0 { self.b.avail_u } else { self.b.avail_u_c }) || y > 0,
                 have_above_right: self.is_decoded(plane, dr as isize - 1, (dc + step_x) as isize),
                 have_below_left: self.is_decoded(plane, (dr + step_y) as isize, dc as isize - 1),
-                max_x: max_x as i32 - 1,
-                max_y: max_y as i32 - 1,
+                max_x: (max_x - x0) as i32 - 1,
+                max_y: (max_y - y0) as i32 - 1,
             };
             let smooth = self.filter_type(plane);
             let (angle, filter) = if plane == 0 { (self.b.angle_y, self.b.filter) } else { (self.b.angle_uv, None) };
             let edge_filter = self.seq.enable_intra_edge_filter;
             let bd = self.bd;
-            predict_intra(&mut self.planes[plane], sx, sy, log2w, log2h, mode, angle, filter, &e, smooth, edge_filter, bd);
+            predict_intra(&mut self.planes[plane], px, py, log2w, log2h, mode, angle, filter, &e, smooth, edge_filter, bd);
             if is_cfl {
+                // the luma window starts at the chroma window's position scaled up (tiles start on
+                // superblocks)
+                let (lx0, ly0) = self.pix_org(0);
+                let (mw, mh) = (self.b.max_luma_w - lx0, self.b.max_luma_h - ly0);
                 let (luma, chroma) = self.planes.split_at_mut(1);
-                predict_cfl(&mut chroma[plane - 1], sx, sy, log2w, log2h, ssx as u32, ssy as u32, self.b.cfl[plane - 1], &luma[0], self.b.max_luma_w, self.b.max_luma_h, bd);
+                predict_cfl(&mut chroma[plane - 1], px, py, log2w, log2h, ssx as u32, ssy as u32, self.b.cfl[plane - 1], &luma[0], mw, mh, bd);
             }
         }
         if plane == 0 {
@@ -1372,7 +1441,7 @@ impl FrameDec {
                 let max = (1i32 << self.bd) - 1;
                 let p = &mut self.planes[plane];
                 for i in 0..h {
-                    let row = (sy + i) * p.stride + sx;
+                    let row = (py + i) * p.stride + px;
                     for j in 0..w {
                         let v = &mut p.data[row + j];
                         *v = (*v as i32 + self.res[i * w + j]).clamp(0, max) as u16;
@@ -1381,9 +1450,10 @@ impl FrameDec {
             }
         }
         let ls = self.lf_stride[plane];
+        let (lr0, lc0) = ((row >> ssy) - (self.org[0] >> ssy), (col >> ssx) - (self.org[1] >> ssx));
         for i in 0..step_y {
             for j in 0..step_x {
-                if let Some(v) = self.lf_tx[plane].get_mut(((row >> ssy) + i) * ls + (col >> ssx) + j) {
+                if let Some(v) = self.lf_tx[plane].get_mut((lr0 + i) * ls + lc0 + j) {
                     *v = tx as u8;
                 }
                 self.decoded[plane][(dr + i + 1) * DEC_STRIDE + dc + j + 1] = true;
@@ -1448,7 +1518,7 @@ impl FrameDec {
         let tt = if self.b.is_inter {
             let (ssx, ssy) = self.sub(plane);
             let (x, y) = (self.b.col.max(x4 << ssx), self.b.row.max(y4 << ssy));
-            self.tx_types[y * self.mi_stride + x]
+            self.tx_types[self.mi_idx(y, x)]
         } else {
             MODE_TO_TXFM[self.b.uv_mode as usize]
         };
@@ -1641,8 +1711,10 @@ impl FrameDec {
             self.left_dc[plane][i] = dc_cat;
         }
         if plane == 0 && self.b.is_inter {
+            let n = (x4 + w4).min(self.h.mi_cols) - x4;
             for y in y4..(y4 + h4).min(self.h.mi_rows) {
-                self.tx_types[y * self.mi_stride + x4..y * self.mi_stride + (x4 + w4).min(self.h.mi_cols)].fill(tt);
+                let i = self.mi_idx(y, x4);
+                self.tx_types[i..i + n].fill(tt);
             }
         }
         Ok((eob, tt))

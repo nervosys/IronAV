@@ -555,7 +555,8 @@ impl FrameDec {
         } else {
             for y in row..(row + h4).min(self.h.mi_rows) {
                 for x in col..(col + w4).min(self.h.mi_cols) {
-                    self.mi[y * self.mi_stride + x].tx = tx as u8;
+                    let i = self.mi_idx(y, x);
+                    self.mi[i].tx = tx as u8;
                 }
             }
             self.b.tx = tx;

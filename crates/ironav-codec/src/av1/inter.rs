@@ -193,17 +193,18 @@ impl FrameDec {
             let (base_x, base_y) = ((col >> ssx) * 4, (row >> ssy) * 4);
             if self.b.interintra {
                 let mode = [DC_PRED, 1, 2, SMOOTH_PRED][self.b.ii_mode as usize];
+                let (x0, y0) = self.pix_org(plane);
                 let e = Edges {
                     have_left: if plane == 0 { self.b.avail_l } else { self.b.avail_l_c },
                     have_above: if plane == 0 { self.b.avail_u } else { self.b.avail_u_c },
                     have_above_right: false,
                     have_below_left: false,
-                    max_x: ((self.h.mi_cols * 4) >> ssx) as i32 - 1,
-                    max_y: ((self.h.mi_rows * 4) >> ssy) as i32 - 1,
+                    max_x: ((self.h.mi_cols * 4) >> ssx) as i32 - 1 - x0 as i32,
+                    max_y: ((self.h.mi_rows * 4) >> ssy) as i32 - 1 - y0 as i32,
                 };
                 let (lw, lh) = (MI_W_LOG2[psz] as u32 + 2, MI_H_LOG2[psz] as u32 + 2);
                 let ef = self.seq.enable_intra_edge_filter;
-                predict_intra(&mut self.planes[plane], base_x, base_y, lw, lh, mode, 0, None, &e, false, ef, self.bd);
+                predict_intra(&mut self.planes[plane], base_x - x0, base_y - y0, lw, lh, mode, 0, None, &e, false, ef, self.bd);
             }
             let (mut cr, mut cc) = ((row >> ssy) << ssy, (col >> ssx) << ssx);
             let (mut pw, mut ph) = ((4usize << MI_W_LOG2[bs]) >> ssx, (4usize << MI_H_LOG2[bs]) >> ssy);
@@ -243,6 +244,8 @@ impl FrameDec {
         let intrabc = m.is_inter && m.ref_frame[0] == 0;
         for l in 0..1 + compound as usize {
             if intrabc {
+                // frames with intra block copy decode their tiles into the frame itself
+                debug_assert_eq!(self.org, [0, 0], "intra block copy in a tile worker");
                 let cur = std::mem::replace(&mut self.planes[plane], Plane::new(0, 0));
                 let (w_, h_) = (self.h.upscaled_width as usize, self.h.height as usize);
                 self.block_inter(&cur, (w_, h_), l, plane, x, y, w, h, m.mv[l], m.interp, r0, r1);
@@ -298,6 +301,8 @@ impl FrameDec {
             }
         }
         let (p0, p1) = (&self.pred[0], &self.pred[1]);
+        let (x0, y0) = self.pix_org(plane);
+        let (x, y) = (x - x0, y - y0);
         let dst = &mut self.planes[plane];
         let stride = dst.stride;
         if !compound && !ii {
@@ -548,6 +553,8 @@ impl FrameDec {
         self.block_inter(&refp.planes[plane], (refp.width, refp.height), 0, plane, px, py, pw, ph, cm.mv[0], cm.interp, r0, r1);
         let mask = obmc_mask(if left { pw } else { ph });
         let max = (1i32 << self.bd) - 1;
+        let (x0, y0) = self.pix_org(plane);
+        let (px, py) = (px - x0, py - y0);
         let dst = &mut self.planes[plane];
         for i in 0..ph {
             for j in 0..pw {
