@@ -213,17 +213,22 @@ fn inverse_recenter(r: i32, v: i32) -> i32 {
 /// The decoding state of one frame: its pictures, the per-4x4 mode info and the tile contexts.
 ///
 /// Its fields fall in three groups:
-/// - frame-wide state that tile decoding only reads: the headers, the reference pictures, the
-///   previous segment ids and the motion field (`tpl`);
+/// - frame-wide state that tile decoding only reads (`FrameShared`): the headers, the
+///   reference pictures, the previous segment ids and the motion field (`tpl`);
 /// - the frame's outputs, which tile decoding writes and reads within the tile's rectangle only:
 ///   the planes, the mode info grid and the palette colours, transform types, delta LF values,
 ///   CDEF indices, loop filter transform sizes, saved motion vectors and restoration units;
 /// - the scratch state of the tile being decoded: the above and left contexts, the block, the
 ///   coefficient buffers and the prediction buffers.
 ///
-/// The frame's own `FrameDec` holds the whole frame's outputs. A `FrameDec` may instead hold a
-/// window of them over one tile's rectangle (`org` is the window's first 4x4 row and column):
-/// tile decoding addresses the outputs by frame position through `mi_idx` and `pix_org`.
+/// The frame's own `FrameDec` holds the whole frame's outputs, and decodes tiles one after
+/// another into them. A tile worker (`FrameShared::tile_worker`) is a `FrameDec` whose outputs
+/// are a window over one tile's rectangle (`org` is the window's first 4x4 row and column).
+/// Tiles are independent: above and left availability, the MV candidate scans, the warp
+/// samples, OBMC neighbours, the intra edges (above-right and below-left availability) and the
+/// segment id and CDEF contexts all stop at the tile's edges, and intra block copy (which reads
+/// the frame being decoded) keeps its tiles on the frame. So workers decode on separate threads,
+/// then each copies its window into its own part of the frame (`split_outputs`, `write_out`).
 pub struct FrameDec {
     pub seq: SequenceHeader,
     pub h: FrameHeader,
@@ -290,12 +295,179 @@ pub struct FrameDec {
 
 const DEC_STRIDE: usize = 35;
 
+/// What tile workers share with their frame: the frame-wide state that tile decoding reads and
+/// never writes. Each tile starts from the same CDFs, which the caller hands to `decode_tile`.
+#[derive(Clone)]
+pub(crate) struct FrameShared {
+    seq: SequenceHeader,
+    h: FrameHeader,
+    refs: [Option<Arc<Picture>>; 8],
+    prev_seg: Option<Arc<Picture>>,
+    tpl: Arc<Vec<Tpl>>,
+}
+
+impl FrameShared {
+    /// The worker that decodes tile (`tile_row`, `tile_col`) on a thread of its own: the frame's
+    /// shared state, fresh tile contexts, and outputs over the tile's rectangle (the superblocks
+    /// it covers), for `write_out` and `merge_lr`.
+    pub(crate) fn tile_worker(&self, tile_row: usize, tile_col: usize) -> FrameDec {
+        let h = &self.h;
+        let win = [h.mi_row_starts[tile_row], h.mi_row_starts[tile_row + 1], h.mi_col_starts[tile_col], h.mi_col_starts[tile_col + 1]];
+        let mut w = FrameDec::with_window(self.seq.clone(), self.h.clone(), win);
+        w.refs = self.refs.clone();
+        w.prev_seg = self.prev_seg.clone();
+        w.tpl = self.tpl.clone();
+        w
+    }
+}
+
+/// One tile's part of the frame's outputs: the rows of its rectangle in each output grid, which
+/// the tile's worker writes (`FrameDec::write_out`) while the other tiles write theirs.
+pub(crate) struct TileOut<'a> {
+    planes: [Vec<&'a mut [u16]>; 3],
+    mi: Vec<&'a mut [Mi]>,
+    pal_colors: Vec<&'a mut [[u16; 16]]>,
+    delta_lf: Vec<&'a mut [[i8; 4]]>,
+    cdef_idx: Vec<&'a mut [i8]>,
+    lf_tx: [Vec<&'a mut [u8]>; 3],
+    saved_mvs: Vec<&'a mut [SavedMv]>,
+}
+
+/// Splits a grid of rows `stride` long at the row bounds `rows` and the column bounds `cols`
+/// (each from 0 to the grid's extent, ascending): each rectangle's rows, in raster order. Rows
+/// past the last row bound are left out.
+fn split_grid<'a, T>(data: &'a mut [T], stride: usize, rows: &[usize], cols: &[usize]) -> Vec<Vec<&'a mut [T]>> {
+    let nc = cols.len() - 1;
+    let mut out: Vec<Vec<&mut [T]>> = (0..(rows.len() - 1) * nc).map(|_| Vec::new()).collect();
+    if stride == 0 {
+        return out;
+    }
+    let mut tr = 0;
+    for (y, mut rest) in data.chunks_mut(stride).enumerate() {
+        while tr + 1 < rows.len() && y >= rows[tr + 1] {
+            tr += 1;
+        }
+        if tr + 1 == rows.len() {
+            break;
+        }
+        for k in 0..nc {
+            let w = (cols[k + 1] - cols[k]).min(rest.len());
+            let (seg, r) = std::mem::take(&mut rest).split_at_mut(w);
+            out[tr * nc + k].push(seg);
+            rest = r;
+        }
+    }
+    out
+}
+
+/// Copies the grid `src` (rows `stride` long) into the rows `dst`.
+fn paste<T: Copy>(dst: &mut [&mut [T]], src: &[T], stride: usize) {
+    if stride == 0 {
+        return;
+    }
+    for (d, s) in dst.iter_mut().zip(src.chunks_exact(stride)) {
+        let n = d.len().min(s.len());
+        d[..n].copy_from_slice(&s[..n]);
+    }
+}
+
 impl FrameDec {
     pub fn new(seq: SequenceHeader, h: FrameHeader) -> FrameDec {
         let win = [0, h.mi_rows, 0, h.mi_cols];
         let mut f = FrameDec::with_window(seq, h, win);
         f.tpl = Arc::new(vec![Tpl { mv: [INVALID_MV, 0], offset: 0 }; f.h.mi_rows.div_ceil(2) * f.h.mi_cols.div_ceil(2)]);
         f
+    }
+
+    /// The frame-wide state its tile workers share.
+    pub(crate) fn shared(&self) -> FrameShared {
+        FrameShared { seq: self.seq.clone(), h: self.h.clone(), refs: self.refs.clone(), prev_seg: self.prev_seg.clone(), tpl: self.tpl.clone() }
+    }
+
+    /// The frame's outputs split by tile, in tile order: disjoint parts, one per tile worker.
+    pub(crate) fn split_outputs(&mut self) -> Vec<TileOut<'_>> {
+        let h = &self.h;
+        // the tile bounds in an output grid: the tile starts scaled by `f`, then `end`
+        let bounds = |starts: &[usize], f: &dyn Fn(usize) -> usize, end: usize| -> Vec<usize> {
+            let mut v: Vec<usize> = starts[..starts.len() - 1].iter().map(|&s| f(s)).collect();
+            v.push(end);
+            v
+        };
+        let (rs, cs) = (&h.mi_row_starts, &h.mi_col_starts);
+        let (mi_rows, mi_cols) = (bounds(rs, &|s| s, h.mi_rows), bounds(cs, &|s| s, h.mi_cols));
+        let n = (rs.len() - 1) * (cs.len() - 1);
+        let mut it_planes: Vec<std::vec::IntoIter<Vec<&mut [u16]>>> = Vec::new();
+        let mut it_lf: Vec<std::vec::IntoIter<Vec<&mut [u8]>>> = Vec::new();
+        for (p, (pl, lf)) in self.planes.iter_mut().zip(self.lf_tx.iter_mut()).enumerate() {
+            let (sx, sy) = if p == 0 { (0, 0) } else { (self.ss[0], self.ss[1]) };
+            let rows = bounds(rs, &|s| (s * 4) >> sy, pl.data.len() / pl.stride.max(1));
+            let cols = bounds(cs, &|s| (s * 4) >> sx, pl.stride);
+            it_planes.push(split_grid(&mut pl.data, pl.stride, &rows, &cols).into_iter());
+            let ls = self.lf_stride[p];
+            let rows = bounds(rs, &|s| s >> sy, lf.len() / ls.max(1));
+            let cols = bounds(cs, &|s| s >> sx, ls);
+            it_lf.push(split_grid(lf, ls, &rows, &cols).into_iter());
+        }
+        let ms = self.mi_stride;
+        let mut mi = split_grid(&mut self.mi, ms, &mi_rows, &mi_cols).into_iter();
+        let mut pal = split_grid(&mut self.pal_colors, ms, &mi_rows, &mi_cols).into_iter();
+        let mut dlf = split_grid(&mut self.delta_lf, ms, &mi_rows, &mi_cols).into_iter();
+        let cdef_rows = bounds(rs, &|s| s >> 4, h.mi_rows.div_ceil(16));
+        let mut cdef = split_grid(&mut self.cdef_idx, self.cdef_stride, &cdef_rows, &bounds(cs, &|s| s >> 4, self.cdef_stride)).into_iter();
+        let mv_rows = bounds(rs, &|s| s >> 1, h.mi_rows.div_ceil(2));
+        let mut mvs = split_grid(&mut self.saved_mvs, self.mvs_stride, &mv_rows, &bounds(cs, &|s| s >> 1, self.mvs_stride)).into_iter();
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let lf_tx = std::array::from_fn(|p| it_lf[p].next().unwrap_or_default());
+            out.push(TileOut {
+                planes: std::array::from_fn(|p| it_planes[p].next().unwrap_or_default()),
+                mi: mi.next().unwrap_or_default(),
+                pal_colors: pal.next().unwrap_or_default(),
+                delta_lf: dlf.next().unwrap_or_default(),
+                cdef_idx: cdef.next().unwrap_or_default(),
+                lf_tx,
+                saved_mvs: mvs.next().unwrap_or_default(),
+            });
+        }
+        out
+    }
+
+    /// Copies a tile worker's outputs into its tile's part of the frame: its planes, mode info,
+    /// palette colours, delta LF values, CDEF indices, loop filter transform sizes and saved
+    /// motion vectors (the restoration units are `merge_lr`'s).
+    pub(crate) fn write_out(&self, o: &mut TileOut) {
+        for p in 0..self.num_planes {
+            paste(&mut o.planes[p], &self.planes[p].data, self.planes[p].stride);
+        }
+        paste(&mut o.mi, &self.mi, self.mi_stride);
+        paste(&mut o.pal_colors, &self.pal_colors, self.mi_stride);
+        paste(&mut o.delta_lf, &self.delta_lf, self.mi_stride);
+        paste(&mut o.cdef_idx, &self.cdef_idx, self.cdef_stride);
+        for p in 0..3 {
+            paste(&mut o.lf_tx[p], &self.lf_tx[p], self.lf_stride[p]);
+        }
+        paste(&mut o.saved_mvs, &self.saved_mvs, self.mvs_stride);
+    }
+
+    /// Copies into the frame the restoration units that the superblocks of tile `tile` (its 4x4
+    /// rows and columns, as `FrameDec::tile`) read into `lr`.
+    pub(crate) fn merge_lr(&mut self, lr: &[lr::Units; 3], tile: [usize; 4]) {
+        let [rs, re, cs, ce] = tile;
+        for plane in 0..self.num_planes {
+            if self.h.lr_type[plane] == lr::RESTORE_NONE || self.h.allow_intrabc {
+                continue;
+            }
+            let ncols = self.lr[plane].cols;
+            for r in (rs..re).step_by(self.sb4) {
+                for c in (cs..ce).step_by(self.sb4) {
+                    let (rows, cols) = self.lr_unit_ranges(plane, r, c, self.sb4);
+                    for ur in rows {
+                        let i = ur * ncols;
+                        self.lr[plane].u[i + cols.start..i + cols.end].copy_from_slice(&lr[plane].u[i + cols.start..i + cols.end]);
+                    }
+                }
+            }
+        }
     }
 
     /// A `FrameDec` whose outputs cover the 4x4 rows `win[0]..win[1]` and columns `win[2]..win[3]`
@@ -1871,5 +2043,35 @@ pub(crate) fn scan_for(tx: usize, tt: u8) -> &'static [u16] {
         (16, 0) => &DEFAULT_32X8,
         (16, 1) => &MCOL_32X8,
         _ => &MROW_32X8,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{paste, split_grid};
+
+    /// A 7x5 grid split into 2x3 uneven rectangles, each filled from its own window: every
+    /// element lands once, in its own rectangle.
+    #[test]
+    fn tile_rectangles_cover_the_grid_once() {
+        let (stride, rows, cols) = (7, [0, 2, 5], [0, 3, 4, 7]);
+        let mut grid = vec![0u16; stride * 5];
+        for (t, mut part) in split_grid(&mut grid, stride, &rows, &cols).into_iter().enumerate() {
+            let (tr, tc) = (t / 3, t % 3);
+            let (h, w) = (rows[tr + 1] - rows[tr], cols[tc + 1] - cols[tc]);
+            assert_eq!(part.len(), h, "tile {t}");
+            assert!(part.iter().all(|r| r.len() == w), "tile {t}");
+            let window: Vec<u16> = (0..h * w).map(|i| (100 * t + i) as u16 + 1).collect();
+            paste(&mut part, &window, w);
+        }
+        for y in 0..5 {
+            for x in 0..stride {
+                let tr = (y >= 2) as usize;
+                let tc = if x < 3 { 0 } else if x < 4 { 1 } else { 2 };
+                let t = tr * 3 + tc;
+                let i = (y - rows[tr]) * (cols[tc + 1] - cols[tc]) + x - cols[tc];
+                assert_eq!(grid[y * stride + x], (100 * t + i) as u16 + 1, "({x}, {y})");
+            }
+        }
     }
 }

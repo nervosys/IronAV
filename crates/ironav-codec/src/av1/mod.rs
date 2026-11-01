@@ -111,20 +111,20 @@ pub struct Av1Decoder {
     refs: [Option<RefSlot>; 8],
     cur: Option<Current>,
     out: Vec<Frame>,
-    /// The threads the post filters may use (1: the caller's thread).
+    /// The threads the tiles and the post filters may use (1: the caller's thread).
     threads: usize,
 }
 
 impl Av1Decoder {
     /// `extradata` is the av1C box (or Matroska CodecPrivate), whose config OBUs may hold the
-    /// sequence header. The post filters use up to as many threads as the machine has (12 at
-    /// most).
+    /// sequence header. The tiles of a frame and its post filters use up to as many threads as the
+    /// machine has (12 at most).
     pub fn new(extradata: &[u8]) -> Self {
         Self::with_threads(extradata, std::thread::available_parallelism().map_or(1, |n| n.get()).min(12))
     }
 
-    /// As `new`, with the post filters on up to `threads` threads; 1 runs them on the caller's
-    /// thread. The output is the same either way.
+    /// As `new`, with the tiles and post filters on up to `threads` threads; 1 runs them on the
+    /// caller's thread. The output is the same either way.
     pub fn with_threads(extradata: &[u8], threads: usize) -> Self {
         let mut d = Av1Decoder { seq: None, refs: Default::default(), cur: None, out: Vec::new(), threads: threads.max(1) };
         if extradata.len() > 4 && extradata[0] & 0x80 != 0 {
@@ -208,7 +208,7 @@ impl Av1Decoder {
         let Some(cur) = self.cur.as_mut() else {
             return Err(invalid("a tile group without a frame header"));
         };
-        let res = Self::tiles(cur, data);
+        let res = Self::tiles(cur, data, self.threads);
         let last = match res {
             Ok(l) => l,
             Err(e) => {
@@ -223,7 +223,7 @@ impl Av1Decoder {
     }
 
     /// Decodes a tile group's tiles; returns whether it held the frame's last tile.
-    fn tiles(cur: &mut Current, data: &[u8]) -> Result<bool> {
+    fn tiles(cur: &mut Current, data: &[u8], threads: usize) -> Result<bool> {
         let h = &cur.f.h;
         let num = h.num_tiles();
         let mut b = Bits::new(data);
@@ -239,6 +239,7 @@ impl Av1Decoder {
         b.byte_align();
         let mut p = b.byte_pos();
         let (cols, tsb, ctx_tile) = (h.tile_cols, h.tile_size_bytes, h.context_update_tile_id);
+        let mut tiles = Vec::with_capacity(end + 1 - start);
         for tn in start..=end {
             let size = if tn == end {
                 data.len().checked_sub(p).ok_or_else(|| invalid("tile group too short"))?
@@ -247,14 +248,73 @@ impl Av1Decoder {
                 p += tsb;
                 b.iter().rev().fold(0usize, |a, &x| (a << 8) | x as usize) + 1
             };
-            let tile = data.get(p..p + size).ok_or_else(|| invalid("tile runs past the tile group"))?;
+            tiles.push((tn, data.get(p..p + size).ok_or_else(|| invalid("tile runs past the tile group"))?));
             p += size;
-            let out = cur.f.decode_tile(tile, tn / cols, tn % cols, cur.cdf.clone())?;
-            if tn == ctx_tile {
-                cur.saved = Some(out);
+        }
+        // Intra block copy predicts from the frame being decoded, so its tiles decode in place.
+        if threads > 1 && tiles.len() > 1 && !h.allow_intrabc {
+            for (tn, res) in Self::tiles_par(&mut cur.f, &cur.cdf, &tiles, threads) {
+                let out = res?;
+                if tn == ctx_tile {
+                    cur.saved = Some(out);
+                }
+            }
+        } else {
+            for (tn, tile) in tiles {
+                let out = cur.f.decode_tile(tile, tn / cols, tn % cols, cur.cdf.clone())?;
+                if tn == ctx_tile {
+                    cur.saved = Some(out);
+                }
             }
         }
         Ok(end == num - 1)
+    }
+
+    /// Decodes `tiles` (tile numbers and data) on up to `threads` threads: each tile from `cdf`
+    /// into a worker of its own (`FrameShared::tile_worker`), which then writes its outputs into
+    /// the tile's part of `f` (`FrameDec::split_outputs`). Returns each tile's final CDFs or
+    /// error, in tile order. When a tile fails, `f` is left part decoded.
+    fn tiles_par(f: &mut FrameDec, cdf: &Cdfs, tiles: &[(usize, &[u8])], threads: usize) -> Vec<(usize, Result<Box<Cdfs>>)> {
+        let cols = f.h.tile_cols;
+        let shared = f.shared();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        type Done = (usize, Result<Box<Cdfs>>, [lr::Units; 3], [usize; 4]);
+        let mut done: Vec<Done> = {
+            let outs: Vec<std::sync::Mutex<Option<block::TileOut>>> = f.split_outputs().into_iter().map(|o| std::sync::Mutex::new(Some(o))).collect();
+            std::thread::scope(|s| {
+                let workers: Vec<_> = (0..threads.min(tiles.len()))
+                    .map(|_| {
+                        s.spawn(|| {
+                            let mut out = Vec::new();
+                            loop {
+                                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                let Some(&(tn, data)) = tiles.get(i) else { break };
+                                let mut w = shared.tile_worker(tn / cols, tn % cols);
+                                let res = w.decode_tile(data, tn / cols, tn % cols, Box::new(cdf.clone()));
+                                if res.is_ok() {
+                                    if let Some(mut o) = outs[tn].lock().ok().and_then(|mut o| o.take()) {
+                                        w.write_out(&mut o);
+                                    }
+                                }
+                                // the worker's buffers are freed here, on its thread
+                                out.push((i, res, std::mem::take(&mut w.lr), w.tile));
+                            }
+                            out
+                        })
+                    })
+                    .collect();
+                workers.into_iter().flat_map(|w| w.join().unwrap_or_else(|e| std::panic::resume_unwind(e))).collect()
+            })
+        };
+        done.sort_by_key(|d| d.0);
+        done.into_iter()
+            .map(|(i, res, lr, tile)| {
+                if res.is_ok() {
+                    f.merge_lr(&lr, tile);
+                }
+                (tiles[i].0, res)
+            })
+            .collect()
     }
 
     fn finish(&mut self, pts: i64) -> Result<()> {

@@ -1,11 +1,12 @@
 //! Throughput of the software AV1 decoder alone, on an IVF file named by `IRONAV_AV1` (none is
 //! checked in: make one with FFmpeg and libaom, e.g. `ffmpeg -f lavfi -i testsrc2=size=1280x720:rate=30
 //! -frames:v 60 -c:v libaom-av1 -cpu-used 6 -crf 30 -aom-params enable-restoration=1:enable-cdef=1
-//! av1.ivf`). If `IRONAV_AV1_REF` names FFmpeg's decode of it as raw planar video
-//! (`ffmpeg -i av1.ivf -f rawvideo av1.yuv`), the output must match it byte for byte. For RGB
-//! streams (matrix_coefficients 0, 4:4:4) the output is packed `rgb24`, so the reference is
-//! `ffmpeg -i av1.ivf -f rawvideo -pix_fmt rgb24 av1.rgb`. `IRONAV_AV1_THREADS` sets the threads
-//! of the post filters (the decoder's default otherwise; 1 runs them on the calling thread).
+//! av1.ivf`; add `-tiles 2x2` for tiles, which decode in parallel). If `IRONAV_AV1_REF` names
+//! FFmpeg's decode of it as raw planar video (`ffmpeg -i av1.ivf -f rawvideo av1.yuv`), the output
+//! must match it byte for byte. For RGB streams (matrix_coefficients 0, 4:4:4) the output is
+//! packed `rgb24`, so the reference is `ffmpeg -i av1.ivf -f rawvideo -pix_fmt rgb24 av1.rgb`.
+//! `IRONAV_AV1_THREADS` sets the threads of the tiles and post filters (the decoder's default
+//! otherwise; 1 runs them on the calling thread).
 //! Run with `cargo test --release -p ironav-codec --test av1_perf -- --ignored --nocapture`.
 
 use ironav_codec::av1::Av1Decoder;
@@ -43,7 +44,7 @@ fn av1_decode_throughput() {
         let t = Instant::now();
         frames.clear();
         for (i, p) in packets.iter().enumerate() {
-            frames.extend(d.decode(&Packet { stream: 0, pts: i as i64, duration: 1, data: p.to_vec() }).unwrap());
+            frames.extend(d.decode(&Packet { stream: 0, pts: i as i64, duration: 1, data: p.to_vec() }).unwrap_or_else(|e| panic!("temporal unit {i}: {e}")));
         }
         best = best.min(t.elapsed().as_secs_f64());
     }
