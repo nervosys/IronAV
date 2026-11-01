@@ -393,7 +393,7 @@ pub fn audio_bitrate_range(codec: CodecId) -> Option<(u32, u32)> {
 
 /// Like `new_encoder`, with a target bit rate for the codecs that take one (`audio_bitrate_range`).
 pub fn new_encoder_with(codec: CodecId, params: &StreamParams, bits: Option<u8>, bitrate_kbps: Option<u32>) -> Result<Box<dyn Encoder>> {
-    new_encoder_with_opts(codec, params, bits, bitrate_kbps, None, None)
+    new_encoder_with_opts(codec, params, bits, bitrate_kbps, None, None, None)
 }
 
 /// Opus encoder settings beyond the bit rate. The defaults are the library's: CELT mode, 20 ms
@@ -423,8 +423,56 @@ impl OpusOptions {
     }
 }
 
-/// Like `new_encoder_with`, with Opus encoder settings for the Opus codec (other codecs ignore them).
-pub fn new_encoder_with_opts(codec: CodecId, params: &StreamParams, bits: Option<u8>, bitrate_kbps: Option<u32>, opus_opts: Option<&OpusOptions>, prores_profile: Option<prores::Profile>) -> Result<Box<dyn Encoder>> {
+/// Video encoder settings beyond the rate and the key frame interval, for the encoders that take them
+/// (the others ignore them). The defaults are the library's: no B pictures, the encoder's own tiles,
+/// half-sample motion search only, and no hidden ALTREF frames.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct VideoOptions {
+    /// B pictures between anchor pictures, for HEVC and MPEG-4 (0 to 3).
+    pub bframes: Option<usize>,
+    /// Tile columns and rows as log2 counts, for AV1 (`with_tiles`).
+    pub tiles: Option<(u32, u32)>,
+    /// Quarter-sample motion refinement, for AV1 (`with_quarter_mv`).
+    pub quarter_mv: bool,
+    /// Hidden ALTREF frames every this many frames, for AV1 (`with_altref`, 2 to 16).
+    pub altref: Option<usize>,
+}
+
+impl VideoOptions {
+    /// The settings for a HEVC encoder.
+    pub fn apply_hevc(&self, enc: hevc::HevcEncoder) -> hevc::HevcEncoder {
+        match self.bframes {
+            Some(n) => enc.with_bframes(n),
+            None => enc,
+        }
+    }
+
+    /// The settings for an MPEG-4 encoder.
+    pub fn apply_mpeg4(&self, enc: mpeg4::enc::Mpeg4Encoder) -> mpeg4::enc::Mpeg4Encoder {
+        match self.bframes {
+            Some(n) => enc.with_bframes(n),
+            None => enc,
+        }
+    }
+
+    /// The settings for an AV1 encoder.
+    pub fn apply_av1(&self, mut enc: av1::enc::Av1Encoder) -> av1::enc::Av1Encoder {
+        if let Some((cols_log2, rows_log2)) = self.tiles {
+            enc = enc.with_tiles(cols_log2, rows_log2);
+        }
+        if self.quarter_mv {
+            enc = enc.with_quarter_mv(true);
+        }
+        if let Some(lag) = self.altref {
+            enc = enc.with_altref(lag);
+        }
+        enc
+    }
+}
+
+/// Like `new_encoder_with`, with Opus encoder settings for the Opus codec (other codecs ignore them), and
+/// with `video` settings for the HEVC, MPEG-4 and AV1 encoders (other codecs ignore them).
+pub fn new_encoder_with_opts(codec: CodecId, params: &StreamParams, bits: Option<u8>, bitrate_kbps: Option<u32>, opus_opts: Option<&OpusOptions>, prores_profile: Option<prores::Profile>, video: Option<&VideoOptions>) -> Result<Box<dyn Encoder>> {
     match (codec, params) {
         (c, StreamParams::Audio { .. }) if c.sample_format().is_some() => Ok(Box::new(pcm::PcmEncoder::new(c.sample_format().unwrap()))),
         (CodecId::Flac, StreamParams::Audio { sample_rate, channels }) => Ok(Box::new(flac::FlacEncoder::new(*sample_rate, *channels, bits)?)),
@@ -464,11 +512,29 @@ pub fn new_encoder_with_opts(codec: CodecId, params: &StreamParams, bits: Option
         (CodecId::Mjpeg, StreamParams::Video { .. }) => Ok(Box::new(jpeg::JpegEncoder::new(jpeg::JpegEncoder::default_quality()))),
         (CodecId::ProRes, StreamParams::Video { .. }) => Ok(Box::new(prores::ProResEncoder::new(params, prores_profile.unwrap_or(prores::Profile::Hq))?)),
         (CodecId::H264, StreamParams::Video { .. }) => Ok(Box::new(h264::H264Encoder::new(params, None, bitrate_kbps.map(|k| k.saturating_mul(1000)))?)),
-        (CodecId::Hevc, StreamParams::Video { .. }) => Ok(Box::new(hevc::HevcEncoder::new(params, None, bitrate_kbps.map(|k| k.saturating_mul(1000)))?)),
+        (CodecId::Hevc, StreamParams::Video { .. }) => {
+            let enc = hevc::HevcEncoder::new(params, None, bitrate_kbps.map(|k| k.saturating_mul(1000)))?;
+            Ok(Box::new(match video {
+                Some(v) => v.apply_hevc(enc),
+                None => enc,
+            }))
+        }
         (CodecId::Vp8, StreamParams::Video { .. }) => Ok(Box::new(vp8::Vp8Encoder::new(params, None, bitrate_kbps.map(|k| k.saturating_mul(1000)))?)),
         (CodecId::Vp9, StreamParams::Video { .. }) => Ok(Box::new(vp9::Vp9Encoder::new(params, None)?)),
-        (CodecId::Mpeg4, StreamParams::Video { .. }) => Ok(Box::new(mpeg4::enc::Mpeg4Encoder::new(params, None, bitrate_kbps.map(|k| k.saturating_mul(1000)))?)),
-        (CodecId::Av1, StreamParams::Video { .. }) => Ok(Box::new(av1::enc::Av1Encoder::new(params, None, bitrate_kbps.map(|k| k.saturating_mul(1000)))?)),
+        (CodecId::Mpeg4, StreamParams::Video { .. }) => {
+            let enc = mpeg4::enc::Mpeg4Encoder::new(params, None, bitrate_kbps.map(|k| k.saturating_mul(1000)))?;
+            Ok(Box::new(match video {
+                Some(v) => v.apply_mpeg4(enc),
+                None => enc,
+            }))
+        }
+        (CodecId::Av1, StreamParams::Video { .. }) => {
+            let enc = av1::enc::Av1Encoder::new(params, None, bitrate_kbps.map(|k| k.saturating_mul(1000)))?;
+            Ok(Box::new(match video {
+                Some(v) => v.apply_av1(enc),
+                None => enc,
+            }))
+        }
         (c, p) if c.media_type() != p.media_type() => Err(Error::invalid_arg(format!(
             "codec {} is {:?} but the stream is {:?}",
             c.name(),
@@ -481,7 +547,7 @@ pub fn new_encoder_with_opts(codec: CodecId, params: &StreamParams, bits: Option
 
 /// The codec configuration for a stream from `new_encoder_with_opts` with the same arguments: as
 /// `encoder_extradata`, but an Opus head carries the pre-skip of the mode asked for.
-pub fn encoder_extradata_with_opts(codec: CodecId, params: &StreamParams, bitrate_kbps: Option<u32>, opus_opts: Option<&OpusOptions>, prores_profile: Option<prores::Profile>) -> Result<Vec<u8>> {
+pub fn encoder_extradata_with_opts(codec: CodecId, params: &StreamParams, bitrate_kbps: Option<u32>, opus_opts: Option<&OpusOptions>, prores_profile: Option<prores::Profile>, video: Option<&VideoOptions>) -> Result<Vec<u8>> {
     match (codec, params, opus_opts) {
         (CodecId::Opus, StreamParams::Audio { sample_rate, channels }, Some(o)) if *channels > 2 => {
             let bitrate = bitrate_kbps.map_or(opus::OpusEncoder::default_bitrate(*channels as usize), |k| k * 1000);
@@ -490,6 +556,9 @@ pub fn encoder_extradata_with_opts(codec: CodecId, params: &StreamParams, bitrat
         (CodecId::Opus, StreamParams::Audio { sample_rate, channels }, Some(o)) => {
             let bitrate = bitrate_kbps.map_or(opus::OpusEncoder::default_bitrate(*channels as usize), |k| k * 1000);
             Ok(o.apply(opus::OpusEncoder::new(*sample_rate, *channels as usize, bitrate)?)?.head())
+        }
+        (CodecId::Mpeg4, StreamParams::Video { width, height, frame_rate, .. }, _) if video.and_then(|v| v.bframes).is_some_and(|n| n > 0) => {
+            Ok(mpeg4::enc::config_with_bframes(*width, *height, if frame_rate.num > 0 { frame_rate.num } else { 25 }))
         }
         (CodecId::ProRes, StreamParams::Video { .. }, _) => Ok(prores_profile.unwrap_or(prores::Profile::Hq).fourcc().to_vec()),
         _ => Ok(encoder_extradata(codec, params)),

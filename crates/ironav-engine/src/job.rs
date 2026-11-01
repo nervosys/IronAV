@@ -68,10 +68,36 @@ pub struct StreamOpts {
     /// predict from, 1 to 16. Default 3.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refs: Option<u32>,
+    /// Video only, for the `hevc` and `mpeg4` encoders: B pictures between anchor pictures, 0 to 3.
+    /// Default 0. The GPU encoder (NVENC) codes none, so it ignores this. Not with `latency: low`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bframes: Option<u32>,
+    /// Video only, for the `av1` encoder: the tile grid as `COLSxROWS`, each a power of two from 1 to
+    /// 64, for example `2x1` (two tile columns, one row). Default: two columns for pictures 1280
+    /// samples wide or more, otherwise one tile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tiles: Option<String>,
+    /// Video only, for the `av1` encoder: refine motion vectors to quarter samples as well as half
+    /// (a little smaller, slower). Default false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub quarter_mv: bool,
+    /// Video only, for the `av1` encoder: code hidden ALTREF frames, one per group of this many frames
+    /// (2 to 16), shown later, with the frames between predicting from them. Default off. Not with
+    /// `latency: low`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub altref: Option<u32>,
     /// Video only, for the `prores` codec: the profile. Default `hq`. The 4444 profiles keep 4:4:4
     /// chroma (10-bit input, or 12-bit); the others are 4:2:2 at 10 bits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prores_profile: Option<ProResProfile>,
+}
+
+/// Parses a tile grid such as `2x1` (`COLSxROWS`): each count a power of two from 1 to 64. None when it is not.
+pub fn parse_tiles(s: &str) -> Option<(u32, u32)> {
+    let (cols, rows) = s.split_once('x')?;
+    let (cols, rows): (u32, u32) = (cols.parse().ok()?, rows.parse().ok()?);
+    let ok = |n: u32| n.is_power_of_two() && n <= 64;
+    (ok(cols) && ok(rows)).then_some((cols, rows))
 }
 
 /// The ProRes profiles (see `StreamOpts::prores_profile`).

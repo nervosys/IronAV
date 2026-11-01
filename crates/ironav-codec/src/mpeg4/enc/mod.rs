@@ -87,6 +87,11 @@ pub fn config(width: u32, height: u32, num: i64) -> Vec<u8> {
     layer_config(width, height, num, false)
 }
 
+/// The codec configuration of a stream with B pictures (`with_bframes`): the Advanced Simple profile's.
+pub fn config_with_bframes(width: u32, height: u32, num: i64) -> Vec<u8> {
+    layer_config(width, height, num, true)
+}
+
 /// The start codes and the layer header as `config` writes them, in the Simple profile, or in the
 /// Advanced Simple profile when `advanced` is set, which B pictures need: its layer carries a version
 /// and its profile is the one FFmpeg writes for B pictures (level 1).

@@ -7,7 +7,7 @@ use ironav_codec::mpeg4::enc::Mpeg4Encoder;
 use ironav_codec::vp8::Vp8Encoder;
 use ironav_codec::vp9::Vp9Encoder;
 use ironav_codec::av1::enc::Av1Encoder;
-use ironav_codec::{build_filter, new_encoder_with_opts};
+use ironav_codec::{build_filter, new_encoder_with_opts, VideoOptions};
 use ironav_core::{CodecId, Decoder, Encoder, Error, ErrorCode, Filter, Frame, MediaType, Packet, Rational, Result};
 use ironav_hwaccel::{new_video_decoder, new_video_encoder, Direction, RateControl};
 use ironav_formats::{create_muxer_with, open_demuxer};
@@ -174,6 +174,12 @@ fn execute(
             for fc in &st.filters {
                 fs.push(build_filter(&fc.name, &fc.args)?);
             }
+            let video = VideoOptions {
+                bframes: st.bframes.map(|n| n as usize),
+                tiles: st.tiles.map(|(cols, rows)| (cols.trailing_zeros(), rows.trailing_zeros())),
+                quarter_mv: st.quarter_mv,
+                altref: st.altref.map(|n| n as usize),
+            };
             let hw = st.hardware.iter().find(|h| h.direction == Direction::Encode).and_then(|h| h.chosen);
             let encoder = match hw {
                 Some(backend) if dst.params.media_type() == MediaType::Video => {
@@ -189,7 +195,7 @@ fn execute(
                         RateControl::ConstQp(q) => (Some(q), None),
                         RateControl::Bitrate(b) => (None, Some(b)),
                     };
-                    let e = HevcEncoder::new(&dst.params, qp, bitrate)?;
+                    let e = video.apply_hevc(HevcEncoder::new(&dst.params, qp, bitrate)?);
                     Box::new(match st.keyint {
                         Some(k) => e.with_keyint(k.into()),
                         None => e,
@@ -226,7 +232,7 @@ fn execute(
                         RateControl::ConstQp(q) => (Some(q), None),
                         RateControl::Bitrate(b) => (None, Some(b)),
                     };
-                    let e = Av1Encoder::new(&dst.params, qp, bitrate)?;
+                    let e = video.apply_av1(Av1Encoder::new(&dst.params, qp, bitrate)?);
                     Box::new(match st.keyint {
                         Some(k) => e.with_keyint(k.into()),
                         None => e,
@@ -249,7 +255,7 @@ fn execute(
                         RateControl::ConstQp(q) => (Some(q), None),
                         RateControl::Bitrate(b) => (None, Some(b)),
                     };
-                    let e = Mpeg4Encoder::new(&dst.params, qp, bitrate)?;
+                    let e = video.apply_mpeg4(Mpeg4Encoder::new(&dst.params, qp, bitrate)?);
                     Box::new(match st.keyint {
                         Some(k) => e.with_keyint(k.into()),
                         None => e,
@@ -257,7 +263,7 @@ fn execute(
                 }
                 _ => {
                     let opus = st.opus.as_ref().map(OpusJob::codec_options);
-                    new_encoder_with_opts(dst.codec, &dst.params, dst.bits, st.bitrate_kbps, opus.as_ref(), st.prores_profile.map(ProResProfile::codec_profile))?
+                    new_encoder_with_opts(dst.codec, &dst.params, dst.bits, st.bitrate_kbps, opus.as_ref(), st.prores_profile.map(ProResProfile::codec_profile), Some(&video))?
                 }
             };
             let hw_dec = st.hardware.iter().find(|h| h.direction == Direction::Decode).and_then(|h| h.chosen);

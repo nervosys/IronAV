@@ -1,5 +1,5 @@
-use crate::job::{FilterCall, Job};
-use ironav_codec::{audio_bitrate_range, build_filter, encoder_extradata_with_opts, new_encoder_with_opts, FILTERS};
+use crate::job::{parse_tiles, FilterCall, Job};
+use ironav_codec::{audio_bitrate_range, build_filter, encoder_extradata_with_opts, new_encoder_with_opts, VideoOptions, FILTERS};
 use ironav_core::{CodecId, Error, ErrorCode, MediaType, PixelFormat, Result, SampleFormat, StreamInfo, StreamParams};
 use ironav_formats::{find_format, format_for_path, open_demuxer};
 use crate::job::{Latency, OpusJob, ProResProfile, StreamOpts};
@@ -38,6 +38,18 @@ pub struct Step {
     /// The reference pictures asked for a P picture, when the software H.264 encoder is used.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refs: Option<u32>,
+    /// The B pictures asked for, when the video is written as hevc or mpeg4.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bframes: Option<u32>,
+    /// The AV1 tile columns and rows asked for, as counts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tiles: Option<(u32, u32)>,
+    /// Quarter-sample motion refinement, for AV1.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub quarter_mv: bool,
+    /// The hidden ALTREF lag asked for, for AV1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub altref: Option<u32>,
     /// The ProRes profile asked for, when the video is written as prores.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prores_profile: Option<ProResProfile>,
@@ -127,6 +139,14 @@ impl Plan {
     pub fn input_at(&self, file: usize) -> &InputSummary {
         if file == 0 { &self.input } else { &self.extra_inputs[file - 1] }
     }
+}
+
+/// The refusal for an AV1-only setting (`name`) on audio, or on a video written as another codec.
+fn av1_only(name: &str, media: MediaType, to: CodecId) -> Error {
+    if media == MediaType::Audio {
+        return Error::invalid_arg(format!("{name} applies to video streams only"));
+    }
+    Error::invalid_arg(format!("{name} applies to the av1 encoder, and this video is written as {}", to.name())).hint(format!("set the video codec to av1, or leave {name} out"))
 }
 
 pub fn plan(job: &Job) -> Result<Plan> {
@@ -287,7 +307,8 @@ pub fn plan(job: &Job) -> Result<Plan> {
             || (media == MediaType::Audio && opts.opus.is_some())
             || (media == MediaType::Video && opts.prores_profile.is_some())
             || (media == MediaType::Video && opts.keyint.is_some())
-            || (media == MediaType::Video && opts.refs.is_some());
+            || (media == MediaType::Video && opts.refs.is_some())
+            || (media == MediaType::Video && (opts.bframes.is_some() || opts.tiles.is_some() || opts.quarter_mv || opts.altref.is_some()));
         let action = if to == s.codec && chain.is_empty() && !rate_wanted { Action::Copy } else { Action::Transcode };
         if rate_wanted && to == s.codec && chain.is_empty() {
             warnings.push(format!("{at}: a rate, quality, latency or encoder setting was set, so the {} stream is re-encoded instead of copied", to.name()));
@@ -330,6 +351,49 @@ pub fn plan(job: &Job) -> Result<Plan> {
                     .hint("set the video codec to h264, or leave refs out"));
             }
         }
+        if let Some(n) = opts.bframes {
+            if media == MediaType::Audio {
+                return Err(Error::invalid_arg("bframes applies to video streams only"));
+            }
+            if n > 3 {
+                return Err(Error::invalid_arg(format!("bframes must be from 0 to 3, not {n}")));
+            }
+            if !matches!(to, CodecId::Hevc | CodecId::Mpeg4) {
+                return Err(Error::invalid_arg(format!("bframes applies to the hevc and mpeg4 encoders, and this video is written as {}", to.name()))
+                    .hint("set the video codec to hevc or mpeg4, or leave bframes out")
+                    .alternatives(["hevc", "mpeg4"]));
+            }
+            if n > 0 && low {
+                return Err(Error::invalid_arg("bframes conflicts with latency low, which codes no B pictures").hint("leave latency at normal, or set bframes to 0"));
+            }
+        }
+        let tile_grid = match opts.tiles.as_deref() {
+            None => None,
+            Some(t) => {
+                if media == MediaType::Audio || to != CodecId::Av1 {
+                    return Err(av1_only("tiles", media, to));
+                }
+                Some(parse_tiles(t).ok_or_else(|| {
+                    Error::invalid_arg(format!("tiles must be COLSxROWS, each a power of two from 1 to 64, got '{t}'"))
+                        .hint("for example 2x1 for two tile columns and one row, or 2x2 for four tiles")
+                })?)
+            }
+        };
+        if opts.quarter_mv && (media == MediaType::Audio || to != CodecId::Av1) {
+            return Err(av1_only("quarter_mv", media, to));
+        }
+        if let Some(lag) = opts.altref {
+            if media == MediaType::Audio || to != CodecId::Av1 {
+                return Err(av1_only("altref", media, to));
+            }
+            if !(2..=16).contains(&lag) {
+                return Err(Error::invalid_arg(format!("altref must be a lag from 2 to 16 frames, not {lag}"))
+                    .hint("the lag is how many frames each hidden ALTREF group spans; leave altref out for none"));
+            }
+            if low {
+                return Err(Error::invalid_arg("altref conflicts with latency low, which holds no frames back").hint("leave latency at normal, or leave altref out"));
+            }
+        }
         if opts.prores_profile.is_some() {
             if media == MediaType::Audio {
                 return Err(Error::invalid_arg("prores_profile applies to video streams only").hint("set the video codec to prores instead"));
@@ -348,6 +412,12 @@ pub fn plan(job: &Job) -> Result<Plan> {
         if media == MediaType::Video && low && action == Action::Copy {
             return Err(Error::invalid_arg("latency has no effect when the stream is copied").hint("set a video codec (for example h264) to re-encode"));
         }
+        let video = (media == MediaType::Video).then(|| VideoOptions {
+            bframes: opts.bframes.map(|n| n as usize),
+            tiles: tile_grid.map(|(cols, rows)| (cols.trailing_zeros(), rows.trailing_zeros())),
+            quarter_mv: opts.quarter_mv,
+            altref: opts.altref.map(|n| n as usize),
+        });
         let mut audio_kbps = None;
         if media == MediaType::Audio && opts.bitrate_kbps.is_some() {
             let Some((lo, hi)) = audio_bitrate_range(to).filter(|_| action == Action::Transcode) else {
@@ -428,6 +498,9 @@ pub fn plan(job: &Job) -> Result<Plan> {
                 hardware.push(select(to, Direction::Encode, policy, &probes)?);
             }
             let hw_chosen = hardware.iter().any(|h| h.direction == Direction::Encode && h.chosen.is_some());
+            if hw_chosen && opts.bframes.is_some_and(|n| n > 0) {
+                warnings.push(format!("{at}: the GPU encoder codes no B pictures, so bframes is ignored"));
+            }
             if hw_chosen {
                 #[cfg(any(windows, target_os = "linux"))]
                 ironav_hwaccel::nvenc::accepts(&params, to).map_err(|m| {
@@ -445,7 +518,7 @@ pub fn plan(job: &Job) -> Result<Plan> {
                     "run `ironav hw probe`; NVENC needs an NVIDIA GPU with a driver that supports NVENC API 13.1"
                 }));
             } else {
-                new_encoder_with_opts(to, &params, bits, audio_kbps, codec_opus.as_ref(), prores)?;
+                new_encoder_with_opts(to, &params, bits, audio_kbps, codec_opus.as_ref(), prores, video.as_ref())?;
             }
         }
 
@@ -464,11 +537,11 @@ pub fn plan(job: &Job) -> Result<Plan> {
             time_base,
             duration,
             bits,
-            extradata: if action == Action::Copy { s.extradata.clone() } else { encoder_extradata_with_opts(to, &params, audio_kbps, codec_opus.as_ref(), prores)? },
+            extradata: if action == Action::Copy { s.extradata.clone() } else { encoder_extradata_with_opts(to, &params, audio_kbps, codec_opus.as_ref(), prores, video.as_ref())? },
             lead_in: if action == Action::Copy { s.lead_in } else { ironav_codec::encoder_lead_in(to) },
             params,
         });
-        steps.push(Step { input_file: file, input_stream: s.index, output_stream: steps.len(), action, from_codec: s.codec, to_codec: to, filters: chain, bitrate_kbps: audio_kbps, opus: opts.opus.clone(), prores_profile: opts.prores_profile, keyint: if media == MediaType::Video && action == Action::Transcode { opts.keyint } else { None }, refs: if media == MediaType::Video && action == Action::Transcode { opts.refs } else { None }, qp: if media == MediaType::Video && action == Action::Transcode { opts.qp } else { None }, low_latency: media == MediaType::Video && action == Action::Transcode && low, hardware });
+        steps.push(Step { input_file: file, input_stream: s.index, output_stream: steps.len(), action, from_codec: s.codec, to_codec: to, filters: chain, bitrate_kbps: audio_kbps, opus: opts.opus.clone(), prores_profile: opts.prores_profile, keyint: if media == MediaType::Video && action == Action::Transcode { opts.keyint } else { None }, refs: if media == MediaType::Video && action == Action::Transcode { opts.refs } else { None }, bframes: if media == MediaType::Video && action == Action::Transcode { opts.bframes } else { None }, tiles: if media == MediaType::Video && action == Action::Transcode { tile_grid } else { None }, quarter_mv: media == MediaType::Video && action == Action::Transcode && opts.quarter_mv, altref: if media == MediaType::Video && action == Action::Transcode { opts.altref } else { None }, qp: if media == MediaType::Video && action == Action::Transcode { opts.qp } else { None }, low_latency: media == MediaType::Video && action == Action::Transcode && low, hardware });
     }
 
     if let Some(i) = used.iter().position(|u| !u) {
