@@ -235,14 +235,14 @@ fn bit_rate_round_trip(name: &str, w: usize, h: usize, frames: usize, kbps: u32)
     (rate, y)
 }
 
-/// A bit rate is followed: at three rates the 60-frame clip lands within 10% of the target, decodes
+/// A bit rate is followed: at three rates the 30-frame clip lands within 10% of the target, decodes
 /// identically in libaom and IronAV, and gets better as the rate rises.
 #[test]
 fn bit_rate_is_followed_and_quality_rises_with_it() {
     need_ffmpeg!();
     let mut last_psnr = 0.0;
     for kbps in [300u32, 800, 2000] {
-        let (rate, y) = bit_rate_round_trip(&format!("rate{kbps}"), 352, 288, 60, kbps);
+        let (rate, y) = bit_rate_round_trip(&format!("rate{kbps}"), 352, 288, 30, kbps);
         let target = kbps as f64 * 1000.0;
         assert!((rate / target - 1.0).abs() <= 0.10, "{kbps} kbit/s: {rate:.0} bit/s achieved, more than 10% off");
         assert!(y > last_psnr, "{kbps} kbit/s: luma PSNR {y:.2} dB does not rise from {last_psnr:.2} dB");

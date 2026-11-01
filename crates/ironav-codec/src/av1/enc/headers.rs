@@ -170,6 +170,8 @@ pub struct FrameParams {
     /// name the slot of LAST_FRAME), and the slots the frame refreshes (inter frames only).
     pub ref_slots: [u8; 3],
     pub refresh: u8,
+    /// Whether inter frames may code compound blocks (reference_select).
+    pub reference_select: bool,
 }
 
 /// The uncompressed header of a shown frame, byte aligned, as the frame OBU starts with it. A key
@@ -256,7 +258,7 @@ pub fn frame_header(p: &FrameParams) -> Vec<u8> {
     }
     b.put(0, 1); // read_tx_mode: TX_MODE_LARGEST
     if !p.key {
-        b.put(0, 1); // reference_select: single reference
+        b.put(p.reference_select as u32, 1); // reference_select
     }
     b.put(0, 1); // reduced_tx_set
     if !p.key {
@@ -296,7 +298,7 @@ mod tests {
 
     #[test]
     fn frame_headers_read_back() {
-        let p = FrameParams { key: true, width: 352, height: 288, base_q_idx: 115, lf_level: 10, cdef: [3, 1, 1, 0], superres: None, restoration: false, ref_slots: [0; 3], refresh: 0xff };
+        let p = FrameParams { key: true, width: 352, height: 288, base_q_idx: 115, lf_level: 10, cdef: [3, 1, 1, 0], superres: None, restoration: false, ref_slots: [0; 3], refresh: 0xff, reference_select: false };
         let hdr = frame_header(&p);
         let mut b = Bits::new(&hdr);
         assert_eq!(b.f(1).unwrap(), 0); // show_existing_frame

@@ -2,7 +2,8 @@
 //! encoders), and inter frames between them. Profile 0, 8-bit 4:2:0, one tile.
 //!
 //! Each frame is a temporal unit: a temporal delimiter, the sequence header, and a frame OBU with
-//! the frame's header and its tile. An inter frame predicts from one of the three frames before it
+//! the frame's header and its tile. An inter frame predicts from one of the three frames before it, or
+//! from the average of LAST_FRAME and LAST2_FRAME or LAST3_FRAME (compound, `with_compound`)
 //! (LAST_FRAME, LAST2_FRAME and LAST3_FRAME, held in reference slots that each frame refreshes in
 //! turn; `with_refs(1)` limits it to LAST_FRAME), with the regular 8-tap filter, quarter-sample motion
 //! vectors (searched to half samples) and the reference MV stack's candidates. LAST_FRAME is searched
@@ -100,6 +101,8 @@ pub struct Av1Encoder {
     head: usize,
     /// How many references a block may use: 1 (LAST_FRAME alone) or 3 (see `with_refs`).
     nrefs: usize,
+    /// Whether blocks may code compound predictions of two references (see `with_compound`).
+    compound: bool,
     /// The source luma of the last frame, which the next frame's motion field reads.
     prev_src: Option<Plane>,
     /// The forward transform bases, built on first use and kept across frames.
@@ -147,6 +150,7 @@ impl Av1Encoder {
             dpb: [None, None, None],
             head: 0,
             nrefs: 3,
+            compound: true,
             prev_src: None,
             bases: fwd::Bases::default(),
             superres: None,
@@ -165,6 +169,15 @@ impl Av1Encoder {
     /// its rate-distortion cost.
     pub fn with_refs(mut self, n: usize) -> Self {
         self.nrefs = n.clamp(1, 3);
+        self
+    }
+
+    /// Lets blocks code compound predictions: the average of two references (LAST_FRAME with
+    /// LAST2_FRAME or LAST3_FRAME, unidirectional), chosen by rate-distortion cost with the other
+    /// modes. On by default; it needs `with_refs(3)`, since with one reference no compound block is
+    /// possible. `with_compound(false)` codes every block with one reference.
+    pub fn with_compound(mut self, on: bool) -> Self {
+        self.compound = on;
         self
     }
 
@@ -258,6 +271,7 @@ impl Av1Encoder {
             restoration: self.restoration,
             ref_slots: ref_slots.map(|s| s as u8),
             refresh: if key { 0xff } else { 1 << new_slot },
+            reference_select: self.compound,
         };
         let hdr = headers::frame_header(&params);
 
@@ -279,7 +293,7 @@ impl Av1Encoder {
                 f.refs[rf] = self.dpb[slot].as_ref().map(|(pic, _)| pic.clone());
             }
         }
-        let enc = tile::FrameEnc::new(f, planes[0], planes[1], planes[2], (coded_w, h), self.prev_src.clone(), std::mem::take(&mut self.bases), self.nrefs);
+        let enc = tile::FrameEnc::new(f, planes[0], planes[1], planes[2], (coded_w, h), self.prev_src.clone(), std::mem::take(&mut self.bases), self.nrefs, self.compound);
         let (tile_bytes, mut f, src_luma, bases) = enc.encode();
         self.bases = bases;
 
@@ -440,8 +454,8 @@ mod tests {
     /// and the moving clip is coded with inter frames at a useful quality.
     #[test]
     fn inter_frames_decode_to_the_encoders_reconstruction() {
-        for &(w, h, nrefs) in &[(96usize, 64usize, 1usize), (177, 99, 1), (96, 64, 3), (177, 99, 3)] {
-            let mut enc = Av1Encoder::new(&params(w, h), Some(24), None).unwrap().with_keyint(4).with_refs(nrefs);
+        for &(w, h, nrefs, compound) in &[(96usize, 64usize, 1usize, false), (177, 99, 1, false), (96, 64, 3, false), (177, 99, 3, false), (96, 64, 3, true), (177, 99, 3, true)] {
+            let mut enc = Av1Encoder::new(&params(w, h), Some(24), None).unwrap().with_keyint(4).with_refs(nrefs).with_compound(compound);
             let mut dec = Av1Decoder::new(&[]);
             for t in 0..6 {
                 let src = picture_shifted(w, h, 2 * t);

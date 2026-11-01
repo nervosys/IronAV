@@ -10,7 +10,7 @@ use super::tables::*;
 const LAST2_FRAME: i8 = 2;
 const LAST3_FRAME: i8 = 3;
 const ALTREF2_FRAME: i8 = 6;
-const COMPOUND_MODE_CTX_MAP: [[usize; 5]; 3] = [[0, 1, 1, 1, 1], [1, 2, 3, 4, 4], [4, 4, 5, 6, 7]];
+pub(crate) const COMPOUND_MODE_CTX_MAP: [[usize; 5]; 3] = [[0, 1, 1, 1, 1], [1, 2, 3, 4, 4], [4, 4, 5, 6, 7]];
 
 /// Whether wedges exist for a block size (Wedge_Bits is not 0).
 pub(crate) fn wedge_used(bs: usize) -> bool {
