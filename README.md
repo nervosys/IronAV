@@ -1025,7 +1025,8 @@ and greedy bit allocation, and the same scale factor codes. For the same 16-bit 
 sweep). The stream carries one more frame than FFmpeg's, so that the decoder's 481-sample delay is flushed. On a 3 s sweep, FFmpeg decodes
 our 192 kb/s 44.1 kHz stereo stream to 23.1 dB SNR (its own stream: 23.1 dB), 128 kb/s 48 kHz stereo to 16.3 dB, 64 kb/s 32 kHz stereo to
 9.2 dB, and 96 kb/s 48 kHz mono to 21.9 dB. Layer II has no psychoacoustic model here, so the SNR is what the bit rate buys. MP4 has an
-edit list that skips the delay; `.mp2`, Matroska and MPEG-TS files do not, so FFmpeg plays them 481 samples late, as it does MP3 in those.
+edit list that skips the delay; `.mp2` and MPEG-TS files do not, so FFmpeg plays them 481 samples late, as it does MP3 in those. Matroska
+carries the delay as CodecDelay (for MP2 and MP3 as for AAC and Opus), which FFmpeg trims: its decoding lines up with the input, and so does IronAV's reading of the file.
 
 ## Matroska output
 

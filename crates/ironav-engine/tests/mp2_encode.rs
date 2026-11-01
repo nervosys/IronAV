@@ -224,6 +224,39 @@ fn containers_hold_mp2() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// MPEG audio IronAV writes into Matroska carries its encoder's lead-in as CodecDelay, which FFmpeg
+/// trims: its decoding then lines up with the input at lag 0 (without the delay it is 481 or 1057
+/// samples late). IronAV reads its own file the same way.
+#[test]
+fn mpeg_audio_in_matroska_has_its_codec_delay_trimmed() {
+    if !ffmpeg_available() {
+        eprintln!("skipped: ffmpeg is not on PATH");
+        return;
+    }
+    let d = scratch("mkv-delay");
+    let input = sweep(44100, 2, 0.4);
+    let wav = d.join("in.wav");
+    write_wav(&wav, &input, 2, 44100);
+    for codec in ["mp2", "mp3"] {
+        let out = d.join(format!("out_{codec}.mkv"));
+        let mut j = Job { input: wav.display().to_string(), output: out.display().to_string(), hwaccel: "auto".into(), ..Job::default() };
+        j.audio.codec = Some(codec.into());
+        run(&j, &mut |_| {}).unwrap_or_else(|e| panic!("{codec}: {e:?}"));
+
+        let raw = d.join(format!("out_{codec}.s16le"));
+        ffmpeg(&["-i", out.to_str().unwrap(), "-map", "0:a:0", "-f", "s16le", "-acodec", "pcm_s16le", raw.to_str().unwrap()]);
+        let decoded: Vec<i16> = std::fs::read(&raw).unwrap().as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes(*b)).collect();
+        let (lag, _) = best_lag(&input, &decoded, 2);
+        assert_eq!(lag, 0, "{codec}: FFmpeg's decoding of the Matroska file starts {lag} frames after the input");
+
+        let back = d.join(format!("back_{codec}.wav"));
+        run(&job(&out, &back), &mut |_| {}).unwrap();
+        let (lag, _) = best_lag(&input, &wav_data_i16(&back), 2);
+        assert_eq!(lag, 0, "{codec}: IronAV's reading of the Matroska file starts {lag} frames after the input");
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 fn job(input: &Path, output: &Path) -> Job {
     Job { input: input.display().to_string(), output: output.display().to_string(), hwaccel: "auto".into(), ..Job::default() }
 }

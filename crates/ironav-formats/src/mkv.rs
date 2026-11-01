@@ -783,7 +783,8 @@ fn build_track(t: &MkTrack, index: usize, frames: &[&Frame], scale: u64, samples
                 time_base = Rational::new(1, rate as i64);
                 // AAC's codec delay is its priming, and its discard padding (the last block's) the end
                 // padding: the stream is the samples between them, as FFmpeg reads it
-                if codec == CodecId::Aac {
+                // (MPEG audio's codec delay is its encoder's priming, which FFmpeg drops too)
+                if matches!(codec, CodecId::Aac | CodecId::Mp2 | CodecId::Mp3) {
                     let to_samples = |ns: i64| ((ns.max(0) as i128 * rate as i128 + 500_000_000) / 1_000_000_000) as i64;
                     let delay = to_samples(t.delay_ns.min(i64::MAX as u64) as i64);
                     if delay > 0 {

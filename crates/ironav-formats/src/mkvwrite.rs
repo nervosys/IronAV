@@ -292,8 +292,8 @@ impl MatroskaWriter {
                         let ns = t.first_duration as u128 * 1_000_000_000 * s.time_base.num as u128 / s.time_base.den as u128;
                         e.extend(uint(0x23_E383, ns as u64));
                     }
-                    // AAC's priming is its codec delay, which the decoder drops (FFmpeg does too)
-                    if s.codec == CodecId::Aac && s.lead_in > 0 && s.time_base.num == 1 && s.time_base.den == *sample_rate as i64 {
+                    // AAC's and MPEG audio's priming is their codec delay, which the decoder drops (FFmpeg does too)
+                    if matches!(s.codec, CodecId::Aac | CodecId::Mp2 | CodecId::Mp3) && s.lead_in > 0 && s.time_base.num == 1 && s.time_base.den == *sample_rate as i64 {
                         e.extend(uint(0x56AA, s.lead_in as u64 * 1_000_000_000 / *sample_rate as u64));
                     }
                     if s.codec == CodecId::Opus && s.extradata.len() >= 12 {

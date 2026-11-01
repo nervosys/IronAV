@@ -1647,15 +1647,14 @@ fn mp3_encoder_output_decodes_close_to_its_input() {
         j.audio.codec = Some("pcm_s16le".into());
         run(&j, &mut |_| {}).unwrap();
         let got = pcm(&back);
-        // the .mp3 is trimmed by its tag; Matroska keeps the encoder's delay
-        let lead = if ext == "mp3" { 0 } else { 1057 };
+        // the .mp3 is trimmed by its tag; Matroska's CodecDelay trims the encoder's delay the same way
         let frames = got.len() / 4;
         if ext == "mp3" {
             assert_eq!(frames, n, "{kbps}: {frames} frames for {n}");
         } else {
-            assert!(frames >= n + lead && frames < n + lead + 1152, "{ext} {kbps}: {frames} frames for {n}");
+            assert!(frames >= n && frames < n + 1152, "{ext} {kbps}: {frames} frames for {n}");
         }
-        let snr = snr_db(&want, &got[lead * 4..lead * 4 + want.len()]);
+        let snr = snr_db(&want, &got[..want.len()]);
         assert!(snr > if kbps == 64 { 10.0 } else { 18.0 }, "{ext} {kbps}: {snr:.1} dB");
         if ext == "mp3" {
             sizes.push(std::fs::metadata(&out).unwrap().len());

@@ -85,7 +85,9 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   Chained Opus links stay separate tracks, each with its own pre-skip. The unit tests cover multiplexed Opus and chained FLAC on
   synthetic files; joined Vorbis links have no FFmpeg-checked file yet.
 - **Containers (copy):** VP9 and AV1 are copied between WebM, Matroska and MP4; AAC keeps its encoder
-  delay in MP4; Opus ends where the source did in Matroska (DiscardPadding) and Ogg.
+  delay in MP4; Opus ends where the source did in Matroska (DiscardPadding) and Ogg. MP2 and MP3 written by IronAV carry their
+  encoder delay as CodecDelay in Matroska, which FFmpeg trims (its decoding lines up with the input, as IronAV's does). An MP4 with
+  MPEG audio is labelled MP2 when its frames are Layer II (object type 0x69 or 0x6B), not MP3.
 - **Live input and streaming (HTTP authentication):** Digest (MD5, MD5-sess, SHA-256 and SHA-256-sess, RFC 7616, and RFC 2069 forms; SHA-256 is preferred) and
   Basic credentials in http(s) URLs, answered per host so that later segments need no extra round trip.
 - **Live input and streaming:** byte sources for growing files, standard input, named pipes, TCP, UDP,
