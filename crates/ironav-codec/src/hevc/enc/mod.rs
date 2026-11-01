@@ -78,6 +78,8 @@ pub struct HevcEncoder {
     bframes: usize,
     /// The quantiser offsets of the picture kinds (IDR, P, B) for the stream's B pictures.
     qp_offsets: [i32; 3],
+    /// The motion search's coarse grid (see `cu::WIDE_GRID`).
+    grid: (i16, i16),
     /// Frames waiting for the anchor picture they are coded with: source, time stamp and display index.
     pending: Vec<(Source, i64, u64)>,
     /// The last two anchor pictures as the decoder reconstructs them: `refs` the last, which the
@@ -110,6 +112,7 @@ impl HevcEncoder {
     pub fn with_bframes(mut self, n: usize) -> Self {
         self.bframes = n.min(3);
         self.qp_offsets = if self.bframes > 0 { QP_OFFSET_BFRAMES } else { QP_OFFSET };
+        self.grid = if self.bframes > 0 { cu::WIDE_GRID } else { cu::NARROW_GRID };
         let reorder = reorder_of(self.bframes);
         let (pw, ph) = (self.sps.width, self.sps.height);
         let crop = [0, pw - self.width, 0, ph - self.height];
@@ -175,6 +178,7 @@ impl HevcEncoder {
             level,
             bframes: DEFAULT_BFRAMES,
             qp_offsets: QP_OFFSET,
+            grid: cu::NARROW_GRID,
             pending: Vec::new(),
             refs: None,
             prev: None,
@@ -251,7 +255,7 @@ impl HevcEncoder {
         let nctb = ctb_w * ctb_h;
         let n = self.slices.clamp(1, ctb_h);
         let bands: Vec<Range<usize>> = (0..n).map(|i| i * ctb_h / n..(i + 1) * ctb_h / n).collect();
-        let (sps, pps, geo) = (&self.sps, &self.pps, &self.geo);
+        let (sps, pps, geo, grid) = (&self.sps, &self.pps, &self.geo, self.grid);
         let coded: Vec<(SliceCoder, Vec<Node>)> = std::thread::scope(|s| {
             let jobs: Vec<_> = bands
                 .iter()
@@ -259,7 +263,7 @@ impl HevcEncoder {
                 .map(|(i, rows)| {
                     let rows = rows.clone();
                     s.spawn(move || {
-                        let coder = SliceCoder::new(sps, pps, geo, src, refs, poc, qp, (rows.start * ctb_w) as i32, i as u16);
+                        let coder = SliceCoder::new(sps, pps, geo, src, refs, poc, qp, (rows.start * ctb_w) as i32, i as u16, grid);
                         coder.run(rows)
                     })
                 })

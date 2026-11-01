@@ -92,10 +92,11 @@ struct Saved {
 /// A rate term: the bits a candidate costs, weighted by lambda into the distortion's units.
 const SIDE_INTRA: f64 = 10.0;
 const SIDE_INTER: f64 = 6.0;
-/// The motion search: whole-sample offsets in [-SEARCH_RANGE, SEARCH_RANGE] on a grid of SEARCH_STEP
-/// around zero (pictures four frames apart move further than the one before), then refinement.
-const SEARCH_RANGE: i16 = 48;
-const SEARCH_STEP: i16 = 4;
+/// The motion search's coarse grid: whole-sample offsets in [-range, range] every `step` around zero,
+/// then the refinements. (0, 0) is no grid. Anchors four frames apart (B pictures on) move further than
+/// the picture before, so they search a wide grid; P pictures keep the narrow search.
+pub const WIDE_GRID: (i16, i16) = (48, 4);
+pub const NARROW_GRID: (i16, i16) = (0, 0);
 /// Scales HM's lambda (for squared error) up: the decisions measure absolute differences, and the
 /// bits are estimates, so a stronger rate weight measures smaller at equal PSNR.
 const LAMBDA_SCALE: f64 = 2.0;
@@ -175,6 +176,8 @@ pub struct SliceCoder<'a> {
     lambda: f64,
     slice_addr: i32,
     slice_idx: u16,
+    /// The coarse grid of the motion search (range, step), see `WIDE_GRID`.
+    grid: (i16, i16),
     /// A P or B slice.
     inter: bool,
     /// A B slice.
@@ -186,7 +189,7 @@ pub struct SliceCoder<'a> {
 
 impl<'a> SliceCoder<'a> {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(sps: &'a Sps, pps: &'a Pps, geo: &'a Geometry, src: &'a Source, refs: [Option<&'a Frame>; 2], poc: i32, qp: i32, slice_addr: i32, slice_idx: u16) -> Self {
+    pub fn new(sps: &'a Sps, pps: &'a Pps, geo: &'a Geometry, src: &'a Source, refs: [Option<&'a Frame>; 2], poc: i32, qp: i32, slice_addr: i32, slice_idx: u16, grid: (i16, i16)) -> Self {
         SliceCoder {
             sps,
             pps,
@@ -200,6 +203,7 @@ impl<'a> SliceCoder<'a> {
             lambda: lambda_for(qp),
             slice_addr,
             slice_idx,
+            grid,
             inter: refs[0].is_some(),
             b: refs[1].is_some(),
             w: sps.width,
@@ -775,10 +779,12 @@ impl<'a> SliceCoder<'a> {
             }
         }
         // a coarse full search of the window around zero, then the refinements below
-        let (sr, ss) = (SEARCH_RANGE, SEARCH_STEP);
-        for dy in (-sr..=sr).step_by(ss as usize) {
-            for dx in (-sr..=sr).step_by(ss as usize) {
-                try_mv([dx * 4, dy * 4], &mut best, &mut bc);
+        let (sr, ss) = self.grid;
+        if sr > 0 {
+            for dy in (-sr..=sr).step_by(ss as usize) {
+                for dx in (-sr..=sr).step_by(ss as usize) {
+                    try_mv([dx * 4, dy * 4], &mut best, &mut bc);
+                }
             }
         }
         for step in [2i16, 1] {
