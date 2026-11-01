@@ -130,7 +130,7 @@ fn mpeg_crc(data: &[u8]) -> u32 {
 /// an adaptation field.
 fn dvb_style_pmt(ts: &[u8]) -> Vec<u8> {
     let mut out = ts.to_vec();
-    for p in out.chunks_exact_mut(188) {
+    for p in out.as_chunks_mut::<188>().0.iter_mut() {
         let pid = (((p[1] & 0x1F) as u16) << 8) | p[2] as u16;
         if p[1] & 0x40 == 0 || p[3] >> 4 != 1 {
             continue;

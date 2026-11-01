@@ -629,7 +629,7 @@ impl TsParser {
                 }
             } else if codec == CodecId::Ac3 {
                 match ironav_codec::ac3::frame_info(&data[i..]) {
-                    Ok(f) if f.offset == 0 => (f.frame_size, 0, f.sample_rate, f.channels as u16, 1536, Vec::new(), CodecId::Ac3),
+                    Ok(f) if f.offset == 0 => (f.frame_size, 0, f.sample_rate, f.channels, 1536, Vec::new(), CodecId::Ac3),
                     _ if data.len() - i < 16 && !last => break,
                     _ => {
                         i += 1;
