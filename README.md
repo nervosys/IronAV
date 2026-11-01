@@ -8,7 +8,7 @@ A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so 
 > Audio codecs, each decoded and encoded: **PCM, FLAC, ALAC, AAC-LC (plus HE-AAC v1 decode), MP3, Opus and Vorbis.**
 > Video: **software decoders for H.264, HEVC (including 4:2:2 and 4:4:4), VP8 and VP9; a software H.264 encoder (High profile: CABAC and the 8x8 transform), a software HEVC encoder (Main profile, 8-bit 4:2:0, merge and skip, SAO), a software VP8 encoder, and a software VP9 encoder (key and inter frames), and a software AV1 encoder (key and inter frames, profile 0, 8-bit 4:2:0); JPEG/Motion-JPEG and Apple ProRes decoded and encoded in software; MPEG-4 Part 2 (Simple and Advanced Simple profiles) decoded in software.**
 > NVIDIA GPUs encode H.264 and HEVC (NVENC, preferred when usable) and decode H.264, HEVC and AV1 (NVDEC).
-> AV1 is decoded on NVIDIA GPUs (NVDEC); the software decoder handles key, intra-only and inter frames, intra block copy included, but not yet superres. The software AV1 encoder writes key and inter frames. VP9 and AV1 copy between WebM, Matroska and MP4.
+> AV1 is decoded on NVIDIA GPUs (NVDEC) or in software (key, intra-only and inter frames; superres is refused). VP9 and AV1 copy between WebM, Matroska and MP4.
 > IronAV is not yet a drop-in replacement for FFmpeg or HandBrake.
 
 ## Interfaces
@@ -269,8 +269,8 @@ What is built and what is still planned is in [docs/design/agentic-realtime.md](
 ## Ontology
 
 Generated from the live registries, never hand-maintained in parallel. Kinds: codec, container, pixel format,
-sample format, filter, hardware backend, platform, operation (each tool). Relations: `carries`, `accelerates`,
-`availableOn`, `usesSampleFormat`, `acceptsPixelFormat`, `producesPixelFormat`.
+sample format, filter, hardware backend, platform, operation (each tool), analyzer and observation. Relations: `carries`, `accelerates`,
+`availableOn`, `usesSampleFormat`, `acceptsPixelFormat`, `producesPixelFormat`, `emits`.
 Export: `ironav ontology jsonld` (also an MCP resource).
 
 ## Hardware acceleration
@@ -313,7 +313,7 @@ exact 8.000 s duration, all frames decoded, and seeking lands on the right keyfr
 `ironav probe`, `convert` and the other tools read MP4 (regular files with the index anywhere, and fragmented files). H.264/HEVC video is decoded by NVDEC through the driver's `nvcuvid` library, loaded at run time like NVENC;
 the output is cropped to the display size and returned as planar `yuv420p` in display order, so B-frame streams work.
 8-bit 4:2:0 H.264 goes to the GPU (10-bit H.264 is decoded in software, as NVDEC cannot take it); for HEVC, 8-bit and 10-bit 4:2:0, 4:2:2 (`yuv422p`, `yuv422p10le`) and 4:4:4 (`yuv444p`, `yuv444p10le`; including the lossless transform-bypass mode) and monochrome (8-bit comes back as `gray`) are accepted (10-bit 4:2:0 comes back as `yuv420p10le`); 12-bit HEVC (`yuv420p12le`, `yuv422p12le`, `yuv444p12le`) goes to the software decoder; interlaced video is refused with a clear error. The GPU cannot take 4:2:2, 4:4:4 or monochrome, so those use the software decoder even with `--hwaccel auto`.
-HEVC also has a software decoder (`--hwaccel off`, or automatically where the GPU cannot take a stream): Main and Main 10 (and monochrome, 4:2:2 and 4:4:4 at 8, 10 and 12 bits) with I, P and B pictures,
+HEVC also has a software decoder (`--hwaccel off`, or automatically where the GPU cannot take a stream): Main and Main 10 (and monochrome, 4:2:0, 4:2:2 and 4:4:4 at 8, 10 and 12 bits) with I, P and B pictures,
 merge and AMVP motion prediction, temporal motion vectors, weighted prediction, wavefronts, multiple slices, default scaling lists, transform skip, lossless (transquant bypass),
 QP deltas, constrained intra, the deblocking filter and sample adaptive offset. These are checked sample-for-sample against FFmpeg on x265 streams (the
 `hevc_streams_decode_to_what_ffmpeg_decodes` test and a wider sweep of encoder settings), and on NVENC streams too (Main and Main 10,
@@ -910,15 +910,15 @@ restoration off, about 9 with CDEF, quantiser matrices and film grain on (releas
 consumer NVENC before the RTX 40 series cannot encode AV1, and AV1 can be copied between WebM, Matroska and MP4 with no GPU (see "Matroska output").
 
 The software encoder writes key frames every 250 frames by default (`--keyint N` changes it) and inter frames between them. An inter frame
-predicts from the frame before it only (LAST_FRAME), with quarter-sample motion: a full-pel search on the source picks the partitions, and a sub-pel
+predicts from the frame before it only (LAST_FRAME), with quarter-sample vectors: a full-pel search on the source picks the partitions, and a sub-pel
 search on the reconstructed reference refines each NEWMV, which competes with NEARESTMV, NEARMV and GLOBALMV from the reference MV stack. Each
 block is intra or inter by squared error plus lambda times the bits its syntax costs under the current CDFs, and intra blocks choose among the 13
 modes and their angle deltas the same way. Deblocking and CDEF run on every frame, at levels that follow the quantiser. The encoder reconstructs
 through the decoder's own state, so every picture it keeps as a reference is the one the decoder makes: the decoder's output equals the encoder's
 reconstruction bit for bit, and libaom decodes the same pictures (`inter_frames_decode_identically_and_are_smaller_than_key_frames` in
-`tests/av1_enc.rs`). The motion search reaches half samples only, for speed. Not yet: compound prediction, more than one reference, and rate control by bit rate.
+`tests/av1_enc.rs`). The motion search reaches half samples only, for speed. Not yet: compound prediction, more than one reference, and rate control by bit rate (it is `--qp` only; `--vbitrate` is refused).
 
-Speed: at 720p (FFmpeg's testsrc2, 60 frames, the default key interval) the encoder runs at about 5 frames a second at qp 20, 30 and 40, against about 1.6 before the open-loop planner, the motion search and the transform bases were made cheaper. Its files are 1 to 4 % smaller than before at the same or a slightly higher PSNR.
+Speed: at 720p (FFmpeg's testsrc2, 60 frames, the default key interval) the encoder runs at about 5 frames a second at qp 20, 30 and 40, against about 1.6 before the open-loop planner, the motion search and the transform bases were made cheaper. Its files are 1 to 3.5 % smaller than before at the same or a slightly higher PSNR.
 
 Checked bit for bit against FFmpeg's libdav1d (through PyAV) on SVT-AV1 output: 27 clips from 128x128 to 3840x2160, including odd sizes, 10-bit, film grain
 (8-bit and 10-bit; the grain is applied, and matches libdav1d's), several key frames, hierarchical prediction with overlay frames, screen-content tools,

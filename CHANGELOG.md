@@ -13,9 +13,9 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   CAVLC and CABAC P and B slices, lossless, several pictures decoded at once), HEVC (Main, Main 10, 4:2:2, 4:4:4, 12-bit), VP8, VP9
   (profiles 0-3, tile columns and a multi-threaded loop filter), baseline and progressive JPEG and
   Motion-JPEG, AAC-LC with HE-AAC v1, MP3 (MPEG-1/2/2.5 Layer III), Vorbis, Opus (SILK, CELT and hybrid)
-  FLAC (4 to 32 bits) and ALAC (16 to 24 bits, one to eight channels).
+  FLAC (4 to 32 bits) and ALAC (16, 20 and 24 bits, and 32-bit mono; one to eight channels).
 - **Codecs (encoders):** software HEVC (Main profile, 8-bit 4:2:0: 64x64 coding tree units, CABAC, intra and P pictures with merge and skip, AMVP motion, quarter-sample search, deblocking, rate control by QP or bit rate; MP4 and Matroska), software H.264 (Constrained Baseline, then Main with CABAC and High with the 8x8
-  transform, B pictures, rate-distortion mode decisions), VP8 (key and inter frames, quarter-pixel motion, rate control), VP9 (key and inter frames with coefficient probability updates, profile 0, WebM, Matroska and MP4), AV1 (key and inter frames, profile 0, 8-bit 4:2:0, WebM, Matroska and MP4), AAC-LC with an ADTS writer, MP3 Layer III with
+  transform, B pictures, rate-distortion mode decisions), VP8 (key and inter frames, quarter-pixel motion, rate control), VP9 (key and inter frames with coefficient probability updates, profile 0, WebM, Matroska and MP4), AAC-LC with an ADTS writer, MP3 Layer III with
   an MP3 writer, Vorbis, Opus (CELT, wideband SILK, hybrid, DTX, in-band FEC, automatic mode switching,
   2.5 to 60 ms frames; the CLI and job JSON select the mode, signal, frame size, FEC and DTX), JPEG and Motion-JPEG, FLAC, and
   ALAC (16 and 24 bits, one to eight channels). `--keyint N` (or `keyint` in a job) sets the key frame interval of H.264, HEVC, VP8, VP9 and AV1.
@@ -28,20 +28,21 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   Matroska (`V_MPEG4/*`): I, P and B pictures, half- and quarter-sample motion, four vectors, direct mode, H.263 and
   MPEG quantisation with custom matrices, resync markers. Decoding matches FFmpeg's bit for bit. Interlaced, sprite
   and global-motion streams, and data partitioning, are refused with a clear error. About 90 frames a second at 720p.
-- **Codecs (AV1, stages 1 to 3):** software decoder for key and intra-only frames: every intra prediction tool, palettes,
-  all transforms, lossless coding, tiles, the deblocking filter, CDEF, loop restoration (Wiener, self-guided and
-  switchable), quantiser matrices and film grain, at 8, 10 and 12 bits in every chroma layout. It matches libaom bit for
-  bit, intra block copy included, and is used when no NVIDIA GPU decodes AV1; superres is still refused by name.
-- **Codecs (AV1, inter frames):** the software decoder decodes inter frames: compound and skip-mode prediction, the
-  motion vector stack and projected motion field, dual filters, global and local warped motion, OBMC, wedge, difference-
-  and distance-weighted compound, interintra, variable inter transforms, hidden frames, `show_existing_frame` and film
-  grain loaded from a reference. It matches libaom bit for bit on P-only and alt-ref streams at every speed.
-- **Codecs (AV1 encoder, inter frames):** the software encoder writes inter frames after each key frame (every 250 frames by
-  default, `--keyint`): LAST_FRAME prediction with quarter-sample motion, the reference MV stack's modes, skip and intra blocks
-  inside inter frames, deblocking and CDEF on every frame, and rate-distortion mode decisions from the CDF bit costs. It runs
-  the decoder's own reconstruction, so the decoder's pictures equal the encoder's references bit for bit, and libaom decodes the
-  same pictures. About 5 frames a second at 720p (testsrc2, 60 frames, qp 20 to 40), up from about 1.6: the open-loop planner
-  and the motion search are cheaper, and the transform bases are built once per stream. Files are 1 to 4 % smaller.
+- **Codecs (AV1 decoder):** software decoder for key, intra-only and inter frames, at 8, 10 and 12 bits in every chroma
+  layout (4:2:0, 4:2:2, 4:4:4 and monochrome). It covers every intra prediction tool, palettes, all transforms, lossless
+  coding, tiles, intra block copy, the deblocking filter, CDEF, loop restoration (Wiener, self-guided and switchable),
+  quantiser matrices and film grain (added to the output only), and every inter tool: compound and skip-mode prediction,
+  the motion vector stack and projected motion field, dual filters, global and local warped motion, OBMC, wedge,
+  difference- and distance-weighted compound, interintra, variable inter transforms, hidden frames, `show_existing_frame`
+  and film grain loaded from a reference. It matches libaom bit for bit on key-frame-only, P-only and alt-ref streams at
+  `-cpu-used` 1 to 8, and is used when no NVIDIA GPU decodes AV1. Superres is refused by name.
+- **Codecs (AV1 encoder):** profile 0, 8-bit 4:2:0, in WebM, Matroska and MP4, `--qp` only (no bit rate). It writes inter
+  frames after each key frame (every 250 frames by default, `--keyint`): LAST_FRAME prediction with quarter-sample vectors
+  searched to half samples, the reference MV stack's modes, skip and intra blocks inside inter frames, deblocking and CDEF
+  on every frame, and rate-distortion mode decisions from the CDF bit costs. It runs the decoder's own reconstruction, so
+  the decoder's pictures equal the encoder's references bit for bit, and libaom decodes the same pictures. About 5 frames a
+  second at 720p (testsrc2, 60 frames, qp 20 to 40), up from about 1.6: the open-loop planner and the motion search are
+  cheaper, and the transform bases are built once per stream. Files are 1 to 3.5 % smaller.
 - **Containers:** WAV, FLAC, Y4M, MP4, QuickTime MOV, Matroska and WebM (read and write), Ogg (Opus, Vorbis and FLAC),
   ADTS, MP3, JPEG, and MPEG transport streams (read and write), and raw H.264 and HEVC (Annex B, write only).
 - **Containers (MP4):** fragmented MP4 is read as it arrives; the writer is constant-frame-rate and
@@ -101,7 +102,32 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Known limitations
 
-- The software AV1 decoder refuses superres; such AV1 needs an NVIDIA GPU. The AV1 encoder predicts from the previous frame only, with no compound prediction and no rate control by bit rate.
-- The software HEVC encoder is Main profile, 8-bit 4:2:0 only, with no sign data hiding or B pictures (its SAO is per-CTB band or edge offsets); wider HEVC encoding needs an NVIDIA GPU.
+- **Hardware:** only NVIDIA is driven: NVENC for H.264 and HEVC, NVDEC for H.264, HEVC and AV1. The other backends
+  (VA-API, Quick Sync, VideoToolbox, D3D11VA, AMF, Vulkan Video, MediaCodec and OpenCL) are planned.
+- **AV1 decoder:** superres is refused by name in software, so such streams need an NVIDIA GPU.
+- **AV1 encoder:** one reference (the previous frame), no compound prediction, no rate control by bit rate (`--qp`
+  only), 8-bit 4:2:0 and one tile; the motion search stops at half samples.
+- **HEVC encoder:** Main profile, 8-bit 4:2:0 only, with no sign data hiding and no B pictures; wider HEVC encoding needs
+  an NVIDIA GPU.
+- **HEVC decoder:** the range extension coding tools (RDPCM, cross-component prediction, extended precision, persistent
+  Rice adaptation and the rest) are refused by name, as are unequal luma and chroma bit depths (10-bit luma with 9-bit
+  chroma, for instance).
+- **H.264:** the decoder refuses interlaced coding (field pictures and MBAFF), slice groups, separate colour planes,
+  SP and SI slices and bit depths above 10. The encoder has one reference picture, no partitions below 8x8 and no
+  10-bit output.
+- **VP9:** 12-bit and 4:4:0 streams, and reference frames of another size, are refused. 10-bit output is untested.
+- **MPEG-4 Part 2:** interlaced, sprite and global-motion pictures, data partitioning and scalable layers are refused;
+  there is no encoder.
+- **AAC:** HE-AAC v2 (parametric stereo) is refused, as are Main prediction, LTP, gain control, coupling channels and
+  program-config layouts. The encoder writes mono and stereo only.
+- **Opus and Vorbis:** multichannel Opus (channel-mapping families 1 and 255) is refused. Vorbis floor type 0 and
+  streams over eight channels are refused, and the Vorbis encoder writes at most two channels.
+- **MP3, JPEG, ProRes:** MP3 layers I and II are refused; JPEG arithmetic-coded, 12-bit and lossless files are refused;
+  ProRes interlaced pictures are refused.
+- **Containers:** Matroska tracks with a content encoding and PCM in Matroska are refused; MPEG-TS does not carry Opus,
+  AC-3 or MPEG-2 video; fragmented MP4 is read but not written; raw H.264 and HEVC are write-only; Ogg reads only the
+  first Opus, Vorbis or FLAC stream (Speex and Theora are refused).
+- **Live:** servers that speak only TLS 1.2 cannot be reached; cameras and microphones are read on Windows and Linux
+  only (no AVFoundation).
 - Sound output through a real device has been built but not verified by listening or measurement.
 - IronAV is not yet a drop-in replacement for FFmpeg or HandBrake.
