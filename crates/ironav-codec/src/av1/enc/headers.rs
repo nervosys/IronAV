@@ -149,7 +149,7 @@ fn tile_info(b: &mut BitWriter, mi_cols: usize, mi_rows: usize) {
 
 /// What a frame's header says about the frame: its type, size, quantiser and filter strengths.
 /// Every frame has one tile, default CDFs (primary_ref_frame NONE), TX_MODE_LARGEST, the regular
-/// 8-tap interpolation filter, and a single reference, LAST_FRAME, which is slot 0.
+/// 8-tap interpolation filter, and single references (reference_select off).
 #[derive(Clone, Copy, Debug)]
 pub struct FrameParams {
     pub key: bool,
@@ -166,12 +166,16 @@ pub struct FrameParams {
     /// Whether the sequence header allows loop restoration, and then whether the frame uses it: the
     /// Wiener filter on every plane, with 64-sample luma units and 32-sample chroma units.
     pub restoration: bool,
+    /// The reference slots of LAST_FRAME, LAST2_FRAME and LAST3_FRAME (the other four references
+    /// name the slot of LAST_FRAME), and the slots the frame refreshes (inter frames only).
+    pub ref_slots: [u8; 3],
+    pub refresh: u8,
 }
 
 /// The uncompressed header of a shown frame, byte aligned, as the frame OBU starts with it. A key
-/// frame refreshes every slot; an inter frame refreshes slot 0 (LAST_FRAME), so LAST_FRAME is the
-/// frame before it. `p.width` is the upscaled width: with superres the frame is coded at the
-/// downscaled width that `superres_params` derives from it.
+/// frame refreshes every slot; an inter frame refreshes the slots `p.refresh` names, and reads its
+/// LAST, LAST2 and LAST3 references from `p.ref_slots`. `p.width` is the upscaled width: with superres
+/// the frame is coded at the downscaled width that `superres_params` derives from it.
 pub fn frame_header(p: &FrameParams) -> Vec<u8> {
     let coded_width = match p.superres {
         Some(d) => downscaled_width(p.width, d),
@@ -189,9 +193,11 @@ pub fn frame_header(p: &FrameParams) -> Vec<u8> {
     b.put(0, 1); // frame_size_override_flag: the size is the sequence's maximum
     if !p.key {
         b.put(7, 3); // primary_ref_frame: none, so the CDFs are the defaults
-        b.put(0x01, 8); // refresh_frame_flags: slot 0
-        for _ in 0..7 {
-            b.put(0, 3); // ref_frame_idx: slot 0 for every reference
+        b.put(p.refresh as u32, 8); // refresh_frame_flags
+        for i in 0..7 {
+            // LAST_FRAME, LAST2_FRAME and LAST3_FRAME from their slots; the other references name LAST_FRAME's
+            let slot = if i < 3 { p.ref_slots[i] } else { p.ref_slots[0] };
+            b.put(slot as u32, 3); // ref_frame_idx
         }
     }
     if let Some(denom) = p.superres {
@@ -290,7 +296,7 @@ mod tests {
 
     #[test]
     fn frame_headers_read_back() {
-        let p = FrameParams { key: true, width: 352, height: 288, base_q_idx: 115, lf_level: 10, cdef: [3, 1, 1, 0], superres: None, restoration: false };
+        let p = FrameParams { key: true, width: 352, height: 288, base_q_idx: 115, lf_level: 10, cdef: [3, 1, 1, 0], superres: None, restoration: false, ref_slots: [0; 3], refresh: 0xff };
         let hdr = frame_header(&p);
         let mut b = Bits::new(&hdr);
         assert_eq!(b.f(1).unwrap(), 0); // show_existing_frame

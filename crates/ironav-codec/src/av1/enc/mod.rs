@@ -2,9 +2,11 @@
 //! encoders), and inter frames between them. Profile 0, 8-bit 4:2:0, one tile.
 //!
 //! Each frame is a temporal unit: a temporal delimiter, the sequence header, and a frame OBU with
-//! the frame's header and its tile. An inter frame predicts from LAST_FRAME alone, the frame before
-//! it (every reference slot holds the last frame, and each frame refreshes slot 0), with the
-//! regular 8-tap filter, quarter-sample motion vectors (searched to half samples) and the reference MV stack's candidates. Superblocks
+//! the frame's header and its tile. An inter frame predicts from one of the three frames before it
+//! (LAST_FRAME, LAST2_FRAME and LAST3_FRAME, held in reference slots that each frame refreshes in
+//! turn; `with_refs(1)` limits it to LAST_FRAME), with the regular 8-tap filter, quarter-sample motion
+//! vectors (searched to half samples) and the reference MV stack's candidates. LAST_FRAME is searched
+//! fully and the others from its vector. Superblocks
 //! are 64x64, split by an open-loop search on the source down to 8x8 (never larger than 32x32, so
 //! every block is coded with one transform of its size). Each block is coded as intra or inter by
 //! rate-distortion cost, and intra blocks take the best of the 13 intra modes with angle deltas.
@@ -91,8 +93,13 @@ pub struct Av1Encoder {
     /// Frames since the last key frame (1 right after one).
     since_key: u64,
     seq: SequenceHeader,
-    /// The last frame as a reference, with what the frame headers read of it.
-    last: Option<(Arc<Picture>, RefState)>,
+    /// The last three frames as references, in reference slots 0 to 2, with what the frame headers
+    /// read of them. The newest is in `head`; each inter frame refreshes the slot after it, which
+    /// holds the oldest, so the slots are LAST (`head`), LAST2 (the one before) and LAST3.
+    dpb: [Option<(Arc<Picture>, RefState)>; 3],
+    head: usize,
+    /// How many references a block may use: 1 (LAST_FRAME alone) or 3 (see `with_refs`).
+    nrefs: usize,
     /// The source luma of the last frame, which the next frame's motion field reads.
     prev_src: Option<Plane>,
     /// The forward transform bases, built on first use and kept across frames.
@@ -137,7 +144,9 @@ impl Av1Encoder {
             keyint: DEFAULT_KEYINT,
             since_key: 0,
             seq,
-            last: None,
+            dpb: [None, None, None],
+            head: 0,
+            nrefs: 3,
             prev_src: None,
             bases: fwd::Bases::default(),
             superres: None,
@@ -149,6 +158,20 @@ impl Av1Encoder {
     pub fn with_keyint(mut self, n: u64) -> Self {
         self.keyint = n.max(1);
         self
+    }
+
+    /// Sets how many references a block chooses from: 1 for LAST_FRAME alone (the frame before),
+    /// or 3 for LAST_FRAME, LAST2_FRAME and LAST3_FRAME (the three frames before), each block by
+    /// its rate-distortion cost.
+    pub fn with_refs(mut self, n: usize) -> Self {
+        self.nrefs = n.clamp(1, 3);
+        self
+    }
+
+    #[cfg(test)]
+    /// The newest reference frame, LAST_FRAME.
+    fn last(&self) -> &(Arc<Picture>, RefState) {
+        self.dpb[self.head].as_ref().expect("an inter frame has a reference")
     }
 
     /// Codes every frame with superres at `denom` (9 to 16, the denominator of 8ths of the width):
@@ -217,9 +240,13 @@ impl Av1Encoder {
         if v.planes[0].len() < w * h || v.planes[1].len() < cw * ch || v.planes[2].len() < cw * ch {
             return Err(Error::invalid_input("a video frame plane is shorter than its dimensions"));
         }
-        let key = self.last.is_none() || self.since_key >= self.keyint;
+        let key = self.dpb[self.head].is_none() || self.since_key >= self.keyint;
         let qp = self.next_qp(key);
         let q = base_q(qp);
+        // LAST_FRAME is the newest slot, LAST2_FRAME the one before it and LAST3_FRAME the oldest; the
+        // frame is then stored in the oldest slot, which becomes the newest
+        let ref_slots = [self.head, (self.head + 2) % 3, (self.head + 1) % 3];
+        let new_slot = (self.head + 1) % 3;
         let params = FrameParams {
             key,
             width: w as u32,
@@ -229,11 +256,13 @@ impl Av1Encoder {
             cdef: cdef_strengths(q),
             superres: self.superres,
             restoration: self.restoration,
+            ref_slots: ref_slots.map(|s| s as u8),
+            refresh: if key { 0xff } else { 1 << new_slot },
         };
         let hdr = headers::frame_header(&params);
 
-        // the frame's header as the decoder reads it, with every slot holding the last frame's state
-        let refs = RefInfo { slots: std::array::from_fn(|_| self.last.as_ref().map(|(_, s)| s.clone())) };
+        // the frame's header as the decoder reads it, with the reference slots holding the frames' states
+        let refs = RefInfo { slots: std::array::from_fn(|i| self.dpb[i % 3].as_ref().map(|(_, s)| s.clone())) };
         let fh = parse_frame_header(&hdr, &self.seq, &refs, 0, 0)?;
         // with superres the frame is coded at its downscaled width, from the resampled source
         let coded_w = self.superres.map_or(w, |d| downscaled_width(w as u32, d) as usize);
@@ -243,12 +272,14 @@ impl Av1Encoder {
             None => [&v.planes[0][..], &v.planes[1][..], &v.planes[2][..]],
         };
         let mut f = FrameDec::new(self.seq.clone(), fh);
-        if let (false, Some((pic, _))) = (key, &self.last) {
-            for slot in f.refs.iter_mut().skip(1) {
-                *slot = Some(pic.clone());
+        if !key {
+            // each reference frame names its slot as the header does; the references past LAST3 name LAST's
+            for rf in 1..8 {
+                let slot = if rf <= 3 { ref_slots[rf - 1] } else { ref_slots[0] };
+                f.refs[rf] = self.dpb[slot].as_ref().map(|(pic, _)| pic.clone());
             }
         }
-        let enc = tile::FrameEnc::new(f, planes[0], planes[1], planes[2], (coded_w, h), self.prev_src.clone(), std::mem::take(&mut self.bases));
+        let enc = tile::FrameEnc::new(f, planes[0], planes[1], planes[2], (coded_w, h), self.prev_src.clone(), std::mem::take(&mut self.bases), self.nrefs);
         let (tile_bytes, mut f, src_luma, bases) = enc.encode();
         self.bases = bases;
 
@@ -284,7 +315,14 @@ impl Av1Encoder {
             seg_ids: Vec::new(),
             planes: std::mem::replace(&mut f.planes, [Plane::new(0, 0), Plane::new(0, 0), Plane::new(0, 0)]),
         };
-        self.last = Some((Arc::new(pic), state));
+        if key {
+            let entry = (Arc::new(pic), state);
+            self.dpb = [Some(entry.clone()), Some(entry.clone()), Some(entry)];
+            self.head = 0;
+        } else {
+            self.dpb[new_slot] = Some((Arc::new(pic), state));
+            self.head = new_slot;
+        }
         self.prev_src = Some(src_luma);
         self.since_key = if key { 1 } else { self.since_key + 1 };
 
@@ -402,13 +440,13 @@ mod tests {
     /// and the moving clip is coded with inter frames at a useful quality.
     #[test]
     fn inter_frames_decode_to_the_encoders_reconstruction() {
-        for &(w, h) in &[(96usize, 64usize), (177, 99)] {
-            let mut enc = Av1Encoder::new(&params(w, h), Some(24), None).unwrap().with_keyint(4);
+        for &(w, h, nrefs) in &[(96usize, 64usize, 1usize), (177, 99, 1), (96, 64, 3), (177, 99, 3)] {
+            let mut enc = Av1Encoder::new(&params(w, h), Some(24), None).unwrap().with_keyint(4).with_refs(nrefs);
             let mut dec = Av1Decoder::new(&[]);
             for t in 0..6 {
                 let src = picture_shifted(w, h, 2 * t);
                 let data = enc.encode_frame(&src).unwrap();
-                let recon = enc.last.as_ref().unwrap().0.planes[0].clone();
+                let recon = enc.last().0.planes[0].clone();
                 let mut frames = dec.decode(&Packet { stream: 0, pts: t as i64, duration: 1, data }).unwrap();
                 assert_eq!(frames.len(), 1, "frame {t} shows one picture");
                 let got = luma_of(frames.remove(0));
@@ -436,7 +474,7 @@ mod tests {
                 for t in 0..4 {
                     let src = picture_shifted(w, h, 2 * t);
                     let data = enc.encode_frame(&src).unwrap();
-                    let recon = enc.last.as_ref().unwrap().0.clone();
+                    let recon = enc.last().0.clone();
                     let mut frames = dec.decode(&Packet { stream: 0, pts: t as i64, duration: 1, data }).unwrap();
                     assert_eq!(frames.len(), 1, "frame {t} shows one picture");
                     let CoreFrame::Video(out) = frames.remove(0) else { panic!("no picture") };

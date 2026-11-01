@@ -39,12 +39,15 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   `-cpu-used` 1 to 8, and is used when no NVIDIA GPU decodes AV1. Superres is decoded (upscaling after CDEF and before loop
   restoration), and matches libaom bit for bit on IronAV-encoded superres streams at 1/9 to 1/16 of the width.
 - **Codecs (AV1 encoder):** profile 0, 8-bit 4:2:0, in WebM, Matroska and MP4, `--qp` or an average bit rate (`--vbitrate`; see below). It writes inter
-  frames after each key frame (every 250 frames by default, `--keyint`): LAST_FRAME prediction with quarter-sample vectors
+  frames after each key frame (every 250 frames by default, `--keyint`): prediction from LAST, LAST2 or LAST3 (the three frames
+  before, each block by rate-distortion cost) with quarter-sample vectors
   searched to half samples, the reference MV stack's modes, skip and intra blocks inside inter frames, deblocking and CDEF
   on every frame, and rate-distortion mode decisions from the CDF bit costs. It runs the decoder's own reconstruction, so
   the decoder's pictures equal the encoder's references bit for bit, and libaom decodes the same pictures. About 5 frames a
   second at 720p (testsrc2, 60 frames, qp 20 to 40), up from about 1.6: the open-loop planner and the motion search are
-  cheaper, and the transform bases are built once per stream. Files are 1 to 3.5 % smaller.
+  cheaper, and the transform bases are built once per stream. Files are 1 to 3.5 % smaller. Three references against one
+  (60 frames, 720p, qp 20/30/40): testsrc2 is 2.0, 3.0 and 7.5 % smaller at 0.06, 0.07 and 0.15 dB higher PSNR; mandelbrot is
+  5.0 to 5.1 % smaller at 0.05 to 0.08 dB higher. Encoding takes about 40 % longer (about 3 frames a second against 5).
 - **Containers:** WAV, FLAC, Y4M, MP4, QuickTime MOV, Matroska and WebM (read and write), Ogg (Opus, Vorbis and FLAC),
   ADTS, MP3, JPEG, and MPEG transport streams (read and write), and raw H.264 and HEVC (Annex B, write only).
 - **Containers (MP4):** fragmented MP4 is read as it arrives, and written with `fragment_seconds` in a job (`--fragment-seconds S`
@@ -132,8 +135,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 - **Hardware:** only NVIDIA is driven: NVENC for H.264 and HEVC, NVDEC for H.264, HEVC and AV1. The other backends
   (VA-API, Quick Sync, VideoToolbox, D3D11VA, AMF, Vulkan Video, MediaCodec and OpenCL) are planned.
-- **AV1 encoder:** one reference (the previous frame), no compound prediction, 8-bit 4:2:0 and one tile; the motion
-  search stops at half samples. Rate control is an average bit rate only: no maximum rate or buffer size (`--maxrate`,
+- **AV1 encoder:** no compound prediction, 8-bit 4:2:0 and one tile; the motion search stops at half samples. Rate control is an average bit rate only: no maximum rate or buffer size (`--maxrate`,
   `--bufsize` are not options of any encoder).
 - **HEVC encoder:** Main profile, 8-bit 4:2:0 only, with no sign data hiding; B pictures are an option (`with_bframes`), off by default: with a quantiser cascade they save about 12 % on the mandelbrot clip at equal PSNR, but only about 3 % on `testsrc2` (see the HEVC section of the README); wider HEVC encoding needs
   an NVIDIA GPU.

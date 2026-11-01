@@ -61,10 +61,12 @@ struct IntraChoice {
     cost: f64,
 }
 
-/// An inter block's choice: the mode, the reference MV stack index it codes against, the motion
-/// vector (row, column, in 1/8 sample) and its cost.
+/// An inter block's choice: the reference frame (LAST_FRAME, LAST2_FRAME or LAST3_FRAME, as 1 to 3),
+/// the mode, the reference MV stack index it codes against, the motion vector (row, column, in 1/8
+/// sample) and its cost.
 #[derive(Clone, Copy)]
 struct InterChoice {
+    rf: usize,
     mode: u8,
     idx: usize,
     mv: Mv,
@@ -101,6 +103,8 @@ pub struct FrameEnc {
     blk: (usize, usize, usize),
     /// The partition decided for each node (row, column, size) by `plan_node`.
     plan: HashMap<(usize, usize, usize), u8>,
+    /// How many references a block chooses from (1: LAST_FRAME; 3: LAST, LAST2 and LAST3).
+    nrefs: usize,
 }
 
 fn bitlen(v: u32) -> usize {
@@ -267,7 +271,7 @@ fn round8(m: Mv) -> Mv {
 impl FrameEnc {
     /// An encoder state for `f`, a frame of the decoder's state, with the source `y`, `u`, `v`
     /// planes (`pic` wide, tightly packed) and the previous picture's source luma.
-    pub fn new(f: FrameDec, y: &[u8], u: &[u8], v: &[u8], pic: (usize, usize), prev: Option<Plane>, bases: Bases) -> FrameEnc {
+    pub fn new(f: FrameDec, y: &[u8], u: &[u8], v: &[u8], pic: (usize, usize), prev: Option<Plane>, bases: Bases, nrefs: usize) -> FrameEnc {
         let (mi_cols, mi_rows) = (f.h.mi_cols, f.h.mi_rows);
         let qidx = f.h.base_q_idx as usize;
         let (aw, ah) = ((mi_cols * 4).div_ceil(64) * 64, (mi_rows * 4).div_ceil(64) * 64);
@@ -311,6 +315,7 @@ impl FrameEnc {
             lambda: lambda_for(acq),
             blk: (0, 0, 0),
             plan: HashMap::new(),
+            nrefs,
         }
     }
 
@@ -870,7 +875,7 @@ impl FrameEnc {
     fn set_inter_block(&mut self, r: usize, c: usize, bs: usize, ic: InterChoice) {
         let mut b = self.base_block(r, c, bs);
         b.is_inter = true;
-        b.ref_frame = [1, -1];
+        b.ref_frame = [ic.rf as i8, -1];
         b.y_mode = ic.mode;
         b.mv = [ic.mv, [0, 0]];
         b.interp = [0, 0];
@@ -918,17 +923,25 @@ impl FrameEnc {
         n
     }
 
-    /// The contexts of the single reference symbols for LAST_FRAME: the three symbols and their
-    /// CDF indices (fwd_bwd, then the counts that the other two use).
-    fn ref_ctxs(&self) -> [(usize, usize); 3] {
+    /// The single reference symbols of LAST_FRAME, LAST2_FRAME or LAST3_FRAME (`rf` 1 to 3), as
+    /// (CDF context, CDF index, bit): forward (single_ref_p1), then LAST3 against GOLDEN (p3, then p5),
+    /// or LAST2 against LAST (p3, then p4). The contexts are the counts of the reference frames above
+    /// and to the left (read_ref_frames).
+    fn ref_syms(&self, rf: usize) -> Vec<(usize, usize, usize)> {
         let n = self.ref_counts();
-        let fwd_bwd = count_ctx(n[1] + n[2] + n[3] + n[4], n[5] + n[6] + n[7]);
-        [(fwd_bwd, 0), (count_ctx(n[1] + n[2], n[3] + n[4]), 2), (count_ctx(n[1], n[2]), 3)]
+        let mut s = vec![(count_ctx(n[1] + n[2] + n[3] + n[4], n[5] + n[6] + n[7]), 0, 0)];
+        s.push((count_ctx(n[1] + n[2], n[3] + n[4]), 2, (rf == 3) as usize));
+        if rf == 3 {
+            s.push((count_ctx(n[3], n[4]), 4, 0));
+        } else {
+            s.push((count_ctx(n[1], n[2]), 3, (rf == 2) as usize));
+        }
+        s
     }
 
-    /// The bits of the reference frame symbols of an inter block (LAST_FRAME).
-    fn ref_bits(&self) -> f64 {
-        self.ref_ctxs().iter().map(|&(ctx, idx)| sym_bits(&self.cdf.single_ref[ctx][idx], 0)).sum()
+    /// The bits of the reference frame symbols of an inter block predicting from `rf`.
+    fn ref_bits(&self, rf: usize) -> f64 {
+        self.ref_syms(rf).iter().map(|&(ctx, idx, bit)| sym_bits(&self.cdf.single_ref[ctx][idx], bit)).sum()
     }
 
     /// The bits of the inter mode, the drl index and the motion vector difference of an inter block.
@@ -973,7 +986,7 @@ impl FrameEnc {
         self.f.b.mv = [mv, [0, 0]];
         self.f.store_mi();
         self.f.predict_inter_block();
-        let ic = InterChoice { mode, idx, mv, cost: 0.0 };
+        let ic = InterChoice { rf: self.f.b.ref_frame[0] as usize, mode, idx, mv, cost: 0.0 };
         let d = self.sse_block(x, y, w, h);
         InterChoice { cost: d + self.lambda * self.inter_mode_bits(st, ic), ..ic }
     }
@@ -1042,48 +1055,58 @@ impl FrameEnc {
     fn inter_search(&mut self, r: usize, c: usize, bs: usize) -> Option<InterChoice> {
         let (x, y) = (c * 4, r * 4);
         let (w, h) = (4 * NUM_4X4_W[bs] as usize, 4 * NUM_4X4_H[bs] as usize);
-        self.f.b = self.base_block(r, c, bs);
-        self.f.b.is_inter = true;
-        self.f.b.ref_frame = [1, -1];
-        self.f.b.y_mode = NEWMV;
-        let st = self.f.find_mv_stack();
 
         // the open-loop motion of the block, in 1/8 sample units
         let (rows, cols) = (self.mi_rows / 2, self.mi_cols / 2);
         let (dy, dx) = self.field[(y / 8).min(rows - 1) * cols + (x / 8).min(cols - 1)];
-        let start = [dy * 8, dx * 8];
+        let open = [dy * 8, dx * 8];
 
-        // the NEWMV's stack index is the candidate nearest the open-loop motion
-        let mut nidx = 0;
-        let mut nd = i64::MAX;
-        for idx in 0..3 {
-            if idx == 0 || idx < st.num {
-                let m = st.mv[idx][0];
-                let d = (m[0] as i64 - start[0] as i64).abs() + (m[1] as i64 - start[1] as i64).abs();
-                if d < nd {
-                    nd = d;
-                    nidx = idx;
+        // LAST_FRAME is searched from the open-loop motion; LAST2 and LAST3 from LAST's motion, as
+        // the frames are alike and the vector that LAST found is the best start for the others
+        let mut best: Option<InterChoice> = None;
+        let mut last_mv = open;
+        for rf in 1..=self.nrefs {
+            self.f.b = self.base_block(r, c, bs);
+            self.f.b.is_inter = true;
+            self.f.b.ref_frame = [rf as i8, -1];
+            self.f.b.y_mode = NEWMV;
+            let st = self.f.find_mv_stack();
+            let start = if rf == 1 { open } else { last_mv };
+
+            // the NEWMV's stack index is the candidate nearest the start
+            let mut nidx = 0;
+            let mut nd = i64::MAX;
+            for idx in 0..3 {
+                if idx == 0 || idx < st.num {
+                    let m = st.mv[idx][0];
+                    let d = (m[0] as i64 - start[0] as i64).abs() + (m[1] as i64 - start[1] as i64).abs();
+                    if d < nd {
+                        nd = d;
+                        nidx = idx;
+                    }
                 }
             }
-        }
-        let pred = st.mv[nidx][0];
-        let mv = self.search(x, y, w, h, pred, start);
-
-        let mut cands: Vec<(u8, usize, Mv)> = vec![(GLOBALMV, 0, st.global[0]), (NEARESTMV, 0, st.mv[0][0])];
-        for idx in 1..=3 {
-            if idx == 1 || idx < st.num {
-                cands.push((NEARMV, idx, st.mv[idx][0]));
+            let pred = st.mv[nidx][0];
+            let mv = self.search(x, y, w, h, pred, start);
+            if rf == 1 {
+                last_mv = mv;
             }
-        }
-        cands.push((NEWMV, nidx, mv));
 
-        let ref_bits = self.ref_bits();
-        let mut best: Option<InterChoice> = None;
-        for (mode, idx, m) in cands {
-            let mut ic = self.eval_inter(&st, x, y, w, h, mode, idx, m);
-            ic.cost += self.lambda * ref_bits;
-            if best.is_none_or(|b| ic.cost < b.cost) {
-                best = Some(ic);
+            let mut cands: Vec<(u8, usize, Mv)> = vec![(GLOBALMV, 0, st.global[0]), (NEARESTMV, 0, st.mv[0][0])];
+            for idx in 1..=3 {
+                if idx == 1 || idx < st.num {
+                    cands.push((NEARMV, idx, st.mv[idx][0]));
+                }
+            }
+            cands.push((NEWMV, nidx, mv));
+
+            let ref_bits = self.ref_bits(rf);
+            for (mode, idx, m) in cands {
+                let mut ic = self.eval_inter(&st, x, y, w, h, mode, idx, m);
+                ic.cost += self.lambda * ref_bits;
+                if best.is_none_or(|b| ic.cost < b.cost) {
+                    best = Some(ic);
+                }
             }
         }
         best
@@ -1099,11 +1122,11 @@ impl FrameEnc {
             self.se.symbol(is_inter as usize, &mut self.cdf.intra_inter[ctx]);
         }
         if is_inter {
-            for (ctx, idx) in self.ref_ctxs() {
-                self.se.symbol(0, &mut self.cdf.single_ref[ctx][idx]);
+            let ic = inter.expect("an inter block has its choice");
+            for (ctx, idx, bit) in self.ref_syms(ic.rf) {
+                self.se.symbol(bit, &mut self.cdf.single_ref[ctx][idx]);
             }
             let st = self.f.find_mv_stack();
-            let ic = inter.expect("an inter block has its choice");
             self.write_inter_mode(&st, ic);
             return;
         }
