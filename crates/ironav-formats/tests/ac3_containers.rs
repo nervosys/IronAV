@@ -199,6 +199,55 @@ fn mpegts_ac3_matches_ffmpeg() {
 }
 
 #[test]
+fn mp4_ac3_matches_ffmpeg() {
+    if !ffmpeg_available() {
+        eprintln!("skipped: ffmpeg is not on PATH");
+        return;
+    }
+    let dir = scratch();
+    encode_and_compare(&dir, "stereo_192.mp4", "mp4", "2");
+    encode_and_compare(&dir, "surround_384.mp4", "mp4", "6");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// AC-3 is read but not written: the MP4 writer refuses it, and the Matroska and raw paths keep working.
+#[test]
+fn ac3_is_not_written_to_mp4() {
+    let dir = scratch();
+    let out = dir.join("refused.mp4");
+    let stream = ironav_core::StreamInfo {
+        index: 0,
+        codec: CodecId::Ac3,
+        time_base: ironav_core::Rational::new(1, 48000),
+        duration: None,
+        bits: None,
+        extradata: Vec::new(),
+        lead_in: 0,
+        params: StreamParams::Audio { sample_rate: 48000, channels: 2 },
+    };
+    let mut muxer = ironav_formats::create_muxer(&out, "mp4").expect("an MP4 writer");
+    let err = muxer.write_header(&[stream]).expect_err("AC-3 is refused");
+    assert_eq!(err.code, ironav_core::ErrorCode::UnsupportedCodec);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// E-AC-3 (bit stream id 16) is refused with a clear error, not decoded as AC-3.
+#[test]
+fn eac3_is_refused() {
+    if !ffmpeg_available() {
+        eprintln!("skipped: ffmpeg is not on PATH");
+        return;
+    }
+    let dir = scratch();
+    let file = dir.join("refused.eac3");
+    assert!(ffmpeg(&["-f", "lavfi", "-i", SIGNAL, "-ac", "2", "-c:a", "eac3", "-f", "eac3", file.to_str().unwrap()]), "encoding E-AC-3");
+    let err = open_demuxer(&file).err().expect("E-AC-3 is refused");
+    assert_eq!(err.code, ironav_core::ErrorCode::UnsupportedCodec, "{}", err.message);
+    assert!(err.message.contains("E-AC-3"), "{}", err.message);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn raw_ac3_matches_ffmpeg() {
     if !ffmpeg_available() {
         eprintln!("skipped: ffmpeg is not on PATH");

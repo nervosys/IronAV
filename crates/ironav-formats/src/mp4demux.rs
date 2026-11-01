@@ -635,6 +635,7 @@ fn parse_trak(trak: &[u8], index: usize, samples: &mut Vec<Sample>, movie_ts: u3
             (None, b"mp4a") => CodecId::Aac,
             (None, b"Opus") => CodecId::Opus,
             (None, b"alac") => CodecId::Alac,
+            (None, b"ac-3") => CodecId::Ac3,
             (None, b".mp3") => CodecId::Mp3,
             _ => return Ok(None),
         };
