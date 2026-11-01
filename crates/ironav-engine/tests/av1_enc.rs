@@ -335,3 +335,63 @@ fn altref_streams_decode_identically_with_libaom_and_ironav() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// Encodes `clip` with an encoder built by `make`, checks that libaom and IronAV's decoder give equal
+/// pictures from the stream, and returns the stream's size and the luma PSNR of the pictures.
+fn direct_round_trip(name: &str, clip: &Clip, qp: u8, make: impl Fn(Av1Encoder) -> Av1Encoder) -> (usize, f64) {
+    let dir = scratch(name);
+    let (w, h) = (clip.w, clip.h);
+    let (cw, ch) = clip.chroma();
+    let params = StreamParams::Video { width: w as u32, height: h as u32, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational { num: 25, den: 1 } };
+    let mut enc = make(Av1Encoder::new(&params, Some(qp), None).unwrap_or_else(|e| panic!("{name}: {e}")));
+    let mut packets = Vec::new();
+    for (t, f) in clip.frames.iter().enumerate() {
+        let planes = vec![f[..w * h].to_vec(), f[w * h..w * h + cw * ch].to_vec(), f[w * h + cw * ch..].to_vec()];
+        let v = VideoFrame { width: w as u32, height: h as u32, pix_fmt: PixelFormat::Yuv420p, pts: t as i64, planes };
+        packets.extend(enc.encode(&Frame::Video(v)).unwrap_or_else(|e| panic!("{name}: {e}")));
+    }
+    packets.extend(enc.flush().unwrap_or_else(|e| panic!("{name}: {e}")));
+    assert_eq!(packets.len(), clip.frames.len(), "{name}: one packet per frame");
+
+    let path = dir.join(format!("{name}.ivf"));
+    std::fs::write(&path, ivf_file(w, h, &packets)).unwrap();
+    let raw = dir.join(format!("{name}.libaom.raw"));
+    assert!(ffmpeg(&["-c:v", "libaom-av1", "-i", path.to_str().unwrap(), "-f", "rawvideo", "-pix_fmt", "yuv420p", raw.to_str().unwrap()]), "{name}: libaom could not decode");
+    let want = std::fs::read(&raw).unwrap();
+
+    let mut dec = Av1Decoder::new(&[]);
+    let mut pictures = Vec::new();
+    for p in &packets {
+        pictures.extend(dec.decode(p).unwrap_or_else(|e| panic!("{name}: {e}")));
+    }
+    pictures.extend(dec.flush().unwrap_or_else(|e| panic!("{name}: {e}")));
+    let mut got = Vec::new();
+    for f in pictures {
+        let Frame::Video(v) = f else { panic!("{name}: no picture") };
+        for pl in &v.planes {
+            got.extend_from_slice(pl);
+        }
+    }
+    if got != want {
+        let i = got.iter().zip(&want).position(|(a, b)| a != b).unwrap_or(got.len().min(want.len()));
+        panic!("{name}: IronAV decodes the stream differently from libaom ({} bytes, libaom {}; first difference at byte {i})", got.len(), want.len());
+    }
+    let (y, _) = psnr(clip, &got);
+    let size = packets.iter().map(|p| p.data.len()).sum();
+    let _ = std::fs::remove_dir_all(&dir);
+    (size, y)
+}
+
+/// Quarter-sample motion search: the streams decode identically with libaom and IronAV, at the same
+/// quality as the half-sample search.
+#[test]
+fn quarter_sample_motion_streams_decode_identically_with_libaom_and_ironav() {
+    need_ffmpeg!();
+    let dir = scratch("qpel_src");
+    let clip = source(&dir, 176, 144, 8);
+    let _ = std::fs::remove_dir_all(&dir);
+    let (half, yh) = direct_round_trip("qpel_off", &clip, 28, |e| e.with_quarter_mv(false));
+    let (quarter, yq) = direct_round_trip("qpel_on", &clip, 28, |e| e.with_quarter_mv(true));
+    eprintln!("quarter-sample motion: {half} bytes at {yh:.2} dB with half samples, {quarter} bytes at {yq:.2} dB with quarter samples");
+    assert!(yq > 30.0 && (yq - yh).abs() < 0.5, "luma PSNR {yq:.2} dB against {yh:.2} dB");
+}

@@ -125,6 +125,8 @@ pub struct FrameEnc {
     /// The display distance of ALTREF_FRAME, a future frame, when the frame may predict from it
     /// (single or bidirectional compound blocks); `None` for a frame that may not.
     alt_dist: Option<i32>,
+    /// How many of the whole, half and quarter sample steps the motion search takes (2 or 3).
+    pub search_steps: usize,
 }
 
 /// A reference symbol: which CDF family it is coded with (see `RefCdf`), its context, the index
@@ -356,6 +358,7 @@ impl FrameEnc {
             compound,
             last_dist: dists.0,
             alt_dist: dists.1,
+            search_steps: 2,
         }
     }
 
@@ -1257,7 +1260,7 @@ impl FrameEnc {
                 best = (c, m);
             }
         }
-        for step in [8, 4] {
+        for step in [8, 4, 2].into_iter().take(self.search_steps) {
             for _ in 0..16 {
                 let centre = best.1;
                 let mut moved = false;
@@ -1286,7 +1289,7 @@ impl FrameEnc {
         let mut seen: HashMap<[Mv; 2], u64> = HashMap::new();
         let mut best = start;
         let mut best_c = self.pair_cost(&mut seen, x, y, w, h, start, pred);
-        for step in [8, 4] {
+        for step in [8, 4, 2].into_iter().take(self.search_steps) {
             for _ in 0..16 {
                 let mut moved = false;
                 for l in 0..2 {

@@ -6,7 +6,7 @@
 //! from the average of LAST_FRAME and LAST2_FRAME or LAST3_FRAME (compound, `with_compound`)
 //! (LAST_FRAME, LAST2_FRAME and LAST3_FRAME, held in reference slots that each frame refreshes in
 //! turn; `with_refs(1)` limits it to LAST_FRAME), with the regular 8-tap filter, quarter-sample motion
-//! vectors (searched to half samples) and the reference MV stack's candidates. LAST_FRAME is searched
+//! vectors (searched to half samples, or quarter with `with_quarter_mv`) and the reference MV stack's candidates. LAST_FRAME is searched
 //! fully and the others from its vector.
 //!
 //! With `with_altref(lag)` the encoder looks `lag` frames ahead: the last of each group of frames is
@@ -136,6 +136,8 @@ pub struct Av1Encoder {
     superres: Option<u32>,
     /// Whether frames use loop restoration (see `with_restoration`).
     restoration: bool,
+    /// Whether the motion search refines to quarter samples (see `with_quarter_mv`).
+    quarter_mv: bool,
 }
 
 impl Av1Encoder {
@@ -183,6 +185,7 @@ impl Av1Encoder {
             bases: fwd::Bases::default(),
             superres: None,
             restoration: false,
+            quarter_mv: false,
         })
     }
 
@@ -245,6 +248,14 @@ impl Av1Encoder {
     pub fn with_restoration(mut self) -> Self {
         self.restoration = true;
         self.set_sequence_header();
+        self
+    }
+
+    /// Whether the motion search refines vectors to quarter samples after the half-sample step
+    /// (off by default), or stops at half samples. On 720p testsrc2 and mandelbrot it saves under 1% of
+    /// the bytes at the same PSNR and costs a fifth to two thirds more encoding time.
+    pub fn with_quarter_mv(mut self, on: bool) -> Self {
+        self.quarter_mv = on;
         self
     }
 
@@ -356,7 +367,8 @@ impl Av1Encoder {
                 f.refs[rf] = self.dpb[ref_idx[rf - 1] as usize].as_ref().map(|(pic, _)| pic.clone());
             }
         }
-        let enc = tile::FrameEnc::new(f, planes[0], planes[1], planes[2], (coded_w, h), self.prev_src.clone(), std::mem::take(&mut self.bases), self.nrefs, self.compound, dists);
+        let mut enc = tile::FrameEnc::new(f, planes[0], planes[1], planes[2], (coded_w, h), self.prev_src.clone(), std::mem::take(&mut self.bases), self.nrefs, self.compound, dists);
+        enc.search_steps = if self.quarter_mv { 3 } else { 2 };
         let (tile_bytes, mut f, src_luma, bases) = enc.encode();
         self.bases = bases;
 
