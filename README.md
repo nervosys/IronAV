@@ -5,7 +5,7 @@ A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so 
 
 > **Status: foundation (v0.1).** The architecture, agent interface, ontology, hardware model, CLI, MCP server
 > and both GUIs are working and tested. Containers: **WAV, FLAC, Y4M, MP4, QuickTime MOV (read and write), Matroska/WebM (read and write), Ogg, ADTS, MP3, JPEG and MPEG transport streams (read and write); raw H.264 and HEVC (Annex B: read and written as files, and read as live sources).**
-> Audio codecs, each decoded and encoded: **PCM, FLAC, ALAC, AAC-LC (plus HE-AAC v1 decode), MP3, MP2, AC-3 (decode only), Opus and Vorbis.**
+> Audio codecs, each decoded and encoded: **PCM, FLAC, ALAC, AAC-LC (plus HE-AAC v1 decode), MP3, MP2, AC-3, Opus and Vorbis.**
 > Video: **software decoders for H.264, HEVC (including 4:2:2 and 4:4:4), VP8 and VP9; a software H.264 encoder (High profile: CABAC and the 8x8 transform), a software HEVC encoder (Main profile, 8-bit 4:2:0, merge and skip, SAO), a software VP8 encoder, and a software VP9 encoder (key and inter frames), and a software AV1 encoder (key and inter frames, profile 0, 8-bit 4:2:0); JPEG/Motion-JPEG and Apple ProRes decoded and encoded in software; MPEG-4 Part 2 (Simple and Advanced Simple profiles) decoded in software, and Simple profile I and P pictures encoded in software, with Advanced Simple B pictures as an option (MP4 and Matroska); MPEG-1 and MPEG-2 video (frame and field pictures, 4:2:0 and 4:2:2) decoded in software.**
 > NVIDIA GPUs encode H.264 and HEVC (NVENC, preferred when usable) and decode H.264, HEVC and AV1 (NVDEC).
 > AV1 is decoded on NVIDIA GPUs (NVDEC) or in software (key, intra-only and inter frames, superres included). VP9 and AV1 copy between WebM, Matroska and MP4.
@@ -1060,8 +1060,8 @@ carries the delay as CodecDelay (for MP2 and MP3 as for AAC and Opus), which FFm
 AC-3 (Dolby Digital, ATSC A/52) is decoded as the `ac3` codec, a translation of FFmpeg's `ac3dec.c` and `ac3dec_float.c`. Every
 channel mode from mono to 3/2 with the LFE channel decodes, with coupling, rematrixing, delta bit allocation, block switching and
 dynamic range at FFmpeg's default (`drc_scale` 1). The output is float, in FFmpeg's channel order. It is read from raw `.ac3`
-files, Matroska (`A_AC3`), MPEG-TS (stream type 0x81, or 0x06 with the AC-3 descriptor) and MP4 (`ac-3` with `dac3`). It is not
-written, except that a raw file can be copied into Matroska. E-AC-3 is refused with an error.
+files, Matroska (`A_AC3`), MPEG-TS (stream type 0x81, or 0x06 with the AC-3 descriptor) and MP4 (`ac-3` with `dac3`). The encoder
+writes the same containers (see "AC-3 encoder" below). E-AC-3 is refused with an error.
 
 Measured against `ffmpeg -c:a ac3 -f f32le` on FFmpeg-encoded streams (3 seconds each, tones with noise bursts):
 
@@ -1074,7 +1074,36 @@ Measured against `ffmpeg -c:a ac3 -f f32le` on FFmpeg-encoded streams (3 seconds
 The worst difference is about one 16-bit step (3.05e-5), and is larger than the 1e-5 aimed for; the cause is not isolated.
 Block switching follows FFmpeg's `do_imdct`, but it is unverified: FFmpeg's encoder writes no short blocks, so no test stream
 has them. The tests are `crates/ironav-codec/tests/ac3_ffmpeg.rs` (the decoder) and `crates/ironav-formats/tests/ac3_containers.rs`
-(the containers, and the E-AC-3 and MP4-writer refusals); both skip without `ffmpeg` on the PATH.
+(the containers, and the E-AC-3 refusal); both skip without `ffmpeg` on the PATH.
+
+### AC-3 encoder
+
+`--acodec ac3` (`--abitrate` 32 to 640 kb/s, snapped to an AC-3 rate; the default is 96, 192, 320, 384 or 448 kb/s for one to five
+full-bandwidth channels, as FFmpeg picks it) writes AC-3 to raw `.ac3`, Matroska (`A_AC3`), MP4 (`ac-3` with `dac3`) and MPEG-TS
+(stream type 0x81 with the `AC-3` registration descriptor). It is a translation of FFmpeg's float encoder (`ac3enc.c` and
+`ac3enc_float.c`) with its defaults: dialnorm -31, coupling and rematrixing where FFmpeg uses them, and the same exponent and
+bit allocation search. It takes 32, 44.1 and 48 kHz, every channel mode from mono to 3/2 with or without LFE, and not dual mono.
+
+Measured against `ffmpeg -c:a ac3` on the same float input (a 3-second sweep with clicks, 14 channel modes at 48 kHz and five other
+rate and bit rate settings). The SNR is of each stream's decode against the input:
+
+| Streams | Identical frames | SNR, FFmpeg's stream | SNR, IronAV's stream |
+|---|---|---|---|
+| mono, 48 kHz, 32 kb/s | 74 of 94 | 12.7 dB | 12.7 dB |
+| stereo, 48 kHz, 192 kb/s | 0 of 94 | 50.9 dB | 50.8 dB |
+| stereo, 44.1 kHz, 128 kb/s | 2 of 87 | 19.7 dB | 19.7 dB |
+| stereo, 32 kHz, 96 kb/s | 0 of 63 | 9.8 dB | 9.8 dB |
+| 5.1, 48 kHz, 640 kb/s | 0 of 94 | 48.6 dB | 48.6 dB |
+| 5.1, 44.1 kHz, 448 kb/s | 0 of 87 | 47.7 dB | 47.7 dB |
+| 4.0, quad, 5.0 and 5.1 at 192 kb/s | 0 to 3 of 94 | 6.7 to 13.7 dB | 6.7 to 13.7 dB |
+
+The other mono, stereo and surround modes at 192 kb/s fall between these, with the same parity. The sweep is a hard signal:
+FFmpeg's own stream reaches only -2.6 dB on quad with LFE, and IronAV's reaches 13.7 dB there. IronAV's decode and FFmpeg's decode of
+IronAV's stream agree to 104 to 113 dB. Frames are not byte-identical: the MDCT and the quantiser round a few coefficients
+differently, and in the first stereo frame the header, the bit allocation and the exponents match FFmpeg's exactly, and 15 bytes of
+mantissas differ (the CRC-1 fields match FFmpeg's). The test is `crates/ironav-engine/tests/ac3_encode.rs`, which skips without
+`ffmpeg` on the PATH. The containers are checked in `crates/ironav-formats/tests/ac3_containers.rs`: FFmpeg's probe names each
+written file AC-3 with the right channel count, the packets read back byte for byte, and the MP4 `dac3` body matches FFmpeg's.
 
 ## Matroska output
 
@@ -1133,7 +1162,7 @@ packet counts and times, and FFmpeg reads what IronAV writes without a decode er
 IronAV's own H.264 encoder with B-frames, a Matroska file remuxed to TS, and HEVC+MP3 transcoded to H.264+AAC. In all of
 them every frame decodes, the decode times always increase, and no presentation time is before its decode time.
 
-Not handled: AC-3 when writing (refused), subtitles (skipped when reading, refused when writing), more than one program,
+Not handled: subtitles (skipped when reading, refused when writing), more than one program,
 and PMT changes during a stream.
 
 ## Performance
