@@ -375,7 +375,9 @@ Checked on files remuxed by FFmpeg: an x264 file with B-frames and AAC and an HE
 (identical pixels when decoded by FFmpeg) and audio samples; the 1080p H.264 file decodes on the GPU to the same 50 frames
 as FFmpeg's decoder; AAC in a `.mka` decodes to within 1 LSB of FFmpeg's. Opus in Matroska decodes too (see below), and so do VP9 and
 AV1 in WebM (see "VP9" and "AV1").
-Not handled: tracks with a content encoding (header stripping, compression, encryption) are refused; chapters, tags, cues
+Content encodings are undone frame by frame: header stripping and zlib compression are read (checked with FFmpeg, which reads
+the same files to the same samples), while encryption, bzip2 and lzo are refused, and so is a live Matroska stream that has any
+content encoding. Not handled: chapters, tags, cues
 and attachments are ignored; subtitle tracks are skipped (for what Matroska output holds, see "Matroska output" below). A copied track starts at its own first
 timestamp rounded to the output's frame grid, so a video that starts a fraction of a frame after the audio in the source
 (23 ms in one test file) ends up up to half a frame (20 ms at 25 fps) away from where it was.

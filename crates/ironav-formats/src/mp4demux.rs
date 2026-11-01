@@ -130,6 +130,32 @@ impl Config {
     }
 }
 
+/// A transform that turns a stored frame back into the frame the codec sees (Matroska content encodings).
+#[derive(Clone, Debug)]
+pub(crate) enum Unwrap {
+    /// Header stripping: these bytes went in front of every frame.
+    Prepend(Vec<u8>),
+    /// zlib compression (RFC 1950) of the whole frame.
+    Inflate,
+}
+
+/// Applies `steps` to a stored frame, first step first.
+pub(crate) fn unwrap_frame(steps: &[Unwrap], mut data: Vec<u8>) -> Result<Vec<u8>> {
+    for step in steps {
+        data = match step {
+            Unwrap::Prepend(prefix) => [prefix.as_slice(), data.as_slice()].concat(),
+            Unwrap::Inflate => {
+                let mut out = Vec::with_capacity(data.len() * 2);
+                flate2::read::ZlibDecoder::new(&data[..])
+                    .read_to_end(&mut out)
+                    .map_err(|e| corrupt(format!("a zlib-compressed frame does not inflate: {e}")))?;
+                out
+            }
+        };
+    }
+    Ok(data)
+}
+
 pub(crate) struct TrackInfo {
     pub stream: StreamInfo,
     pub config: Config,
@@ -137,6 +163,8 @@ pub(crate) struct TrackInfo {
     pub convert: bool,
     /// Byte width of each big-endian sample to reverse (QuickTime PCM), or 0.
     pub swap: usize,
+    /// Undoes the frame's Matroska content encodings (header stripping, zlib), in order; empty for MP4.
+    pub unwrap: Vec<Unwrap>,
 }
 
 #[derive(Clone, Copy)]
@@ -615,7 +643,7 @@ fn parse_trak(trak: &[u8], index: usize, samples: &mut Vec<Sample>) -> Result<Op
     let duration: i64 = samples[first..].iter().map(|s| s.duration as i64).sum();
     let lead_in = edit_lead_in(trak)?;
     let stream = StreamInfo { index, codec, time_base, duration: Some(duration), bits, extradata, lead_in, params };
-    Ok(Some(TrackInfo { stream, config, convert, swap }))
+    Ok(Some(TrackInfo { stream, config, convert, swap, unwrap: Vec::new() }))
 }
 
 /// Media time at which the track's first non-empty edit starts, from `edts/elst`; 0 without one.
@@ -892,6 +920,7 @@ impl<R: Read + Seek + Send> Demuxer for Mp4Demuxer<R> {
             self.pos = s.offset + s.size as u64;
 
             let t = &self.tracks[st];
+            let mut raw = if t.unwrap.is_empty() { raw } else { unwrap_frame(&t.unwrap, raw)? };
             let data = if t.convert {
                 let n = t.config.nal_length;
                 let mut out = Vec::with_capacity(raw.len() + t.config.prefix.len() + 16);

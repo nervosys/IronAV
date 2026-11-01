@@ -2079,6 +2079,7 @@ dependencies = [
 name = "ironav-formats"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "ironav-codec",
  "ironav-core",
  "serde",

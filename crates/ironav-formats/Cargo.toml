@@ -21,3 +21,4 @@ serde.workspace = true
 serde_json.workspace = true
 ironav-core.workspace = true
 ironav-codec.workspace = true
+flate2 = "1"

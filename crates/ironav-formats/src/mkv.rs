@@ -11,13 +11,15 @@
 //! take the reorder delay. Audio is given a sample-rate time base when the frame length is known
 //! (so its times are exact despite the file's millisecond ticks).
 //!
-//! Not handled: content encodings (header stripping, compression, encryption), which are refused;
+//! Content encodings: header stripping and zlib are undone frame by frame (the live reader refuses encoded
+//! tracks); encryption, bzip2, lzo and encodings of the CodecPrivate alone are refused.
+//! Not handled:
 //! chapters, tags, cues and attachments, which are skipped; and a track's start offset, since a
 //! copy re-bases each track to its own first timestamp.
 
 pub(crate) mod live;
 
-use crate::mp4demux::{av1c_config, gcd, parse_avcc, parse_hvcc, Config, Mp4Demuxer, Sample, TrackInfo};
+use crate::mp4demux::{av1c_config, gcd, parse_avcc, parse_hvcc, unwrap_frame, Config, Mp4Demuxer, Sample, TrackInfo, Unwrap};
 use ironav_core::{CodecId, Error, ErrorCode, Rational, Result, StreamInfo, StreamParams};
 use std::io::{BufReader, Read, Seek, SeekFrom};
 
@@ -48,6 +50,13 @@ const SAMPLING_FREQUENCY: u32 = 0xB5;
 const CHANNELS: u32 = 0x9F;
 const BIT_DEPTH: u32 = 0x6264;
 const CONTENT_ENCODINGS: u32 = 0x6D80;
+const CONTENT_ENCODING: u32 = 0x6240;
+const CONTENT_ENCODING_ORDER: u32 = 0x5031;
+const CONTENT_ENCODING_SCOPE: u32 = 0x5032;
+const CONTENT_ENCODING_TYPE: u32 = 0x5033;
+const CONTENT_COMPRESSION: u32 = 0x5034;
+const CONTENT_COMP_ALGO: u32 = 0x4254;
+const CONTENT_COMP_SETTINGS: u32 = 0x4255;
 
 const CLUSTER_TIMECODE: u32 = 0xE7;
 const SIMPLE_BLOCK: u32 = 0xA3;
@@ -476,7 +485,66 @@ struct MkTrack {
     rate: f64,
     channels: u16,
     bits: Option<u8>,
+    /// Whether the track has a ContentEncodings element (the live reader refuses such tracks).
     encoded: bool,
+    /// The steps that undo its content encodings, first step first (empty when it has none).
+    encodings: Vec<Unwrap>,
+}
+
+/// The content encodings of a track's frames, as the steps that undo them in the order a reader applies
+/// them (the highest ContentEncodingOrder first). Header stripping and zlib are undone; encryption, other
+/// compression algorithms, and encodings that cover only the CodecPrivate are refused.
+fn content_encodings(body: &[u8]) -> Result<Vec<Unwrap>> {
+    let mut steps: Vec<(u64, Unwrap)> = Vec::new();
+    for e in Elems(body) {
+        let (id, enc) = e?;
+        if id != CONTENT_ENCODING {
+            continue;
+        }
+        let (mut order, mut scope, mut kind) = (0u64, 1u64, 0u64);
+        let mut compression = None;
+        for e in Elems(enc) {
+            let (id, v) = e?;
+            match id {
+                CONTENT_ENCODING_ORDER => order = be_uint(v)?,
+                CONTENT_ENCODING_SCOPE => scope = be_uint(v)?,
+                CONTENT_ENCODING_TYPE => kind = be_uint(v)?,
+                CONTENT_COMPRESSION => compression = Some(content_compression(v)?),
+                _ => {}
+            }
+        }
+        if kind != 0 {
+            return Err(Error::new(ErrorCode::UnsupportedFormat, "Matroska content encryption is not supported"));
+        }
+        if scope & 1 == 0 {
+            return Err(Error::new(ErrorCode::UnsupportedFormat, "a Matroska content encoding of the CodecPrivate alone is not supported"));
+        }
+        let (algo, settings) = compression.ok_or_else(|| bad("a content encoding has no compression"))?;
+        let step = match algo {
+            0 => Unwrap::Inflate,
+            3 => Unwrap::Prepend(settings),
+            other => {
+                return Err(Error::new(ErrorCode::UnsupportedFormat, format!("Matroska content compression algorithm {other} is not supported (0, zlib, and 3, header stripping, are)")));
+            }
+        };
+        steps.push((order, step));
+    }
+    steps.sort_by(|a, b| b.0.cmp(&a.0));
+    Ok(steps.into_iter().map(|s| s.1).collect())
+}
+
+/// ContentCompression: the algorithm, and its settings (for header stripping, the bytes taken off each frame).
+fn content_compression(body: &[u8]) -> Result<(u64, Vec<u8>)> {
+    let (mut algo, mut settings) = (0u64, Vec::new());
+    for e in Elems(body) {
+        let (id, v) = e?;
+        match id {
+            CONTENT_COMP_ALGO => algo = be_uint(v)?,
+            CONTENT_COMP_SETTINGS => settings = v.to_vec(),
+            _ => {}
+        }
+    }
+    Ok((algo, settings))
 }
 
 fn parse_tracks(body: &[u8]) -> Result<Vec<MkTrack>> {
@@ -486,7 +554,7 @@ fn parse_tracks(body: &[u8]) -> Result<Vec<MkTrack>> {
         if id != TRACK_ENTRY {
             continue;
         }
-        let mut t = MkTrack { number: 0, kind: 0, codec: String::new(), private: Vec::new(), default_ns: 0, width: 0, height: 0, rate: 8000.0, channels: 1, bits: None, encoded: false };
+        let mut t = MkTrack { number: 0, kind: 0, codec: String::new(), private: Vec::new(), default_ns: 0, width: 0, height: 0, rate: 8000.0, channels: 1, bits: None, encoded: false, encodings: Vec::new() };
         for e in Elems(entry) {
             let (id, v) = e?;
             match id {
@@ -495,7 +563,10 @@ fn parse_tracks(body: &[u8]) -> Result<Vec<MkTrack>> {
                 CODEC_ID => t.codec = String::from_utf8_lossy(v).trim_end_matches('\0').to_string(),
                 CODEC_PRIVATE => t.private = v.to_vec(),
                 DEFAULT_DURATION => t.default_ns = be_uint(v)?,
-                CONTENT_ENCODINGS => t.encoded = true,
+                CONTENT_ENCODINGS => {
+                    t.encoded = true;
+                    t.encodings = content_encodings(v)?;
+                }
                 VIDEO => {
                     for e in Elems(v) {
                         let (id, v) = e?;
@@ -631,9 +702,6 @@ fn build_track(t: &MkTrack, index: usize, frames: &[&Frame], scale: u64, samples
     // big-endian samples are turned little-endian by the reader, a sample at a time
     let swap = pcm.as_ref().map_or(0, |p| if p.big { p.width } else { 0 });
     let Some(codec) = codec else { return Ok(None) };
-    if t.encoded {
-        return Err(Error::new(ErrorCode::UnsupportedFormat, format!("track {} uses a Matroska content encoding (header stripping, compression or encryption)", t.number)));
-    }
     let g = gcd(scale as i64, 1_000_000_000);
     let tick = Rational::new(scale as i64 / g, 1_000_000_000 / g);
     let default_ticks = (t.default_ns / scale.max(1)) as i64;
@@ -744,7 +812,7 @@ fn build_track(t: &MkTrack, index: usize, frames: &[&Frame], scale: u64, samples
     }
     let duration: i64 = samples[first..].iter().map(|s| s.duration as i64).sum();
     let stream = StreamInfo { index, codec, time_base, duration: Some(duration), bits, extradata, lead_in: 0, params };
-    Ok(Some(TrackInfo { stream, config, convert, swap }))
+    Ok(Some(TrackInfo { stream, config, convert, swap, unwrap: t.encodings.clone() }))
 }
 
 /// Open a Matroska or WebM file for reading.
@@ -773,9 +841,12 @@ pub fn open<R: Read + Seek + Send>(mut r: R) -> Result<Mp4Demuxer<BufReader<R>>>
         let mut vp9 = None;
         if video_codec(&t.codec) == Some(CodecId::Vp9) {
             if let Some(f) = frames.iter().find(|f| f.key) {
-                let mut head = vec![0u8; (f.size as usize).min(16)];
-                if scan.r.seek(SeekFrom::Start(f.offset)).is_ok() && scan.r.read_exact(&mut head).is_ok() {
-                    vp9 = vp9_format(&head);
+                // the header is read from the frame as the codec sees it, so an encoded track is decoded first
+                let mut raw = vec![0u8; f.size as usize];
+                if scan.r.seek(SeekFrom::Start(f.offset)).is_ok() && scan.r.read_exact(&mut raw).is_ok() {
+                    if let Ok(frame) = unwrap_frame(&t.encodings, raw) {
+                        vp9 = vp9_format(&frame[..frame.len().min(16)]);
+                    }
                 }
             }
         }
@@ -940,10 +1011,85 @@ mod tests {
 
     #[test]
     fn content_encodings_are_refused() {
-        let video = [uint(TRACK_NUMBER, 1), uint(TRACK_TYPE, 1), el(CODEC_ID, b"V_VP9"), el(CONTENT_ENCODINGS, &[])].concat();
+        // an empty list of encodings changes nothing; encryption and other compression do
+        assert!(content_encodings(&[]).unwrap().is_empty());
+        let encrypted = el(CONTENT_ENCODING, &uint(CONTENT_ENCODING_TYPE, 1));
+        let err = content_encodings(&encrypted).err().unwrap();
+        assert!(err.message.contains("encryption"), "{}", err.message);
+        let bzip2 = el(CONTENT_ENCODING, &el(CONTENT_COMPRESSION, &uint(CONTENT_COMP_ALGO, 1)));
+        let err = content_encodings(&bzip2).err().unwrap();
+        assert!(err.message.contains("algorithm 1"), "{}", err.message);
+    }
+
+    /// The content encoding element for one step: its order and a compression algorithm, with its settings.
+    fn encoding(order: u64, algo: u64, settings: Option<&[u8]>) -> Vec<u8> {
+        let mut comp = uint(CONTENT_COMP_ALGO, algo);
+        if let Some(s) = settings {
+            comp.extend(el(CONTENT_COMP_SETTINGS, s));
+        }
+        el(CONTENT_ENCODING, &[uint(CONTENT_ENCODING_ORDER, order), el(CONTENT_COMPRESSION, &comp)].concat())
+    }
+
+    /// A Matroska file with one PCM track (16-bit mono, 8 kHz) whose frames are stored with `encodings`.
+    fn encoded_pcm(encodings: &[u8], frames: &[Vec<u8>]) -> Vec<u8> {
+        let audio = [el(0xB5, &8000f64.to_be_bytes()), uint(0x9F, 1), uint(0x6264, 16)].concat();
+        let track = [uint(TRACK_NUMBER, 1), uint(TRACK_TYPE, 2), el(CODEC_ID, b"A_PCM/INT/LIT"), el(AUDIO, &audio), el(CONTENT_ENCODINGS, encodings)].concat();
+        let blocks: Vec<u8> = frames.iter().flat_map(|f| simple(1, 0, true, f)).collect();
+        let body = [el(INFO, &uint(TIMECODE_SCALE, 1_000_000)), el(TRACKS, &el(TRACK_ENTRY, &track)), el(CLUSTER, &[uint(CLUSTER_TIMECODE, 0), blocks].concat())].concat();
         let mut f = el(EBML, &el(DOC_TYPE, b"matroska"));
-        f.extend(el(SEGMENT, &el(TRACKS, &el(TRACK_ENTRY, &video))));
-        let err = open(Cursor::new(f)).err().unwrap();
-        assert!(err.message.contains("content encoding"), "{}", err.message);
+        f.extend(el(SEGMENT, &body));
+        f
+    }
+
+    fn packets_of(file: Vec<u8>) -> Vec<Vec<u8>> {
+        let mut d = open(Cursor::new(file)).unwrap();
+        let mut out = Vec::new();
+        while let Some(p) = d.read_packet().unwrap() {
+            out.push(p.data);
+        }
+        out
+    }
+
+    #[test]
+    fn header_stripped_frames_get_their_header_back() {
+        // every frame began with the same two bytes, which the muxer took off
+        let prefix = [0xAA, 0xBB];
+        let frames: Vec<Vec<u8>> = vec![vec![0xAA, 0xBB, 1, 2, 3, 4], vec![0xAA, 0xBB, 5, 6, 7, 8]];
+        let stored: Vec<Vec<u8>> = frames.iter().map(|f| f[prefix.len()..].to_vec()).collect();
+        let file = encoded_pcm(&encoding(0, 3, Some(&prefix)), &stored);
+        assert_eq!(packets_of(file), frames);
+    }
+
+    #[test]
+    fn zlib_frames_are_inflated() {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        let frames: Vec<Vec<u8>> = vec![(0..64u8).collect(), vec![9; 40]];
+        let stored: Vec<Vec<u8>> = frames
+            .iter()
+            .map(|f| {
+                let mut z = ZlibEncoder::new(Vec::new(), Compression::default());
+                z.write_all(f).unwrap();
+                z.finish().unwrap()
+            })
+            .collect();
+        let file = encoded_pcm(&encoding(0, 0, None), &stored);
+        assert_eq!(packets_of(file), frames);
+    }
+
+    #[test]
+    fn header_stripping_and_zlib_undo_in_reverse_order() {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        // order 0 (header stripping) was applied to the sample first, and order 1 (zlib) after it
+        let prefix = [0x10, 0x20];
+        let frame = vec![0x10, 0x20, 7, 7, 7, 7, 7, 7];
+        let mut z = ZlibEncoder::new(Vec::new(), Compression::default());
+        z.write_all(&frame[prefix.len()..]).unwrap();
+        let stored = z.finish().unwrap();
+        let encodings = [encoding(0, 3, Some(&prefix)), encoding(1, 0, None)].concat();
+        assert_eq!(packets_of(encoded_pcm(&encodings, &[stored])), vec![frame]);
     }
 }

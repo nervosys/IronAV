@@ -241,7 +241,7 @@ pub fn open<R: Read>(mut r: R) -> Result<Mp4Demuxer<Cursor<Vec<u8>>>> {
             params: StreamParams::Audio { sample_rate: 48_000, channels },
         }
     };
-    let track = TrackInfo { stream, config: Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma: 1 }, convert: false, swap: 0 };
+    let track = TrackInfo { stream, config: Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma: 1 }, convert: false, swap: 0, unwrap: Vec::new() };
     Ok(Mp4Demuxer::from_parts(Cursor::new(data), "ogg", vec![track], samples))
 }
 
