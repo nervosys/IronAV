@@ -156,7 +156,7 @@ fn tile_info(b: &mut BitWriter, mi_cols: usize, mi_rows: usize) {
 
 /// What a frame's header says about the frame: its type, size, quantiser and filter strengths.
 /// Every frame has one tile, default CDFs (primary_ref_frame NONE), TX_MODE_LARGEST, the regular
-/// 8-tap interpolation filter, and single references (reference_select off).
+/// 8-tap interpolation filter; `reference_select` lets an inter frame's blocks be compound.
 #[derive(Clone, Copy, Debug)]
 pub struct FrameParams {
     pub key: bool,
