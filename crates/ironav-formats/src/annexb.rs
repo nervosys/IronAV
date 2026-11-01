@@ -1,6 +1,6 @@
 //! Raw Annex B elementary streams (`.h264`, `.hevc`): the encoder's NAL units with start
 //! codes, written back to back. There is no header, index or timing, so these files are
-//! write-only here; they exist so hardware-encoded video has a container before MP4/MKV land.
+//! write-only here: a plain container for an encoder's output when no MP4 or MKV is wanted.
 
 use crate::WriteSeek;
 use ironav_core::{CodecId, Error, ErrorCode, Muxer, Packet, Result, StreamInfo};

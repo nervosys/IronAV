@@ -59,7 +59,7 @@ pub static FORMATS: &[FormatSpec] = &[
     FormatSpec {
         name: "jpeg",
         extensions: &["jpg", "jpeg"],
-        description: "One JPEG image (baseline, 8-bit; gray, 4:2:0, 4:2:2 or 4:4:4): read as a single Motion-JPEG frame, written from one",
+        description: "One JPEG image (8-bit baseline, progressive or lossless; gray, YCbCr 4:2:0, 4:2:2 or 4:4:4, or RGB; CMYK is refused): read as a single Motion-JPEG frame, written from one",
         media: MediaType::Video,
         demux: true,
         mux: true,
@@ -140,7 +140,7 @@ pub static FORMATS: &[FormatSpec] = &[
     FormatSpec {
         name: "ogg",
         extensions: &["ogg", "opus", "oga"],
-        description: "Ogg: read Opus, Vorbis and FLAC audio (Speex and Theora are refused); write Opus, Vorbis (copied) and FLAC",
+        description: "Ogg: read Opus, Vorbis and FLAC audio (Speex and Theora are refused); write Opus, Vorbis and FLAC",
         media: MediaType::Audio,
         demux: true,
         mux: true,

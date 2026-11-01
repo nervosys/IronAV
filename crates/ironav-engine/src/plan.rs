@@ -412,7 +412,7 @@ pub fn plan(job: &Job) -> Result<Plan> {
                             ironav_codec::new_decoder_for(s)?;
                             use_gpu = false;
                         } else {
-                            return Err(Error::new(ErrorCode::UnsupportedCodec, m).hint("only 8-bit and 10-bit 4:2:0 H.264, HEVC and AV1 can be decoded on the GPU"));
+                            return Err(Error::new(ErrorCode::UnsupportedCodec, m).hint("only 8-bit and 10-bit 4:2:0 video can be decoded on the GPU (10-bit H.264 also needs a GPU whose NVDEC supports it)"));
                         }
                     }
                     if use_gpu {
