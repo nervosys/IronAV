@@ -1930,6 +1930,27 @@ fn h264_444_422_and_monochrome_decode_to_what_ffmpeg_decodes() {
     }
 }
 
+/// Interlaced H.264 coded as MBAFF frames (field and frame macroblock pairs) from libx264: CABAC with
+/// spatial direct and explicit weights over a fade, CAVLC with temporal direct and the bottom field
+/// first, and three slices without the 8x8 transform, are bit-exact with FFmpeg's decoder. Larger
+/// streams and more tools are checked in ironav-codec's h264_mbaff tests.
+#[test]
+fn h264_mbaff_decodes_to_what_ffmpeg_decodes() {
+    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    for name in ["mbaff_b_cabac", "mbaff_tm_cavlc", "mbaff_slices"] {
+        let dir = scratch(&format!("h264-{name}"));
+        let out = dir.join("out.y4m");
+        let mut j = job(&data.join(format!("h264_{name}.mp4")), &out);
+        j.hwaccel = "off".into();
+        j.video.codec = Some("rawvideo".into());
+        run(&j, &mut |_| {}).unwrap();
+        let got: Vec<u8> = y4m_frames_any(&out).concat();
+        let want = std::fs::read(data.join(format!("h264_{name}.ffmpeg.yuv"))).unwrap();
+        assert_eq!(got.len(), want.len(), "{name}: size");
+        assert!(got == want, "{name}: pixels differ from FFmpeg's");
+    }
+}
+
 /// HEVC Main, Main 10 and range extension streams from x265 (intra, P and B pictures, weighted prediction,
 /// wavefronts, multiple slices, conformance-window cropping, monochrome, 4:2:2 and 4:4:4 at 8 and 10 bits,
 /// and 12-bit 4:2:0 and 4:2:2)
