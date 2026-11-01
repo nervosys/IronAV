@@ -23,12 +23,22 @@ fn floor_log2(x: u32) -> i32 {
     31 - x.leading_zeros() as i32
 }
 
-fn constrain(diff: i32, thr: i32, damping: i32) -> i32 {
+/// The damping shift of constrain for strength `thr` (spec 7.15.2): it depends on the strength only.
+fn constrain_shift(thr: i32, damping: i32) -> i32 {
+    if thr == 0 {
+        0
+    } else {
+        (damping - floor_log2(thr as u32)).max(0)
+    }
+}
+
+/// constrain (spec 7.15.2) with the shift from `constrain_shift`.
+fn constrain(diff: i32, thr: i32, adj: i32) -> i32 {
     if thr == 0 {
         return 0;
     }
-    let adj = (damping - floor_log2(thr as u32)).max(0);
-    let v = diff.abs().min((thr - (diff.abs() >> adj)).max(0));
+    let a = diff.abs();
+    let v = a.min((thr - (a >> adj)).max(0));
     if diff < 0 {
         -v
     } else {
@@ -99,29 +109,45 @@ fn filter(src: &Plane, dst: &mut Plane, geo: (usize, usize, usize, usize, u32), 
     let (x0, y0) = ((c * 4) >> sx, (r * 4) >> sy);
     let (w, h) = (8 >> sx, 8 >> sy);
     let (mr, mc) = (mi_rows as isize, mi_cols as isize);
-    let avail = |y: isize, x: isize| -> Option<i32> {
-        let (cr, cc) = ((y << sy) >> 2, (x << sx) >> 2);
-        (cr >= 0 && cr < mr && cc >= 0 && cc < mc).then(|| src.at(x as usize, y as usize))
-    };
+    // The block with a margin of 2 samples, the reach of the taps. A sample outside the frame's
+    // mode-info grid is unavailable and is left out of the sums and of the clamp.
+    let mut win = [[0i32; 12]; 12];
+    let mut ok = [[false; 12]; 12];
+    for (i, (wr, okr)) in win.iter_mut().zip(ok.iter_mut()).enumerate().take(h + 4) {
+        let yy = (y0 + i) as isize - 2;
+        for (j, (wv, okv)) in wr.iter_mut().zip(okr.iter_mut()).enumerate().take(w + 4) {
+            let xx = (x0 + j) as isize - 2;
+            let (cr, cc) = ((yy << sy) >> 2, (xx << sx) >> 2);
+            if cr >= 0 && cr < mr && cc >= 0 && cc < mc {
+                *okv = true;
+                *wv = src.at(xx as usize, yy as usize);
+            }
+        }
+    }
     let pt = PRI_TAPS[((pri >> shift) & 1) as usize];
     let dirs = [dir, (dir + 6) & 7, (dir + 2) & 7];
+    let (pri_adj, sec_adj) = (constrain_shift(pri, damping), constrain_shift(sec, damping));
     for i in 0..h {
         for j in 0..w {
-            let (yy, xx) = ((y0 + i) as isize, (x0 + j) as isize);
-            let x = src.at(x0 + j, y0 + i);
+            let (ci, cj) = (i + 2, j + 2);
+            let x = win[ci][cj];
             let (mut sum, mut mx, mut mn) = (0i32, x, x);
             for k in 0..2 {
                 for sign in [-1i32, 1] {
                     let d = DIRS[dir][k];
-                    if let Some(p) = avail(yy + (sign * d[0]) as isize, xx + (sign * d[1]) as isize) {
-                        sum += pt[k] * constrain(p - x, pri, damping);
+                    let (py, px) = ((ci as i32 + sign * d[0]) as usize, (cj as i32 + sign * d[1]) as usize);
+                    if ok[py][px] {
+                        let p = win[py][px];
+                        sum += pt[k] * constrain(p - x, pri, pri_adj);
                         mx = mx.max(p);
                         mn = mn.min(p);
                     }
                     for &dd in &dirs[1..] {
                         let d = DIRS[dd][k];
-                        if let Some(s) = avail(yy + (sign * d[0]) as isize, xx + (sign * d[1]) as isize) {
-                            sum += SEC_TAPS[k] * constrain(s - x, sec, damping);
+                        let (sy_, sx_) = ((ci as i32 + sign * d[0]) as usize, (cj as i32 + sign * d[1]) as usize);
+                        if ok[sy_][sx_] {
+                            let s = win[sy_][sx_];
+                            sum += SEC_TAPS[k] * constrain(s - x, sec, sec_adj);
                             mx = mx.max(s);
                             mn = mn.min(s);
                         }
