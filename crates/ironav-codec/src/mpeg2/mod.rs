@@ -13,6 +13,7 @@
 
 mod mb;
 mod mc;
+pub mod enc;
 mod tables;
 
 use crate::mpeg4::bits::{Bits, Vlc};
