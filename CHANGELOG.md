@@ -151,7 +151,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - **Hardware:** only NVIDIA is driven: NVENC for H.264 and HEVC, NVDEC for H.264, HEVC and AV1. The other backends
   (VA-API, Quick Sync, VideoToolbox, D3D11VA, AMF, Vulkan Video, MediaCodec and OpenCL) are planned.
 - **AV1 encoder:** no joint compound (COMPOUND_DISTANCE), no motion field projection and no skip mode; hidden ALTREF frames are an
-  encoder option (`with_altref`), off by default; 8-bit 4:2:0 and one tile; the motion search stops at half samples unless `with_quarter_mv(true)` adds a quarter-sample step (under 1 % fewer bytes for 18 to 112 % more time at 720p, so off by default). Rate control is an average bit rate only: no maximum rate or buffer size (`--maxrate`,
+  encoder option (`with_altref`), off by default; 8-bit 4:2:0; tile columns and rows (`with_tiles`, two columns by default from 1280 pixels wide, each tile coded on its own thread; 0.2 to 2.8 % more bytes, 1.2 to 3.0 times as fast at 720p); the motion search stops at half samples unless `with_quarter_mv(true)` adds a quarter-sample step (under 1 % fewer bytes for 18 to 112 % more time at 720p, so off by default). Rate control is an average bit rate only: no maximum rate or buffer size (`--maxrate`,
   `--bufsize` are not options of any encoder).
 - **AV1 decoder:** RGB and monochrome above 8 bits are refused, as there is no output format for them.
 - **HEVC encoder:** Main profile, 8-bit 4:2:0 only, with no sign data hiding; B pictures are an option (`with_bframes`), off by default: with a quantiser cascade they save about 12 % on the mandelbrot clip at equal PSNR, but only about 3 % on `testsrc2` (see the HEVC section of the README); 10-bit HEVC encoding needs an NVIDIA GPU (NVENC).

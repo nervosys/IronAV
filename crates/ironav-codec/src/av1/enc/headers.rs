@@ -132,10 +132,14 @@ pub fn sequence_header_with(width: u32, height: u32, superres: bool, restoration
     b.buf
 }
 
-/// The tile layout of a single tile: the uniform spacing syntax with every increment left at zero.
-/// Frames the encoder cannot code in one tile (more superblocks than the minimum tile count allows)
-/// are rejected by the caller, so the minimum log2 tile counts are zero here.
-fn tile_info(b: &mut BitWriter, mi_cols: usize, mi_rows: usize) {
+/// The tile layout: the uniform spacing syntax, with `2^cols` by `2^rows` tiles asked for (each
+/// clamped to the most the picture's superblock counts allow; a count that does not divide the
+/// superblocks evenly gives fewer tiles, as the decoder derives them). Frames the encoder cannot
+/// code in one tile (more superblocks than the minimum tile count allows) are rejected by the
+/// caller, so the minimum log2 tile counts are zero here. Several tiles come with the tile to
+/// update the CDFs from (tile 0, which does not matter: the frame end update is off) and 4 bytes for
+/// each tile size.
+fn tile_info(b: &mut BitWriter, mi_cols: usize, mi_rows: usize, (cols, rows): (u32, u32)) {
     let sb_cols = mi_cols.div_ceil(16);
     let sb_rows = mi_rows.div_ceil(16);
     let tile_log2 = |blk: usize, target: usize| {
@@ -146,11 +150,24 @@ fn tile_info(b: &mut BitWriter, mi_cols: usize, mi_rows: usize) {
         k
     };
     b.put(1, 1); // uniform_tile_spacing_flag
-    if tile_log2(1, sb_cols.min(64)) > 0 {
-        b.put(0, 1); // increment_tile_cols_log2
+    let (max_cols, max_rows) = (tile_log2(1, sb_cols.min(64)), tile_log2(1, sb_rows.min(64)));
+    let (cols, rows) = (cols.min(max_cols as u32), rows.min(max_rows as u32));
+    // increment_tile_cols_log2 and increment_tile_rows_log2: a 1 for each step up, then a 0 unless at the most
+    for _ in 0..cols {
+        b.put(1, 1);
     }
-    if tile_log2(1, sb_rows.min(64)) > 0 {
-        b.put(0, 1); // increment_tile_rows_log2
+    if (cols as usize) < max_cols {
+        b.put(0, 1);
+    }
+    for _ in 0..rows {
+        b.put(1, 1);
+    }
+    if (rows as usize) < max_rows {
+        b.put(0, 1);
+    }
+    if cols > 0 || rows > 0 {
+        b.put(0, cols + rows); // context_update_tile_id
+        b.put(3, 2); // tile_size_bytes_minus_1: 4 bytes
     }
 }
 
@@ -173,6 +190,9 @@ pub struct FrameParams {
     /// Whether the sequence header allows loop restoration, and then whether the frame uses it: the
     /// Wiener filter on every plane, with 64-sample luma units and 32-sample chroma units.
     pub restoration: bool,
+    /// The log2 of the tile columns and rows asked for (uniform spacing); the header clamps them to
+    /// what the picture's size allows, and the tile counts are then read back from it.
+    pub tiles_log2: (u32, u32),
     /// The display index of the frame, as its order hint (the low 7 bits are written).
     pub order_hint: u32,
     /// Whether the frame is shown (a hidden frame is an ALTREF, shown later by a show_existing_frame).
@@ -270,7 +290,7 @@ pub fn frame_header(p: &FrameParams) -> Vec<u8> {
         b.put(0, 1); // is_motion_mode_switchable
     }
     b.put(1, 1); // disable_frame_end_update_cdf
-    tile_info(&mut b, mi_cols, mi_rows);
+    tile_info(&mut b, mi_cols, mi_rows, p.tiles_log2);
     b.put(p.base_q_idx, 8);
     b.put(0, 1); // DeltaQYDc: delta_coded
     b.put(0, 1); // DeltaQUDc
@@ -354,7 +374,7 @@ mod tests {
 
     #[test]
     fn frame_headers_read_back() {
-        let p = FrameParams { key: true, width: 352, height: 288, base_q_idx: 115, lf_level: 10, cdef: [3, 1, 1, 0], superres: None, restoration: false, order_hint: 0, shown: true, ref_idx: [0; 7], ref_hints: [0; 7], refresh: 0xff, reference_select: false };
+        let p = FrameParams { key: true, width: 352, height: 288, base_q_idx: 115, lf_level: 10, cdef: [3, 1, 1, 0], superres: None, restoration: false, tiles_log2: (0, 0), order_hint: 0, shown: true, ref_idx: [0; 7], ref_hints: [0; 7], refresh: 0xff, reference_select: false };
         let hdr = frame_header(&p);
         let mut b = Bits::new(&hdr);
         assert_eq!(b.f(1).unwrap(), 0); // show_existing_frame

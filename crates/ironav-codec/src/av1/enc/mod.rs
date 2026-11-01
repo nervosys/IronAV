@@ -1,8 +1,8 @@
 //! A software AV1 encoder: key frames every `keyint` frames (250 by default, as the VP9 and HEVC
-//! encoders), and inter frames between them. Profile 0, 8-bit 4:2:0, one tile.
+//! encoders), and inter frames between them. Profile 0, 8-bit 4:2:0, in one tile or several (`with_tiles`).
 //!
 //! Each frame is a temporal unit: a temporal delimiter, the sequence header, and a frame OBU with
-//! the frame's header and its tile. An inter frame predicts from one of the three frames before it, or
+//! the frame's header and its tiles. An inter frame predicts from one of the three frames before it, or
 //! from the average of LAST_FRAME and LAST2_FRAME or LAST3_FRAME (compound, `with_compound`)
 //! (LAST_FRAME, LAST2_FRAME and LAST3_FRAME, held in reference slots that each frame refreshes in
 //! turn; `with_refs(1)` limits it to LAST_FRAME), with the regular 8-tap filter, quarter-sample motion
@@ -72,6 +72,13 @@ const BPP: f64 = 0.1;
 /// The largest picture one tile holds: 4096 wide, and no more than 2304 superblocks, so that the
 /// minimum tile counts stay zero.
 const MAX_WIDTH: u32 = 4096;
+
+/// The width from which the encoder codes tile columns by default, and the log2 of how many.
+const AUTO_TILE_WIDTH: usize = 1280;
+const AUTO_TILE_COLS_LOG2: u32 = 1;
+
+/// The narrowest tile libaom accepts when the frame is coded with superres, in upscaled samples.
+const MIN_SUPERRES_TILE_WIDTH: usize = 128;
 const MAX_SUPERBLOCKS: usize = 2304;
 
 /// The quantiser offset of key frames under rate control, in the 0 to 51 quantiser: key frames are
@@ -138,6 +145,10 @@ pub struct Av1Encoder {
     restoration: bool,
     /// Whether the motion search refines to quarter samples (see `with_quarter_mv`).
     quarter_mv: bool,
+    /// The log2 of the tile columns and rows (see `with_tiles`); `None` picks them from the width.
+    tiles: Option<(u32, u32)>,
+    /// The most threads the tiles of a frame are coded on (see `with_threads`).
+    threads: usize,
 }
 
 impl Av1Encoder {
@@ -154,7 +165,7 @@ impl Av1Encoder {
         }
         let superblocks = width.div_ceil(64) as usize * height.div_ceil(64) as usize;
         if width == 0 || height == 0 || width > MAX_WIDTH || superblocks > MAX_SUPERBLOCKS {
-            return Err(Error::invalid_arg(format!("{width}x{height} is too large for the software AV1 encoder (one tile, up to 4096 wide)")));
+            return Err(Error::invalid_arg(format!("{width}x{height} is too large for the software AV1 encoder (up to 4096 wide and 2304 superblocks)")));
         }
         let seq = parse_sequence_header(&headers::sequence_header(width, height))?;
         let fps = if frame_rate.num > 0 && frame_rate.den > 0 { frame_rate.num as f64 / frame_rate.den as f64 } else { 25.0 };
@@ -186,6 +197,8 @@ impl Av1Encoder {
             superres: None,
             restoration: false,
             quarter_mv: false,
+            tiles: None,
+            threads: std::thread::available_parallelism().map_or(1, |n| n.get()),
         })
     }
 
@@ -257,6 +270,46 @@ impl Av1Encoder {
     pub fn with_quarter_mv(mut self, on: bool) -> Self {
         self.quarter_mv = on;
         self
+    }
+
+    /// Codes each frame in `2^cols_log2` tile columns by `2^rows_log2` tile rows (each at most as many
+    /// as the picture has superblock columns or rows, 64 at most, and fewer when they do not divide
+    /// the superblocks evenly). Tiles are independent, so a frame's tiles are coded on several
+    /// threads (see `with_threads`) and the decoder can decode them on several; each costs bits, since
+    /// its contexts and CDFs start afresh and its edges predict from less. Without this the encoder
+    /// picks two tile columns for a picture 1280 samples wide or more (at 720p that costs 0.2 to 1.8 % in
+    /// bytes and encodes 1.2 to 1.8 times as fast, on enough cores). `with_tiles(0, 0)` codes one tile. With
+    /// superres the tile columns are cut to keep each tile 128 samples wide once upscaled, which libaom
+    /// requires.
+    pub fn with_tiles(mut self, cols_log2: u32, rows_log2: u32) -> Self {
+        self.tiles = Some((cols_log2.min(6), rows_log2.min(6)));
+        self
+    }
+
+    /// Codes the tiles of a frame on up to `n` threads (at least 1; by default as many as the machine
+    /// has). The stream does not depend on it.
+    pub fn with_threads(mut self, n: usize) -> Self {
+        self.threads = n.max(1);
+        self
+    }
+
+    /// The log2 of the tile columns and rows the frames use.
+    fn tiles_log2(&self) -> (u32, u32) {
+        let (mut cols, rows) = self.tiles.unwrap_or(if self.width >= AUTO_TILE_WIDTH { (AUTO_TILE_COLS_LOG2, 0) } else { (0, 0) });
+        if let Some(d) = self.superres {
+            // libaom rejects tiles narrower than MIN_SUPERRES_TILE_WIDTH samples once upscaled: use
+            // fewer tile columns until the narrowest (the last) is wide enough
+            let sb_cols = (downscaled_width(self.width as u32, d) as usize).div_ceil(64);
+            while cols > 0 {
+                let w = sb_cols.div_ceil(1 << cols);
+                let last = sb_cols - (sb_cols.div_ceil(w) - 1) * w;
+                if last * 64 * d as usize / 8 >= MIN_SUPERRES_TILE_WIDTH {
+                    break;
+                }
+                cols -= 1;
+            }
+        }
+        (cols, rows)
     }
 
     /// Parses the sequence header of the options set so far, for the encoder's own frame headers.
@@ -341,6 +394,7 @@ impl Av1Encoder {
             cdef: cdef_strengths(q),
             superres: self.superres,
             restoration: self.restoration,
+            tiles_log2: self.tiles_log2(),
             order_hint,
             shown,
             ref_idx,
@@ -369,7 +423,7 @@ impl Av1Encoder {
         }
         let mut enc = tile::FrameEnc::new(f, planes[0], planes[1], planes[2], (coded_w, h), self.prev_src.clone(), std::mem::take(&mut self.bases), self.nrefs, self.compound, dists);
         enc.search_steps = if self.quarter_mv { 3 } else { 2 };
-        let (tile_bytes, mut f, src_luma, bases) = enc.encode();
+        let (tile_bytes, mut f, src_luma, bases) = enc.encode(self.threads);
         self.bases = bases;
 
         // the post filters, as the decoder runs them on the frame

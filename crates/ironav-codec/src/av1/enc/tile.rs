@@ -362,28 +362,117 @@ impl FrameEnc {
         }
     }
 
-    /// Codes the tile: every superblock in raster order. Returns the tile's bytes, the frame's
+    /// Codes the frame's tiles. Returns the tile group's bytes (after the frame header), the frame's
     /// decoder state (reconstructed, not yet filtered) and the source luma for the next frame.
-    pub fn encode(mut self) -> (Vec<u8>, FrameDec, Plane, Bases) {
-        self.f.tile = [0, self.mi_rows, 0, self.mi_cols];
-        for r in (0..self.mi_rows).step_by(16) {
-            for c in (0..self.mi_cols).step_by(16) {
+    ///
+    /// A frame of several tiles is coded by one worker per tile, each a `FrameEnc` over its own copy of
+    /// the frame state that codes only its tile's rectangle (tiles share nothing: the contexts, the
+    /// availability and the CDFs all start afresh in each), on up to `threads` threads; the
+    /// reconstructions are then merged into the frame, as the decoder's tile workers do.
+    pub fn encode(mut self, threads: usize) -> (Vec<u8>, FrameDec, Plane, Bases) {
+        let (rows, cols) = (self.f.h.tile_rows, self.f.h.tile_cols);
+        let tsb = self.f.h.tile_size_bytes;
+        let bytes = if rows * cols == 1 {
+            self.encode_tile([0, self.mi_rows, 0, self.mi_cols])
+        } else {
+            let (rs, cs) = (self.f.h.mi_row_starts.clone(), self.f.h.mi_col_starts.clone());
+            let rects: Vec<[usize; 4]> = (0..rows * cols).map(|t| [rs[t / cols], rs[t / cols + 1], cs[t % cols], cs[t % cols + 1]]).collect();
+            let mut workers: Vec<FrameEnc> = rects.iter().map(|_| self.worker()).collect();
+            let threads = threads.clamp(1, workers.len());
+            let mut coded: Vec<Vec<u8>> = vec![Vec::new(); workers.len()];
+            if threads == 1 {
+                for ((w, r), out) in workers.iter_mut().zip(&rects).zip(coded.iter_mut()) {
+                    *out = w.encode_tile(*r);
+                }
+            } else {
+                // each thread takes a run of the tiles in turn
+                let per = workers.len().div_ceil(threads);
+                std::thread::scope(|s| {
+                    for ((ws, rs), outs) in workers.chunks_mut(per).zip(rects.chunks(per)).zip(coded.chunks_mut(per)) {
+                        s.spawn(move || {
+                            for ((w, r), out) in ws.iter_mut().zip(rs).zip(outs.iter_mut()) {
+                                *out = w.encode_tile(*r);
+                            }
+                        });
+                    }
+                });
+            }
+            let mut bytes = vec![0u8]; // tile_start_and_end_present_flag 0, byte aligned
+            let n = coded.len();
+            for (t, (w, r)) in workers.iter().zip(&rects).enumerate() {
+                self.f.merge_tile(&w.f, *r);
+                self.bases.merge(&w.bases);
+                if t + 1 < n {
+                    let size = coded[t].len() - 1;
+                    assert!(size >> (8 * tsb.min(7)) == 0, "a tile of {} bytes does not fit its size field", size + 1);
+                    bytes.extend_from_slice(&size.to_le_bytes()[..tsb]);
+                }
+                bytes.extend_from_slice(&coded[t]);
+            }
+            bytes
+        };
+        let FrameEnc { f, src, bases, .. } = self;
+        let [luma, _, _] = src;
+        (bytes, f, luma, bases)
+    }
+
+    /// A worker for one tile of the frame: a copy of this encoder's state over a fresh frame state
+    /// (the same headers and references, nothing coded), with fresh contexts, CDFs and symbol coder.
+    fn worker(&self) -> FrameEnc {
+        let (aw, ah) = ((self.mi_cols * 4).div_ceil(64) * 64, (self.mi_rows * 4).div_ceil(64) * 64);
+        let ctx = || [vec![0u8; aw / 4 + 32], vec![0u8; aw / 4 + 32], vec![0u8; aw / 4 + 32]];
+        let lctx = || [vec![0u8; ah / 4 + 32], vec![0u8; ah / 4 + 32], vec![0u8; ah / 4 + 32]];
+        let qidx = self.f.h.base_q_idx as usize;
+        FrameEnc {
+            f: self.f.peer(),
+            mi_rows: self.mi_rows,
+            mi_cols: self.mi_cols,
+            key: self.key,
+            src: self.src.clone(),
+            prev: self.prev.clone(),
+            field: self.field.clone(),
+            above_lvl: ctx(),
+            above_dc: ctx(),
+            left_lvl: lctx(),
+            left_dc: lctx(),
+            decoded: [vec![false; (aw / 4) * (ah / 4)], vec![false; (aw / 8) * (ah / 8)], vec![false; (aw / 8) * (ah / 8)]],
+            cdf: Cdfs::new(qidx as i32),
+            se: SymbolEncoder::new(true),
+            bases: self.bases.clone(),
+            dcq: self.dcq,
+            acq: self.acq,
+            lambda: self.lambda,
+            blk: (0, 0, 0),
+            plan: HashMap::new(),
+            nrefs: self.nrefs,
+            compound: self.compound,
+            last_dist: self.last_dist,
+            alt_dist: self.alt_dist,
+            search_steps: self.search_steps,
+        }
+    }
+
+    /// Codes the tile with the 4x4 rows and columns `tile` (`[row start, row end, column start, column
+    /// end]`, as `FrameDec::tile`): every superblock in raster order. Returns the tile's bytes.
+    fn encode_tile(&mut self, tile: [usize; 4]) -> Vec<u8> {
+        self.f.tile = tile;
+        let [rs, re, cs, ce] = tile;
+        for r in (rs..re).step_by(16) {
+            for c in (cs..ce).step_by(16) {
                 self.plan_node(r, c, BLOCK_64X64);
             }
         }
-        for r in (0..self.mi_rows).step_by(16) {
+        for r in (rs..re).step_by(16) {
             for p in 0..3 {
                 self.left_lvl[p].fill(0);
                 self.left_dc[p].fill(0);
             }
-            for c in (0..self.mi_cols).step_by(16) {
+            for c in (cs..ce).step_by(16) {
                 self.write_lr(r, c, 16);
                 self.partition(r, c, BLOCK_64X64);
             }
         }
-        let FrameEnc { f, se, src, bases, .. } = self;
-        let [luma, _, _] = src;
-        (se.finish(), f, luma, bases)
+        std::mem::replace(&mut self.se, SymbolEncoder::new(true)).finish()
     }
 
     /// read_lr for the superblock at (`r`, `c`): each unit's filter type and, for a Wiener unit, its
@@ -464,8 +553,8 @@ impl FrameEnc {
         let (w4, h4) = ((1isize << log2w) >> 2, (1isize << log2h) >> 2);
         let (x4, y4) = ((x >> 2) as isize, (y >> 2) as isize);
         Edges {
-            have_left: x > 0,
-            have_above: y > 0,
+            have_left: x > (self.f.tile[2] * 4) >> ss,
+            have_above: y > (self.f.tile[0] * 4) >> ss,
             have_above_right: self.is_decoded(plane, y4 - 1, x4 + w4),
             have_below_left: self.is_decoded(plane, y4 + h4, x4 - 1),
             max_x: ((self.mi_cols * 4) >> ss) as i32 - 1,
@@ -485,7 +574,7 @@ impl FrameEnc {
             (SMOOTH_PRED..=SMOOTH_H_PRED).contains(&mode)
         };
         let mut s = false;
-        if r > 0 {
+        if r > self.f.tile[0] {
             let (mut rr, mut cc) = (r - 1, c);
             if plane > 0 {
                 if c & 1 == 0 {
@@ -497,7 +586,7 @@ impl FrameEnc {
             }
             s |= mode(rr, cc);
         }
-        if c > 0 {
+        if c > self.f.tile[2] {
             let (mut rr, mut cc) = (r, c - 1);
             if plane > 0 {
                 if c & 1 == 1 {
@@ -753,8 +842,8 @@ impl FrameEnc {
         let has_cols = c + half < self.mi_cols;
         let p = self.plan.get(&(r, c, bs)).map_or(3, |&p| p as usize);
         let bsl = MI_W_LOG2[bs] as usize;
-        let above = r > 0 && (MI_W_LOG2[self.mi_at(r - 1, c).size as usize] as usize) < bsl;
-        let left = c > 0 && (MI_H_LOG2[self.mi_at(r, c - 1).size as usize] as usize) < bsl;
+        let above = r > self.f.tile[0] && (MI_W_LOG2[self.mi_at(r - 1, c).size as usize] as usize) < bsl;
+        let left = c > self.f.tile[2] && (MI_H_LOG2[self.mi_at(r, c - 1).size as usize] as usize) < bsl;
         let ctx = left as usize * 2 + above as usize;
         if has_rows && has_cols {
             let cdf: &mut [u16] = match bsl {
@@ -1469,8 +1558,8 @@ impl FrameEnc {
         }
         let (y_mode, ang_y, uv_mode, ang_uv) = (self.f.b.y_mode, self.f.b.angle_y, self.f.b.uv_mode, self.f.b.angle_uv);
         if self.key {
-            let above = if r > 0 { self.mi_at(r - 1, c).y_mode } else { DC_PRED };
-            let left = if c > 0 { self.mi_at(r, c - 1).y_mode } else { DC_PRED };
+            let above = if r > self.f.tile[0] { self.mi_at(r - 1, c).y_mode } else { DC_PRED };
+            let left = if c > self.f.tile[2] { self.mi_at(r, c - 1).y_mode } else { DC_PRED };
             self.se.symbol(y_mode as usize, &mut self.cdf.kf_y_mode[INTRA_MODE_CONTEXT[above as usize]][INTRA_MODE_CONTEXT[left as usize]]);
         } else {
             self.se.symbol(y_mode as usize, &mut self.cdf.y_mode[SIZE_GROUP[bs] as usize]);

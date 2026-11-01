@@ -384,6 +384,57 @@ impl FrameDec {
         FrameShared { seq: self.seq.clone(), h: self.h.clone(), refs: self.refs.clone(), prev_seg: self.prev_seg.clone(), tpl: self.tpl.clone() }
     }
 
+    /// A frame state like this one's, with nothing coded: the same headers, references and motion
+    /// field, and outputs over the whole frame. A tile encoder's worker codes one tile into it, and
+    /// `merge_tile` then copies the tile into the frame.
+    pub(crate) fn peer(&self) -> FrameDec {
+        let mut w = FrameDec::with_window(self.seq.clone(), self.h.clone(), [0, self.h.mi_rows, 0, self.h.mi_cols]);
+        w.refs = self.refs.clone();
+        w.prev_seg = self.prev_seg.clone();
+        w.tpl = self.tpl.clone();
+        w
+    }
+
+    /// Copies into this frame the outputs of tile `tile` (its 4x4 rows and columns, as
+    /// `FrameDec::tile`) from `w`, a frame state over the whole frame (see `peer`) that coded it:
+    /// planes, mode info, palette colours, delta LF values, CDEF indices, loop filter transform sizes,
+    /// saved motion vectors and restoration units. The tile's superblocks are copied whole.
+    pub(crate) fn merge_tile(&mut self, w: &FrameDec, tile: [usize; 4]) {
+        // copies the rectangle of rows `r0..r1` and columns `c0..c1` of a grid `stride` wide
+        fn copy<T: Copy>(dst: &mut [T], src: &[T], stride: usize, (r0, r1): (usize, usize), (c0, c1): (usize, usize)) {
+            if stride == 0 {
+                return;
+            }
+            for r in r0..r1 {
+                let (a, b) = (r * stride + c0, r * stride + c1.min(stride));
+                if b > dst.len() || b > src.len() {
+                    break;
+                }
+                dst[a..b].copy_from_slice(&src[a..b]);
+            }
+        }
+        let [rs, re, cs, ce] = tile;
+        let sb4 = self.sb4;
+        // the tile's superblocks: the end rounded up to whole superblocks
+        let (re_sb, ce_sb) = (re.div_ceil(sb4) * sb4, ce.div_ceil(sb4) * sb4);
+        for p in 0..self.num_planes {
+            let (sx, sy) = if p == 0 { (0, 0) } else { (self.ss[0], self.ss[1]) };
+            let (stride, rows) = (self.planes[p].stride, self.planes[p].data.len() / self.planes[p].stride.max(1));
+            let rect = ((rs * 4) >> sy, ((re_sb * 4) >> sy).min(rows));
+            copy(&mut self.planes[p].data, &w.planes[p].data, stride, rect, ((cs * 4) >> sx, (ce_sb * 4) >> sx));
+            let ls = self.lf_stride[p];
+            let rows = self.lf_tx[p].len() / ls.max(1);
+            copy(&mut self.lf_tx[p], &w.lf_tx[p], ls, (rs >> sy, (re_sb >> sy).min(rows)), (cs >> sx, ce_sb >> sx));
+        }
+        let ms = self.mi_stride;
+        copy(&mut self.mi, &w.mi, ms, (rs, re), (cs, ce));
+        copy(&mut self.pal_colors, &w.pal_colors, ms, (rs, re), (cs, ce));
+        copy(&mut self.delta_lf, &w.delta_lf, ms, (rs, re), (cs, ce));
+        copy(&mut self.cdef_idx, &w.cdef_idx, self.cdef_stride, (rs >> 4, re.div_ceil(16)), (cs >> 4, ce.div_ceil(16)));
+        copy(&mut self.saved_mvs, &w.saved_mvs, self.mvs_stride, (rs >> 1, re.div_ceil(2)), (cs >> 1, ce.div_ceil(2)));
+        self.merge_lr(&w.lr, tile);
+    }
+
     /// The frame's outputs split by tile, in tile order: disjoint parts, one per tile worker.
     pub(crate) fn split_outputs(&mut self) -> Vec<TileOut<'_>> {
         let h = &self.h;

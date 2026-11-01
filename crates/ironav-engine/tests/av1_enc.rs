@@ -337,8 +337,8 @@ fn altref_streams_decode_identically_with_libaom_and_ironav() {
 }
 
 /// Encodes `clip` with an encoder built by `make`, checks that libaom and IronAV's decoder give equal
-/// pictures from the stream, and returns the stream's size and the luma PSNR of the pictures.
-fn direct_round_trip(name: &str, clip: &Clip, qp: u8, make: impl Fn(Av1Encoder) -> Av1Encoder) -> (usize, f64) {
+/// pictures from the stream, and returns the stream's size, the luma PSNR of the pictures and the stream.
+fn direct_round_trip(name: &str, clip: &Clip, qp: u8, make: impl Fn(Av1Encoder) -> Av1Encoder) -> (usize, f64, Vec<u8>) {
     let dir = scratch(name);
     let (w, h) = (clip.w, clip.h);
     let (cw, ch) = clip.chroma();
@@ -377,9 +377,9 @@ fn direct_round_trip(name: &str, clip: &Clip, qp: u8, make: impl Fn(Av1Encoder) 
         panic!("{name}: IronAV decodes the stream differently from libaom ({} bytes, libaom {}; first difference at byte {i})", got.len(), want.len());
     }
     let (y, _) = psnr(clip, &got);
-    let size = packets.iter().map(|p| p.data.len()).sum();
+    let stream: Vec<u8> = packets.iter().flat_map(|p| p.data.iter().copied()).collect();
     let _ = std::fs::remove_dir_all(&dir);
-    (size, y)
+    (stream.len(), y, stream)
 }
 
 /// Quarter-sample motion search: the streams decode identically with libaom and IronAV, at the same
@@ -390,8 +390,56 @@ fn quarter_sample_motion_streams_decode_identically_with_libaom_and_ironav() {
     let dir = scratch("qpel_src");
     let clip = source(&dir, 176, 144, 8);
     let _ = std::fs::remove_dir_all(&dir);
-    let (half, yh) = direct_round_trip("qpel_off", &clip, 28, |e| e.with_quarter_mv(false));
-    let (quarter, yq) = direct_round_trip("qpel_on", &clip, 28, |e| e.with_quarter_mv(true));
+    let (half, yh, _) = direct_round_trip("qpel_off", &clip, 28, |e| e.with_quarter_mv(false));
+    let (quarter, yq, _) = direct_round_trip("qpel_on", &clip, 28, |e| e.with_quarter_mv(true));
     eprintln!("quarter-sample motion: {half} bytes at {yh:.2} dB with half samples, {quarter} bytes at {yq:.2} dB with quarter samples");
     assert!(yq > 30.0 && (yq - yh).abs() < 0.5, "luma PSNR {yq:.2} dB against {yh:.2} dB");
+}
+
+/// Tile columns and rows: the streams decode identically with libaom and IronAV, at the same quality
+/// as one tile; the stream does not depend on how many threads code the tiles. The sizes cover tiles of whole and part superblocks, uneven tile
+/// counts (5 superblock columns in 4 tiles come out as 3), and odd pictures.
+#[test]
+fn tiled_streams_decode_identically_with_libaom_and_ironav() {
+    need_ffmpeg!();
+    for (w, h) in [(352usize, 288usize), (177, 99), (320, 200)] {
+        let dir = scratch("tiles_src");
+        let clip = source(&dir, w, h, 6);
+        let _ = std::fs::remove_dir_all(&dir);
+        let (one, y1, _) = direct_round_trip(&format!("tiles_{w}_one"), &clip, 28, |e| e.with_tiles(0, 0));
+        for (cols, rows) in [(1u32, 0u32), (0, 1), (1, 1), (2, 2), (3, 0)] {
+            let (size, y, stream) = direct_round_trip(&format!("tiles_{w}_{cols}{rows}"), &clip, 28, |e| e.with_tiles(cols, rows).with_threads(1));
+            let (_, _, threaded) = direct_round_trip(&format!("tiles_{w}_{cols}{rows}_threads"), &clip, 28, |e| e.with_tiles(cols, rows).with_threads(4));
+            assert_eq!(stream, threaded, "{w}x{h} tiles 2^{cols} x 2^{rows}: the stream depends on the thread count");
+            eprintln!("{w}x{h}, {} x {} tiles: {size} bytes at {y:.2} dB against {one} bytes at {y1:.2} dB with one", 1 << cols, 1 << rows);
+            assert!(y > 30.0 && (y - y1).abs() < 0.5, "{w}x{h} tiles 2^{cols} x 2^{rows}: luma PSNR {y:.2} dB against {y1:.2} dB");
+        }
+    }
+}
+
+/// Tiles with the other tools: ALTREF frames (a hidden frame and bidirectional prediction), quarter-sample
+/// motion, one reference, and superres with loop restoration, whose units straddle the tiles.
+#[test]
+fn tiles_work_with_altref_superres_restoration_and_one_reference() {
+    need_ffmpeg!();
+    let dir = scratch("tiles_tools_src");
+    let clip = source(&dir, 352, 288, 9);
+    let _ = std::fs::remove_dir_all(&dir);
+    direct_round_trip("tiles_altref", &clip, 28, |e| e.with_tiles(1, 1).with_altref(4));
+    direct_round_trip("tiles_qpel", &clip, 28, |e| e.with_tiles(2, 0).with_quarter_mv(true).with_refs(1));
+    direct_round_trip("tiles_superres", &clip, 28, |e| e.with_tiles(2, 1).with_superres(12).with_restoration());
+}
+
+/// The default tiling: a picture 1280 samples wide or more is coded in tile columns, one narrower in a
+/// single tile (the tile count is read from the stream's frame header by the decoder).
+#[test]
+fn wide_pictures_are_coded_in_tile_columns_by_default() {
+    need_ffmpeg!();
+    let dir = scratch("tiles_wide");
+    let clip = source(&dir, 1280, 64, 3);
+    let _ = std::fs::remove_dir_all(&dir);
+    let (auto, ya, _) = direct_round_trip("tiles_wide_auto", &clip, 28, |e| e);
+    let (one, y1, _) = direct_round_trip("tiles_wide_one", &clip, 28, |e| e.with_tiles(0, 0));
+    eprintln!("1280x64: {auto} bytes at {ya:.2} dB by default, {one} bytes at {y1:.2} dB in one tile");
+    assert!(auto != one, "the default codes 1280 samples wide in one tile");
 }

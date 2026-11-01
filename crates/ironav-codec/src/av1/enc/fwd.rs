@@ -15,6 +15,7 @@ use crate::av1::tables::{TX_H_LOG2, TX_W_LOG2};
 /// The coefficient the probes synthesise with: large enough that rounding is negligible.
 const PROBE: i32 = 16384;
 
+#[derive(Clone)]
 pub struct Basis {
     w: usize,
     h: usize,
@@ -129,10 +130,17 @@ impl Basis {
 }
 
 /// The bases of the transforms an encoder uses, built on first use.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Bases(HashMap<(usize, u8), Basis>);
 
 impl Bases {
+    /// Adds the bases `other` has built that this lacks.
+    pub fn merge(&mut self, other: &Bases) {
+        for (k, b) in &other.0 {
+            self.0.entry(*k).or_insert_with(|| b.clone());
+        }
+    }
+
     pub fn get(&mut self, tx: usize, tt: u8) -> &Basis {
         self.0.entry((tx, tt)).or_insert_with(|| Basis::new(tx, tt))
     }
