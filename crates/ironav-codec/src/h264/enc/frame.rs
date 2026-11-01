@@ -272,6 +272,20 @@ impl MbCode {
 /// The input picture, padded to whole macroblocks by repeating its edges.
 pub struct Source {
     pub planes: [Vec<u16>; 3],
+    /// Bits per sample (8 or 10).
+    pub bd: u32,
+}
+
+impl Source {
+    /// The largest sample value.
+    fn maxv(&self) -> i32 {
+        (1 << self.bd) - 1
+    }
+
+    /// QpBdOffsetY: what the transform's quantiser gains over the QP the stream codes (8.5.9).
+    fn qp_offset(&self) -> i32 {
+        6 * (self.bd as i32 - 8)
+    }
 }
 
 pub struct FrameCoder<'a> {
@@ -323,14 +337,14 @@ impl<'a> FrameCoder<'a> {
             half1: None,
             dist: (1, 2),
             b_slice: false,
-            pic: Picture::new(mb_w, mb_h, 1, 8),
+            pic: Picture::new(mb_w, mb_h, 1, src.bd),
             rows,
             slice_id,
             mb_w,
             mb_h,
             qp,
-            qpc: chroma_qp(qp, 0, 8),
-            lambda: lambda(qp),
+            qpc: chroma_qp(qp, 0, src.bd),
+            lambda: lambda(qp + src.qp_offset()),
             p_slice: refp.is_some(),
             state: vec![MbState::default(); mb_w * mb_h],
             w: BitWriter::new(),
@@ -391,6 +405,11 @@ impl<'a> FrameCoder<'a> {
     }
 
     /// Whether the macroblock row above `mby` belongs to this slice.
+    /// The quantiser the transform scales by for luma: QP'Y, which is QP_Y plus the bit depth's offset.
+    fn qpp(&self) -> i32 {
+        self.qp + self.src.qp_offset()
+    }
+
     fn up(&self, mby: usize) -> bool {
         mby > self.rows.start
     }
@@ -625,7 +644,7 @@ impl<'a> FrameCoder<'a> {
             self.luma_pred(0, 0, x0, y0, 16, 16, skip_mv, &mut pred);
             let ls = self.ls();
             let sad: i32 = (0..256).map(|i| (self.src.planes[0][(y0 + i / 16) * ls + x0 + i % 16] as i32 - pred[i] as i32).abs()).sum();
-            if (sad as f64) < 256.0 * 0.625 * 2f64.powf(self.qp as f64 / 6.0) {
+            if (sad as f64) < 256.0 * 0.625 * 2f64.powf(self.qpp() as f64 / 6.0) {
                 let mut code = self.code_inter(mbx, mby, 0, [skip_mv; 4], [0; 4], false);
                 if code.cbp == 0 {
                     code.skip = true;
@@ -704,7 +723,7 @@ impl<'a> FrameCoder<'a> {
                 continue;
             }
             let mut pred = [0u16; 256];
-            predict_16x16(mode, &top, &left, tl, ta, la, &mut pred, 8);
+            predict_16x16(mode, &top, &left, tl, ta, la, &mut pred, self.src.bd);
             let cost = self.satd(0, mbx * 16, mby * 16, 16, 16, &pred) + self.lambda * if mode == 2 { 0 } else { 1 };
             if cost < best.1 {
                 best = (mode, cost);
@@ -933,7 +952,7 @@ impl<'a> FrameCoder<'a> {
                     continue;
                 }
                 let mut pred = [0u16; 16];
-                predict_nxn(4, mode, &e, &mut pred, 8);
+                predict_nxn(4, mode, &e, &mut pred, self.src.bd);
                 let c = self.satd(0, x, y, 4, 4, &pred) + self.lambda * if mode == predicted { 1 } else { 4 };
                 if c < best.1 {
                     best = (mode, c, pred);
@@ -944,13 +963,13 @@ impl<'a> FrameCoder<'a> {
             let mut s = [0i32; 16];
             self.src_block(0, x, y, 4, &mut s);
             let pred: [i32; 16] = best.2.map(|v| v as i32);
-            let (lv, co, _) = self.quant_block(&s, &pred, self.qp, true, false);
+            let (lv, co, _) = self.quant_block(&s, &pred, self.qpp(), true, false);
             let p = &mut self.pic.planes[0];
             for r in 0..4 {
                 p[(y + r) * ls + x..(y + r) * ls + x + 4].copy_from_slice(&best.2[r * 4..r * 4 + 4]);
             }
             if lv.iter().any(|&l| l != 0) {
-                idct4_add(&co, &mut p[y * ls + x..], ls, 255);
+                idct4_add(&co, &mut p[y * ls + x..], ls, self.src.maxv());
             }
             code.nnz[by * 4 + bx] = lv.iter().filter(|&&l| l != 0).count() as u8;
             code.luma[by * 4 + bx] = lv;
@@ -969,9 +988,9 @@ impl<'a> FrameCoder<'a> {
         code.i16_mode = mode;
         let (top, left, tl) = self.i16_neighbours(mbx, mby);
         let mut pred = [0u16; 256];
-        predict_16x16(mode, &top, &left, tl, self.up(mby), mbx > 0, &mut pred, 8);
+        predict_16x16(mode, &top, &left, tl, self.up(mby), mbx > 0, &mut pred, self.src.bd);
         let (x0, y0, ls) = (mbx * 16, mby * 16, self.ls());
-        let qp = self.qp;
+        let qp = self.qpp();
         let mut dcs = [0i32; 16];
         let mut cos = [[0i32; 16]; 16];
         for b in 0..16 {
@@ -1016,7 +1035,7 @@ impl<'a> FrameCoder<'a> {
             co[0] = if qp >= 36 { (f[b] * lsd) << (qp / 6 - 6) } else { (f[b] * lsd + (1 << (5 - qp / 6))) >> (6 - qp / 6) };
             if co.iter().any(|&v| v != 0) {
                 let (bx, by) = (b % 4, b / 4);
-                idct4_add(&co, &mut self.pic.planes[0][(y0 + by * 4) * ls + x0 + bx * 4..], ls, 255);
+                idct4_add(&co, &mut self.pic.planes[0][(y0 + by * 4) * ls + x0 + bx * 4..], ls, self.src.maxv());
             }
             code.nnz[b] = code.luma[b].iter().filter(|&&l| l != 0).count() as u8;
         }
@@ -1056,7 +1075,7 @@ impl<'a> FrameCoder<'a> {
                         pr[r * 4 + c] = pred[(by * 4 + r) * 16 + bx * 4 + c] as i32;
                     }
                 }
-                let (lv, co, _) = self.quant_block(&s, &pr, self.qp, false, false);
+                let (lv, co, _) = self.quant_block(&s, &pr, self.qpp(), false, false);
                 score[(by / 2) * 2 + bx / 2] += decimate_score(&lv);
                 code.luma[b] = lv;
                 cos[b] = co;
@@ -1081,7 +1100,7 @@ impl<'a> FrameCoder<'a> {
                 code.nnz[b] = code.luma[b].iter().filter(|&&l| l != 0).count() as u8;
                 if code.nnz[b] > 0 {
                     let (bx, by) = (b % 4, b / 4);
-                    idct4_add(&cos[b], &mut self.pic.planes[0][(y0 + by * 4) * ls + x0 + bx * 4..], ls, 255);
+                    idct4_add(&cos[b], &mut self.pic.planes[0][(y0 + by * 4) * ls + x0 + bx * 4..], ls, self.src.maxv());
                     code.cbp |= 1 << ((by / 2) * 2 + bx / 2);
                 }
             }
@@ -1101,7 +1120,7 @@ impl<'a> FrameCoder<'a> {
             let mut s = [0i32; 64];
             self.src_block(0, x0 + bx, y0 + by, 8, &mut s);
             let pr: [i32; 64] = std::array::from_fn(|k| pred[(by + k / 8) * 16 + bx + k % 8] as i32);
-            let (lv, co) = quant8(&s, &pr, self.qp, false);
+            let (lv, co) = quant8(&s, &pr, self.qpp(), false);
             score[i8] = decimate_score8(&lv);
             code.luma8[i8] = lv;
             cos[i8] = co;
@@ -1117,7 +1136,7 @@ impl<'a> FrameCoder<'a> {
             }
             let n = code.luma8[i8].iter().filter(|&&l| l != 0).count() as u8;
             if n > 0 {
-                idct8_add(&cos[i8], &mut self.pic.planes[0][(y0 + (i8 >> 1) * 8) * ls + x0 + (i8 & 1) * 8..], ls, 255);
+                idct8_add(&cos[i8], &mut self.pic.planes[0][(y0 + (i8 >> 1) * 8) * ls + x0 + (i8 & 1) * 8..], ls, self.src.maxv());
                 code.cbp |= 1 << i8;
             }
             // CABAC counts an 8x8 block's levels in each of its 4x4 blocks
@@ -1184,7 +1203,7 @@ impl<'a> FrameCoder<'a> {
                     continue;
                 }
                 let mut pred = [0u16; 64];
-                predict_nxn(8, mode, &e, &mut pred, 8);
+                predict_nxn(8, mode, &e, &mut pred, self.src.bd);
                 let c = self.satd(0, x, y, 8, 8, &pred) + self.lambda * if mode == predicted { 1 } else { 4 };
                 if c < best.1 {
                     best = (mode, c, pred);
@@ -1192,14 +1211,14 @@ impl<'a> FrameCoder<'a> {
             }
             let mut s = [0i32; 64];
             self.src_block(0, x, y, 8, &mut s);
-            let (lv, co) = quant8(&s, &best.2.map(|v| v as i32), self.qp, true);
+            let (lv, co) = quant8(&s, &best.2.map(|v| v as i32), self.qpp(), true);
             let p = &mut self.pic.planes[0];
             for r in 0..8 {
                 p[(y + r) * ls + x..(y + r) * ls + x + 8].copy_from_slice(&best.2[r * 8..r * 8 + 8]);
             }
             let n = lv.iter().filter(|&&l| l != 0).count() as u8;
             if n > 0 {
-                idct8_add(&co, &mut p[y * ls + x..], ls, 255);
+                idct8_add(&co, &mut p[y * ls + x..], ls, self.src.maxv());
                 code.cbp |= 1 << i8;
             }
             for j in 0..4 {
@@ -1286,7 +1305,7 @@ impl<'a> FrameCoder<'a> {
     /// and inter, so intra is always tried.
     fn decide_rd(&mut self, mbx: usize, mby: usize, i16: u8, inter: Option<(u8, [[i16; 2]; 4], [u8; 4], i32)>) -> MbCode {
         // larger than the usual 0.85 * 2^((qp - 12) / 3): the residual decisions are not RD optimised
-        let lam2 = 1.6 * 2f64.powf((self.qp as f64 - 12.0) / 3.0);
+        let lam2 = 1.6 * 2f64.powf((self.qpp() as f64 - 12.0) / 3.0);
         let mut best: Option<(f64, MbCode, [u16; 384])> = None;
         let mut keep = |this: &Self, j: f64, code: MbCode| {
             if best.as_ref().is_none_or(|b| j < b.0) {
@@ -1341,7 +1360,7 @@ impl<'a> FrameCoder<'a> {
     /// that, and Intra16x16 and Intra4x4.
     fn decide_b(&mut self, mbx: usize, mby: usize) -> MbCode {
         let lam = self.lambda;
-        let lam2 = 1.6 * 2f64.powf((self.qp as f64 - 12.0) / 3.0);
+        let lam2 = 1.6 * 2f64.powf((self.qpp() as f64 - 12.0) / 3.0);
         let mut best: Option<(f64, MbCode, [u16; 384])> = None;
         let mut keep = |this: &Self, j: f64, code: MbCode| {
             if best.as_ref().is_none_or(|b| j < b.0) {
@@ -1663,7 +1682,7 @@ impl<'a> FrameCoder<'a> {
             let mut cost = self.lambda * if mode == 0 { 1 } else { 3 };
             for c in 0..2 {
                 let mut out = [0u16; 128];
-                predict_chroma(mode, &nbs[c].0, &nbs[c].1, nbs[c].2, ta, la, &mut out, 8, 8);
+                predict_chroma(mode, &nbs[c].0, &nbs[c].1, nbs[c].2, ta, la, &mut out, self.src.bd, 8);
                 preds[c].copy_from_slice(&out[..64]);
                 cost += self.satd(1 + c, x0, y0, 8, 8, &preds[c]);
             }
@@ -1679,7 +1698,7 @@ impl<'a> FrameCoder<'a> {
     /// the chroma part of the coded block pattern.
     fn code_chroma(&mut self, code: &mut MbCode, mbx: usize, mby: usize, pred: &[[u16; 64]; 2], intra: bool) {
         let (x0, y0, cs) = (mbx * 8, mby * 8, self.cs());
-        let qp = self.qpc;
+        let qp = self.qpc + self.src.qp_offset();
         let m = (qp % 6) as usize;
         let mut cos = [[[0i32; 16]; 4]; 2];
         let mut any_dc = false;
@@ -1735,7 +1754,7 @@ impl<'a> FrameCoder<'a> {
                 code.cnnz[c][blk] = code.cac[c][blk].iter().filter(|&&v| v != 0).count() as u8;
                 if co.iter().any(|&v| v != 0) {
                     let (bx, by) = (blk & 1, blk >> 1);
-                    idct4_add(&co, &mut plane[(y0 + by * 4) * cs + x0 + bx * 4..], cs, 255);
+                    idct4_add(&co, &mut plane[(y0 + by * 4) * cs + x0 + bx * 4..], cs, self.src.maxv());
                 }
             }
         }

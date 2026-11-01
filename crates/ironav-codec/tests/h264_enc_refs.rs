@@ -30,17 +30,20 @@ fn encoder_size_and_speed_by_references() {
     let frames: usize = std::env::var("IRONAV_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
     let out = std::env::var("IRONAV_OUT").unwrap_or_else(|_| ".".into());
     let data = std::fs::read(&raw).unwrap();
-    let fsize = w * h * 3 / 2;
+    // IRONAV_BITS 10 reads the clip as yuv420p10le (two bytes a sample)
+    let bytes = if std::env::var("IRONAV_BITS").is_ok_and(|v| v == "10") { 2 } else { 1 };
+    let pix_fmt = if bytes == 2 { PixelFormat::Yuv420p10 } else { PixelFormat::Yuv420p };
+    let fsize = w * h * 3 / 2 * bytes;
     assert!(data.len() >= fsize * frames, "the clip holds fewer than {frames} frames");
     let clip: Vec<VideoFrame> = (0..frames)
         .map(|t| {
             let f = &data[t * fsize..(t + 1) * fsize];
-            let (y, c) = f.split_at(w * h);
-            let (u, v) = c.split_at(w * h / 4);
-            VideoFrame { width: w as u32, height: h as u32, pix_fmt: PixelFormat::Yuv420p, pts: t as i64, planes: vec![y.to_vec(), u.to_vec(), v.to_vec()] }
+            let (y, c) = f.split_at(w * h * bytes);
+            let (u, v) = c.split_at(w * h * bytes / 4);
+            VideoFrame { width: w as u32, height: h as u32, pix_fmt, pts: t as i64, planes: vec![y.to_vec(), u.to_vec(), v.to_vec()] }
         })
         .collect();
-    let params = StreamParams::Video { width: w as u32, height: h as u32, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational::new(25, 1) };
+    let params = StreamParams::Video { width: w as u32, height: h as u32, pix_fmt, frame_rate: Rational::new(25, 1) };
     for refs in list("IRONAV_REFS", "1,3") {
         for qp in list("IRONAV_QPS", "20,26,32,38") {
             let mut enc = H264Encoder::new(&params, Some(qp as u8), None).unwrap().with_refs(refs);

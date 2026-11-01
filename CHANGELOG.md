@@ -139,7 +139,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   chroma, for instance).
 - **H.264:** the decoder refuses field pictures (PAFF; MBAFF frames are decoded), slice groups, separate colour planes,
   SP and SI slices and bit depths above 10. The encoder's P pictures predict from up to three reference pictures (see
-  `with_refs`; the command line does not set it yet), with no partitions below 8x8 and no 10-bit output.
+  `with_refs`; `--refs` sets it), with no partitions below 8x8. Its 10-bit output (High 10 profile) decodes identically with FFmpeg.
 - **VP9:** reference frames of another size (spatial resampling) are refused; scaled motion compensation is not implemented,
   because no available encoder makes such a stream to test it against. 12-bit and 4:4:0 streams decode (output `yuv420p12le`,
   `yuv440p`, `yuv440p10le` and so on), and 10-bit and 12-bit output is checked against FFmpeg's decoder.

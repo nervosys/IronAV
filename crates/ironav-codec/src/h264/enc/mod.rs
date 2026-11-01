@@ -1,5 +1,5 @@
 //! A software H.264 encoder: High profile with CABAC and the 8x8 transform (or Main without it, or
-//! Constrained Baseline with CAVLC), 8-bit 4:2:0 with even dimensions. Pictures are I and P, a P picture
+//! Constrained Baseline with CAVLC), 8-bit or 10-bit (High 10) 4:2:0 with even dimensions. Pictures are I and P, a P picture
 //! predicting from up to three reference pictures (`with_refs`), and with CABAC two non-reference B
 //! pictures between each pair of P pictures.
 //! Macroblocks are coded as Intra4x4, Intra8x8, Intra16x16, P_L0_16x16, P_L0_L0_16x8,
@@ -84,6 +84,8 @@ pub struct H264Encoder {
     bframes: usize,
     /// The most reference pictures a P picture may predict from (and the stream keeps).
     nrefs: usize,
+    /// Bits per sample: 8 (yuv420p), or 10 (yuv420p10le, High 10 profile).
+    bd: u32,
     pending: Vec<(Source, i64, u64)>,
     /// Pictures between IDR pictures, and the seconds of bits the spending may run ahead or behind.
     keyint: u64,
@@ -115,10 +117,14 @@ impl H264Encoder {
         let StreamParams::Video { width, height, pix_fmt, frame_rate } = *params else {
             return Err(Error::invalid_arg("the H.264 encoder takes video"));
         };
-        if pix_fmt != PixelFormat::Yuv420p {
-            return Err(Error::new(ErrorCode::UnsupportedCodec, format!("the software H.264 encoder takes yuv420p frames, not {}", pix_fmt.name()))
-                .hint("add a format filter to convert to yuv420p"));
-        }
+        let bd = match pix_fmt {
+            PixelFormat::Yuv420p => 8,
+            PixelFormat::Yuv420p10 => 10,
+            _ => {
+                return Err(Error::new(ErrorCode::UnsupportedCodec, format!("the software H.264 encoder takes yuv420p or yuv420p10 frames, not {}", pix_fmt.name()))
+                    .hint("add a format filter to convert to yuv420p or yuv420p10"));
+            }
+        };
         if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
             return Err(Error::invalid_arg(format!("the software H.264 encoder needs even dimensions, not {width}x{height}")).hint("scale or crop to an even width and height"));
         }
@@ -147,6 +153,7 @@ impl H264Encoder {
             refs: Vec::new(),
             bframes: BFRAMES,
             nrefs: REFS,
+            bd,
             pending: Vec::new(),
             keyint: KEYINT,
             rc_window: 1.0,
@@ -204,8 +211,11 @@ impl H264Encoder {
 
     fn sps(&self) -> Vec<u8> {
         let mut w = BitWriter::new();
-        let high = self.cabac && self.transform8;
-        if high {
+        let high = (self.cabac && self.transform8) || self.bd > 8;
+        if self.bd > 8 {
+            w.put(8, 110); // High 10
+            w.put(8, 0);
+        } else if high {
             w.put(8, 100); // High
             w.put(8, 0);
         } else if self.cabac {
@@ -219,8 +229,8 @@ impl H264Encoder {
         w.ue(0); // seq_parameter_set_id
         if high {
             w.ue(1); // chroma_format_idc: 4:2:0
-            w.ue(0); // bit_depth_luma_minus8
-            w.ue(0); // bit_depth_chroma_minus8
+            w.ue(self.bd - 8); // bit_depth_luma_minus8
+            w.ue(self.bd - 8); // bit_depth_chroma_minus8
             w.flag(false); // qpprime_y_zero_transform_bypass_flag
             w.flag(false); // seq_scaling_matrix_present_flag
         }
@@ -346,10 +356,19 @@ impl H264Encoder {
     }
 
     fn source(&self, v: &ironav_core::VideoFrame) -> Result<Source> {
-        if v.pix_fmt != PixelFormat::Yuv420p || v.width as usize != self.width || v.height as usize != self.height || v.planes.len() < 3 {
-            return Err(Error::invalid_input(format!("the H.264 encoder was set up for {}x{} yuv420p frames", self.width, self.height)));
+        let want = if self.bd == 8 { PixelFormat::Yuv420p } else { PixelFormat::Yuv420p10 };
+        if v.pix_fmt != want || v.width as usize != self.width || v.height as usize != self.height || v.planes.len() < 3 {
+            return Err(Error::invalid_input(format!("the H.264 encoder was set up for {}x{} {} frames", self.width, self.height, want.name())));
         }
-        let pad = |p: &[u8], w: usize, h: usize, pw: usize, ph: usize| -> Result<Vec<u16>> {
+        // samples as u16 whatever the depth: two bytes each, little-endian, at 10 bits
+        let unpack = |p: &[u8]| -> Vec<u16> {
+            if self.bd == 8 {
+                p.iter().map(|&b| b as u16).collect()
+            } else {
+                p.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
+            }
+        };
+        let pad = |p: &[u16], w: usize, h: usize, pw: usize, ph: usize| -> Result<Vec<u16>> {
             if p.len() < w * h {
                 return Err(Error::invalid_input("a video frame plane is shorter than its dimensions"));
             }
@@ -357,14 +376,15 @@ impl H264Encoder {
             for y in 0..ph {
                 let row = &p[y.min(h - 1) * w..y.min(h - 1) * w + w];
                 for x in 0..pw {
-                    out[y * pw + x] = row[x.min(w - 1)] as u16;
+                    out[y * pw + x] = row[x.min(w - 1)];
                 }
             }
             Ok(out)
         };
         let (pw, ph) = (self.mb_w * 16, self.mb_h * 16);
         let (cw, ch) = (self.width / 2, self.height / 2);
-        Ok(Source { planes: [pad(&v.planes[0], self.width, self.height, pw, ph)?, pad(&v.planes[1], cw, ch, pw / 2, ph / 2)?, pad(&v.planes[2], cw, ch, pw / 2, ph / 2)?] })
+        let (y, u, v2) = (unpack(&v.planes[0]), unpack(&v.planes[1]), unpack(&v.planes[2]));
+        Ok(Source { planes: [pad(&y, self.width, self.height, pw, ph)?, pad(&u, cw, ch, pw / 2, ph / 2)?, pad(&v2, cw, ch, pw / 2, ph / 2)?], bd: self.bd })
     }
 }
 
@@ -462,7 +482,7 @@ impl H264Encoder {
             jobs.into_iter().map(|j| j.join().expect("an H.264 slice thread panicked")).collect()
         });
         // the slices' rows and macroblocks make up the picture, which is then loop filtered across them
-        let mut pic = Picture::new(mb_w, mb_h, 1, 8);
+        let mut pic = Picture::new(mb_w, mb_h, 1, self.bd);
         let mut data = Vec::new();
         if idr {
             put_nal(&mut data, 3, 7, &self.sps());
@@ -479,12 +499,12 @@ impl H264Encoder {
             pic.mbs[rows.start * mb_w..rows.end * mb_w].copy_from_slice(&part.mbs[rows.start * mb_w..rows.end * mb_w]);
         }
         pic.slices = vec![SliceParams { disable_deblocking: 0, alpha_offset: 0, beta_offset: 0, chroma_qp_offset: [0, 0] }; n];
-        deblock_picture(&mut pic, 8);
+        deblock_picture(&mut pic, self.bd);
         self.rate_update(data.len() * 8, qp, kind);
         #[cfg(test)]
         self.recon.push((pts, pic.planes.clone()));
         if !b {
-            let half = HalfPel::new(&pic.planes[0], mb_w * 16, mb_h * 16);
+            let half = HalfPel::new(&pic.planes[0], mb_w * 16, mb_h * 16, self.bd);
             // the references kept: the pictures either side of the B pictures, and as many more as
             // P pictures may use
             if self.refs.len() == self.ref_count() {
@@ -673,6 +693,64 @@ mod tests {
                         let (_, _, single) = run_refs(w, h, 8, Some(qp), None, slices, mode, 1);
                         assert_ne!(multi, single, "{w}x{h} qp {qp} mode {mode}: {refs} references are used");
                     }
+                }
+            }
+        }
+    }
+
+    /// `scene` at 10 bits: its samples scaled up, with the low two bits changing from picture to picture.
+    fn scene10(w: usize, h: usize, t: usize) -> VideoFrame {
+        let f8 = scene(w, h, t);
+        let planes = f8.planes.iter().map(|p| p.iter().flat_map(|&v| ((v as u16) << 2 | (t as u16 & 3)).to_le_bytes()).collect::<Vec<u8>>()).collect();
+        VideoFrame { width: f8.width, height: f8.height, pix_fmt: PixelFormat::Yuv420p10, pts: f8.pts, planes }
+    }
+
+    #[test]
+    fn ten_bit_pictures_decode_to_the_encoders_reference() {
+        for (w, h, slices) in [(64, 48, 1), (200, 120, 3)] {
+            for qp in [4, 20, 36] {
+                let params = StreamParams::Video { width: w as u32, height: h as u32, pix_fmt: PixelFormat::Yuv420p10, frame_rate: Rational::new(25, 1) };
+                let mut enc = H264Encoder::new(&params, Some(qp), None).unwrap();
+                enc.slices = slices;
+                let (mut src, mut pkts) = (Vec::new(), Vec::new());
+                for t in 0..6 {
+                    let f = scene10(w, h, t);
+                    pkts.extend(enc.encode(&Frame::Video(f.clone())).unwrap());
+                    src.push(f);
+                }
+                pkts.extend(enc.flush().unwrap());
+                let mut dec = H264Decoder::new();
+                let mut out = Vec::new();
+                for p in &pkts {
+                    out.extend(dec.decode(p).unwrap());
+                }
+                out.extend(dec.flush().unwrap());
+                assert_eq!(out.len(), 6, "{w}x{h} qp {qp}");
+                let s = enc.mb_w * 16;
+                let samples = |p: &[u8]| -> Vec<u16> { p.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect() };
+                for f in out {
+                    let Frame::Video(d) = f else { unreachable!() };
+                    assert_eq!(d.pix_fmt, PixelFormat::Yuv420p10);
+                    let recon = &enc.recon.iter().find(|r| r.0 == d.pts).unwrap().1;
+                    let luma = samples(&d.planes[0]);
+                    for r in 0..h {
+                        assert_eq!(&luma[r * w..r * w + w], &recon[0][r * s..r * s + w], "{w}x{h} qp {qp} frame {} luma row {r}", d.pts);
+                    }
+                    for c in 1..3 {
+                        let plane = samples(&d.planes[c]);
+                        for r in 0..h / 2 {
+                            assert_eq!(&plane[r * w / 2..r * w / 2 + w / 2], &recon[c][r * s / 2..r * s / 2 + w / 2], "{w}x{h} qp {qp} frame {} plane {c} row {r}", d.pts);
+                        }
+                    }
+                    let se: f64 = samples(&src[d.pts as usize].planes[0]).iter().zip(&luma).map(|(&a, &b)| (a as f64 - b as f64).powi(2)).sum::<f64>() / (w * h) as f64;
+                    let p = 10.0 * (1023.0f64 * 1023.0 / se.max(1e-9)).log10();
+                    // measured 31 to 61 dB across these settings (the low bits change from picture to picture)
+                    let want = match qp {
+                        0..=10 => 48.0,
+                        11..=28 => 36.0,
+                        _ => 28.0,
+                    };
+                    assert!(p > want, "{w}x{h} qp {qp} frame {}: luma PSNR {p:.1}", d.pts);
                 }
             }
         }

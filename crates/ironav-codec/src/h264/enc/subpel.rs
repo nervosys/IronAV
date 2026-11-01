@@ -13,7 +13,7 @@ pub struct HalfPel {
     ph: usize,
     /// Integer samples (with the picture's edges repeated), and the half samples to the right (b),
     /// below (h) and diagonally between (j), each at the integer sample's index.
-    planes: [Vec<u8>; 4],
+    planes: [Vec<u16>; 4],
 }
 
 fn tap6(a: i32, b: i32, c: i32, d: i32, e: i32, f: i32) -> i32 {
@@ -36,19 +36,20 @@ const MIX: [[(usize, usize, usize, usize, usize, usize); 4]; 4] = {
 };
 
 impl HalfPel {
-    /// Builds the planes from a `pw` x `ph` luma plane.
-    pub fn new(luma: &[u16], pw: usize, ph: usize) -> Self {
+    /// Builds the planes from a `pw` x `ph` luma plane of `bd`-bit samples.
+    pub fn new(luma: &[u16], pw: usize, ph: usize, bd: u32) -> Self {
+        let maxv = (1i32 << bd) - 1;
         let (sw, sh) = (pw + 2 * PAD, ph + 2 * PAD);
-        let mut g = vec![0u8; sw * sh];
+        let mut g = vec![0u16; sw * sh];
         for y in 0..sh {
             let sy = y.saturating_sub(PAD).min(ph - 1);
             for x in 0..sw {
-                g[y * sw + x] = luma[sy * pw + x.saturating_sub(PAD).min(pw - 1)] as u8;
+                g[y * sw + x] = luma[sy * pw + x.saturating_sub(PAD).min(pw - 1)];
             }
         }
-        let mut b = vec![0u8; sw * sh];
-        let mut h = vec![0u8; sw * sh];
-        let mut j = vec![0u8; sw * sh];
+        let mut b = vec![0u16; sw * sh];
+        let mut h = vec![0u16; sw * sh];
+        let mut j = vec![0u16; sw * sh];
         // unrounded horizontal sums, which the diagonal half samples filter again vertically
         let mut b1 = vec![0i32; sw * sh];
         let at = |x: usize, y: usize| g[y * sw + x] as i32;
@@ -56,16 +57,16 @@ impl HalfPel {
             for x in 2..sw - 3 {
                 let v = tap6(at(x - 2, y), at(x - 1, y), at(x, y), at(x + 1, y), at(x + 2, y), at(x + 3, y));
                 b1[y * sw + x] = v;
-                b[y * sw + x] = ((v + 16) >> 5).clamp(0, 255) as u8;
+                b[y * sw + x] = ((v + 16) >> 5).clamp(0, maxv) as u16;
             }
         }
         for y in 2..sh - 3 {
             for x in 0..sw {
                 let v = tap6(at(x, y - 2), at(x, y - 1), at(x, y), at(x, y + 1), at(x, y + 2), at(x, y + 3));
-                h[y * sw + x] = ((v + 16) >> 5).clamp(0, 255) as u8;
+                h[y * sw + x] = ((v + 16) >> 5).clamp(0, maxv) as u16;
                 let c = |yy: usize| b1[yy * sw + x];
                 let v = tap6(c(y - 2), c(y - 1), c(y), c(y + 1), c(y + 2), c(y + 3));
-                j[y * sw + x] = ((v + 512) >> 10).clamp(0, 255) as u8;
+                j[y * sw + x] = ((v + 512) >> 10).clamp(0, maxv) as u16;
             }
         }
         HalfPel { stride: sw, pw, ph, planes: [g, b, h, j] }
@@ -88,21 +89,21 @@ impl HalfPel {
         if pa == pb && (ax, ay) == (bx, by) {
             for r in 0..h {
                 for c in 0..w {
-                    out[r * w + c] = a[r * s + c] as u16;
+                    out[r * w + c] = a[r * s + c];
                 }
             }
         } else {
             let b = &self.planes[pb][self.offset(ix + bx as i32, iy + by as i32)..];
             for r in 0..h {
                 for c in 0..w {
-                    out[r * w + c] = (a[r * s + c] as u16 + b[r * s + c] as u16 + 1) >> 1;
+                    out[r * w + c] = (a[r * s + c] as u32 + b[r * s + c] as u32).div_ceil(2) as u16;
                 }
             }
         }
     }
 
     /// The integer-sample `w` x `h` block at (x, y), row by row.
-    pub fn rows(&self, x: i32, y: i32, w: usize, h: usize) -> impl Iterator<Item = &[u8]> {
+    pub fn rows(&self, x: i32, y: i32, w: usize, h: usize) -> impl Iterator<Item = &[u16]> {
         let o = self.offset(x, y);
         (0..h).map(move |r| &self.planes[0][o + r * self.stride..o + r * self.stride + w])
     }
@@ -115,33 +116,36 @@ mod tests {
 
     #[test]
     fn predictions_equal_the_decoders_interpolation() {
-        let (pw, ph) = (48usize, 32usize);
-        let mut seed = 99u32;
-        let luma: Vec<u16> = (0..pw * ph)
-            .map(|_| {
-                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
-                ((seed >> 16) % 256) as u16
-            })
-            .collect();
-        let hp = HalfPel::new(&luma, pw, ph);
-        for (x, y) in [(0, 0), (16, 16), (32, 16)] {
-            for my in -100i16..100 {
-                for mx in [-97i16, -40, -3, -2, -1, 0, 1, 2, 3, 5, 6, 7, 30, 97] {
-                    let (mut a, mut b) = ([0u16; 256], [0u16; 256]);
-                    hp.predict(x, y, [mx, my], 16, 16, &mut a);
-                    luma_mc(&luma, pw, ph, x, y, mx as i32, my as i32, 16, 16, &mut b, 255);
-                    assert_eq!(a, b, "block ({x}, {y}) vector ({mx}, {my})");
+        for bd in [8u32, 10] {
+            let (pw, ph) = (48usize, 32usize);
+            let mut seed = 99u32;
+            let luma: Vec<u16> = (0..pw * ph)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                    ((seed >> 16) % (1 << bd)) as u16
+                })
+                .collect();
+            let maxv = (1 << bd) - 1;
+            let hp = HalfPel::new(&luma, pw, ph, bd);
+            for (x, y) in [(0, 0), (16, 16), (32, 16)] {
+                for my in -100i16..100 {
+                    for mx in [-97i16, -40, -3, -2, -1, 0, 1, 2, 3, 5, 6, 7, 30, 97] {
+                        let (mut a, mut b) = ([0u16; 256], [0u16; 256]);
+                        hp.predict(x, y, [mx, my], 16, 16, &mut a);
+                        luma_mc(&luma, pw, ph, x, y, mx as i32, my as i32, 16, 16, &mut b, maxv);
+                        assert_eq!(a, b, "{bd}-bit block ({x}, {y}) vector ({mx}, {my})");
+                    }
                 }
             }
-        }
-        // vectors far outside the picture, as temporal direct prediction can give
-        for (x, y) in [(0, 0), (40, 24), (32, 16)] {
-            for my in [-2049i16, -1203, -300, -1, 2, 299, 1205, 2047] {
-                for mx in [-8191i16, -2001, -401, 3, 398, 1999, 8190] {
-                    let (mut a, mut b) = ([0u16; 64], [0u16; 64]);
-                    hp.predict(x, y, [mx, my], 8, 8, &mut a);
-                    luma_mc(&luma, pw, ph, x, y, mx as i32, my as i32, 8, 8, &mut b, 255);
-                    assert_eq!(a, b, "8x8 block ({x}, {y}) vector ({mx}, {my})");
+            // vectors far outside the picture, as temporal direct prediction can give
+            for (x, y) in [(0, 0), (40, 24), (32, 16)] {
+                for my in [-2049i16, -1203, -300, -1, 2, 299, 1205, 2047] {
+                    for mx in [-8191i16, -2001, -401, 3, 398, 1999, 8190] {
+                        let (mut a, mut b) = ([0u16; 64], [0u16; 64]);
+                        hp.predict(x, y, [mx, my], 8, 8, &mut a);
+                        luma_mc(&luma, pw, ph, x, y, mx as i32, my as i32, 8, 8, &mut b, maxv);
+                        assert_eq!(a, b, "{bd}-bit 8x8 block ({x}, {y}) vector ({mx}, {my})");
+                    }
                 }
             }
         }
