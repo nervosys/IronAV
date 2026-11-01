@@ -563,7 +563,7 @@ Not covered: multichannel Opus (channel-mapping families 1 and 255 are refused),
 and CELT, which our fixed-delay filter does not reproduce, so the few samples at such a switch can differ. The libopus encoder
 only produced streams in one mode at a time; mode switches and their redundant CELT frames are covered by IronAV's own
 automatic-mode streams instead, which this decoder and libopus both decode (see the encoder's automatic mode below).
-Opus is read from Matroska/WebM (`.mka`, `.webm`) and from Ogg (`.opus`, `.ogg`); for writing see "Opus encoder" below. The Ogg reader (pages are checksummed; the file is read into memory, up to 1 GiB) takes only the first Opus, Vorbis or FLAC stream: Speex and Theora in Ogg are refused with a message naming the codec, and chained streams after the first are ignored. The final page's granule position shortens the last packet, so the output ends where the file says (for Opus the length is the granule minus the pre-skip). Tested on libopus files remuxed to Ogg (identical samples to the Matroska copies); multi-page packets are covered by a synthetic unit test only. FLAC in Ogg (the native-FLAC mapping, as FFmpeg's muxer writes it) decodes bit for bit to the PCM it was made from.
+Opus is read from Matroska/WebM (`.mka`, `.webm`) and from Ogg (`.opus`, `.ogg`); for writing see "Opus encoder" below. The Ogg reader (pages are checksummed; the file is read into memory, up to 1 GiB) reads every logical stream: multiplexed Opus, Vorbis or FLAC streams are separate tracks, and chained Vorbis or FLAC links with the same setup are one track (the timeline carries on); chained Opus links are separate tracks, each with its own pre-skip. Speex and Theora in Ogg are refused with a message naming the codec when a file holds nothing else, and passed over otherwise. The final page's granule position shortens the last packet, so the output ends where the file says (for Opus the length is the granule minus the pre-skip). Tested on libopus files remuxed to Ogg (identical samples to the Matroska copies); multi-page packets are covered by a synthetic unit test only. FLAC in Ogg (the native-FLAC mapping, as FFmpeg's muxer writes it) decodes bit for bit to the PCM it was made from.
 
 
 ### Ogg Opus, Vorbis and FLAC output
@@ -757,8 +757,7 @@ those spectral lines (35 dB SNR on the test file); libvorbis streams did not hit
 reproduces the old behaviour, and with it the FFmpeg-encoder test file matches bit for bit.
 
 Not covered: **floor type 0** (obsolete; a stream that uses it is refused) and streams with more than 8 channels. The Ogg
-granule position of the last page trims the end; a stream that begins mid-way (a first granule above zero) is not shifted. Chained or multiplexed Ogg streams: only the first Vorbis stream is
-read. Mid-stream changes of the headers are not followed. Decoding 120 s of 44.1 kHz stereo to WAV takes about 0.25 to 0.29 s end to end
+granule position of the last page trims the end; a stream that begins mid-way (a first granule above zero) is not shifted. Chained Vorbis links are joined into one track only when their setup matches; a link that differs is a track of its own, and the joined case is not yet checked against FFmpeg. Mid-stream changes of the headers are not followed. Decoding 120 s of 44.1 kHz stereo to WAV takes about 0.25 to 0.29 s end to end
 inside IronAV's own timing, of which the decoder alone is about 0.15 s (it was about 0.25 s: the inverse transform now runs a
 radix-2 butterfly with no generic loop, the transform's output is mirrored with slice copies, and the overlap-add runs in
 segments instead of deciding per sample). FFmpeg's decoder alone ran the same file in 0.08 to 0.19 s through PyAV, so the two are

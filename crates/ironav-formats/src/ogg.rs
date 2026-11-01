@@ -5,19 +5,27 @@
 //! reader's machinery (`Mp4Demuxer::from_parts`) over that buffer, which reads, interleaves and
 //! seeks them.
 //!
+//! Every logical stream is read. Multiplexed streams (sharing the file in time, each with its own
+//! serial number) are separate tracks. Chained streams (one link after another, each beginning when
+//! the last one ends) of Vorbis or FLAC are joined into one track when their setup matches, so the
+//! timeline runs on across the links. Opus links are never joined: the decoder removes the pre-skip
+//! once per track, so each Opus link stays a track of its own.
+//!
 //! Timing comes from the packets themselves (an Opus packet knows its length; a Vorbis packet's
 //! block size follows from its mode, see `PacketTimer`), starting at zero: the Opus decoder drops
-//! the pre-skip announced by `OpusHead`. The granule position of the last page, which gives the
-//! true length, shortens the last packet (see `trim_end`); the decoders cut their output to it.
+//! the pre-skip announced by `OpusHead`. The granule position of the last page of each link, which
+//! gives its true length, shortens the link's last packet (see `trim_end`); the decoders cut their
+//! output to it.
 //!
 //! FLAC in Ogg is the native-FLAC mapping: one FLAC frame per packet, durations from the frame
 //! headers, no end trim (a FLAC frame is exact).
 //!
-//! Not handled: Speex, Theora and other codecs in Ogg (refused), chained streams (only the first
-//! Opus, Vorbis or FLAC stream is read) and files too big to hold in memory (refused above 1 GiB).
+//! Not handled: Speex, Theora and other codecs in Ogg (refused, or passed over when they share the
+//! file with a readable stream) and files too big to hold in memory (refused above 1 GiB).
 
 use crate::mp4demux::{Config, Mp4Demuxer, Sample, TrackInfo};
 use ironav_core::{CodecId, Error, ErrorCode, Rational, Result, StreamInfo, StreamParams};
+use std::collections::HashMap;
 use std::io::{Cursor, Read};
 
 const MAX_FILE: u64 = 1 << 30;
@@ -62,7 +70,70 @@ fn trim_end(samples: &mut [Sample], total: &mut i64, granule: Option<u64>) {
     }
 }
 
+/// The codec of a logical Ogg stream, from its first packet.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Kind {
+    Opus,
+    Vorbis,
+    Flac,
+}
+
+impl Kind {
+    /// The codec of a stream whose first packet is `first`, or `None` for codecs that are not read.
+    fn of(first: &[u8]) -> Option<Kind> {
+        if first.starts_with(b"OpusHead") {
+            Some(Kind::Opus)
+        } else if first.starts_with(b"\x01vorbis") {
+            Some(Kind::Vorbis)
+        } else if first.starts_with(b"\x7fFLAC") {
+            Some(Kind::Flac)
+        } else {
+            None
+        }
+    }
+
+    /// How many packets at the start of the stream are headers (not audio).
+    fn headers(self) -> usize {
+        match self {
+            Kind::Opus => 2,
+            Kind::Vorbis => 3,
+            Kind::Flac => 1, // more metadata packets may follow; see `is_header`
+        }
+    }
+}
+
+/// One logical stream (a serial number, from its first page to its last): its audio packets and headers, as
+/// offsets into the unwrapped packet buffer.
+struct Logical {
+    kind: Kind,
+    /// Page index of the stream's first page (its beginning-of-stream) and of its last page so far.
+    first_page: usize,
+    last_page: usize,
+    /// The packet being assembled from lacing values, which may continue over pages.
+    partial: Vec<u8>,
+    /// Packets completed so far.
+    seen: usize,
+    headers: Vec<(u64, usize)>,
+    packets: Vec<(u64, usize)>,
+    /// The granule position of its last page, which gives the stream's true length.
+    last_granule: Option<u64>,
+}
+
+/// A track of the output: one logical stream, or several chained ones decoded as one.
+struct Track {
+    kind: Kind,
+    /// Indices into the logical streams, in file order.
+    streams: Vec<usize>,
+    /// What must match for a chained stream to join the track (the decoder's setup, which is in the headers).
+    key: Vec<u8>,
+}
+
 /// Open an Ogg file for reading.
+///
+/// Every logical stream is read: multiplexed streams (sharing the file in time) are separate tracks, and
+/// chained streams (one after another) of Vorbis or FLAC whose setup matches are joined into one track. An
+/// Opus stream is never joined to a chained one: the decoder removes the pre-skip once per track, so each link
+/// stays a track of its own. Streams of other codecs (Speex, Theora, ...) are passed over.
 pub fn open<R: Read>(mut r: R) -> Result<Mp4Demuxer<Cursor<Vec<u8>>>> {
     let mut file = Vec::new();
     r.by_ref().take(MAX_FILE + 1).read_to_end(&mut file)?;
@@ -70,19 +141,14 @@ pub fn open<R: Read>(mut r: R) -> Result<Mp4Demuxer<Cursor<Vec<u8>>>> {
         return Err(Error::new(ErrorCode::UnsupportedFormat, "Ogg: files over 1 GiB are not supported (the file is read into memory)"));
     }
 
-    let mut data: Vec<u8> = Vec::new(); // unwrapped packet bytes
-    let mut serial: Option<u32> = None; // the Opus or Vorbis stream being read
-    let mut vorbis = false;
-    let mut flac = false;
-    let mut ignored: Vec<u32> = Vec::new();
-    let mut headers: Vec<(u64, usize)> = Vec::new(); // OpusHead and OpusTags, or Vorbis's three headers
-    let mut packets: Vec<(u64, usize)> = Vec::new(); // audio packets
-    let mut seen = 0usize; // packets of the stream so far
-    let mut start = 0usize; // where the packet being assembled begins in `data`
+    let mut data: Vec<u8> = Vec::new(); // unwrapped packet bytes of every stream
+    let mut streams: Vec<Logical> = Vec::new();
+    // the stream each serial number is in now: None for a codec that is not read
+    let mut current: HashMap<u32, Option<usize>> = HashMap::new();
     let mut unsupported: Option<String> = None;
-    let mut last_granule: Option<u64> = None; // position after the last page that completed a packet
 
     let mut at = 0usize;
+    let mut page_no = 0usize;
     while at + 27 <= file.len() {
         if &file[at..at + 4] != b"OggS" {
             return Err(bad(format!("expected a page at byte {at}")));
@@ -106,144 +172,226 @@ pub fn open<R: Read>(mut r: R) -> Result<Mp4Demuxer<Cursor<Vec<u8>>>> {
             return Err(bad(format!("the page at byte {at} fails its checksum")));
         }
         at = end;
+        let this_page = page_no;
+        page_no += 1;
 
-        if flags & 0x02 != 0 && serial.is_none() {
-            // a new stream begins: take it if it is Opus or Vorbis
+        if flags & 0x02 != 0 {
+            // a stream begins: read it if it is Opus, Vorbis or FLAC, and pass over it otherwise
             let first = &page[27 + nseg..];
-            if first.starts_with(b"OpusHead") || first.starts_with(b"\x01vorbis") || first.starts_with(b"\x7fFLAC") {
-                serial = Some(ser);
-                vorbis = first[0] == 1;
-                flac = first[0] == 0x7F;
-            } else if unsupported.is_none() {
-                let name = [(&b"Speex"[..], "Speex"), (&b"\x80theora"[..], "Theora")]
-                    .iter()
-                    .find(|(m, _)| first.starts_with(m))
-                    .map_or("an unrecognised codec", |(_, n)| n);
-                unsupported = Some(name.to_string());
-            }
+            let slot = match Kind::of(first) {
+                Some(kind) => {
+                    streams.push(Logical { kind, first_page: this_page, last_page: this_page, partial: Vec::new(), seen: 0, headers: Vec::new(), packets: Vec::new(), last_granule: None });
+                    Some(streams.len() - 1)
+                }
+                None => {
+                    if unsupported.is_none() {
+                        let name = [(&b"Speex"[..], "Speex"), (&b"\x80theora"[..], "Theora")].iter().find(|(m, _)| first.starts_with(m)).map_or("an unrecognised codec", |(_, n)| n);
+                        unsupported = Some(name.to_string());
+                    }
+                    None
+                }
+            };
+            current.insert(ser, slot);
         }
-        if serial != Some(ser) {
-            if !ignored.contains(&ser) {
-                ignored.push(ser);
-            }
-            continue;
-        }
-
+        let Some(&Some(si)) = current.get(&ser) else { continue };
+        let s = &mut streams[si];
+        s.last_page = this_page;
         let granule = u64::from_le_bytes(page[6..14].try_into().unwrap());
-        last_granule = (granule != u64::MAX).then_some(granule);
+        if granule != u64::MAX {
+            s.last_granule = Some(granule);
+        }
+        if flags & 0x01 == 0 {
+            s.partial.clear(); // the packet that was being assembled lost its tail: drop it
+        }
 
         let mut p = 27 + nseg;
-        if flags & 0x01 == 0 && start != data.len() {
-            data.truncate(start); // a packet lost its tail: drop it
-        }
-        for &s in table {
-            data.extend_from_slice(&page[p..p + s as usize]);
-            p += s as usize;
-            if s < 255 {
-                let pkt = (start as u64, data.len() - start);
-                let body = &data[start..];
+        for &len in table {
+            s.partial.extend_from_slice(&page[p..p + len as usize]);
+            p += len as usize;
+            if len < 255 {
+                let pkt = std::mem::take(&mut s.partial);
+                let off = data.len() as u64;
+                data.extend_from_slice(&pkt);
                 // FLAC's metadata packets never start with a frame sync code
-                let header = if flac { seen == 0 || body.len() < 2 || body[0] != 0xFF || body[1] & 0xFE != 0xF8 } else { seen < if vorbis { 3 } else { 2 } };
-                if header {
-                    headers.push(pkt);
+                let is_header = if s.kind == Kind::Flac {
+                    s.seen == 0 || pkt.len() < 2 || pkt[0] != 0xFF || pkt[1] & 0xFE != 0xF8
                 } else {
-                    packets.push(pkt);
+                    s.seen < s.kind.headers()
+                };
+                if is_header {
+                    s.headers.push((off, pkt.len()));
+                } else {
+                    s.packets.push((off, pkt.len()));
                 }
-                seen += 1;
-                start = data.len();
+                s.seen += 1;
             }
         }
     }
 
-    if headers.is_empty() {
+    if streams.is_empty() {
         return Err(match unsupported {
             Some(n) => Error::new(ErrorCode::UnsupportedCodec, format!("Ogg: the file holds {n}; only Opus, Vorbis and FLAC in Ogg are read so far")),
             None => bad("no Opus or Vorbis stream found"),
         });
     }
-    let hdr = |i: usize| -> Result<&[u8]> {
-        let &(off, len) = headers.get(i).ok_or_else(|| bad("the stream ends inside its headers"))?;
-        Ok(&data[off as usize..off as usize + len])
-    };
-    let mut samples = Vec::with_capacity(packets.len());
-    let mut pts = 0i64;
-    let stream = if flac {
-        let hd = hdr(0)?;
-        // 0x7F "FLAC", version (2), header count (2), "fLaC", a metadata block header (4), STREAMINFO (34)
-        if hd.len() < 51 || &hd[9..13] != b"fLaC" || hd[5] != 1 {
-            return Err(bad("the FLAC mapping header is too short or has an unknown version"));
+
+    // the tracks: each stream is either a track of its own or joins an earlier chained stream of its codec
+    let mut tracks: Vec<Track> = Vec::new();
+    for (i, s) in streams.iter().enumerate() {
+        if s.headers.len() < s.kind.headers() {
+            continue; // a stream cut off inside its headers has nothing to decode
         }
-        let b = &hd[17..51];
-        let packed = u64::from_be_bytes(b[10..18].try_into().unwrap());
-        let (rate, channels, bits) = ((packed >> 44) as u32, ((packed >> 41) & 7) as u16 + 1, ((packed >> 36) & 31) as u8 + 1);
-        if rate == 0 {
-            return Err(bad("STREAMINFO has a zero sample rate"));
+        let key = match s.kind {
+            Kind::Opus => Vec::new(),
+            Kind::Vorbis => [header(&data, s, 0)?, header(&data, s, 2)?].concat(), // identification and setup
+            Kind::Flac => {
+                let hd = header(&data, s, 0)?;
+                if hd.len() < 51 {
+                    return Err(bad("the FLAC mapping header is too short"));
+                }
+                // rate, channels and sample size: the STREAMINFO fields that a chained stream must share
+                (u64::from_be_bytes(hd[27..35].try_into().unwrap()) >> 36).to_be_bytes().to_vec()
+            }
+        };
+        let joined = match tracks.iter_mut().find(|t| s.kind != Kind::Opus && t.kind == s.kind && t.key == key && streams[*t.streams.last().unwrap()].last_page < s.first_page) {
+            Some(t) => {
+                t.streams.push(i);
+                true
+            }
+            None => false,
+        };
+        if !joined {
+            tracks.push(Track { kind: s.kind, streams: vec![i], key });
         }
-        let max_block = u16::from_be_bytes([b[2], b[3]]) as u32;
-        for &(off, size) in &packets {
-            let frame = &data[off as usize..off as usize + size];
-            let len = ironav_codec::flac::header::parse_header(frame).map_or(max_block, |h| h.block_size);
-            samples.push(Sample { stream: 0, sync: true, offset: off, size: size as u32, dts: pts, cts_offset: 0, duration: len });
-            pts += len as i64;
+    }
+    if tracks.is_empty() {
+        return Err(match unsupported {
+            Some(n) => Error::new(ErrorCode::UnsupportedCodec, format!("Ogg: the file holds {n}; only Opus, Vorbis and FLAC in Ogg are read so far")),
+            None => bad("no Opus or Vorbis stream found"),
+        });
+    }
+
+    let mut samples: Vec<Sample> = Vec::new();
+    let mut infos: Vec<StreamInfo> = Vec::new();
+    for (ti, t) in tracks.iter().enumerate() {
+        let first = &streams[t.streams[0]];
+        let (stream, timer_headers) = track_info(t.kind, first, &data, ti)?;
+        let mut pts = 0i64;
+        for &si in &t.streams {
+            let s = &streams[si];
+            let link_at = samples.len();
+            let mut link = 0i64;
+            match t.kind {
+                Kind::Flac => {
+                    // STREAMINFO's minimum and maximum block size, for a frame whose header will not parse
+                    let max_block = u16::from_be_bytes([header(&data, s, 0)?[19], header(&data, s, 0)?[20]]) as u32;
+                    for &(off, size) in &s.packets {
+                        let frame = &data[off as usize..off as usize + size];
+                        let len = ironav_codec::flac::header::parse_header(frame).map_or(max_block, |h| h.block_size);
+                        samples.push(Sample { stream: ti as u16, sync: true, offset: off, size: size as u32, dts: pts + link, cts_offset: 0, duration: len });
+                        link += len as i64;
+                    }
+                }
+                Kind::Vorbis => {
+                    let mut timer = ironav_codec::vorbis::PacketTimer::new(&timer_headers)?;
+                    for &(off, size) in &s.packets {
+                        let len = timer.next(&data[off as usize..off as usize + size]);
+                        samples.push(Sample { stream: ti as u16, sync: true, offset: off, size: size as u32, dts: pts + link, cts_offset: 0, duration: len });
+                        link += len as i64;
+                    }
+                    trim_end(&mut samples[link_at..], &mut link, s.last_granule);
+                }
+                Kind::Opus => {
+                    for &(off, size) in &s.packets {
+                        let h = &data[off as usize..off as usize + size.min(2)];
+                        let len = if size == 0 { 960 } else { ironav_codec::opus::packet_samples(h).unwrap_or(960) as u32 };
+                        samples.push(Sample { stream: ti as u16, sync: true, offset: off, size: size as u32, dts: pts + link, cts_offset: 0, duration: len });
+                        link += len as i64;
+                    }
+                    trim_end(&mut samples[link_at..], &mut link, s.last_granule);
+                }
+            }
+            pts += link;
         }
-        StreamInfo {
-            index: 0,
-            codec: CodecId::Flac,
-            time_base: Rational::new(1, rate as i64),
-            duration: Some(pts),
-            bits: Some(bits),
-            extradata: Vec::new(),
-            lead_in: 0,
-            params: StreamParams::Audio { sample_rate: rate, channels },
-        }
-    } else if vorbis {
-        let extradata = ironav_codec::vorbis::join_headers([hdr(0)?, hdr(1)?, hdr(2)?]);
-        let (channels, rate) = ironav_codec::vorbis::PacketTimer::channels_and_rate(&extradata)?;
-        let mut timer = ironav_codec::vorbis::PacketTimer::new(&extradata)?;
-        for &(off, size) in &packets {
-            let len = timer.next(&data[off as usize..off as usize + size]);
-            samples.push(Sample { stream: 0, sync: true, offset: off, size: size as u32, dts: pts, cts_offset: 0, duration: len });
-            pts += len as i64;
-        }
-        trim_end(&mut samples, &mut pts, last_granule);
-        StreamInfo {
-            index: 0,
-            codec: CodecId::Vorbis,
-            time_base: Rational::new(1, rate as i64),
-            duration: Some(pts),
-            bits: None,
-            extradata,
-            lead_in: 0,
-            params: StreamParams::Audio { sample_rate: rate, channels },
-        }
-    } else {
-        let hd = hdr(0)?;
-        if hd.len() < 19 || hd[8] >> 4 != 0 {
-            return Err(bad("OpusHead is too short or has an unknown version"));
-        }
-        let channels = hd[9] as u16;
-        let extradata = hd.to_vec();
-        for &(off, size) in &packets {
-            let h = &data[off as usize..off as usize + size.min(2)];
-            let len = if size == 0 { 960 } else { ironav_codec::opus::packet_samples(h).unwrap_or(960) as u32 };
-            samples.push(Sample { stream: 0, sync: true, offset: off, size: size as u32, dts: pts, cts_offset: 0, duration: len });
-            pts += len as i64;
-        }
-        trim_end(&mut samples, &mut pts, last_granule);
-        StreamInfo {
-            index: 0,
-            codec: CodecId::Opus,
-            time_base: Rational::new(1, 48_000),
-            duration: Some(pts),
-            bits: None,
-            extradata,
-            lead_in: 0,
-            params: StreamParams::Audio { sample_rate: 48_000, channels },
-        }
-    };
-    let track = TrackInfo { stream, config: Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma: 1 }, convert: false, swap: 0, unwrap: Vec::new() };
-    Ok(Mp4Demuxer::from_parts(Cursor::new(data), "ogg", vec![track], samples))
+        infos.push(StreamInfo { index: ti, duration: Some(pts), ..stream });
+    }
+    let tracks_out: Vec<TrackInfo> = infos
+        .into_iter()
+        .map(|stream| TrackInfo { stream, config: Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma: 1 }, convert: false, swap: 0, unwrap: Vec::new() })
+        .collect();
+    Ok(Mp4Demuxer::from_parts(Cursor::new(data), "ogg", tracks_out, samples))
 }
+
+/// The `i`-th header packet of a stream.
+fn header<'a>(data: &'a [u8], s: &Logical, i: usize) -> Result<&'a [u8]> {
+    let &(off, len) = s.headers.get(i).ok_or_else(|| bad("the stream ends inside its headers"))?;
+    Ok(&data[off as usize..off as usize + len])
+}
+
+/// The stream description of a track, from the headers of its first stream, and the header bytes the
+/// packet timer needs (the Vorbis headers joined; empty for the other codecs).
+fn track_info(kind: Kind, first: &Logical, data: &[u8], index: usize) -> Result<(StreamInfo, Vec<u8>)> {
+    Ok(match kind {
+        Kind::Flac => {
+            let hd = header(data, first, 0)?;
+            // 0x7F "FLAC", version (2), header count (2), "fLaC", a metadata block header (4), STREAMINFO (34)
+            if hd.len() < 51 || &hd[9..13] != b"fLaC" || hd[5] != 1 {
+                return Err(bad("the FLAC mapping header is too short or has an unknown version"));
+            }
+            let b = &hd[17..51];
+            let packed = u64::from_be_bytes(b[10..18].try_into().unwrap());
+            let (rate, channels, bits) = ((packed >> 44) as u32, ((packed >> 41) & 7) as u16 + 1, ((packed >> 36) & 31) as u8 + 1);
+            if rate == 0 {
+                return Err(bad("STREAMINFO has a zero sample rate"));
+            }
+            let stream = StreamInfo {
+                index,
+                codec: CodecId::Flac,
+                time_base: Rational::new(1, rate as i64),
+                duration: None,
+                bits: Some(bits),
+                extradata: Vec::new(),
+                lead_in: 0,
+                params: StreamParams::Audio { sample_rate: rate, channels },
+            };
+            (stream, Vec::new())
+        }
+        Kind::Vorbis => {
+            let extradata = ironav_codec::vorbis::join_headers([header(data, first, 0)?, header(data, first, 1)?, header(data, first, 2)?]);
+            let (channels, rate) = ironav_codec::vorbis::PacketTimer::channels_and_rate(&extradata)?;
+            let stream = StreamInfo {
+                index,
+                codec: CodecId::Vorbis,
+                time_base: Rational::new(1, rate as i64),
+                duration: None,
+                bits: None,
+                extradata: extradata.clone(),
+                lead_in: 0,
+                params: StreamParams::Audio { sample_rate: rate, channels },
+            };
+            (stream, extradata)
+        }
+        Kind::Opus => {
+            let hd = header(data, first, 0)?;
+            if hd.len() < 19 || hd[8] >> 4 != 0 {
+                return Err(bad("OpusHead is too short or has an unknown version"));
+            }
+            let channels = hd[9] as u16;
+            let stream = StreamInfo {
+                index,
+                codec: CodecId::Opus,
+                time_base: Rational::new(1, 48_000),
+                duration: None,
+                bits: None,
+                extradata: hd.to_vec(),
+                lead_in: 0,
+                params: StreamParams::Audio { sample_rate: 48_000, channels },
+            };
+            (stream, Vec::new())
+        }
+    })
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -330,5 +478,96 @@ mod tests {
         let n = f.len();
         f[n - 1] ^= 1;
         assert!(open(&f[..]).is_err());
+    }
+
+    /// A native-FLAC mapping header: 0x7F "FLAC", version 1, a header count, "fLaC", and STREAMINFO.
+    fn flac_head(rate: u32, channels: u8, max_block: u16) -> Vec<u8> {
+        let mut h = vec![0x7F];
+        h.extend(b"FLAC");
+        h.extend([1, 0, 0, 0]);
+        h.extend(b"fLaC");
+        h.extend([0x80, 0, 0, 34]); // last metadata block, STREAMINFO, 34 bytes
+        let mut info = [0u8; 34];
+        info[0..2].copy_from_slice(&max_block.to_be_bytes()); // minimum block size
+        info[2..4].copy_from_slice(&max_block.to_be_bytes()); // maximum block size
+        let packed = ((rate as u64) << 44) | (((channels - 1) as u64) << 41) | (15u64 << 36);
+        info[10..18].copy_from_slice(&packed.to_be_bytes());
+        h.extend(info);
+        h
+    }
+
+    #[test]
+    fn multiplexed_opus_streams_are_separate_tracks() {
+        // two Opus streams, serials 7 and 9, whose pages alternate in the file
+        let mut a = vec![0xFC];
+        a.extend(vec![1u8; 99]);
+        let mut b = vec![0xFC];
+        b.extend(vec![2u8; 99]);
+        let mut f = page(0x02, 0, 7, 0, &[&opus_head()], false);
+        f.extend(page(0x02, 0, 9, 0, &[&opus_head()], false));
+        f.extend(page(0, 0, 7, 1, &[b"OpusTags....."], false));
+        f.extend(page(0, 0, 9, 1, &[b"OpusTags....."], false));
+        f.extend(page(0, 960, 7, 2, &[&a], false));
+        f.extend(page(0x04, 960, 9, 2, &[&b], false));
+        f.extend(page(0x04, 1920, 7, 3, &[&a], false));
+        let mut d = open(&f[..]).unwrap();
+        assert_eq!(d.streams().len(), 2, "one track per stream");
+        let mut got = [Vec::new(), Vec::new()];
+        while let Some(p) = d.read_packet().unwrap() {
+            got[p.stream].push((p.pts, p.data[0]));
+        }
+        assert_eq!(got[0], vec![(0, 0xFC), (960, 0xFC)]);
+        assert_eq!(got[1], vec![(0, 0xFC)]);
+    }
+
+    #[test]
+    fn chained_flac_streams_are_one_track_on_one_timeline() {
+        // two links with the same rate, channels and sample size: the second starts where the first ends
+        // a frame whose header does not parse (block size code 0 is reserved), so each takes the maximum block size
+        let frame = |fill: u8| {
+            let mut v = vec![0xFF, 0xF8, 0, 0];
+            v.extend(vec![fill; 40]);
+            v
+        };
+        let mut f = page(0x02, 0, 1, 0, &[&flac_head(44_100, 2, 4096)], false);
+        f.extend(page(0, 0, 1, 1, &[&frame(1)], false));
+        f.extend(page(0x04, 0, 1, 2, &[&frame(2)], false));
+        f.extend(page(0x02, 0, 2, 0, &[&flac_head(44_100, 2, 4096)], false));
+        f.extend(page(0, 0, 2, 1, &[&frame(3)], false));
+        f.extend(page(0x04, 0, 2, 2, &[&frame(4)], false));
+        let mut d = open(&f[..]).unwrap();
+        assert_eq!(d.streams().len(), 1, "the chained links are one track");
+        let mut got = Vec::new();
+        while let Some(p) = d.read_packet().unwrap() {
+            got.push((p.pts, p.data[4]));
+        }
+        assert_eq!(got.iter().map(|g| g.1).collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+        // each frame is as long as the others, and the second link starts where the first one ends
+        let step = got[1].0 - got[0].0;
+        assert!(step > 0);
+        assert_eq!(got[2].0, got[0].0 + 2 * step, "the second link continues the timeline");
+        assert_eq!(got[3].0, got[0].0 + 3 * step);
+    }
+
+    #[test]
+    fn chained_flac_with_another_format_stays_a_separate_track() {
+        let mut f = page(0x02, 0, 1, 0, &[&flac_head(44_100, 2, 4096)], false);
+        f.extend(page(0x04, 0, 1, 1, &[&[0xFF, 0xF8, 9, 9]], false));
+        f.extend(page(0x02, 0, 2, 0, &[&flac_head(48_000, 2, 4096)], false));
+        f.extend(page(0x04, 0, 2, 1, &[&[0xFF, 0xF8, 8, 8]], false));
+        let d = open(&f[..]).unwrap();
+        assert_eq!(d.streams().len(), 2, "a link at another rate is a track of its own");
+    }
+
+    #[test]
+    fn chained_opus_links_are_separate_tracks() {
+        let mut f = page(0x02, 0, 7, 0, &[&opus_head()], false);
+        f.extend(page(0, 0, 7, 1, &[b"OpusTags....."], false));
+        f.extend(page(0x04, 960, 7, 2, &[&[0xFC, 1, 1]], false));
+        f.extend(page(0x02, 0, 9, 0, &[&opus_head()], false));
+        f.extend(page(0, 0, 9, 1, &[b"OpusTags....."], false));
+        f.extend(page(0x04, 960, 9, 2, &[&[0xFC, 2, 2]], false));
+        let d = open(&f[..]).unwrap();
+        assert_eq!(d.streams().len(), 2, "each Opus link keeps its own pre-skip");
     }
 }

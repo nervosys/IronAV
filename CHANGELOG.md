@@ -61,6 +61,10 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   IronAV reads in the order the specification gives); no writer produces encodings.
 - **Containers (Matroska PCM):** PCM is read and written in Matroska (`A_PCM/INT/LIT`, `A_PCM/INT/BIG` and `A_PCM/FLOAT/IEEE`, 8 to 64 bits):
   FFmpeg's files decode to the same bytes IronAV reads, and FFmpeg reads IronAV's copies to the same bytes.
+- **Containers (Ogg streams):** every logical stream of an Ogg file is read. Multiplexed Opus, Vorbis or FLAC streams (serial numbers
+  that share the file in time) are separate tracks; chained Vorbis or FLAC links with the same setup are one track on one timeline.
+  Chained Opus links stay separate tracks, each with its own pre-skip. The unit tests cover multiplexed Opus and chained FLAC on
+  synthetic files; joined Vorbis links have no FFmpeg-checked file yet.
 - **Containers (copy):** VP9 and AV1 are copied between WebM, Matroska and MP4; AAC keeps its encoder
   delay in MP4; Opus ends where the source did in Matroska (DiscardPadding) and Ogg.
 - **Live input and streaming (HTTP authentication):** Digest (MD5, MD5-sess, SHA-256 and SHA-256-sess, RFC 7616, and RFC 2069 forms; SHA-256 is preferred) and
@@ -136,8 +140,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   ProRes interlaced pictures are refused.
 - **Containers:** Matroska tracks with encryption, bzip2 or lzo content encodings are refused (header stripping and zlib are read;
   the live reader refuses any content encoding); MPEG-TS does not carry Opus,
-  AC-3 or MPEG-2 video; raw H.264 and HEVC are write-only; Ogg reads only the
-  first Opus, Vorbis or FLAC stream (Speex and Theora are refused).
+  AC-3 or MPEG-2 video; raw H.264 and HEVC are write-only; Ogg refuses files
+  holding only Speex or Theora (other streams in a file are passed over).
 - **Live:** servers that speak only TLS 1.2 cannot be reached; cameras and microphones are read on Windows and Linux
   only (no AVFoundation).
 - Sound output through a real device has been built but not verified by listening or measurement.
