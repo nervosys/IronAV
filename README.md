@@ -970,7 +970,7 @@ becomes 160 kb/s MP3 in about 2 s. Converting an MP3 to MP3 is a copy unless a b
 
 ## Matroska output
 
-`.mkv` and `.mka` can be written: H.264 or HEVC video (from the software or hardware encoder, or copied), or VP8, VP9, AV1 or Motion-JPEG video (copied, or encoded by IronAV for VP8, VP9 and Motion-JPEG), with AAC, FLAC, MP3, Opus or Vorbis
+`.mkv` and `.mka` can be written: H.264 or HEVC video (from the software or hardware encoder, or copied), or VP8, VP9, AV1 or Motion-JPEG video (copied, or encoded by IronAV for VP8, VP9, AV1 and Motion-JPEG), with AAC, FLAC, MP3, Opus or Vorbis
 audio, copied or encoded, at most one stream of each kind. Timestamps are in milliseconds; clusters are gathered in memory and
 written whole, so there are no unknown-size elements, and the file ends with Cues for the video key frames (or the clusters, for
 audio only). The header is held back until every stream has delivered a packet and the video's SPS/PPS have been seen.
@@ -981,7 +981,7 @@ FFmpeg decodes all 50 frames of each video. IronAV's own tests copy audio throug
 configuration, and decode FLAC through Matroska to the PCM it was made from.
 
 `.webm` is written with VP8, VP9 or AV1 video and Opus or Vorbis audio (document type `webm`; FFmpeg opens the files and decodes them).
-VP8 and VP9 video can be encoded by IronAV (see "VP8" and "VP9"); otherwise the video is copied, from WebM, Matroska or (VP9 and AV1) MP4. Key frames come from
+VP8, VP9 and AV1 video can be encoded by IronAV (see "VP8", "VP9" and "AV1"); otherwise the video is copied, from WebM, Matroska or (VP9 and AV1) MP4. Key frames come from
 the bitstream: VP8's frame tag, the first frame header of a VP9 packet (or superframe), and for AV1 the first frame header of the temporal unit,
 which must be a shown key frame. So the Cues are right. VP8 and VP9 have no CodecPrivate. AV1's is its `av1C` record (a stream without one is
 refused), and temporal delimiter and padding OBUs are dropped, as the Matroska AV1 mapping asks. FFmpeg (through PyAV) checked the copies:
