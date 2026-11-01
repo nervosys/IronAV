@@ -5,28 +5,35 @@
 //! straight from the standard's definitions (a 36-point IMDCT per subband and the 64x32 matrixing
 //! synthesis filter) in `f64`, which is plenty fast for audio.
 //!
-//! A packet is one whole frame, header included. Layers I and II are refused. After a seek, or at
-//! the start of a stream, a frame that points back into data the decoder never saw (the bit
-//! reservoir) decodes to silence.
+//! Layer II frames (MPEG-1/2 Layer II, "MP2") are decoded by the same type: `layer2.rs` holds their
+//! tables and decoding, and `Mp2Decoder` is the decoder for an MP2 stream. Layer I is refused.
+//!
+//! A packet is one whole frame, header included. After a seek, or at the start of a stream, a frame
+//! that points back into data the decoder never saw (the bit reservoir) decodes to silence.
 
 mod enc;
+mod layer2;
 mod tables;
 
 pub use enc::{Mp3Encoder, DECODER_DELAY, LEAD_IN};
+pub use layer2::Mp2Decoder;
 
-use ironav_core::{AudioFrame, Decoder, Error, ErrorCode, Frame, Packet, Result, StreamParams};
+use ironav_core::{AudioFrame, CodecId, Decoder, Error, ErrorCode, Frame, Packet, Result, StreamParams};
 use std::f64::consts::PI;
 use std::sync::OnceLock;
 use tables::*;
 
 const BITRATES_V1: [u32; 15] = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320];
+const BITRATES_V1_L2: [u32; 15] = [0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384];
 const BITRATES_LSF: [u32; 15] = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
 const RATES_V1: [u32; 3] = [44100, 48000, 32000];
 
-/// A parsed Layer III frame header.
+/// A parsed Layer III or Layer II frame header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
-    /// Whether the frame is MPEG-2 or MPEG-2.5 (half or quarter sample rate, one granule).
+    /// 3 for Layer III, 2 for Layer II.
+    pub layer: u8,
+    /// Whether the frame is MPEG-2 or MPEG-2.5 (half or quarter sample rate, one granule for Layer III).
     pub lsf: bool,
     /// Whether a 16-bit CRC follows the header.
     pub crc: bool,
@@ -47,7 +54,11 @@ impl Header {
     }
     /// Samples per channel in the frame.
     pub fn samples(&self) -> usize {
-        if self.lsf { 576 } else { 1152 }
+        if self.layer == 3 && self.lsf { 576 } else { 1152 }
+    }
+    /// The codec the frame belongs to: Layer III is MP3, Layer II is MP2.
+    pub fn codec(&self) -> CodecId {
+        if self.layer == 3 { CodecId::Mp3 } else { CodecId::Mp2 }
     }
     /// Bytes of side information.
     pub fn side_len(&self) -> usize {
@@ -60,14 +71,19 @@ impl Header {
     }
 }
 
-/// Parse the header at the start of `b`; `None` if it is not a valid Layer III header.
-pub fn parse_header(b: &[u8]) -> Option<Header> {
+/// Parse the header at the start of `b`: a Layer III or Layer II frame. `None` for anything else,
+/// Layer I included.
+pub fn parse_frame(b: &[u8]) -> Option<Header> {
     if b.len() < 4 || b[0] != 0xFF || b[1] & 0xE0 != 0xE0 {
         return None;
     }
     let version = (b[1] >> 3) & 3; // 0: 2.5, 2: 2, 3: 1
-    let layer = (b[1] >> 1) & 3;
-    if version == 1 || layer != 1 {
+    let layer = match (b[1] >> 1) & 3 {
+        1 => 3,
+        2 => 2,
+        _ => return None,
+    };
+    if version == 1 {
         return None;
     }
     let crc = b[1] & 1 == 0;
@@ -78,13 +94,42 @@ pub fn parse_header(b: &[u8]) -> Option<Header> {
         return None;
     }
     let lsf = version != 3;
-    let bitrate = if lsf { BITRATES_LSF[br] } else { BITRATES_V1[br] };
+    let bitrate = if lsf {
+        BITRATES_LSF[br]
+    } else if layer == 3 {
+        BITRATES_V1[br]
+    } else {
+        BITRATES_V1_L2[br]
+    };
     let sample_rate = RATES_V1[sr] >> (if version == 3 { 0 } else if version == 2 { 1 } else { 2 });
     let rate_index = sr + 3 * (if version == 3 { 0 } else if version == 2 { 1 } else { 2 });
     let mode = b[3] >> 6;
     let mode_ext = (b[3] >> 4) & 3;
-    let frame_len = (if lsf { 72 } else { 144 }) * bitrate as usize * 1000 / sample_rate as usize + padding;
-    Some(Header { lsf, crc, bitrate, sample_rate, rate_index, mode, mode_ext, frame_len })
+    // Layer III's frame is 72 slots at MPEG-2, Layer II's is 144 at every rate
+    let slots = if layer == 3 && lsf { 72 } else { 144 };
+    let frame_len = slots * bitrate as usize * 1000 / sample_rate as usize + padding;
+    Some(Header { layer, lsf, crc, bitrate, sample_rate, rate_index, mode, mode_ext, frame_len })
+}
+
+/// Parse the header at the start of `b`; `None` if it is not a valid Layer III header.
+pub fn parse_header(b: &[u8]) -> Option<Header> {
+    parse_frame(b).filter(|h| h.layer == 3)
+}
+
+/// A damaged frame decodes to silence, like the reference decoder's concealment-free path, when its
+/// header still parses for `channels`; any other damage is an error.
+fn conceal(channels: u16, p: &Packet, res: Result<Frame>) -> Result<Vec<Frame>> {
+    match res {
+        Ok(f) => Ok(vec![f]),
+        Err(e) => {
+            let Some(h) = parse_frame(&p.data) else { return Err(e) };
+            if channels != h.channels() {
+                return Err(e);
+            }
+            let n = h.samples() * channels as usize;
+            Ok(vec![Frame::Audio(AudioFrame { sample_rate: h.sample_rate, channels, pts: p.pts, samples: vec![0.0; n] })])
+        }
+    }
 }
 
 // ---- bits ----------------------------------------------------------------------------------------
@@ -390,6 +435,8 @@ pub struct Mp3Decoder {
     v: Vec<[f32; 1024]>,
     v_off: Vec<usize>,
     granules: Vec<[Granule; 2]>,
+    /// The synthesis state of Layer II frames, for a stream labelled as Layer III that carries them.
+    layer2: layer2::Layer2,
 }
 
 impl Mp3Decoder {
@@ -405,16 +452,12 @@ impl Mp3Decoder {
             v: vec![[0.0; 1024]; 2],
             v_off: vec![0; 2],
             granules: vec![Default::default(), Default::default()],
+            layer2: layer2::Layer2::new(),
         })
     }
 
-    fn silence(&mut self, h: &Header, pts: i64) -> Vec<Frame> {
-        let n = h.samples() * self.channels as usize;
-        vec![Frame::Audio(AudioFrame { sample_rate: h.sample_rate, channels: self.channels, pts, samples: vec![0.0; n] })]
-    }
-
-    fn decode_frame(&mut self, p: &Packet) -> Result<Vec<Frame>> {
-        let h = parse_header(&p.data).ok_or_else(|| bad("not a Layer III frame header (layers I and II are not supported)"))?;
+    fn decode_frame(&mut self, p: &Packet) -> Result<Frame> {
+        let h = parse_header(&p.data).ok_or_else(|| bad("not a Layer III frame header"))?;
         let nch = h.channels() as usize;
         let hdr = 4 + if h.crc { 2 } else { 0 };
         let end = h.frame_len.min(p.data.len());
@@ -558,7 +601,7 @@ impl Mp3Decoder {
                 }
             }
         }
-        Ok(vec![Frame::Audio(AudioFrame { sample_rate: h.sample_rate, channels: nch as u16, pts: p.pts, samples: out })])
+        Ok(Frame::Audio(AudioFrame { sample_rate: h.sample_rate, channels: nch as u16, pts: p.pts, samples: out }))
     }
 }
 
@@ -1039,17 +1082,9 @@ fn granule_pcm(s: &Statics, g: &Granule, overlap: &mut [[f32; 18]; 32], v: &mut 
 
 impl Decoder for Mp3Decoder {
     fn decode(&mut self, p: &Packet) -> Result<Vec<Frame>> {
-        match self.decode_frame(p) {
-            Ok(f) => Ok(f),
-            Err(e) => {
-                // a damaged frame is silence, like the reference decoder's concealment-free path
-                let Some(h) = parse_header(&p.data) else { return Err(e) };
-                if self.channels != h.channels() {
-                    return Err(e);
-                }
-                Ok(self.silence(&h, p.pts))
-            }
-        }
+        // a Layer II frame in a stream labelled Layer III (MP4 files may be) decodes all the same
+        let res = if parse_frame(&p.data).is_some_and(|h| h.layer == 2) { self.layer2.decode(p) } else { self.decode_frame(p) };
+        conceal(self.channels, p, res)
     }
 }
 

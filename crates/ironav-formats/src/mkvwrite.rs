@@ -244,6 +244,7 @@ impl MatroskaWriter {
                 CodecId::Flac => "A_FLAC",
                 CodecId::Opus => "A_OPUS",
                 CodecId::Vorbis => "A_VORBIS",
+                CodecId::Mp2 => "A_MPEG/L2",
                 CodecId::PcmF32Le | CodecId::PcmF64Le => "A_PCM/FLOAT/IEEE",
                 c if c.sample_format().is_some() => "A_PCM/INT/LIT",
                 _ => "A_MPEG/L3",
@@ -264,7 +265,7 @@ impl MatroskaWriter {
                 }
                 StreamParams::Audio { sample_rate, channels } => {
                     // a fixed frame length lets readers time the frames without the container
-                    if matches!(s.codec, CodecId::Aac | CodecId::Mp3) && t.first_duration > 0 {
+                    if matches!(s.codec, CodecId::Aac | CodecId::Mp3 | CodecId::Mp2) && t.first_duration > 0 {
                         let ns = t.first_duration as u128 * 1_000_000_000 * s.time_base.num as u128 / s.time_base.den as u128;
                         e.extend(uint(0x23_E383, ns as u64));
                     }
@@ -432,7 +433,7 @@ impl Muxer for MatroskaWriter {
                     }
                     false
                 }
-                (StreamParams::Audio { .. }, CodecId::Flac | CodecId::Mp3) => false,
+                (StreamParams::Audio { .. }, CodecId::Flac | CodecId::Mp3 | CodecId::Mp2) => false,
                 (StreamParams::Audio { .. }, c) if c.sample_format().is_some() => false,
                 _ => {
                     return Err(Error::new(

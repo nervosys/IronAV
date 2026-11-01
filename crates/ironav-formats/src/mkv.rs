@@ -619,6 +619,7 @@ fn audio_codec(id: &str) -> Option<CodecId> {
         "A_VORBIS" => CodecId::Vorbis,
         "A_FLAC" => CodecId::Flac,
         "A_MPEG/L3" => CodecId::Mp3,
+        "A_MPEG/L2" => CodecId::Mp2,
         "A_ALAC" => CodecId::Alac,
         s if s == "A_AAC" || s.starts_with("A_AAC/") => CodecId::Aac,
         _ => return None,
@@ -656,6 +657,7 @@ fn audio_frame_len(t: &MkTrack, codec: CodecId) -> Option<u32> {
     match codec {
         CodecId::Aac => Some(1024),
         CodecId::Mp3 => Some(if t.rate >= 32000.0 { 1152 } else { 576 }),
+        CodecId::Mp2 => Some(1152),
         _ => None,
     }
 }
@@ -764,7 +766,7 @@ fn build_track(t: &MkTrack, index: usize, frames: &[&Frame], scale: u64, samples
         convert = false;
         let rate = t.rate.round() as u32;
         bits = t.bits;
-        if matches!(codec, CodecId::Aac | CodecId::Opus | CodecId::Mp3 | CodecId::Vorbis) {
+        if matches!(codec, CodecId::Aac | CodecId::Opus | CodecId::Mp3 | CodecId::Mp2 | CodecId::Vorbis) {
             extradata = t.private.clone();
             bits = None;
         }

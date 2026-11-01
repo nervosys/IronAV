@@ -18,7 +18,7 @@
 
 use crate::stream::{Pending, StreamDemuxer, StreamPacket, MAX_PENDING};
 use crate::{adts, ogg};
-use ironav_codec::mp3::{parse_header, Header};
+use ironav_codec::mp3::{parse_frame, Header};
 use ironav_core::{CodecId, Error, ErrorCode, Packet, Rational, Result, StreamInfo, StreamParams};
 use std::collections::VecDeque;
 
@@ -375,7 +375,7 @@ impl StreamDemuxer for Mp3Stream {
                 self.pending.skip(tag);
                 continue;
             }
-            let Some(h) = parse_header(&d[..4]) else {
+            let Some(h) = parse_frame(&d[..4]) else {
                 self.pending.skip(1);
                 continue;
             };
@@ -384,7 +384,7 @@ impl StreamDemuxer for Mp3Stream {
                 return Ok(None);
             }
             match self.locked {
-                Some(f) if f.sample_rate == h.sample_rate && f.lsf == h.lsf => {}
+                Some(f) if f.sample_rate == h.sample_rate && f.lsf == h.lsf && f.layer == h.layer => {}
                 Some(_) => {
                     self.pending.skip(1);
                     continue;
@@ -393,20 +393,20 @@ impl StreamDemuxer for Mp3Stream {
                     if d.len() < h.frame_len + 4 && !self.ended {
                         return Ok(None);
                     }
-                    let follows = d.get(h.frame_len..h.frame_len + 4).and_then(parse_header).is_some_and(|n| n.sample_rate == h.sample_rate && n.lsf == h.lsf);
+                    let follows = d.get(h.frame_len..h.frame_len + 4).and_then(parse_frame).is_some_and(|n| n.sample_rate == h.sample_rate && n.lsf == h.lsf && n.layer == h.layer);
                     if !follows && !(self.ended && d.len() == h.frame_len) {
                         self.pending.skip(1);
                         continue;
                     }
                     self.locked = Some(h);
-                    if crate::mp3::is_info_frame(d, 0, &h) {
+                    if h.layer == 3 && crate::mp3::is_info_frame(d, 0, &h) {
                         self.pending.skip(h.frame_len);
                         continue;
                     }
                 }
             }
             if self.streams.is_empty() {
-                self.streams.push(info(CodecId::Mp3, h.sample_rate, h.channels(), None, Vec::new()));
+                self.streams.push(info(h.codec(), h.sample_rate, h.channels(), None, Vec::new()));
             }
             let data = self.pending.take(h.frame_len);
             let pts = self.pts;
@@ -446,7 +446,7 @@ impl Id3Stream {
         let mut inner: Box<dyn StreamDemuxer> = if adts::looks_like_adts(rest) {
             // HLS packed audio says in the tag where it starts
             Box::new(crate::stream::AdtsStream::starting_at(crate::stream::apple_timestamp(&d[..tag.min(d.len())])))
-        } else if rest.len() >= 4 && parse_header(rest).is_some() {
+        } else if rest.len() >= 4 && parse_frame(rest).is_some() {
             Box::new(Mp3Stream::default())
         } else if self.ended {
             return Err(Error::new(ErrorCode::UnsupportedFormat, "neither MP3 nor ADTS follows the stream's ID3v2 tag"));

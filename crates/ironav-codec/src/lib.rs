@@ -57,6 +57,9 @@ pub fn implemented() -> Vec<CodecImpl> {
             if c == CodecId::Mp3 {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-mp3" });
             }
+            if c == CodecId::Mp2 {
+                return Some(CodecImpl { codec: c, decode: true, encode: false, implementation: "ironav-mp2" });
+            }
             if c == CodecId::Alac {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-alac" });
             }
@@ -169,6 +172,7 @@ pub fn new_decoder_for(s: &ironav_core::StreamInfo) -> Result<Box<dyn Decoder>> 
                 _ => kept_span(s, d),
             })
         }
+        CodecId::Mp2 => Ok(Box::new(mp3::Mp2Decoder::new(&s.params)?)),
         CodecId::Alac => Ok(Box::new(alac::AlacDecoder::new(&s.extradata, &s.params)?)),
         CodecId::Opus => Ok(trimmed(s, opus::new_decoder(&s.extradata, &s.params)?)),
         CodecId::Vorbis => Ok(trimmed(s, Box::new(vorbis::VorbisDecoder::new(&s.extradata, &s.params)?))),

@@ -454,7 +454,7 @@ impl MkvStream {
                 let extradata = if t.codec == CodecId::Av1 { t.t.private.clone() } else { Vec::new() };
                 (tick, StreamParams::Video { width: t.t.width, height: t.t.height, pix_fmt: config.pix_fmt(), frame_rate: frame_rate(fps) }, extradata, None)
             } else {
-                let keep = matches!(t.codec, CodecId::Aac | CodecId::Opus | CodecId::Mp3 | CodecId::Vorbis);
+                let keep = matches!(t.codec, CodecId::Aac | CodecId::Opus | CodecId::Mp3 | CodecId::Mp2 | CodecId::Vorbis);
                 let tb = if t.fixed.is_some() { Rational::new(1, t.rate as i64) } else { tick };
                 (tb, StreamParams::Audio { sample_rate: t.rate, channels: t.t.channels }, if keep { t.t.private.clone() } else { Vec::new() }, if keep { None } else { t.t.bits })
             };

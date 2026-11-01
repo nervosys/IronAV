@@ -1,4 +1,5 @@
-//! Raw MP3 files (`.mp3`): a run of Layer III frames, optionally behind an ID3v2 tag.
+//! Raw MP3 files (`.mp3`): a run of Layer III frames, optionally behind an ID3v2 tag. MPEG audio
+//! Layer II files (`.mp2`) are read the same way, as MP2 streams; the layer of the first frame says which.
 //!
 //! The file is walked once, header to header, to find where every frame lies; the list of frames
 //! goes to the MP4 reader's machinery (`Mp4Demuxer::from_parts`), which reads, seeks and
@@ -18,7 +19,7 @@
 //! Not handled: streams that change sample rate (frames at other rates than the first are dropped).
 
 use crate::mp4demux::{Config, Mp4Demuxer, Sample, TrackInfo};
-use ironav_codec::mp3::{parse_header, Header};
+use ironav_codec::mp3::{parse_frame, parse_header, Header};
 use crate::WriteSeek;
 use ironav_core::{CodecId, Error, ErrorCode, Muxer, Packet, Rational, Result, StreamInfo, StreamParams};
 use std::io::{Read, Seek, SeekFrom};
@@ -26,9 +27,9 @@ use std::io::{Read, Seek, SeekFrom};
 /// The largest file whose frames are indexed.
 const MAX_SCAN: u64 = 2 << 30;
 
-/// Whether `magic` starts an MP3 file: an ID3v2 tag or a Layer III frame header.
+/// Whether `magic` starts an MPEG audio file: an ID3v2 tag or a Layer III or II frame header.
 pub fn looks_like_mp3(magic: &[u8]) -> bool {
-    magic.starts_with(b"ID3") || parse_header(magic).is_some()
+    magic.starts_with(b"ID3") || parse_frame(magic).is_some()
 }
 
 /// The encoder delay and end padding of a LAME tag in the Xing/Info frame at `at`.
@@ -83,7 +84,7 @@ pub fn open<R: Read + Seek + Send>(mut r: R) -> Result<Mp4Demuxer<R>> {
     let mut total = 0i64;
     let mut lame = None;
     while pos + 4 <= len {
-        let Some(h) = parse_header(&file[pos..pos + 4]) else {
+        let Some(h) = parse_frame(&file[pos..pos + 4]) else {
             pos += 1;
             continue;
         };
@@ -91,7 +92,7 @@ pub fn open<R: Read + Seek + Send>(mut r: R) -> Result<Mp4Demuxer<R>> {
         let next = pos + h.frame_len;
         let ok = if next + 4 <= len {
             // a different header after the frame is fine when only a trailer (ID3v1, APE) is left
-            parse_header(&file[next..next + 4]).is_some_and(|n| n.sample_rate == h.sample_rate && n.lsf == h.lsf) || len - next <= 256
+            parse_frame(&file[next..next + 4]).is_some_and(|n| n.sample_rate == h.sample_rate && n.lsf == h.lsf && n.layer == h.layer) || len - next <= 256
         } else {
             true
         };
@@ -102,7 +103,7 @@ pub fn open<R: Read + Seek + Send>(mut r: R) -> Result<Mp4Demuxer<R>> {
         let size = h.frame_len.min(len - pos);
         match &first {
             None => {
-                let info = is_info_frame(&file, pos, &h);
+                let info = h.layer == 3 && is_info_frame(&file, pos, &h);
                 first = Some(h);
                 if info {
                     lame = lame_tag(&file, pos, &h);
@@ -111,7 +112,7 @@ pub fn open<R: Read + Seek + Send>(mut r: R) -> Result<Mp4Demuxer<R>> {
                     total += h.samples() as i64;
                 }
             }
-            Some(f) if f.sample_rate == h.sample_rate && f.lsf == h.lsf => {
+            Some(f) if f.sample_rate == h.sample_rate && f.lsf == h.lsf && f.layer == h.layer => {
                 samples.push(Sample { stream: 0, sync: true, offset: pos as u64, size: size as u32, dts: total, cts_offset: 0, duration: h.samples() as u32 });
                 total += h.samples() as i64;
             }
@@ -120,7 +121,7 @@ pub fn open<R: Read + Seek + Send>(mut r: R) -> Result<Mp4Demuxer<R>> {
         pos = next;
     }
     let Some(h) = first else {
-        return Err(Error::new(ErrorCode::InvalidInput, "MP3: no Layer III frames found"));
+        return Err(Error::new(ErrorCode::InvalidInput, "MP3: no Layer III or II frames found"));
     };
     if samples.is_empty() {
         return Err(Error::new(ErrorCode::InvalidInput, "MP3: the file holds no audio frames"));
@@ -133,7 +134,7 @@ pub fn open<R: Read + Seek + Send>(mut r: R) -> Result<Mp4Demuxer<R>> {
     });
     let stream = StreamInfo {
         index: 0,
-        codec: CodecId::Mp3,
+        codec: h.codec(),
         time_base: Rational::new(1, h.sample_rate as i64),
         duration: Some(total),
         bits: None,
@@ -314,5 +315,26 @@ mod tests {
             n += 1;
         }
         assert_eq!((n, first), (3, Some(0)));
+    }
+
+    #[test]
+    fn a_layer_ii_file_is_read_as_mp2() {
+        // MPEG-1 Layer II, 44.1 kHz, 192 kb/s, stereo: 626-byte frames of 1152 samples
+        let mut file = Vec::new();
+        for _ in 0..3 {
+            let mut f = vec![0xFF, 0xFD, 0xA0, 0x00];
+            f.resize(626, 0x11);
+            file.extend(f);
+        }
+        assert!(looks_like_mp3(&file));
+        let mut d = open(Cursor::new(file)).unwrap();
+        let s = d.streams()[0].clone();
+        assert_eq!((s.codec, s.time_base), (CodecId::Mp2, Rational::new(1, 44100)));
+        let mut pts = Vec::new();
+        while let Some(p) = d.read_packet().unwrap() {
+            assert_eq!(p.data.len(), 626);
+            pts.push(p.pts);
+        }
+        assert_eq!(pts, vec![0, 1152, 2304]);
     }
 }

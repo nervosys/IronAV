@@ -975,13 +975,20 @@ MPEG-1, MPEG-2 and MPEG-2.5 Layer III are decoded (mono, stereo, joint stereo wi
 skipped, a leading Xing/Info frame not played) and from Matroska. The Huffman and band tables and the scale-factor, stereo and
 short-block handling follow FFmpeg's decoder; the filterbank is written from the standard's definitions in `f64`.
 
+MPEG-1 and MPEG-2 Layer II (MP2) is decoded as the `mp2` codec, from raw `.mp2` files, Matroska `A_MPEG/L2` and any
+stream labelled MP3 that carries Layer II frames (the Layer III decoder hands them to the same code). Checked against
+FFmpeg's `mp2float` decoder on eleven encoded streams (16 to 48 kHz, mono and stereo, each of the four MPEG-1 allocation
+tables, the MPEG-2 tables) and a full-scale noise stream: they agree to float32 rounding. Joint-stereo (intensity) Layer II
+is decoded from the standard but has no FFmpeg reference (its encoder writes none, and patched streams do not decode to
+FFmpeg's samples), so it is unverified. Layer I has no encoder to make a test stream with and is refused. MP2 is not encoded.
+
 Checked against FFmpeg's `mp3float` decoder on twelve LAME-encoded files (44.1, 48, 32, 22.05, 24, 16, 11.025 and 8 kHz;
 mono and stereo; 16 to 320 kb/s, CBR and VBR; long, start, short and stop blocks): **116 to 124 dB SNR**, largest sample
 difference about 3e-6 of full scale. The same frames in Matroska decode identically. Fuzzed with 120 damaged and truncated
 files: no panics.
 
 Not covered, and not tested because the encoder used never produced them: **mixed blocks, intensity stereo, CRC-protected
-frames and the 8 kHz mixed-block tables** are ported from FFmpeg but unverified. Layers I and II are refused. A frame whose
+frames and the 8 kHz mixed-block tables** are ported from FFmpeg but unverified. Layer I is refused. A frame whose
 bit-reservoir data is missing (the first frames after a seek) decodes to silence. A LAME (or Lavf) tag's encoder delay and padding
 are applied: the reader hands the decoder where the audio starts and ends (delay plus the decoder's 529 samples at the start,
 padding less 529 at the end), and on the three LAME fixtures the output has exactly FFmpeg's length and samples. An MP3 in

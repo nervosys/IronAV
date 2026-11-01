@@ -187,6 +187,7 @@ codecs! {
     PcmF64Le => "pcm_f64le", Audio;
     Aac => "aac", Audio;
     Mp3 => "mp3", Audio;
+    Mp2 => "mp2", Audio;
     Opus => "opus", Audio;
     Vorbis => "vorbis", Audio;
     Flac => "flac", Audio;
