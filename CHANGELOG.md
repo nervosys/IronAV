@@ -46,8 +46,11 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   cheaper, and the transform bases are built once per stream. Files are 1 to 3.5 % smaller.
 - **Containers:** WAV, FLAC, Y4M, MP4, QuickTime MOV, Matroska and WebM (read and write), Ogg (Opus, Vorbis and FLAC),
   ADTS, MP3, JPEG, and MPEG transport streams (read and write), and raw H.264 and HEVC (Annex B, write only).
-- **Containers (MP4):** fragmented MP4 is read as it arrives; the writer is constant-frame-rate and
-  writes fast-start files; B-frames are copied with `ctts` and an edit list; ALAC audio is read and written
+- **Containers (MP4):** fragmented MP4 is read as it arrives, and written with `fragment_seconds` in a job (`--fragment-seconds S`
+  on the CLI): the index first, with no samples in it, then a `moof` and `mdat` for each fragment, cut at a key frame once
+  it is at least S seconds long (at any audio packet in a file with no video). Composition offsets are signed, as in
+  `trun` version 1. FFmpeg decodes a fragmented copy to the same pictures and samples as the plain copy. The writer is
+  constant-frame-rate and writes fast-start files otherwise; B-frames are copied with `ctts` and an edit list; ALAC audio is read and written
   in the `alac` sample entry, in MP4 and MOV.
 - **Containers (QuickTime):** MOV is read as MP4 is, including QuickTime sound entries (versions 1 and 2, `wave`
   atoms, and PCM in `twos`, `sowt`, `in24`, `in32`, `fl32`, `fl64`, `raw ` and `lpcm` form) and files with no `ftyp`;
@@ -127,7 +130,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - **MP3, JPEG, ProRes:** MP3 layers I and II are refused; JPEG arithmetic-coded, 12-bit and lossless files are refused;
   ProRes interlaced pictures are refused.
 - **Containers:** Matroska tracks with a content encoding and PCM in Matroska are refused; MPEG-TS does not carry Opus,
-  AC-3 or MPEG-2 video; fragmented MP4 is read but not written; raw H.264 and HEVC are write-only; Ogg reads only the
+  AC-3 or MPEG-2 video; raw H.264 and HEVC are write-only; Ogg reads only the
   first Opus, Vorbis or FLAC stream (Speex and Theora are refused).
 - **Live:** servers that speak only TLS 1.2 cannot be reached; cameras and microphones are read on Windows and Linux
   only (no AVFoundation).

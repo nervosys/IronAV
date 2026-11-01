@@ -71,6 +71,9 @@ pub struct Plan {
     pub output: OutputSummary,
     pub steps: Vec<Step>,
     pub warnings: Vec<String>,
+    /// The fragment length of a fragmented MP4 or MOV output (see `Job::fragment_seconds`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fragment_seconds: Option<f64>,
 }
 
 /// Bit depth of the coded output. FLAC keeps the source depth when it has one; from PCM it
@@ -133,6 +136,14 @@ pub fn plan(job: &Job) -> Result<Plan> {
     };
     if !spec.mux {
         return Err(Error::new(ErrorCode::UnsupportedFormat, format!("format '{}' cannot be written", spec.name)));
+    }
+    if let Some(s) = job.fragment_seconds {
+        if !(s.is_finite() && s > 0.0) {
+            return Err(Error::invalid_arg(format!("fragment_seconds must be a positive number of seconds, got {s}")));
+        }
+        if !matches!(spec.name, "mp4" | "mov") {
+            return Err(Error::invalid_arg(format!("fragment_seconds applies to mp4 and mov output, not {}", spec.name)).hint("write the output as .mp4 or .mov, or leave fragment_seconds out"));
+        }
     }
     if out_path.exists() {
         if in_paths.iter().any(|p| matches!((p.canonicalize(), out_path.canonicalize()), (Ok(a), Ok(b)) if a == b)) {
@@ -456,5 +467,6 @@ pub fn plan(job: &Job) -> Result<Plan> {
         output: OutputSummary { path: job.output.clone(), format: spec.name, streams: out_streams },
         steps,
         warnings,
+        fragment_seconds: job.fragment_seconds,
     })
 }

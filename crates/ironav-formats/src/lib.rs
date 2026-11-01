@@ -86,7 +86,7 @@ pub static FORMATS: &[FormatSpec] = &[
     FormatSpec {
         name: "mp4",
         extensions: &["mp4", "m4a", "m4v"],
-        description: "MP4 (ISO BMFF) with H.264 or HEVC video (or VP9 or AV1 copied from another file) and optionally AAC, FLAC or ALAC audio (AAC copied or encoded). Read as well as written; written with the index first (fast-start); fragmented files (moof) are read but never written",
+        description: "MP4 (ISO BMFF) with H.264 or HEVC video (or VP9 or AV1 copied from another file) and optionally AAC, FLAC or ALAC audio (AAC copied or encoded). Read as well as written; written with the index first (fast-start), or fragmented (moov, then a moof and mdat per fragment) when a fragment length is given; fragmented files are read too",
         media: MediaType::Video,
         demux: true,
         mux: true,
@@ -244,15 +244,30 @@ pub trait WriteSeek: Write + Seek + Send {}
 impl<T: Write + Seek + Send> WriteSeek for T {}
 
 pub fn create_muxer(path: &Path, format: &str) -> Result<Box<dyn Muxer>> {
+    create_muxer_with(path, format, None)
+}
+
+/// [`create_muxer`], where `fragment_seconds` makes an MP4 or MOV writer produce a fragmented file, with a
+/// fragment at a key frame once that many seconds have gone by. Other formats refuse it.
+pub fn create_muxer_with(path: &Path, format: &str, fragment_seconds: Option<f64>) -> Result<Box<dyn Muxer>> {
     let spec = find_format(format)?;
+    if fragment_seconds.is_some() && !matches!(spec.name, "mp4" | "mov") {
+        return Err(Error::invalid_arg(format!("fragmented output is written to mp4 and mov files, not {}", spec.name)));
+    }
     let out: Box<dyn WriteSeek> = Box::new(BufWriter::with_capacity(1 << 20, File::create(path)?));
     match spec.name {
         "wav" => Ok(Box::new(wav::WavMuxer::new(out))),
         "y4m" => Ok(Box::new(y4m::Y4mMuxer::new(out))),
         "jpeg" => Ok(Box::new(jpeg::JpegMuxer::new(out))),
         "flac" => Ok(Box::new(flac::FlacMuxer::new(out))),
-        "mp4" => Ok(Box::new(mp4::Mp4Muxer::with_faststart(out, path))),
-        "mov" => Ok(Box::new(mp4::Mp4Muxer::quicktime(out, Some(path)))),
+        "mp4" => Ok(Box::new(match fragment_seconds {
+            Some(s) => mp4::Mp4Muxer::fragmented(out, false, s),
+            None => mp4::Mp4Muxer::with_faststart(out, path),
+        })),
+        "mov" => Ok(Box::new(match fragment_seconds {
+            Some(s) => mp4::Mp4Muxer::fragmented(out, true, s),
+            None => mp4::Mp4Muxer::quicktime(out, Some(path)),
+        })),
         "aac" => Ok(Box::new(adts::AdtsMuxer::new(out))),
         "mp3" => Ok(Box::new(mp3::Mp3Muxer::new(out))),
         "mkv" => Ok(Box::new(mkvwrite::MatroskaWriter::new(out))),

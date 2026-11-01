@@ -359,7 +359,9 @@ depth, chroma layout), AV1 keeps its `av1C` record and loses its temporal delimi
 listed in `stss` (see "Matroska output" for how the copies were checked).
 Fragmented MP4 (`moof`/`traf`/`trun`, as made by streaming tools and `-movflags frag_keyframe`) is read too, with or without
 `default-base-is-moof`; checked on two fragmented files made by FFmpeg, which copy to the same frames, times and audio samples.
-Fragmented MP4 is not written.
+Fragmented MP4 is written too, with `--fragment-seconds S` (or `fragment_seconds` in a job) in MP4 and MOV: the index first, then a
+`moof` and `mdat` per fragment, cut at a key frame once S seconds have passed. The copy of the B-frame Matroska clip reads back
+packet for packet, and FFmpeg decodes it to the same pictures and samples as the index-first copy.
 
 ### Reading Matroska and WebM
 

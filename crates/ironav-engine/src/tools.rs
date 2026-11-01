@@ -96,6 +96,7 @@ pub fn job_schema() -> Value {
             "output": { "type": "string", "description": "Path to write. Written atomically via <output>.partial." },
             "format": { "type": "string", "enum": FORMATS.iter().filter(|f| f.mux).map(|f| f.name).collect::<Vec<_>>(),
                         "description": "Output container. Inferred from the output extension when omitted." },
+            "fragment_seconds": { "type": "number", "exclusiveMinimum": 0, "description": "mp4 and mov output only: write a fragmented file (the index first, then a moof and mdat per fragment), cutting a fragment at a video key frame (or at any audio packet, with no video) once it is at least this many seconds long. Omit for the usual file with its index first." },
             "audio": object(json!({ "codec": { "type": "string", "enum": codec_names(MediaType::Audio),
                         "description": "Target audio codec; 'copy' (default) forwards packets untouched; 'none' leaves the audio out." },
                         "bitrate_kbps": { "type": "integer", "minimum": 6, "maximum": 510, "description": "Target bitrate in kbit/s; Opus only (default 64 per channel)." },

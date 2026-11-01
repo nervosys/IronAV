@@ -131,6 +131,27 @@ struct Track {
     lead_in: i64,
     /// The stream's declared length (in `time_base` units), which ends the edit list of an audio track.
     declared: Option<i64>,
+    /// Fragmented output: the index has no sample tables, and samples are gathered per fragment.
+    fragmented: bool,
+    /// Fragmented output: the samples of the fragment being gathered (their data is in `pending`).
+    frag: Vec<FragSample>,
+    /// Fragmented output: the decode time (media units) of the next sample, and of the first sample
+    /// of the gathered fragment.
+    dts: u64,
+    frag_dts: u64,
+    /// Fragmented output: samples written so far, which `finish` checks for each track.
+    frag_total: u64,
+    /// Fragmented output: added to every composition offset, so that the first fragment's earliest
+    /// offset is zero (as in the index-first file); set when the `moov` is written.
+    frag_shift: i64,
+}
+
+/// One sample of a fragment: its size, duration, composition offset and whether it is a sync sample.
+struct FragSample {
+    size: u32,
+    delta: u32,
+    cts: i32,
+    key: bool,
 }
 
 impl Track {
@@ -306,6 +327,24 @@ impl Track {
         (runs, shift)
     }
 
+    /// The `traf` of one fragment for this track: its id, decode time, and a version 1 `trun` whose samples
+    /// carry their own duration, size, flags and composition offset. `data_at` is where the samples start
+    /// in the `moof`'s `mdat` (the base is the `moof` itself).
+    fn traf(&self, id: u32, data_at: i32) -> Vec<u8> {
+        let tfhd = full(b"tfhd", 0, 0x02_0000, &u32s(&[id])); // default-base-is-moof
+        let tfdt = full(b"tfdt", 1, 0, &self.frag_dts.to_be_bytes());
+        let mut run = u32s(&[self.frag.len() as u32, data_at as u32]);
+        for s in &self.frag {
+            // a sync sample depends on nothing; any other depends on an earlier one
+            let flags: u32 = if s.key { 0x0200_0000 } else { 0x0101_0000 };
+            let cts = (s.cts as i64 + self.frag_shift) as i32;
+            run.extend_from_slice(&u32s(&[s.delta, s.size, flags, cts as u32]));
+        }
+        // data offset, duration, size, flags and composition offset are present
+        let trun = full(b"trun", 1, 0x0F01, &run);
+        bx(b"traf", &[tfhd, tfdt, trun].concat())
+    }
+
     /// `shift` is added to every chunk offset (used when the movie box is moved in front of the data).
     fn trak(&self, id: u32, shift: u64) -> Result<Vec<u8>> {
         let ms = self.movie_ms() as u32;
@@ -372,7 +411,18 @@ impl Track {
 
         let mut stbl = vec![stsd, stts];
         let mut edts = Vec::new();
-        if self.is_video() && self.reordered {
+        if self.fragmented {
+            // The fragments carry the timing. The index trims the lead-in and the composition shift (as the
+            // index-first file's edit list does), when the stream's length is known to end the edit.
+            let start = self.media_time(self.lead_in) + self.frag_shift;
+            if let (true, Some(d)) = (start > 0, self.declared.filter(|&d| d > 0)) {
+                let start = start as u64;
+                let shown = (self.media_time(d) as u64).saturating_sub(start) * 1000 / self.timescale as u64;
+                let mut elst = u32s(&[1, shown as u32, start as u32]);
+                elst.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+                edts = bx(b"edts", &full(b"elst", 0, 0, &elst));
+            }
+        } else if self.is_video() && self.reordered {
             let (runs, shift) = self.composition();
             let mut ctts = u32s(&[runs.len() as u32]);
             for (count, offset) in runs {
@@ -387,7 +437,7 @@ impl Track {
                 edts = bx(b"edts", &full(b"elst", 0, 0, &elst));
             }
         }
-        if !self.is_video() && self.lead_in > 0 {
+        if !self.fragmented && !self.is_video() && self.lead_in > 0 {
             let lead = self.media_time(self.lead_in) as u64;
             let lead_ms = lead * 1000 / self.timescale as u64;
             // the audio ends where the stream says, not at the end of the last (padded) frame
@@ -397,7 +447,7 @@ impl Track {
             elst.extend_from_slice(&0x0001_0000u32.to_be_bytes());
             edts = bx(b"edts", &full(b"elst", 0, 0, &elst));
         }
-        if self.is_video() {
+        if self.is_video() && !self.fragmented {
             let mut stss = u32s(&[self.sync.len() as u32]);
             stss.extend_from_slice(&u32s(&self.sync));
             stbl.push(full(b"stss", 0, 0, &stss));
@@ -520,6 +570,17 @@ pub struct Mp4Muxer {
     faststart: Option<std::path::PathBuf>,
     /// QuickTime (MOV): a `qt  ` brand, and PCM and Motion-JPEG tracks as well.
     quicktime: bool,
+    /// Fragmented output (see the module notes): the fragment length and the state of the fragment.
+    fragments: Option<Fragments>,
+}
+
+/// The state of a fragmented writer: the fragment length in seconds, the number of fragments written,
+/// the time (seconds) of the first sample gathered, and whether the `moov` has been written.
+struct Fragments {
+    seconds: f64,
+    seq: u32,
+    start: Option<f64>,
+    moov_written: bool,
 }
 
 /// Sample size in bits of a PCM codec.
@@ -578,7 +639,15 @@ fn hevc_bit_depths(sps: &[u8]) -> Option<(u8, u8)> {
 
 impl Mp4Muxer {
     pub fn new(out: Box<dyn WriteSeek>) -> Self {
-        Self { out, tracks: Vec::new(), mdat_start: 0, data_len: 0, faststart: None, quicktime: false }
+        Self { out, tracks: Vec::new(), mdat_start: 0, data_len: 0, faststart: None, quicktime: false, fragments: None }
+    }
+
+    /// A fragmented MP4 (or QuickTime MOV) writer: the index comes first, with no samples in it, and then
+    /// a `moof` and `mdat` for each fragment. A fragment is cut at the first key frame once it is at least
+    /// `seconds` long (in a file with no video, at the first packet after that), so each one can be played
+    /// alone. Used for live delivery and for files that are read while they are written.
+    pub fn fragmented(out: Box<dyn WriteSeek>, quicktime: bool, seconds: f64) -> Self {
+        Self { quicktime, fragments: Some(Fragments { seconds, seq: 0, start: None, moov_written: false }), ..Self::new(out) }
     }
 
     /// Like `new`, but once the file is complete it is rewritten so that the index comes first and
@@ -605,7 +674,119 @@ impl Mp4Muxer {
         for (i, t) in self.tracks.iter().enumerate() {
             moov.extend_from_slice(&t.trak(i as u32 + 1, shift)?);
         }
+        if self.fragments.is_some() {
+            // trex: the defaults of the fragments' samples are all given in each trun, so they are zero
+            let mut mvex = Vec::new();
+            for i in 0..self.tracks.len() {
+                mvex.extend_from_slice(&full(b"trex", 0, 0, &u32s(&[i as u32 + 1, 1, 0, 0, 0])));
+            }
+            moov.extend_from_slice(&bx(b"mvex", &mvex));
+        }
         Ok(bx(b"moov", &moov))
+    }
+
+    /// The `moof` of the gathered fragment: a `mfhd` and a `traf` for each track that has samples in it.
+    /// `data_at` is where the first track's samples start, counted from the start of the `moof`.
+    fn moof(&self, seq: u32, data_at: u64) -> Result<Vec<u8>> {
+        let mut at = data_at;
+        let mut body = full(b"mfhd", 0, 0, &u32s(&[seq]));
+        for (i, t) in self.tracks.iter().enumerate() {
+            if t.frag.is_empty() {
+                continue;
+            }
+            let run = i32::try_from(at).map_err(|_| Error::invalid_input("a fragment is larger than 2 GiB"))?;
+            body.extend_from_slice(&t.traf(i as u32 + 1, run));
+            at += t.pending.len() as u64;
+        }
+        Ok(bx(b"moof", &body))
+    }
+
+    /// Write the gathered fragment as a `moof` and an `mdat` (preceded by the `moov` the first time).
+    fn write_fragment(&mut self) -> Result<()> {
+        let written = self.fragments.as_ref().is_some_and(|f| f.moov_written);
+        if !written {
+            // the first fragment's earliest composition offset becomes zero, which the edit list then cancels
+            for t in &mut self.tracks {
+                t.frag_shift = -t.frag.iter().map(|s| s.cts as i64).min().unwrap_or(0).min(0);
+            }
+            let moov = self.moov(0)?;
+            self.out.write_all(&moov)?;
+            if let Some(f) = self.fragments.as_mut() {
+                f.moov_written = true;
+            }
+        }
+        let total: u64 = self.tracks.iter().map(|t| t.pending.len() as u64).sum();
+        if total == 0 {
+            return Ok(());
+        }
+        let seq = self.fragments.as_ref().map_or(0, |f| f.seq) + 1;
+        // the mdat header is 8 bytes, or 16 when its size needs 64 bits
+        let mdat = if total + 8 <= u32::MAX as u64 {
+            [((total + 8) as u32).to_be_bytes().to_vec(), b"mdat".to_vec()].concat()
+        } else {
+            [1u32.to_be_bytes().to_vec(), b"mdat".to_vec(), (total + 16).to_be_bytes().to_vec()].concat()
+        };
+        // the moof's size does not depend on the offsets it holds, so measure it first
+        let head = self.moof(seq, 0)?.len() as u64 + mdat.len() as u64;
+        let moof = self.moof(seq, head)?;
+        self.out.write_all(&moof)?;
+        self.out.write_all(&mdat)?;
+        for t in &mut self.tracks {
+            self.out.write_all(&t.pending)?;
+            t.pending.clear();
+            t.frag.clear();
+        }
+        if let Some(f) = self.fragments.as_mut() {
+            f.seq = seq;
+            f.start = None;
+        }
+        Ok(())
+    }
+
+    /// One packet of a fragmented file: its sample joins the fragment being gathered. A video key frame
+    /// (or any audio packet, when there is no video) ends the fragment once it is long enough.
+    fn write_fragment_packet(&mut self, p: &Packet) -> Result<()> {
+        let t = p.stream;
+        let tr = self.tracks.get_mut(t).ok_or_else(|| Error::new(ErrorCode::Internal, format!("packet for unknown output stream {t}")))?;
+        let (sample, key, delta, cts) = if tr.is_video() {
+            let Some((sample, key)) = tr.video_sample(p)? else { return Ok(()) };
+            let pts = tr.media_time(p.pts);
+            (sample, key, tr.video_delta, Some(pts))
+        } else {
+            if p.duration <= 0 {
+                return Err(Error::new(ErrorCode::Internal, "audio packet has no duration"));
+            }
+            (p.data.clone(), true, p.duration as u32, None)
+        };
+        if sample.len() > u32::MAX as usize {
+            return Err(Error::invalid_input("a single sample exceeds 4 GiB"));
+        }
+        if !tr.is_video() && tr.codec == CodecId::Flac {
+            tr.flac.record(p);
+        }
+        let at = p.pts as f64 * tr.time_base.as_f64();
+        let cut_here = if tr.is_video() { key } else { !self.tracks.iter().any(Track::is_video) };
+        let (seconds, start) = match self.fragments.as_ref() {
+            Some(f) => (f.seconds, f.start),
+            None => (0.0, None),
+        };
+        if cut_here && start.is_some_and(|s| at - s >= seconds) {
+            self.write_fragment()?;
+        }
+        if let Some(f) = self.fragments.as_mut() {
+            f.start.get_or_insert(at);
+        }
+        let tr = &mut self.tracks[t];
+        if tr.frag.is_empty() {
+            tr.frag_dts = tr.dts;
+        }
+        // composition offset: presentation time minus decode time (negative only before the first frame's delay)
+        let cts = cts.map_or(0, |pts| (pts - tr.dts as i64).clamp(i32::MIN as i64, i32::MAX as i64) as i32);
+        tr.frag.push(FragSample { size: sample.len() as u32, delta, cts, key });
+        tr.pending.extend_from_slice(&sample);
+        tr.dts += delta as u64;
+        tr.frag_total += 1;
+        Ok(())
     }
 
     /// Copy the finished file to a new one in the order ftyp, moov, mdat, then replace it.
@@ -729,6 +910,12 @@ impl Muxer for Mp4Muxer {
                 av1_still,
                 lead_in: s.lead_in.max(0),
                 declared: s.duration,
+                fragmented: self.fragments.is_some(),
+                frag: Vec::new(),
+                dts: 0,
+                frag_dts: 0,
+                frag_total: 0,
+                frag_shift: 0,
             });
         }
 
@@ -756,6 +943,9 @@ impl Muxer for Mp4Muxer {
             bx(b"ftyp", &ftyp)
         };
         self.out.write_all(&ftyp)?;
+        if self.fragments.is_some() {
+            return Ok(()); // the moov follows with the first fragment, when every stream's description is known
+        }
         self.mdat_start = ftyp.len() as u64;
         // 64-bit mdat header: size field 1, then the real size, patched in finish().
         self.out.write_all(&1u32.to_be_bytes())?;
@@ -765,6 +955,9 @@ impl Muxer for Mp4Muxer {
     }
 
     fn write_packet(&mut self, p: &Packet) -> Result<()> {
+        if self.fragments.is_some() {
+            return self.write_fragment_packet(p);
+        }
         let t = p.stream;
         let tr = self.tracks.get_mut(t).ok_or_else(|| Error::new(ErrorCode::Internal, format!("packet for unknown output stream {t}")))?;
         let (sample, key, delta) = if tr.is_video() {
@@ -804,8 +997,14 @@ impl Muxer for Mp4Muxer {
     }
 
     fn finish(&mut self) -> Result<()> {
-        if let Some(i) = self.tracks.iter().position(|t| t.sizes.is_empty()) {
+        let fragmented = self.fragments.is_some();
+        let empty = |t: &Track| if fragmented { t.frag_total == 0 } else { t.sizes.is_empty() };
+        if let Some(i) = self.tracks.iter().position(empty) {
             return Err(Error::invalid_input(format!("output stream {i} received no packets, so there is nothing to put in the MP4")));
+        }
+        if fragmented {
+            self.write_fragment()?;
+            return self.out.flush().map_err(Into::into);
         }
         for t in 0..self.tracks.len() {
             self.flush_chunk(t)?;
@@ -1098,6 +1297,78 @@ mod tests {
         all.sort();
         // Audio fills its second chunk just before video fills its own, so the order is a v a v.
         assert_eq!(all.iter().map(|x| x.1).collect::<String>(), "avav", "tracks should interleave");
+    }
+
+    /// The top-level boxes of a file, as (offset, kind).
+    fn top_boxes(mut d: &[u8]) -> Vec<(usize, [u8; 4])> {
+        let (mut at, mut out) = (0usize, Vec::new());
+        while d.len() >= 8 {
+            let size = u32::from_be_bytes(d[..4].try_into().unwrap()) as usize;
+            out.push((at, d[4..8].try_into().unwrap()));
+            if size < 8 || size > d.len() {
+                break;
+            }
+            at += size;
+            d = &d[size..];
+        }
+        out
+    }
+
+    #[test]
+    fn fragmented_file_is_index_then_moof_mdat_pairs_that_read_back() {
+        use crate::mp4demux::Mp4Demuxer;
+        use ironav_core::Demuxer;
+        let sink = Arc::new(Mutex::new(Cursor::new(Vec::new())));
+        // fragments of at least half a second: a key frame every 10 frames at 30 fps cuts at 20, 40 and 60
+        let mut m = Mp4Muxer::fragmented(Box::new(Shared(sink.clone())), false, 0.5);
+        let info = StreamInfo {
+            index: 0,
+            codec: CodecId::H264,
+            time_base: Rational::new(1, 30),
+            duration: None,
+            bits: None,
+            extradata: Vec::new(),
+            lead_in: 0,
+            params: StreamParams::Video { width: 64, height: 48, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational::new(30, 1) },
+        };
+        m.write_header(&[info]).unwrap();
+        let sps = vec![0, 0, 0, 1, 0x67, 100, 0, 40, 0xAC];
+        let pps = vec![0, 0, 0, 1, 0x68, 0xEE, 0x3C];
+        let idr = [&[0u8, 0, 0, 1, 0x65][..], &[7; 20]].concat();
+        let p = [&[0u8, 0, 0, 1, 0x41][..], &[5; 6]].concat();
+        for i in 0..70 {
+            let data = match i {
+                0 => [sps.clone(), pps.clone(), idr.clone()].concat(),
+                _ if i % 10 == 0 => idr.clone(),
+                _ => p.clone(),
+            };
+            m.write_packet(&Packet { stream: 0, pts: i, duration: 1, data }).unwrap();
+        }
+        m.finish().unwrap();
+        let file = sink.lock().unwrap().get_ref().clone();
+
+        let boxes = top_boxes(&file);
+        let kinds: Vec<&[u8; 4]> = boxes.iter().map(|b| &b.1).collect();
+        assert_eq!(kinds[0], b"ftyp");
+        assert_eq!(kinds[1], b"moov", "the index comes right after ftyp");
+        assert_eq!(kinds[2..], [b"moof", b"mdat", b"moof", b"mdat", b"moof", b"mdat", b"moof", b"mdat"], "a fragment starts at 0, 20, 40 and 60");
+        let moov = find(&file, &[b"moov"]).unwrap();
+        assert!(find(moov, &[b"mvex", b"trex"]).is_some());
+        let stsz = find(moov, &[b"trak", b"mdia", b"minf", b"stbl", b"stsz"]).unwrap();
+        assert_eq!(u32::from_be_bytes(stsz[8..12].try_into().unwrap()), 0, "the index holds no samples");
+
+        // the first fragment's data offset points at its first sample, the length-prefixed key frame
+        let first_moof = boxes[2].0;
+        let trun = find(&file[first_moof..], &[b"moof", b"traf", b"trun"]).unwrap();
+        let data_at = i32::from_be_bytes(trun[8..12].try_into().unwrap()) as usize;
+        assert_eq!(&file[first_moof + data_at..first_moof + data_at + 5], &[0, 0, 0, 21, 0x65]);
+
+        let mut d = Mp4Demuxer::open(Cursor::new(file)).unwrap();
+        let mut pts = Vec::new();
+        while let Some(pk) = d.read_packet().unwrap() {
+            pts.push(pk.pts);
+        }
+        assert_eq!(pts, (0..70).collect::<Vec<i64>>(), "every frame reads back in order");
     }
 
     #[test]
