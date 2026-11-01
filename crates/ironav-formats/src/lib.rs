@@ -202,7 +202,7 @@ pub static FORMATS: &[FormatSpec] = &[
     FormatSpec {
         name: "mpegts",
         extensions: &["ts", "m2ts", "mts"],
-        description: "MPEG transport stream (broadcast, IPTV, HLS segments); 192-byte M2TS packets are read too",
+        description: "MPEG transport stream (broadcast, IPTV, HLS segments); 192-byte M2TS packets are read too; AC-3 is read (stream type 0x81, or 0x06 with the AC-3 descriptor) but not written",
         media: MediaType::Video,
         demux: true,
         mux: true,

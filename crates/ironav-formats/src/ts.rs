@@ -85,6 +85,8 @@ fn codec_of(stream_type: u8) -> Option<CodecId> {
         0x02 => Some(CodecId::Mpeg2Video),
         0x0F => Some(CodecId::Aac),
         0x03 | 0x04 => Some(CodecId::Mp3),
+        // AC-3 as the ATSC and Blu-ray tables give it (0x06 with a descriptor is the DVB way)
+        0x81 => Some(CodecId::Ac3),
         _ => None,
     }
 }
@@ -136,6 +138,21 @@ fn opus_code(head: &[u8]) -> Option<u8> {
         1 if (3..=8).contains(&ch) && head.len() >= 21 + ch && head[19] == OPUS_STREAMS[ch] && head[20] == OPUS_COUPLED[ch] && head[21..21 + ch] == *OPUS_MAP[ch - 1] => Some(ch as u8),
         _ => None,
     }
+}
+
+/// Whether a private (0x06) stream's PMT descriptors say it is AC-3: the DVB AC-3 descriptor (tag
+/// 0x6A) or the `AC-3` registration descriptor (tag 0x05).
+fn has_ac3_descriptor(desc: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 2 <= desc.len() {
+        let (tag, len) = (desc[i], desc[i + 1] as usize);
+        let Some(body) = desc.get(i + 2..i + 2 + len) else { return false };
+        if tag == 0x6A || (tag == 0x05 && body.starts_with(b"AC-3")) {
+            return true;
+        }
+        i += 2 + len;
+    }
+    false
 }
 
 /// The OpusHead of an Opus stream from its PMT descriptors: the `Opus` registration descriptor
@@ -490,7 +507,8 @@ impl TsParser {
                 let es_len = (((body[i + 3] & 0x0F) as usize) << 8) | body[i + 4] as usize;
                 // private PES (0x06) carries Opus when its descriptors say so
                 let opus = if ty == 0x06 { body.get(i + 5..i + 5 + es_len).and_then(opus_head_from_descriptors) } else { None };
-                if let Some(codec) = if opus.is_some() { Some(CodecId::Opus) } else { codec_of(ty) } {
+                let ac3 = ty == 0x06 && body.get(i + 5..i + 5 + es_len).is_some_and(has_ac3_descriptor);
+                if let Some(codec) = if opus.is_some() { Some(CodecId::Opus) } else if ac3 { Some(CodecId::Ac3) } else { codec_of(ty) } {
                     self.es.push(Es {
                         pid,
                         codec,
@@ -605,6 +623,15 @@ impl TsParser {
                     }
                     None if data.len() - i < 9 && !last => break,
                     None => {
+                        i += 1;
+                        continue;
+                    }
+                }
+            } else if codec == CodecId::Ac3 {
+                match ironav_codec::ac3::frame_info(&data[i..]) {
+                    Ok(f) if f.offset == 0 => (f.frame_size, 0, f.sample_rate, f.channels as u16, 1536, Vec::new(), CodecId::Ac3),
+                    _ if data.len() - i < 16 && !last => break,
+                    _ => {
                         i += 1;
                         continue;
                     }
@@ -763,7 +790,7 @@ impl TsParser {
         let (pts, duration) = match e.info.as_ref().map(|i| &i.params) {
             Some(StreamParams::Audio { sample_rate, .. }) => {
                 let r = *sample_rate as i64;
-                let samples = u.dur.unwrap_or_else(|| if e.codec == CodecId::Aac { 1024 } else { ironav_codec::mp3::parse_header(&u.data).map_or(1152, |h| h.samples() as i64) });
+                let samples = u.dur.unwrap_or_else(|| if e.codec == CodecId::Aac { 1024 } else if e.codec == CodecId::Ac3 { 1536 } else { ironav_codec::mp3::parse_header(&u.data).map_or(1152, |h| h.samples() as i64) });
                 ((t * r + CLOCK / 2).div_euclid(CLOCK), samples)
             }
             _ => (t, e.frame.max(1)),
@@ -887,6 +914,7 @@ impl<R: Read + Seek + Send> TsDemuxer<R> {
                 // an Opus frame is 20 ms; the last one's length is not read from the tail
                 StreamParams::Audio { sample_rate, .. } => span * sample_rate as i64 / CLOCK + match e.codec {
                     CodecId::Aac => 1024,
+                    CodecId::Ac3 => 1536,
                     CodecId::Opus => 960,
                     _ => 1152,
                 },
