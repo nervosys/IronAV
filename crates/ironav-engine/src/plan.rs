@@ -35,6 +35,9 @@ pub struct Step {
     /// The key frame interval asked for, in frames, when the video encoder takes one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keyint: Option<u32>,
+    /// The reference pictures asked for a P picture, when the software H.264 encoder is used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refs: Option<u32>,
     /// The ProRes profile asked for, when the video is written as prores.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prores_profile: Option<ProResProfile>,
@@ -280,7 +283,8 @@ pub fn plan(job: &Job) -> Result<Plan> {
             || (media == MediaType::Video && low && named)
             || (media == MediaType::Audio && opts.opus.is_some())
             || (media == MediaType::Video && opts.prores_profile.is_some())
-            || (media == MediaType::Video && opts.keyint.is_some());
+            || (media == MediaType::Video && opts.keyint.is_some())
+            || (media == MediaType::Video && opts.refs.is_some());
         let action = if to == s.codec && chain.is_empty() && !rate_wanted { Action::Copy } else { Action::Transcode };
         if rate_wanted && to == s.codec && chain.is_empty() {
             warnings.push(format!("{at}: a rate, quality, latency or encoder setting was set, so the {} stream is re-encoded instead of copied", to.name()));
@@ -309,6 +313,18 @@ pub fn plan(job: &Job) -> Result<Plan> {
             if !matches!(to, CodecId::H264 | CodecId::Hevc | CodecId::Vp8 | CodecId::Vp9 | CodecId::Av1) {
                 return Err(Error::invalid_arg(format!("keyint applies to the h264, hevc, vp8, vp9 and av1 encoders, and this video is written as {}", to.name()))
                     .hint("set the video codec to one of them, or leave keyint out"));
+            }
+        }
+        if let Some(n) = opts.refs {
+            if media == MediaType::Audio {
+                return Err(Error::invalid_arg("refs applies to video streams only"));
+            }
+            if !(1..=16).contains(&n) {
+                return Err(Error::invalid_arg(format!("refs must be from 1 to 16, not {n}")));
+            }
+            if to != CodecId::H264 {
+                return Err(Error::invalid_arg(format!("refs applies to the h264 encoder, and this video is written as {}", to.name()))
+                    .hint("set the video codec to h264, or leave refs out"));
             }
         }
         if opts.prores_profile.is_some() {
@@ -445,7 +461,7 @@ pub fn plan(job: &Job) -> Result<Plan> {
             lead_in: if action == Action::Copy { s.lead_in } else { ironav_codec::encoder_lead_in(to) },
             params,
         });
-        steps.push(Step { input_file: file, input_stream: s.index, output_stream: steps.len(), action, from_codec: s.codec, to_codec: to, filters: chain, bitrate_kbps: audio_kbps, opus: opts.opus.clone(), prores_profile: opts.prores_profile, keyint: if media == MediaType::Video && action == Action::Transcode { opts.keyint } else { None }, qp: if media == MediaType::Video && action == Action::Transcode { opts.qp } else { None }, low_latency: media == MediaType::Video && action == Action::Transcode && low, hardware });
+        steps.push(Step { input_file: file, input_stream: s.index, output_stream: steps.len(), action, from_codec: s.codec, to_codec: to, filters: chain, bitrate_kbps: audio_kbps, opus: opts.opus.clone(), prores_profile: opts.prores_profile, keyint: if media == MediaType::Video && action == Action::Transcode { opts.keyint } else { None }, refs: if media == MediaType::Video && action == Action::Transcode { opts.refs } else { None }, qp: if media == MediaType::Video && action == Action::Transcode { opts.qp } else { None }, low_latency: media == MediaType::Video && action == Action::Transcode && low, hardware });
     }
 
     if let Some(i) = used.iter().position(|u| !u) {

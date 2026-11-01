@@ -201,6 +201,10 @@ fn execute(
                     };
                     let e = H264Encoder::new(&dst.params, qp, bitrate)?;
                     let e = if st.low_latency { e.low_latency() } else { e };
+                    let e = match st.refs {
+                        Some(n) => e.with_refs(n as usize),
+                        None => e,
+                    };
                     Box::new(match st.keyint {
                         Some(k) => e.with_keyint(k.into()),
                         None => e,

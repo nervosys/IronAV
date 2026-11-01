@@ -63,6 +63,10 @@ pub struct StreamOpts {
     /// (one a second with `latency: low`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keyint: Option<u32>,
+    /// Video only, for the software h264 encoder: how many reference pictures a P picture may
+    /// predict from, 1 to 16. Default 3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refs: Option<u32>,
     /// Video only, for the `prores` codec: the profile. Default `hq`. The 4444 profiles keep 4:4:4
     /// chroma (10-bit input, or 12-bit); the others are 4:2:2 at 10 bits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
