@@ -121,7 +121,8 @@ struct Case {
 
 fn run_case(c: &Case) {
     let channels = [2usize, 1, 2, 3, 3, 4, 4, 5][c.acmod] + c.lfe as usize;
-    let dir = scratch(c.name);
+    // the tests run in parallel and share case names (two "stereo"s), so the rate and size name the directory too
+    let dir = scratch(&format!("{}-{}-{}", c.name, c.rate, c.kbps));
     // the LFE is the bit 3 of the mask, so its index is the number of front channels before it
     let mask = u32::from_str_radix(&c.mask[2..], 16).unwrap();
     let lfe_index = c.lfe.then(|| (mask & 0x7).count_ones() as usize);
