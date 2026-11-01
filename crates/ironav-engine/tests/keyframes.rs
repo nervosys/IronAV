@@ -75,5 +75,5 @@ fn keyint_must_be_a_frame_count_for_a_video_encoder_with_one() {
     j.output = d.join("out.mov").display().to_string();
     j.video.codec = Some("prores".into());
     let e = plan(&j).unwrap_err().to_string();
-    assert!(e.contains("keyint applies to the h264, hevc, vp8 and vp9 encoders"), "{e}");
+    assert!(e.contains("keyint applies to the h264, hevc, vp8, vp9 and av1 encoders"), "{e}");
 }

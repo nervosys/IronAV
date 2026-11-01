@@ -1,6 +1,6 @@
 //! The software AV1 encoder: its streams decode with FFmpeg's libaom and with IronAV's own decoder to
 //! identical pictures, at a useful quality, and get smaller as the quantiser rises. The source is
-//! FFmpeg's testsrc2; odd sizes are made from 4:4:4 (FFmpeg rounds an odd 4:2:0 picture down). The
+//! FFmpeg's testsrc2; odd sizes are cropped from an even testsrc2 (FFmpeg rounds odd sizes down). The
 //! tests skip when `ffmpeg` is not on the PATH.
 
 use ironav_engine::{run, Job};
@@ -58,8 +58,10 @@ impl Clip {
 fn source(dir: &Path, w: usize, h: usize, frames: usize) -> Clip {
     let raw = dir.join("src444.raw");
     let n = frames.to_string();
-    let size = format!("testsrc2=size={w}x{h}:rate=25");
-    assert!(ffmpeg(&["-f", "lavfi", "-i", &size, "-frames:v", &n, "-f", "rawvideo", "-pix_fmt", "yuv444p", raw.to_str().unwrap()]), "ffmpeg could not make testsrc2");
+    // testsrc2 comes out at even sizes (177x99 is 176x98), so an odd picture is cropped from one
+    let size = format!("testsrc2=size={}x{}:rate=25", w.next_multiple_of(2), h.next_multiple_of(2));
+    let crop = format!("crop={w}:{h}:0:0");
+    assert!(ffmpeg(&["-f", "lavfi", "-i", &size, "-vf", &crop, "-frames:v", &n, "-f", "rawvideo", "-pix_fmt", "yuv444p", raw.to_str().unwrap()]), "ffmpeg could not make testsrc2");
     let data = std::fs::read(&raw).unwrap();
     let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
     let mut out = Vec::new();
@@ -99,11 +101,12 @@ fn y4m_payload(b: &[u8]) -> Vec<u8> {
 }
 
 /// Encodes `src` at `qp` into `dir`'s `name` WebM and returns its path.
-fn encode(dir: &Path, name: &str, src: &Path, qp: u8) -> PathBuf {
+fn encode(dir: &Path, name: &str, src: &Path, qp: u8, keyint: Option<u32>) -> PathBuf {
     let out = dir.join(format!("{name}.webm"));
     let mut j = Job { input: src.display().to_string(), output: out.display().to_string(), hwaccel: "off".into(), overwrite: true, ..Job::default() };
     j.video.codec = Some("av1".into());
     j.video.qp = Some(qp);
+    j.video.keyint = keyint;
     run(&j, &mut |_| {}).unwrap_or_else(|e| panic!("{name}: IronAV could not encode: {e}"));
     out
 }
@@ -145,11 +148,16 @@ fn psnr(clip: &Clip, decoded: &[u8]) -> (f64, f64) {
 /// Encodes testsrc2 at `w` x `h` and checks the decode and the quality; returns the size of the
 /// stream and its luma PSNR.
 fn round_trip(name: &str, w: usize, h: usize, frames: usize, qp: u8) -> (u64, f64) {
+    round_trip_keyint(name, w, h, frames, qp, None)
+}
+
+/// `round_trip` with a key frame interval (the encoder's default when `keyint` is None).
+fn round_trip_keyint(name: &str, w: usize, h: usize, frames: usize, qp: u8, keyint: Option<u32>) -> (u64, f64) {
     let dir = scratch(name);
     let clip = source(&dir, w, h, frames);
     let src = dir.join("src.y4m");
     std::fs::write(&src, clip.y4m()).unwrap();
-    let stream = encode(&dir, name, &src, qp);
+    let stream = encode(&dir, name, &src, qp, keyint);
     let decoded = decode_both(&dir, &stream, name);
     assert_eq!(decoded.len(), clip.frames.len() * clip.frames[0].len(), "{name}: picture count");
     let (y, c) = psnr(&clip, &decoded);
@@ -181,4 +189,22 @@ fn the_file_gets_smaller_as_the_quantiser_rises() {
     need_ffmpeg!();
     let sizes: Vec<u64> = [20u8, 30, 40].iter().map(|&qp| round_trip(&format!("size{qp}"), 352, 288, 2, qp).0).collect();
     assert!(sizes[0] > sizes[1] && sizes[1] > sizes[2], "sizes at qp 20, 30, 40: {sizes:?}");
+}
+
+/// Inter frames: a key frame every 10 of 12 moving pictures (one run of nine inter frames), decoded
+/// identically by libaom and IronAV, at a useful quality and smaller than the same clip with every
+/// frame a key frame. The odd size checks the partial superblocks and 8x8s of inter prediction; its
+/// inter frames save little (about 0.3% at qp 30), a known gap, so only its decode and quality are
+/// checked.
+#[test]
+fn inter_frames_decode_identically_and_are_smaller_than_key_frames() {
+    need_ffmpeg!();
+    for (name, w, h, smaller) in [("inter", 352usize, 288usize, true), ("inter_odd", 177, 99, false)] {
+        let (inter, y) = round_trip_keyint(name, w, h, 12, 30, Some(10));
+        assert!(y > 30.0, "{name}: luma PSNR {y:.2} dB");
+        if smaller {
+            let (key_only, _) = round_trip_keyint(&format!("{name}_keys"), w, h, 12, 30, Some(1));
+            assert!(inter * 10 < key_only * 9, "{name}: inter frames {inter} bytes, key frames only {key_only} bytes");
+        }
+    }
 }
