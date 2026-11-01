@@ -36,7 +36,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   difference- and distance-weighted compound, interintra, variable inter transforms, hidden frames, `show_existing_frame`
   and film grain loaded from a reference. It matches libaom bit for bit on key-frame-only, P-only and alt-ref streams at
   `-cpu-used` 1 to 8, and is used when no NVIDIA GPU decodes AV1. Superres is decoded (upscaling after CDEF and before loop
-  restoration), and matches libaom bit for bit on IronAV-encoded superres streams at 1/9 to 1/16 of the width.
+  restoration), and matches libaom bit for bit on IronAV-encoded superres streams at 1/9 to 1/16 of the width. The post filters run on threads, and so do the tiles of a tile group (not frames with intra block copy): at 1080p with 4x2 tiles, 45 against 24 frames a second, bit-identical to the serial decode.
 - **Codecs (AV1 encoder):** profile 0, 8-bit 4:2:0, in WebM, Matroska and MP4, `--qp` or an average bit rate (`--vbitrate`; see below). It writes inter
   frames after each key frame (every 250 frames by default, `--keyint`): prediction from LAST, LAST2 or LAST3 (the three frames
   before, each block by rate-distortion cost) with quarter-sample vectors
