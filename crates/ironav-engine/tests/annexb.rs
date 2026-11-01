@@ -3,6 +3,7 @@
 //! read by ffprobe and decodes alike too. The tests skip when `ffmpeg` and `ffprobe` are not on the
 //! PATH.
 
+use ironav_core::PixelFormat;
 use ironav_engine::{run, Job};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -32,9 +33,9 @@ fn ffmpeg(args: &[&str]) {
     assert!(st.success(), "ffmpeg {args:?} failed");
 }
 
-/// The picture-by-picture yuv420p bytes of a file, as FFmpeg decodes it.
-fn ffmpeg_decode(path: &Path, raw: &Path) -> Vec<u8> {
-    ffmpeg(&["-i", path.to_str().unwrap(), "-f", "rawvideo", "-pix_fmt", "yuv420p", raw.to_str().unwrap()]);
+/// The pictures of a file in `pix` (FFmpeg's pixel format name), as FFmpeg decodes it.
+fn ffmpeg_decode(path: &Path, raw: &Path, pix: &str) -> Vec<u8> {
+    ffmpeg(&["-i", path.to_str().unwrap(), "-f", "rawvideo", "-pix_fmt", pix, raw.to_str().unwrap()]);
     std::fs::read(raw).unwrap()
 }
 
@@ -68,6 +69,12 @@ fn ffprobe_avg_rate(path: &Path) -> (i64, i64) {
 /// reader against FFmpeg's decoder. `expected` is the stream's frame rate: the SPS timing says it, and
 /// ffprobe reads a raw H.264 stream's rate as twice that (its ticks count fields).
 fn round_trip(name: &str, codec: &str, ext: &str, rate: &str, expected: (i64, i64), bframes: u32, extra: &[&str]) {
+    round_trip_as(name, codec, ext, rate, expected, bframes, "yuv420p", extra);
+}
+
+/// [`round_trip`] for pictures of the pixel format `pix` (FFmpeg's name, `yuv420p` or `yuv420p10le`).
+#[allow(clippy::too_many_arguments)]
+fn round_trip_as(name: &str, codec: &str, ext: &str, rate: &str, expected: (i64, i64), bframes: u32, pix: &str, extra: &[&str]) {
     let d = scratch(name);
     let src = d.join("src.y4m");
     let size = format!("testsrc2=size={W}x{H}:rate={rate}");
@@ -75,46 +82,54 @@ fn round_trip(name: &str, codec: &str, ext: &str, rate: &str, expected: (i64, i6
     ffmpeg(&["-f", "lavfi", "-i", &size, "-frames:v", &n, "-pix_fmt", "yuv420p", src.to_str().unwrap()]);
     let stream = d.join(format!("clip.{ext}"));
     let bf = bframes.to_string();
-    let mut enc = vec!["-i", src.to_str().unwrap(), "-c:v", codec, "-bf", &bf, "-g", "4"];
+    let mut enc = vec!["-i", src.to_str().unwrap(), "-c:v", codec, "-pix_fmt", pix, "-bf", &bf, "-g", "4"];
     enc.extend_from_slice(extra);
     let fmt = if codec == "libx265" { "hevc" } else { "h264" };
     enc.extend_from_slice(&["-f", fmt, stream.to_str().unwrap()]);
     ffmpeg(&enc);
 
-    // the frame rate the SPS states is the one IronAV's reader gives the stream
+    // the frame rate the SPS states is the one IronAV's reader gives the stream, and the pixel format
+    // the SPS describes
     let demux = ironav_formats::open_demuxer(&stream).unwrap();
     let info = demux.streams()[0].clone();
+    let want_fmt = match pix {
+        "yuv420p10le" => PixelFormat::Yuv420p10,
+        _ => PixelFormat::Yuv420p,
+    };
     match info.params {
-        ironav_core::StreamParams::Video { frame_rate, width, height, .. } => {
+        ironav_core::StreamParams::Video { frame_rate, width, height, pix_fmt } => {
             assert_eq!((width, height), (W, H), "{name}: picture size");
             assert_eq!((frame_rate.num, frame_rate.den), expected, "{name}: frame rate");
+            assert_eq!(pix_fmt, want_fmt, "{name}: pixel format");
         }
         _ => panic!("{name}: not a video stream"),
     }
 
     // decoded by IronAV and by FFmpeg, the same pictures
-    let want_raw = ffmpeg_decode(&stream, &d.join("ffmpeg.raw"));
-    assert_eq!(want_raw.len(), FRAMES * (W * H * 3 / 2) as usize, "{name}: FFmpeg's picture count");
+    let bytes_per_picture = (W * H * 3 / 2) as usize * if pix == "yuv420p10le" { 2 } else { 1 };
+    let want_raw = ffmpeg_decode(&stream, &d.join("ffmpeg.raw"), pix);
+    assert_eq!(want_raw.len(), FRAMES * bytes_per_picture, "{name}: FFmpeg's picture count");
     let back = d.join("ironav.y4m");
     run(&job(&stream, &back), &mut |_| {}).unwrap();
     assert_eq!(y4m_bytes(&std::fs::read(&back).unwrap()), want_raw, "{name}: IronAV and FFmpeg decode differently");
 
-    // a stream copy into MP4 is a file ffprobe reads at the same rate and size
-    let mp4 = d.join("copy.mp4");
-    run(&job(&stream, &mp4), &mut |_| {}).unwrap();
-    let probe = Command::new("ffprobe")
-        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name,width,height", "-of", "csv=p=0"])
-        .arg(&mp4)
-        .output()
-        .unwrap();
-    let text = String::from_utf8_lossy(&probe.stdout).trim().to_string();
-    assert_eq!(text, format!("{fmt},{W},{H}"), "{name}: ffprobe of the copy");
-    assert_eq!(ffprobe_avg_rate(&mp4), expected, "{name}: frame rate of the copy");
-    // Pictures are numbered in decoding order and the MP4 takes those numbers as presentation times,
-    // so a stream with B pictures is out of order in the copy: FFmpeg then repeats pictures to fill
-    // the gaps. Only a stream without B pictures decodes alike from the copy.
-    if bframes == 0 {
-        assert_eq!(ffmpeg_decode(&mp4, &d.join("copy.raw")), want_raw, "{name}: the copy decodes differently");
+    // a stream copy into MP4 and into Matroska is a file ffprobe reads at the same rate and size, and
+    // FFmpeg decodes it to the same pictures in the same order (B pictures included)
+    for ext in ["mp4", "mkv"] {
+        let out = d.join(format!("copy.{ext}"));
+        run(&job(&stream, &out), &mut |_| {}).unwrap();
+        let probe = Command::new("ffprobe")
+            .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name,width,height", "-of", "csv=p=0"])
+            .arg(&out)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&probe.stdout).trim().to_string();
+        assert_eq!(text, format!("{fmt},{W},{H}"), "{name}: ffprobe of the {ext} copy");
+        if ext == "mp4" {
+            assert_eq!(ffprobe_avg_rate(&out), expected, "{name}: frame rate of the copy");
+        }
+        let raw = ffmpeg_decode(&out, &d.join(format!("copy-{ext}.raw")), pix);
+        assert!(raw == want_raw, "{name}: the {ext} copy decodes to other pictures or times ({} bytes, want {})", raw.len(), want_raw.len());
     }
     let _ = std::fs::remove_dir_all(&d);
 }
@@ -146,4 +161,22 @@ fn hevc_annex_b_reads_and_decodes_like_ffmpeg() {
     }
     round_trip("hevc", "libx265", "hevc", "25", (25, 1), 0, &["-x265-params", "log-level=error"]);
     round_trip("hevc-b", "libx265", "hevc", "25", (25, 1), 2, &["-x265-params", "log-level=error"]);
+}
+
+#[test]
+fn hevc_10_bit_annex_b_reads_its_pixel_format_and_decodes_like_ffmpeg() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not on PATH; skipping");
+        return;
+    }
+    round_trip_as("hevc-10bit", "libx265", "hevc", "25", (25, 1), 2, "yuv420p10le", &["-x265-params", "log-level=error"]);
+}
+
+#[test]
+fn h264_10_bit_annex_b_reads_its_pixel_format_and_decodes_like_ffmpeg() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not on PATH; skipping");
+        return;
+    }
+    round_trip_as("h264-10bit", "libx264", "h264", "25", (25, 1), 2, "yuv420p10le", &["-preset", "ultrafast", "-profile:v", "high10"]);
 }

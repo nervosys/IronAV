@@ -8,6 +8,7 @@
 //! in RTSP's interleaved framing ([`crate::rtp`]), and Ogg and MP3 (`audio_stream`).
 
 use crate::{adts, wav, y4m};
+use ironav_codec::order::PictureOrder;
 use ironav_core::{CodecId, Error, ErrorCode, Packet, PixelFormat, Rational, Result, StreamInfo, StreamParams};
 use std::collections::VecDeque;
 
@@ -495,9 +496,28 @@ pub struct AnnexBStream {
     au_vcl: bool,
     au_key: bool,
     started: bool,
-    count: i64,
+    /// Picture order of the slices: the picture order count and whether it starts a coded video
+    /// sequence, for the access unit being gathered.
+    order: PictureOrder,
+    au_pic: Option<(i64, bool)>,
+    /// How many pictures a presentation time runs ahead of decoding order by (the reordering depth).
+    depth: usize,
+    /// Pictures in decoding order that have not been handed out, and the pictures among them whose
+    /// output index is not yet known, as (picture order count, sequence number).
+    queue: VecDeque<Queued>,
+    window: Vec<(i64, u64)>,
+    head_seq: u64,
+    next_seq: u64,
+    next_out: i64,
     ready: VecDeque<StreamPacket>,
     ended: bool,
+}
+
+/// A picture waiting in decoding order: its output index, once settled.
+struct Queued {
+    data: Vec<u8>,
+    key: bool,
+    out: Option<i64>,
 }
 
 impl AnnexBStream {
@@ -511,7 +531,14 @@ impl AnnexBStream {
             au_vcl: false,
             au_key: false,
             started: false,
-            count: 0,
+            order: PictureOrder::new(codec).expect("picture order is read for H.264 and HEVC"),
+            au_pic: None,
+            depth: 0,
+            queue: VecDeque::new(),
+            window: Vec::new(),
+            head_seq: 0,
+            next_seq: 0,
+            next_out: 0,
             ready: VecDeque::new(),
             ended: false,
         }
@@ -522,9 +549,9 @@ impl AnnexBStream {
     }
 
     /// One whole NAL unit (header first, no start code).
-    fn nal(&mut self, nal: &[u8]) {
+    fn nal(&mut self, nal: &[u8]) -> Result<()> {
         if nal.is_empty() {
-            return;
+            return Ok(());
         }
         let (vcl, first_slice, key, sps, starts_au) = if self.hevc() {
             let ty = (nal[0] >> 1) & 63;
@@ -537,12 +564,25 @@ impl AnnexBStream {
             (vcl, vcl && nal.get(1).is_some_and(|b| b & 0x80 != 0), ty == 5, ty == 7, matches!(ty, 6..=9 | 14..=18))
         };
         if self.au_vcl && (starts_au || first_slice) {
-            self.finish_au();
+            self.finish_au()?;
+        }
+        let ty = if self.hevc() { (nal[0] >> 1) & 63 } else { nal[0] & 31 };
+        let is_params = if self.hevc() { ty == 33 || ty == 34 } else { ty == 7 || ty == 8 };
+        if is_params {
+            self.order.parameter_set(nal);
+        }
+        if self.hevc() && (ty == 36 || ty == 37) {
+            self.order.end_of_sequence();
+        }
+        if vcl && first_slice {
+            self.au_pic = self.order.picture(nal)?;
         }
         if sps && self.streams.is_empty() {
             if let Some((w, h)) = ironav_codec::sps_picture_size(self.codec, nal) {
                 let fps = self.fps.or_else(|| ironav_codec::sps_frame_rate(self.codec, nal)).unwrap_or(Rational::new(25, 1));
                 self.fps = Some(fps);
+                self.depth = self.order.depth();
+                let pix_fmt = ironav_codec::sps_pixel_format(self.codec, nal).unwrap_or(PixelFormat::Yuv420p);
                 self.streams.push(StreamInfo {
                     index: 0,
                     codec: self.codec,
@@ -550,8 +590,9 @@ impl AnnexBStream {
                     duration: None,
                     bits: None,
                     extradata: Vec::new(),
-                    lead_in: 0,
-                    params: StreamParams::Video { width: w, height: h, pix_fmt: PixelFormat::Yuv420p, frame_rate: fps },
+                    // presentation times run this many pictures ahead of decoding times (see `push`)
+                    lead_in: self.depth as i64,
+                    params: StreamParams::Video { width: w, height: h, pix_fmt, frame_rate: fps },
                 });
             }
         }
@@ -559,19 +600,77 @@ impl AnnexBStream {
         self.au.extend_from_slice(nal);
         self.au_vcl |= vcl;
         self.au_key |= key;
+        Ok(())
     }
 
-    fn finish_au(&mut self) {
+    fn finish_au(&mut self) -> Result<()> {
         let data = std::mem::take(&mut self.au);
         let (vcl, key) = (self.au_vcl, self.au_key);
+        let pic = self.au_pic.take();
         (self.au_vcl, self.au_key) = (false, false);
         if !vcl || self.streams.is_empty() || !(self.started || key) {
-            return;
+            return Ok(());
         }
+        let Some((poc, boundary)) = pic else {
+            return Err(Error::invalid_input("a picture whose slices do not parse, or whose parameter sets have not arrived"));
+        };
         self.started = true;
-        let pts = self.count;
-        self.count += 1;
-        self.ready.push_back(StreamPacket { packet: Packet { stream: 0, pts, duration: 1, data }, key });
+        self.push(poc, boundary, data, key);
+        Ok(())
+    }
+
+    /// Queues a picture in decoding order. Presentation times come from picture order: the window
+    /// holds `depth` pictures that are not yet numbered, and the one that comes first in picture order
+    /// is numbered as it leaves the window, so a picture is numbered once every picture before it in
+    /// output order has been decoded (for a stream within its reordering depth). A picture that starts a
+    /// coded video sequence numbers everything before it first, since picture order starts again.
+    fn push(&mut self, poc: i64, boundary: bool, data: Vec<u8>, key: bool) {
+        if boundary {
+            self.settle_all();
+        }
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.queue.push_back(Queued { data, key, out: None });
+        self.window.push((poc, seq));
+        while self.window.len() > self.depth {
+            self.settle_one();
+        }
+        self.release();
+    }
+
+    /// Numbers the picture that comes first in picture order among those in the window.
+    fn settle_one(&mut self) {
+        let Some(i) = (0..self.window.len()).min_by_key(|&i| self.window[i].0) else { return };
+        let (_, seq) = self.window.remove(i);
+        self.queue[(seq - self.head_seq) as usize].out = Some(self.next_out);
+        self.next_out += 1;
+    }
+
+    fn settle_all(&mut self) {
+        while !self.window.is_empty() {
+            self.settle_one();
+        }
+    }
+
+    /// Hands out the pictures at the front of the queue that are numbered, in decoding order. The
+    /// presentation time is the output index plus the depth, so it is never before the decoding time
+    /// (the stream's `lead_in` says so to the containers).
+    fn release(&mut self) {
+        while let Some(q) = self.queue.front() {
+            let Some(out) = q.out else { break };
+            let q = self.queue.pop_front().expect("the front was just seen");
+            self.head_seq += 1;
+            let pts = out + self.depth as i64;
+            self.ready.push_back(StreamPacket { packet: Packet { stream: 0, pts, duration: 1, data: q.data }, key: q.key });
+        }
+    }
+
+    /// The end of the input: the access unit in progress and the window come out.
+    fn close(&mut self) -> Result<()> {
+        self.finish_au()?;
+        self.settle_all();
+        self.release();
+        Ok(())
     }
 }
 
@@ -606,7 +705,7 @@ impl StreamDemuxer for AnnexBStream {
                 self.pending.skip(n);
                 if self.ended {
                     self.pending.skip(keep);
-                    self.finish_au();
+                    self.close()?;
                     return Ok(self.ready.pop_front());
                 }
                 return Ok(None);
@@ -621,14 +720,14 @@ impl StreamDemuxer for AnnexBStream {
                     }
                     let nal = nal.to_vec();
                     self.pending.skip(body + len);
-                    self.nal(&nal);
+                    self.nal(&nal)?;
                 }
                 None if self.ended => {
                     let nal = d[body..].to_vec();
                     let n = d.len();
                     self.pending.skip(n);
-                    self.nal(&nal);
-                    self.finish_au();
+                    self.nal(&nal)?;
+                    self.finish_au()?;
                 }
                 None => {
                     self.pending.skip(s0);

@@ -16,6 +16,7 @@ mod filters;
 pub mod mp3;
 pub mod mpeg4;
 pub mod opus;
+pub mod order;
 pub mod prores;
 pub mod vorbis;
 pub mod vp8;
@@ -162,6 +163,37 @@ pub fn sps_frame_rate(codec: CodecId, nal: &[u8]) -> Option<ironav_core::Rationa
     }
     let g = gcd(num, den);
     Some(ironav_core::Rational::new(num / g, den / g))
+}
+
+/// The pixel format an H.264 or HEVC sequence parameter set describes, from its chroma format and bit
+/// depth: monochrome 8-bit is `gray`, deeper monochrome comes out as 4:2:0 (as the decoders give it).
+/// `nal` is the whole NAL unit, header included.
+pub fn sps_pixel_format(codec: CodecId, nal: &[u8]) -> Option<ironav_core::PixelFormat> {
+    let (chroma, depth) = match codec {
+        CodecId::H264 if nal.len() > 1 && nal[0] & 31 == 7 => {
+            let s = h264::ps::parse_sps(&h264::bits::unescape(&nal[1..])).ok()?;
+            (s.chroma_format_idc, s.bit_depth_luma.max(s.bit_depth_chroma))
+        }
+        CodecId::Hevc if nal.len() > 2 && (nal[0] >> 1) & 63 == 33 => {
+            let s = hevc::ps::parse_sps(&h264::bits::unescape(&nal[2..])).ok()?;
+            (s.chroma_format_idc, s.bit_depth_luma.max(s.bit_depth_chroma))
+        }
+        _ => return None,
+    };
+    use ironav_core::PixelFormat as P;
+    let bits = if depth <= 8 { 8 } else if depth <= 10 { 10 } else { 12 };
+    Some(match (chroma, bits) {
+        (0, 8) => P::Gray8,
+        (1, 8) => P::Yuv420p,
+        (0 | 1, 10) => P::Yuv420p10,
+        (0 | 1, _) => P::Yuv420p12,
+        (2, 8) => P::Yuv422p,
+        (2, 10) => P::Yuv422p10,
+        (2, _) => P::Yuv422p12,
+        (_, 8) => P::Yuv444p,
+        (_, 10) => P::Yuv444p10,
+        _ => P::Yuv444p12,
+    })
 }
 
 fn gcd(a: i64, b: i64) -> i64 {

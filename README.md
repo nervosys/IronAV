@@ -142,7 +142,7 @@ Outbound connections go only to loopback, private and link-local addresses (not 
 169.254.169.254 and 169.254.170.2/.23), checked after the name resolves. Whoever runs IronAV can allow more with `IRONAV_NET_ALLOW`:
 addresses and CIDR ranges separated by commas, or `any`. A request cannot widen it.
 Readable as it arrives: MPEG-TS, Matroska/WebM, fragmented MP4 (CMAF), Y4M, WAV, ADTS AAC, MP3, Ogg (Opus, Vorbis, FLAC)
-and raw H.264/HEVC (Annex B, which carries no frame rate: give `fps`, else the SPS's VUI timing, else 25). Ogg and MP3 are read the way internet
+and raw H.264/HEVC (Annex B: the frame rate is the SPS's VUI timing, else 25, or `fps` when given; presentation times come from picture order, so B-frame streams copy right; the pixel format comes from the SPS). Ogg and MP3 are read the way internet
 radio sends them: an ID3v2 tag in front (whatever follows it, MP3 or AAC, decides the reader), chained Ogg streams between
 songs (the timeline carries on; a Vorbis song set up differently, even at another rate or channel count, has its
 headers passed to the decoder, which starts over with them), and damaged pages stepped over. Matroska is read the way a browser's MediaRecorder, OBS or `ffmpeg -f matroska -`
