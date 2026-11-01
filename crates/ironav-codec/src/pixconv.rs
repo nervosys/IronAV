@@ -1,5 +1,5 @@
 //! The `format` video filter: convert between the supported pixel formats (gray8, yuv420p,
-//! yuv422p, yuv444p, rgb24, and the same YUV layouts at 10 and 12 bits).
+//! yuv422p, yuv440p, yuv444p, rgb24, and the same YUV layouts at 10 and 12 bits).
 //!
 //! Everything goes through full-resolution Y/U/V planes. Chroma is resampled with the same
 //! triangle filter as `scale`, and RGB conversion uses limited-range ("TV") BT.601 or BT.709
@@ -50,10 +50,10 @@ fn to_yuv444(v: &VideoFrame, m: Matrix) -> [Vec<u8>; 3] {
     match v.pix_fmt {
         PixelFormat::Gray8 => [v.planes[0].clone(), vec![128; w * h], vec![128; w * h]],
         PixelFormat::Yuv444p => [v.planes[0].clone(), v.planes[1].clone(), v.planes[2].clone()],
-        PixelFormat::Yuv420p10 | PixelFormat::Yuv422p10 | PixelFormat::Yuv444p10 | PixelFormat::Yuv420p12 | PixelFormat::Yuv422p12 | PixelFormat::Yuv444p12 => {
+        PixelFormat::Yuv420p10 | PixelFormat::Yuv422p10 | PixelFormat::Yuv444p10 | PixelFormat::Yuv420p12 | PixelFormat::Yuv422p12 | PixelFormat::Yuv444p12 | PixelFormat::Yuv440p10 | PixelFormat::Yuv440p12 => {
             unreachable!("deep frames are narrowed before conversion")
         }
-        PixelFormat::Yuv420p | PixelFormat::Yuv422p => {
+        PixelFormat::Yuv420p | PixelFormat::Yuv422p | PixelFormat::Yuv440p => {
             let (cw, ch, _) = layout[1];
             [v.planes[0].clone(), resize_plane(&v.planes[1], cw, ch, w, h, 1), resize_plane(&v.planes[2], cw, ch, w, h, 1)]
         }
@@ -119,10 +119,10 @@ fn convert8(v: VideoFrame, to: PixelFormat, m: Matrix) -> VideoFrame {
     let planes = match to {
         PixelFormat::Gray8 => vec![y],
         PixelFormat::Yuv444p => vec![y, u, vv],
-        PixelFormat::Yuv420p10 | PixelFormat::Yuv422p10 | PixelFormat::Yuv444p10 | PixelFormat::Yuv420p12 | PixelFormat::Yuv422p12 | PixelFormat::Yuv444p12 => {
+        PixelFormat::Yuv420p10 | PixelFormat::Yuv422p10 | PixelFormat::Yuv444p10 | PixelFormat::Yuv420p12 | PixelFormat::Yuv422p12 | PixelFormat::Yuv444p12 | PixelFormat::Yuv440p10 | PixelFormat::Yuv440p12 => {
             unreachable!("deep output is widened from 8-bit")
         }
-        PixelFormat::Yuv420p | PixelFormat::Yuv422p => {
+        PixelFormat::Yuv420p | PixelFormat::Yuv422p | PixelFormat::Yuv440p => {
             let (cw, ch, _) = to.planes(w, h)[1];
             vec![y, resize_plane(&u, w, h, cw, ch, 1), resize_plane(&vv, w, h, cw, ch, 1)]
         }
@@ -186,7 +186,7 @@ mod tests {
     fn subsampling_changes_only_the_chroma_planes() {
         let f = rgb_frame(8, 6, |x, y| [(x * 30) as u8, (y * 40) as u8, 100]);
         let full = convert(f.clone(), PixelFormat::Yuv444p, Matrix::Bt601);
-        for to in [PixelFormat::Yuv420p, PixelFormat::Yuv422p] {
+        for to in [PixelFormat::Yuv420p, PixelFormat::Yuv422p, PixelFormat::Yuv440p] {
             let o = convert(f.clone(), to, Matrix::Bt601);
             assert_eq!(o.planes[0], full.planes[0], "luma is untouched");
             let want: Vec<usize> = to.planes(8, 6).iter().map(|&(w, h, b)| w * h * b).collect();

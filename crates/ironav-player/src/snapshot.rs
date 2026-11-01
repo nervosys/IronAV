@@ -32,6 +32,7 @@ pub fn rgb_frame(v: &VideoFrame, max_w: Option<u32>, max_h: Option<u32>) -> (u32
     let (sx, sy) = match src.pix_fmt {
         PixelFormat::Yuv420p => (2, 2),
         PixelFormat::Yuv422p => (2, 1),
+        PixelFormat::Yuv440p => (1, 2),
         _ => (1, 1),
     };
     for y in 0..h {

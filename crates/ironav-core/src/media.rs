@@ -68,10 +68,18 @@ pub enum PixelFormat {
     /// 4:4:4 with 12-bit samples stored as little-endian 16-bit words.
     #[serde(rename = "yuv444p12le")]
     Yuv444p12,
+    /// 4:4:0 (chroma halved vertically only) with 8-bit samples.
+    Yuv440p,
+    /// 4:4:0 with 10-bit samples stored as little-endian 16-bit words.
+    #[serde(rename = "yuv440p10le")]
+    Yuv440p10,
+    /// 4:4:0 with 12-bit samples stored as little-endian 16-bit words.
+    #[serde(rename = "yuv440p12le")]
+    Yuv440p12,
 }
 
 impl PixelFormat {
-    pub const ALL: [PixelFormat; 11] = [
+    pub const ALL: [PixelFormat; 14] = [
         Self::Gray8,
         Self::Yuv420p,
         Self::Yuv422p,
@@ -83,6 +91,9 @@ impl PixelFormat {
         Self::Yuv420p12,
         Self::Yuv422p12,
         Self::Yuv444p12,
+        Self::Yuv440p,
+        Self::Yuv440p10,
+        Self::Yuv440p12,
     ];
     pub fn name(self) -> &'static str {
         match self {
@@ -97,13 +108,16 @@ impl PixelFormat {
             Self::Yuv420p12 => "yuv420p12le",
             Self::Yuv422p12 => "yuv422p12le",
             Self::Yuv444p12 => "yuv444p12le",
+            Self::Yuv440p => "yuv440p",
+            Self::Yuv440p10 => "yuv440p10le",
+            Self::Yuv440p12 => "yuv440p12le",
         }
     }
     /// Bits per sample.
     pub fn bit_depth(self) -> u8 {
         match self {
-            Self::Yuv420p10 | Self::Yuv422p10 | Self::Yuv444p10 => 10,
-            Self::Yuv420p12 | Self::Yuv422p12 | Self::Yuv444p12 => 12,
+            Self::Yuv420p10 | Self::Yuv422p10 | Self::Yuv444p10 | Self::Yuv440p10 => 10,
+            Self::Yuv420p12 | Self::Yuv422p12 | Self::Yuv444p12 | Self::Yuv440p12 => 12,
             _ => 8,
         }
     }
@@ -114,12 +128,13 @@ impl PixelFormat {
             Yuv420p | Yuv420p10 | Yuv420p12 => 0,
             Yuv422p | Yuv422p10 | Yuv422p12 => 1,
             Yuv444p | Yuv444p10 | Yuv444p12 => 2,
+            Yuv440p | Yuv440p10 | Yuv440p12 => 3,
             Gray8 | Rgb24 => return (depth == 8).then_some(self),
         };
         let row = match depth {
-            8 => [Yuv420p, Yuv422p, Yuv444p],
-            10 => [Yuv420p10, Yuv422p10, Yuv444p10],
-            12 => [Yuv420p12, Yuv422p12, Yuv444p12],
+            8 => [Yuv420p, Yuv422p, Yuv444p, Yuv440p],
+            10 => [Yuv420p10, Yuv422p10, Yuv444p10, Yuv440p10],
+            12 => [Yuv420p12, Yuv422p12, Yuv444p12, Yuv440p12],
             _ => return None,
         };
         Some(row[layout])
@@ -139,6 +154,9 @@ impl PixelFormat {
             Self::Yuv420p12 => vec![(w, h, 2), (cw, ch, 2), (cw, ch, 2)],
             Self::Yuv422p12 => vec![(w, h, 2), (cw, h, 2), (cw, h, 2)],
             Self::Yuv444p12 => vec![(w, h, 2); 3],
+            Self::Yuv440p => vec![(w, h, 1), (w, ch, 1), (w, ch, 1)],
+            Self::Yuv440p10 => vec![(w, h, 2), (w, ch, 2), (w, ch, 2)],
+            Self::Yuv440p12 => vec![(w, h, 2), (w, ch, 2), (w, ch, 2)],
         }
     }
     pub fn frame_bytes(self, w: usize, h: usize) -> usize {

@@ -1,8 +1,8 @@
 //! A software VP9 decoder.
 //!
-//! Handles profiles 0 to 3 (8 and 10 bit output), every subsampling, tiles, segmentation, compound
-//! prediction, and superframes. Reference frames of a different size than the frame being decoded
-//! (spatial resampling) are refused.
+//! Handles profiles 0 to 3 (8, 10 and 12 bit output), every subsampling (4:2:0, 4:2:2, 4:4:0, 4:4:4),
+//! tiles, segmentation, compound prediction, and superframes. Reference frames of a different size
+//! than the frame being decoded (spatial resampling) are refused.
 
 #![allow(dead_code)]
 
@@ -72,10 +72,16 @@ impl Vp9Decoder {
         let pix_fmt = match (p.bpp, p.ss_h, p.ss_v) {
             (8, true, true) => PixelFormat::Yuv420p,
             (8, true, false) => PixelFormat::Yuv422p,
+            (8, false, true) => PixelFormat::Yuv440p,
             (8, false, false) => PixelFormat::Yuv444p,
             (10, true, true) => PixelFormat::Yuv420p10,
             (10, true, false) => PixelFormat::Yuv422p10,
+            (10, false, true) => PixelFormat::Yuv440p10,
             (10, false, false) => PixelFormat::Yuv444p10,
+            (12, true, true) => PixelFormat::Yuv420p12,
+            (12, true, false) => PixelFormat::Yuv422p12,
+            (12, false, true) => PixelFormat::Yuv440p12,
+            (12, false, false) => PixelFormat::Yuv444p12,
             _ => return Err(err("VP9 pixel format has no output format")),
         };
         let wide = p.bpp > 8;
@@ -109,9 +115,6 @@ impl Vp9Decoder {
         if h.show_existing {
             let p = self.refs[h.show_existing_idx].clone().ok_or_else(|| Error::new(ErrorCode::InvalidInput, "requested reference not available".to_string()))?;
             return self.emit(&p);
-        }
-        if h.bpp != 8 && h.bpp != 10 {
-            return Err(err("12-bit VP9 is not supported"));
         }
         let comp = &data[h.uncompressed_size..h.uncompressed_size + h.compressed_size];
         let (probs, coef) = parse_compressed(comp, &mut h, &self.st).map_err(bad)?;

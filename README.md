@@ -863,15 +863,18 @@ counted statistics, and golden or altref references other than the key frame.
 ## VP9
 
 VP9 video is decoded in software (`ironav-codec/src/vp9`, a port of FFmpeg's `vp9*.c` files; the tables are generated from FFmpeg's sources).
-Profiles 0 to 3 are parsed; output is 8-bit `yuv420p`, `yuv422p` or `yuv444p` (and the 10-bit forms), cropped to the coded size. It covers key, inter and
+Profiles 0 to 3 are decoded; output is `yuv420p`, `yuv422p`, `yuv440p` or `yuv444p` at 8, 10 or 12 bits (`yuv420p12le` and so on), cropped to the coded size. It covers key, inter and
 intra-only frames, all block sizes and transforms (including the lossless Walsh-Hadamard mode), compound prediction, switchable interpolation filters,
 segmentation, loop-filter deltas, tiles, superframes with hidden frames and "show existing frame", and backward probability adaptation.
-Reference frames of a different size than the frame being decoded (spatial resampling) are refused with an error, as is 12-bit and 4:4:0.
+Reference frames of a different size than the frame being decoded (spatial resampling) are refused with an error. No stream could be made to test
+that path: the libvpx encoder reachable from FFmpeg keeps its size, so the scaled motion compensation is not implemented.
 
 Checked bit for bit against FFmpeg's decoder (through PyAV) on libvpx output: about 30 clips (key frames at several quantisers, 10 to 20 frame inter
 sequences with alt-ref and compound prediction, odd sizes down to 33x17, 640x360, noise, segmentation modes 1 to 3, error-resilient and frame-parallel streams,
 tile columns and rows, 4:2:2, 4:4:4, lossless) all match on every frame, and six small clips are kept as the `vp9_streams_decode_to_what_ffmpeg_decodes` test.
-**Not tested against any stream:** 10-bit output (the libvpx build used here cannot encode it), intra-only frames, and corrupted-stream robustness beyond what is noted in the
+The 10-bit 4:2:0, 12-bit 4:2:0, 12-bit 4:4:4, 4:4:0 at 8, 10 and 12 bits, and odd-sized 12-bit 4:2:0 and 4:4:0 clips (FFmpeg's libvpx-vp9 encoder made them)
+match FFmpeg's decoder on every frame in `vp9_formats.rs`.
+**Not tested against any stream:** intra-only frames, and corrupted-stream robustness beyond what is noted in the
 changelog. VP9 is also encoded in software (`--vcodec vp9`, profile 0, 8-bit 4:2:0): a key frame every 250 frames by default, and inter frames between them that predict from the frame before, with quarter-pixel motion vectors, one reference frame and coefficient probabilities sent as per-frame updates. It writes WebM, Matroska or MP4, and its output is checked against FFmpeg's decoder in the tests (`vp9_encoded_files_decode_to_what_ffmpeg_decodes`). VP9 can also be copied between WebM, Matroska and MP4 (see "Matroska output").
 
 Tile columns are decoded on separate threads (one per core, at most one per tile column), each into its own copy of the picture, and merged
