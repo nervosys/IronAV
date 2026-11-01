@@ -52,6 +52,8 @@ pub struct Sps {
     pub crop: [usize; 4],
     /// `max_num_reorder_frames` from the VUI, when the stream states it.
     pub num_reorder_frames: Option<u32>,
+    /// `num_units_in_tick` and `time_scale` from the VUI timing, when the stream states them.
+    pub timing: Option<(u32, u32)>,
 }
 
 fn flat_lists() -> ([[u8; 16]; 6], [[u8; 64]; 6]) {
@@ -210,9 +212,9 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps> {
         return Err(Error::invalid_input("H.264 cropping leaves no picture"));
     }
     // the VUI is optional; only the reordering depth is of interest
-    let mut num_reorder_frames = None;
+    let (mut num_reorder_frames, mut timing) = (None, None);
     if r.flag().unwrap_or(false) {
-        num_reorder_frames = parse_vui_reorder(&mut r).unwrap_or(None);
+        num_reorder_frames = parse_vui(&mut r, &mut timing).unwrap_or(None);
     }
     Ok(Sps {
         profile_idc,
@@ -241,11 +243,13 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps> {
         direct_8x8_inference,
         crop,
         num_reorder_frames,
+        timing,
     })
 }
 
-/// Walks the VUI far enough to read bitstream_restriction's max_num_reorder_frames.
-fn parse_vui_reorder(r: &mut BitReader) -> Result<Option<u32>> {
+/// Walks the VUI far enough to read bitstream_restriction's max_num_reorder_frames. The timing info,
+/// which comes earlier, goes to `timing`.
+fn parse_vui(r: &mut BitReader, timing: &mut Option<(u32, u32)>) -> Result<Option<u32>> {
     if r.flag()? && r.bits(8)? == 255 {
         r.bits(32)?; // sar width and height
     }
@@ -263,8 +267,9 @@ fn parse_vui_reorder(r: &mut BitReader) -> Result<Option<u32>> {
         r.ue()?;
     }
     if r.flag()? {
-        r.bits(32)?;
-        r.bits(32)?;
+        let units = r.bits(32)?;
+        let scale = r.bits(32)?;
+        *timing = Some((units, scale));
         r.flag()?;
     }
     let nal_hrd = r.flag()?;

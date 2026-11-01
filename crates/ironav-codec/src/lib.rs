@@ -141,6 +141,37 @@ pub fn sps_picture_size(codec: CodecId, nal: &[u8]) -> Option<(u32, u32)> {
     }
 }
 
+/// The frame rate a H.264 or HEVC sequence parameter set states in its VUI timing, reduced; `nal`
+/// is the whole NAL unit, header included. `None` when the VUI says nothing about timing. H.264
+/// counts ticks per field, so a frame is two ticks; HEVC counts ticks per picture.
+pub fn sps_frame_rate(codec: CodecId, nal: &[u8]) -> Option<ironav_core::Rational> {
+    let (units, scale, ticks) = match codec {
+        CodecId::H264 if nal.len() > 1 && nal[0] & 31 == 7 => {
+            let (units, scale) = h264::ps::parse_sps(&h264::bits::unescape(&nal[1..])).ok()?.timing?;
+            (units, scale, 2)
+        }
+        CodecId::Hevc if nal.len() > 2 && (nal[0] >> 1) & 63 == 33 => {
+            let (units, scale) = hevc::ps::parse_sps(&h264::bits::unescape(&nal[2..])).ok()?.timing?;
+            (units, scale, 1)
+        }
+        _ => return None,
+    };
+    let (num, den) = (scale as i64, units as i64 * ticks);
+    if num == 0 || den == 0 {
+        return None;
+    }
+    let g = gcd(num, den);
+    Some(ironav_core::Rational::new(num / g, den / g))
+}
+
+fn gcd(a: i64, b: i64) -> i64 {
+    if b == 0 {
+        a
+    } else {
+        gcd(b, a % b)
+    }
+}
+
 /// How a decoder from [`new_decoder_with`] behaves.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct DecoderOptions {

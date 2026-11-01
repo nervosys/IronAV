@@ -356,7 +356,7 @@ fn stream_open_schema() -> Value {
             "digest_seconds": { "type": "number", "exclusiveMinimum": 0, "default": 10 },
             "retain_seconds": { "type": "number", "minimum": 0, "default": 60, "description": "Media kept for stream_snapshot and stream_clip (at most 256 MiB of it)." },
             "format": { "type": "string", "enum": ironav_formats::stream::STREAM_FORMATS, "description": "The stream's format, when its first bytes do not say (raw H.264 and HEVC usually do)." },
-            "fps": { "type": "number", "exclusiveMinimum": 0, "description": "Frame rate of a raw H.264/HEVC stream, which carries none (25 when absent)." },
+            "fps": { "type": "number", "exclusiveMinimum": 0, "description": "Frame rate of a raw H.264/HEVC stream, which carries none of its own (the SPS's VUI timing when absent, else 25)." },
             "pace": { "type": "string", "enum": ["realtime", "none"], "description": "realtime: read no faster than the media plays." },
             "thumbnail_seconds": { "type": "number", "minimum": 2, "default": 10 },
             "hwaccel": { "type": "string", "default": "auto" },

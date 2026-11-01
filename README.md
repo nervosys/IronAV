@@ -4,7 +4,7 @@ Audio and video conversion in Rust, built to be driven by AI agents as well as p
 A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so they cannot drift apart.
 
 > **Status: foundation (v0.1).** The architecture, agent interface, ontology, hardware model, CLI, MCP server
-> and both GUIs are working and tested. Containers: **WAV, FLAC, Y4M, MP4, QuickTime MOV (read and write), Matroska/WebM (read and write), Ogg, ADTS, MP3, JPEG and MPEG transport streams (read and write); raw H.264 and HEVC (Annex B: write only as files, read as live sources).**
+> and both GUIs are working and tested. Containers: **WAV, FLAC, Y4M, MP4, QuickTime MOV (read and write), Matroska/WebM (read and write), Ogg, ADTS, MP3, JPEG and MPEG transport streams (read and write); raw H.264 and HEVC (Annex B: read and written as files, and read as live sources).**
 > Audio codecs, each decoded and encoded: **PCM, FLAC, ALAC, AAC-LC (plus HE-AAC v1 decode), MP3, MP2, Opus and Vorbis.**
 > Video: **software decoders for H.264, HEVC (including 4:2:2 and 4:4:4), VP8 and VP9; a software H.264 encoder (High profile: CABAC and the 8x8 transform), a software HEVC encoder (Main profile, 8-bit 4:2:0, merge and skip, SAO), a software VP8 encoder, and a software VP9 encoder (key and inter frames), and a software AV1 encoder (key and inter frames, profile 0, 8-bit 4:2:0); JPEG/Motion-JPEG and Apple ProRes decoded and encoded in software; MPEG-4 Part 2 (Simple and Advanced Simple profiles) decoded in software, and Simple profile I and P pictures encoded in software (MP4 and Matroska).**
 > NVIDIA GPUs encode H.264 and HEVC (NVENC, preferred when usable) and decode H.264, HEVC and AV1 (NVDEC).
@@ -142,7 +142,7 @@ Outbound connections go only to loopback, private and link-local addresses (not 
 169.254.169.254 and 169.254.170.2/.23), checked after the name resolves. Whoever runs IronAV can allow more with `IRONAV_NET_ALLOW`:
 addresses and CIDR ranges separated by commas, or `any`. A request cannot widen it.
 Readable as it arrives: MPEG-TS, Matroska/WebM, fragmented MP4 (CMAF), Y4M, WAV, ADTS AAC, MP3, Ogg (Opus, Vorbis, FLAC)
-and raw H.264/HEVC (Annex B, which carries no frame rate: give `fps`, 25 by default). Ogg and MP3 are read the way internet
+and raw H.264/HEVC (Annex B, which carries no frame rate: give `fps`, else the SPS's VUI timing, else 25). Ogg and MP3 are read the way internet
 radio sends them: an ID3v2 tag in front (whatever follows it, MP3 or AAC, decides the reader), chained Ogg streams between
 songs (the timeline carries on; a Vorbis song set up differently, even at another rate or channel count, has its
 headers passed to the decoder, which starts over with them), and damaged pages stepped over. Matroska is read the way a browser's MediaRecorder, OBS or `ffmpeg -f matroska -`

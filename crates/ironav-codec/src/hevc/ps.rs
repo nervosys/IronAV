@@ -234,8 +234,9 @@ fn skip_hrd(r: &mut BitReader, max_sub_layers_minus1: u32) -> Result<()> {
     Ok(())
 }
 
-/// Reads past vui_parameters() (E.2.1): nothing in it changes decoding.
-fn skip_vui(r: &mut BitReader, max_sub_layers_minus1: u32) -> Result<()> {
+/// Reads past vui_parameters() (E.2.1): nothing in it changes decoding, but the timing info
+/// (`vui_num_units_in_tick`, `vui_time_scale`) is returned when the VUI states it.
+fn skip_vui(r: &mut BitReader, max_sub_layers_minus1: u32) -> Result<Option<(u32, u32)>> {
     if r.flag()? && r.bits(8)? == 255 {
         r.skip(32); // sar_width, sar_height
     }
@@ -258,8 +259,11 @@ fn skip_vui(r: &mut BitReader, max_sub_layers_minus1: u32) -> Result<()> {
             r.ue()?; // default display window offsets
         }
     }
+    let mut timing = None;
     if r.flag()? {
-        r.skip(64); // vui_num_units_in_tick, vui_time_scale
+        let units = r.bits(32)?;
+        let scale = r.bits(32)?;
+        timing = Some((units, scale));
         if r.flag()? {
             r.ue()?; // vui_num_ticks_poc_diff_one_minus1
         }
@@ -276,7 +280,7 @@ fn skip_vui(r: &mut BitReader, max_sub_layers_minus1: u32) -> Result<()> {
     if r.bits_left() == 0 {
         return Err(bad("the VUI runs to the end of the SPS"));
     }
-    Ok(())
+    Ok(timing)
 }
 
 /// The first range extension coding tool an SPS turns on (7.3.2.2.2), if any.
@@ -365,6 +369,8 @@ pub struct Sps {
     pub ctb_h: usize,
     /// A range extension coding tool the SPS turns on, which this decoder does not implement.
     pub range_tool: Option<&'static str>,
+    /// `vui_num_units_in_tick` and `vui_time_scale`, when the VUI states them.
+    pub timing: Option<(u32, u32)>,
 }
 
 impl Sps {
@@ -474,7 +480,14 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps> {
     let temporal_mvp = r.flag()?;
     let strong_intra_smoothing = r.flag()?;
     // a VUI that does not parse (some encoders write it wrongly) leaves the extensions unread
-    let vui_ok = !r.flag()? || skip_vui(&mut r, max_sub_layers_minus1).is_ok();
+    let (timing, vui_ok) = if r.flag()? {
+        match skip_vui(&mut r, max_sub_layers_minus1) {
+            Ok(t) => (t, true),
+            Err(_) => (None, false),
+        }
+    } else {
+        (None, true)
+    };
     let mut range_tool = None;
     if vui_ok && r.flag().unwrap_or(false) {
         let range = r.flag()?;
@@ -521,6 +534,7 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps> {
         ctb_w: width.div_ceil(ctb),
         ctb_h: height.div_ceil(ctb),
         range_tool,
+        timing,
     })
 }
 
@@ -1068,7 +1082,7 @@ mod tests {
         }
         let bytes: Vec<u8> = bits.as_bytes().chunks(8).map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap(), 2).unwrap()).collect();
         let mut r = BitReader::new(&bytes);
-        skip_vui(&mut r, 0).unwrap();
+        assert_eq!(skip_vui(&mut r, 0).unwrap(), Some((1, 25)));
         assert_eq!(r.pos(), at);
     }
 }

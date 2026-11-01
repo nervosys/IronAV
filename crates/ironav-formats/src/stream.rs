@@ -79,7 +79,8 @@ impl Pending {
 pub struct StreamOptions {
     /// One of [`STREAM_FORMATS`]; detected from the first bytes when absent.
     pub format: Option<String>,
-    /// Pictures per second of an Annex B stream, which carries no timing (25 when absent).
+    /// Pictures per second of an Annex B stream, which carries no timing of its own: when absent,
+    /// the sequence parameter set's VUI timing, else 25.
     pub frame_rate: Option<Rational>,
 }
 
@@ -93,7 +94,6 @@ pub const SNIFF_BYTES: usize = 200;
 /// A stream demuxer for input starting with `magic` (at least [`SNIFF_BYTES`] of it, unless the
 /// input is shorter), or of the format `opts.format` names.
 pub fn stream_demuxer(magic: &[u8], opts: &StreamOptions) -> Result<Box<dyn StreamDemuxer>> {
-    let fps = opts.frame_rate.unwrap_or(Rational::new(25, 1));
     // made by the HLS source whatever the format named; each part tells its own from its bytes
     if magic.starts_with(crate::renditions::MAGIC) {
         return Ok(Box::new(crate::renditions::Renditions::new(opts)));
@@ -115,8 +115,8 @@ pub fn stream_demuxer(magic: &[u8], opts: &StreamOptions) -> Result<Box<dyn Stre
         "mp3" => Box::new(crate::audio_stream::Mp3Stream::default()),
         "ogg" | "opus" | "oga" => Box::new(crate::audio_stream::OggStream::default()),
         "id3" => Box::new(crate::audio_stream::Id3Stream::default()),
-        "h264" | "avc" => Box::new(AnnexBStream::new(CodecId::H264, fps)),
-        "hevc" | "h265" => Box::new(AnnexBStream::new(CodecId::Hevc, fps)),
+        "h264" | "avc" => Box::new(AnnexBStream::new(CodecId::H264, opts.frame_rate)),
+        "hevc" | "h265" => Box::new(AnnexBStream::new(CodecId::Hevc, opts.frame_rate)),
         "mpegts" | "ts" | "m2ts" => Box::new(crate::ts::TsStream::default()),
         "matroska" | "mkv" | "webm" => Box::new(crate::mkv::live::MkvStream::default()),
         "mp4" | "fmp4" | "cmaf" => Box::new(crate::mp4demux::live::Mp4Stream::default()),
@@ -129,7 +129,8 @@ pub fn stream_demuxer(magic: &[u8], opts: &StreamOptions) -> Result<Box<dyn Stre
     })
 }
 
-fn sniff(m: &[u8]) -> Option<&'static str> {
+/// The name of the format that `m`, the first bytes of a stream, shows itself to be.
+pub(crate) fn sniff(m: &[u8]) -> Option<&'static str> {
     if m.starts_with(crate::renditions::MAGIC) {
         return Some("renditions");
     }
@@ -484,7 +485,8 @@ impl StreamDemuxer for AdtsStream {
 /// given frame rate.
 pub struct AnnexBStream {
     codec: CodecId,
-    fps: Rational,
+    /// The frame rate given, or else the one the SPS states; set when the SPS arrives.
+    fps: Option<Rational>,
     pending: Pending,
     streams: Vec<StreamInfo>,
     /// The access unit being gathered: its bytes, whether it has a picture's slices yet, and
@@ -499,7 +501,7 @@ pub struct AnnexBStream {
 }
 
 impl AnnexBStream {
-    pub fn new(codec: CodecId, fps: Rational) -> Self {
+    pub fn new(codec: CodecId, fps: Option<Rational>) -> Self {
         AnnexBStream {
             codec,
             fps,
@@ -539,15 +541,17 @@ impl AnnexBStream {
         }
         if sps && self.streams.is_empty() {
             if let Some((w, h)) = ironav_codec::sps_picture_size(self.codec, nal) {
+                let fps = self.fps.or_else(|| ironav_codec::sps_frame_rate(self.codec, nal)).unwrap_or(Rational::new(25, 1));
+                self.fps = Some(fps);
                 self.streams.push(StreamInfo {
                     index: 0,
                     codec: self.codec,
-                    time_base: self.fps.invert(),
+                    time_base: fps.invert(),
                     duration: None,
                     bits: None,
                     extradata: Vec::new(),
                     lead_in: 0,
-                    params: StreamParams::Video { width: w, height: h, pix_fmt: PixelFormat::Yuv420p, frame_rate: self.fps },
+                    params: StreamParams::Video { width: w, height: h, pix_fmt: PixelFormat::Yuv420p, frame_rate: fps },
                 });
             }
         }
@@ -766,7 +770,7 @@ mod tests {
     #[test]
     fn annex_b_starts_at_a_keyframe() {
         // a slice with no parameter sets before it is dropped; nothing comes out
-        let mut s = AnnexBStream::new(CodecId::H264, Rational::new(25, 1));
+        let mut s = AnnexBStream::new(CodecId::H264, None);
         s.feed(&[0, 0, 0, 1, 0x41, 0x80, 0, 0, 0, 1, 0x41, 0x80]).unwrap();
         s.end();
         assert!(s.next_packet().unwrap().is_none());

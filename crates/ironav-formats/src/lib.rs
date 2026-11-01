@@ -155,18 +155,18 @@ pub static FORMATS: &[FormatSpec] = &[
     FormatSpec {
         name: "h264",
         extensions: &["h264", "264"],
-        description: "Raw H.264 Annex B elementary stream (write-only)",
+        description: "Raw H.264 Annex B elementary stream; read at the SPS's VUI frame rate (25 when it states none), written as given",
         media: MediaType::Video,
-        demux: false,
+        demux: true,
         mux: true,
         codecs: &[CodecId::H264],
     },
     FormatSpec {
         name: "hevc",
         extensions: &["hevc", "h265", "265"],
-        description: "Raw H.265/HEVC Annex B elementary stream (write-only)",
+        description: "Raw H.265/HEVC Annex B elementary stream; read at the SPS's VUI frame rate (25 when it states none), written as given",
         media: MediaType::Video,
-        demux: false,
+        demux: true,
         mux: true,
         codecs: &[CodecId::Hevc],
     },
@@ -238,6 +238,9 @@ pub fn open_demuxer(path: &Path) -> Result<Box<dyn Demuxer>> {
         Ok(Box::new(jpeg::JpegDemuxer::open(f)?))
     } else if magic.starts_with(b"YUV4MPEG2") {
         Ok(Box::new(y4m::Y4mDemuxer::open(f)?))
+    } else if let Some(codec) = annexb::looks_like(magic) {
+        // last: a raw stream is recognised by its start code and first NAL unit alone
+        Ok(Box::new(annexb::AnnexBDemuxer::open(f, codec)?))
     } else {
         Err(Error::new(ErrorCode::UnsupportedFormat, format!("unrecognised input format: {}", path.display()))
             .hint("only formats listed by `ironav capabilities` can be read so far")
