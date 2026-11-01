@@ -396,7 +396,7 @@ the SDP, each track's channel, and RTP-Info's `rtptime` and `seq`). `stream_demu
 The demuxer takes H.264 (single, STAP-A, FU-A), HEVC (single, AP, FU), AAC (RFC 3640 hbr/lbr), Opus, and G.711 and L16
 (decoded to 16-bit PCM). Its reorder buffer holds up to 64 packets per track and costs nothing in order. A gap it gives
 up on drops the damaged picture, and the next one when the lost packet may have begun it. Tracks are aligned by
-RTP-Info's `rtptime`; RTCP is passed through but not yet used, so a server without RTP-Info leaves each track counting
+RTP-Info's `rtptime`; RTCP sender reports give each track's wall-clock time (`captured_at`, `sender_clock`) but do not align tracks, so a server without RTP-Info leaves each track counting
 from its first packet. Checked against FFmpeg's RTP muxer: captured, played through a stand-in camera, recorded, and
 decoded by FFmpeg without an error. RTP over UDP (`?transport=udp`) uses an even/odd local port pair per track, takes
 datagrams only from the server's address (or a `source=` it names that the allow-list permits), frames them the same
