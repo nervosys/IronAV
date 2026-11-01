@@ -2,6 +2,7 @@
 
 use super::block::FrameDec;
 use super::ipred::Plane;
+use super::{bands, for_each_par, Band};
 
 const DIV_TABLE: [i64; 9] = [0, 840, 420, 280, 210, 168, 140, 120, 105];
 /// Cdef_Uv_Dir by [subsampling_x][subsampling_y] and the luma direction.
@@ -102,7 +103,7 @@ fn direction(p: &Plane, bd: u32, r: usize, c: usize) -> (usize, i32) {
 
 /// Filters one plane's 8x8 (or 4x4 chroma) block at mi (`r`, `c`) from `src` into `dst`.
 #[allow(clippy::too_many_arguments)]
-fn filter(src: &Plane, dst: &mut Plane, geo: (usize, usize, usize, usize, u32), r: usize, c: usize, str_: (i32, i32, i32, usize)) {
+fn filter(src: &Plane, dst: &mut Band, geo: (usize, usize, usize, usize, u32), r: usize, c: usize, str_: (i32, i32, i32, usize)) {
     let (sx, sy, mi_rows, mi_cols, bd) = geo;
     let (pri, sec, damping, dir) = str_;
     let shift = bd - 8;
@@ -155,48 +156,63 @@ fn filter(src: &Plane, dst: &mut Plane, geo: (usize, usize, usize, usize, u32), 
                 }
             }
             let v = x + ((8 + sum - (sum < 0) as i32) >> 4);
-            dst.data[(y0 + i) * dst.stride + x0 + j] = v.clamp(mn, mx) as u16;
+            dst.data[(y0 + i - dst.row0) * dst.stride + x0 + j] = v.clamp(mn, mx) as u16;
         }
     }
 }
 
-/// Applies CDEF to the frame's planes (the 64x64 blocks whose cdef_idx was read).
-pub fn cdef(f: &mut FrameDec) {
+/// The 64x64 blocks of a frame are filtered in parallel: each reads only the pre-CDEF copy and
+/// writes its own rows of the output, so a band of 16 mode-info rows is one job.
+pub fn cdef(f: &mut FrameDec, threads: usize) {
     if f.cdef_idx.iter().all(|&i| i < 0) {
         return;
     }
     let src: Vec<Plane> = f.planes.iter().map(copy).collect();
-    let (mi_rows, mi_cols, bd) = (f.h.mi_rows, f.h.mi_cols, f.bd);
-    let shift = bd - 8;
-    let ss = f.ss;
-    let skip = |r: usize, c: usize| f.mi[r * f.mi_stride + c].skip;
-    for r in (0..mi_rows).step_by(2) {
-        for c in (0..mi_cols).step_by(2) {
-            let idx = f.cdef_idx[(r >> 4) * f.cdef_stride + (c >> 4)];
-            if idx < 0 || (skip(r, c) && skip(r + 1, c) && skip(r, c + 1) && skip(r + 1, c + 1)) {
-                continue;
-            }
-            let idx = idx as usize;
-            let (ydir, var) = direction(&src[0], bd, r, c);
-            let h = &f.h;
-            let pri = (h.cdef_y_pri[idx] as i32) << shift;
-            let sec = (h.cdef_y_sec[idx] as i32) << shift;
-            let dir = if pri == 0 { 0 } else { ydir };
-            let vs = if var >> 6 != 0 { floor_log2((var >> 6) as u32).min(12) } else { 0 };
-            let pri_adj = if var != 0 { (pri * (4 + vs) + 8) >> 4 } else { 0 };
-            let damping = h.cdef_damping as i32 + shift as i32;
-            filter(&src[0], &mut f.planes[0], (0, 0, mi_rows, mi_cols, bd), r, c, (pri_adj, sec, damping, dir));
-            if f.num_planes == 1 {
-                continue;
-            }
-            let h = &f.h;
-            let pri = (h.cdef_uv_pri[idx] as i32) << shift;
-            let sec = (h.cdef_uv_sec[idx] as i32) << shift;
-            let dir = if pri == 0 { 0 } else { UV_DIR[ss[0]][ss[1]][ydir] };
-            let geo_c = (ss[0], ss[1], mi_rows, mi_cols, bd);
-            for pl in 1..3 {
-                filter(&src[pl], &mut f.planes[pl], geo_c, r, c, (pri, sec, damping - 1, dir));
-            }
+    let mut planes = std::mem::replace(&mut f.planes, [Plane::new(0, 0), Plane::new(0, 0), Plane::new(0, 0)]);
+    {
+        let f: &FrameDec = f;
+        let (mi_rows, mi_cols, bd) = (f.h.mi_rows, f.h.mi_cols, f.bd);
+        let shift = bd - 8;
+        let ss = f.ss;
+        let num_planes = f.num_planes;
+        let skip = |r: usize, c: usize| f.mi[r * f.mi_stride + c].skip;
+        // Per band, one output band of each plane.
+        let mut per_plane: Vec<_> = planes.iter_mut().enumerate().take(num_planes).map(|(p, pl)| bands(pl, 64 >> if p == 0 { 0 } else { ss[1] })).collect();
+        let mut jobs = Vec::new();
+        for k in 0..mi_rows.div_ceil(16) {
+            let outs: Vec<Band> = per_plane.iter_mut().map(|it| it.next().expect("a band per 64 rows")).collect();
+            jobs.push((k, outs));
         }
+        for_each_par(jobs, threads, |(k, mut outs)| {
+            for r in (k * 16..(k * 16 + 16).min(mi_rows)).step_by(2) {
+                for c in (0..mi_cols).step_by(2) {
+                    let idx = f.cdef_idx[(r >> 4) * f.cdef_stride + (c >> 4)];
+                    if idx < 0 || (skip(r, c) && skip(r + 1, c) && skip(r, c + 1) && skip(r + 1, c + 1)) {
+                        continue;
+                    }
+                    let idx = idx as usize;
+                    let (ydir, var) = direction(&src[0], bd, r, c);
+                    let h = &f.h;
+                    let pri = (h.cdef_y_pri[idx] as i32) << shift;
+                    let sec = (h.cdef_y_sec[idx] as i32) << shift;
+                    let dir = if pri == 0 { 0 } else { ydir };
+                    let vs = if var >> 6 != 0 { floor_log2((var >> 6) as u32).min(12) } else { 0 };
+                    let pri_adj = if var != 0 { (pri * (4 + vs) + 8) >> 4 } else { 0 };
+                    let damping = h.cdef_damping as i32 + shift as i32;
+                    filter(&src[0], &mut outs[0], (0, 0, mi_rows, mi_cols, bd), r, c, (pri_adj, sec, damping, dir));
+                    if num_planes == 1 {
+                        continue;
+                    }
+                    let pri = (h.cdef_uv_pri[idx] as i32) << shift;
+                    let sec = (h.cdef_uv_sec[idx] as i32) << shift;
+                    let dir = if pri == 0 { 0 } else { UV_DIR[ss[0]][ss[1]][ydir] };
+                    let geo_c = (ss[0], ss[1], mi_rows, mi_cols, bd);
+                    for pl in 1..3 {
+                        filter(&src[pl], &mut outs[pl], geo_c, r, c, (pri, sec, damping - 1, dir));
+                    }
+                }
+            }
+        });
     }
+    f.planes = planes;
 }

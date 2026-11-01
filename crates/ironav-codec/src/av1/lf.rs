@@ -2,27 +2,58 @@
 
 use super::block::{plane_block, FrameDec};
 use super::ipred::Plane;
+use super::{bands, for_each_par, Band};
 use super::mvpred::{GLOBALMV, GLOBAL_GLOBALMV};
 use super::tables::{MI_H_LOG2, MI_W_LOG2, TX_H_LOG2, TX_W_LOG2};
 
-pub fn deblock(f: &mut FrameDec) {
-    for plane in 0..f.num_planes {
-        if plane > 0 && f.h.lf_level[plane + 1] == 0 {
-            continue;
-        }
-        let (sx, sy) = if plane == 0 { (0, 0) } else { (f.ss[0], f.ss[1]) };
-        for pass in 0..2 {
-            for row in (0..f.h.mi_rows).step_by(1 << sy) {
-                for col in (0..f.h.mi_cols).step_by(1 << sx) {
-                    edge(f, plane, pass, row, col, sx, sy);
-                }
+/// The mode-info rows of a band of plane rows: 64 luma rows, which is 16 mode-info rows.
+const BAND_MI: usize = 16;
+
+/// Filters the edges of the frame. Each plane's vertical edges (pass 0) come first, then its
+/// horizontal ones (pass 1). A vertical edge changes samples of its own row only, so bands of
+/// rows run in parallel for pass 0; a horizontal edge is applied to whole planes, which run in
+/// parallel with each other.
+pub fn deblock(f: &mut FrameDec, threads: usize) {
+    let on = |f: &FrameDec, p: usize| p == 0 || f.h.lf_level[p + 1] != 0;
+    let mut planes = std::mem::replace(&mut f.planes, [Plane::new(0, 0), Plane::new(0, 0), Plane::new(0, 0)]);
+    {
+        let f: &FrameDec = f;
+        let geo = |p: usize| if p == 0 { (0, 0) } else { (f.ss[0], f.ss[1]) };
+        let mut jobs = Vec::new();
+        for (p, plane) in planes.iter_mut().enumerate().take(f.num_planes) {
+            if !on(f, p) {
+                continue;
+            }
+            let rows = 64 >> geo(p).1;
+            for (k, band) in bands(plane, rows).enumerate() {
+                jobs.push((p, k * BAND_MI, band));
             }
         }
+        for_each_par(jobs, threads, |(p, mi0, mut band)| {
+            let (sx, sy) = geo(p);
+            for row in (mi0..(mi0 + BAND_MI).min(f.h.mi_rows)).step_by(1 << sy) {
+                for col in (0..f.h.mi_cols).step_by(1 << sx) {
+                    edge(f, &mut band, p, 0, row, col, sx, sy);
+                }
+            }
+        });
+        let jobs: Vec<(usize, &mut Plane)> = planes.iter_mut().enumerate().take(f.num_planes).filter(|(p, _)| on(f, *p)).collect();
+        for_each_par(jobs, threads, |(p, plane)| {
+            let (sx, sy) = geo(p);
+            let stride = plane.stride;
+            let mut band = Band { data: &mut plane.data, stride, row0: 0 };
+            for row in (0..f.h.mi_rows).step_by(1 << sy) {
+                for col in (0..f.h.mi_cols).step_by(1 << sx) {
+                    edge(f, &mut band, p, 1, row, col, sx, sy);
+                }
+            }
+        });
     }
+    f.planes = planes;
 }
 
 /// edge_loop_filter: the edge on the left (pass 0) or top (pass 1) of the 4x4 at (`row`, `col`).
-fn edge(f: &mut FrameDec, plane: usize, pass: usize, row: usize, col: usize, sx: usize, sy: usize) {
+fn edge(f: &FrameDec, p: &mut Band, plane: usize, pass: usize, row: usize, col: usize, sx: usize, sy: usize) {
     let (x, y) = (col * 4, row * 4);
     if x >= f.h.width as usize || y >= f.h.height as usize || (pass == 0 && x == 0) || (pass == 1 && y == 0) {
         return;
@@ -58,7 +89,6 @@ fn edge(f: &mut FrameDec, plane: usize, pass: usize, row: usize, col: usize, sx:
     let limit = if sh > 0 { (lvl >> shift).clamp(1, 9 - sh) } else { (lvl >> shift).max(1) };
     let bd = f.bd;
     let lim = [limit << (bd - 8), (2 * (lvl + 2) + limit) << (bd - 8), (lvl >> 4) << (bd - 8)];
-    let p = &mut f.planes[plane];
     for i in 0..4 {
         let (px, py) = if pass == 0 { (xp, yp + i) } else { (xp + i, yp) };
         filter(p, px, py, pass == 0, size, plane > 0, lim, bd);
@@ -91,9 +121,9 @@ fn level(f: &FrameDec, row: usize, col: usize, plane: usize, pass: usize) -> i32
 
 /// sample_filtering across the edge just before (`x`, `y`); `lim` is limit, blimit and thresh.
 #[allow(clippy::too_many_arguments)]
-fn filter(p: &mut Plane, x: usize, y: usize, vertical: bool, size: usize, chroma: bool, lim: [i32; 3], bd: u32) {
+fn filter(p: &mut Band, x: usize, y: usize, vertical: bool, size: usize, chroma: bool, lim: [i32; 3], bd: u32) {
     let step = if vertical { 1 } else { p.stride as isize };
-    let base = (y * p.stride + x) as isize;
+    let base = ((y - p.row0) * p.stride + x) as isize;
     let len = if size == 4 { 4 } else if chroma { 6 } else if size == 8 { 8 } else { 16 };
     let n = match len {
         4 => 2,

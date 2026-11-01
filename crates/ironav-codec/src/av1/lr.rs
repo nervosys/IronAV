@@ -6,6 +6,7 @@
 
 use super::block::FrameDec;
 use super::ipred::Plane;
+use super::{for_each_par, Band};
 
 pub const RESTORE_NONE: u8 = 0;
 pub const RESTORE_WIENER: u8 = 1;
@@ -117,12 +118,12 @@ fn window(src: &Source, r: Rect) -> Vec<i32> {
     v
 }
 
-fn put(out: &mut Plane, x: usize, y: usize, v: i32) {
-    out.data[y * out.stride + x] = v as u16;
+fn put(out: &mut Band, x: usize, y: usize, v: i32) {
+    out.data[(y - out.row0) * out.stride + x] = v as u16;
 }
 
 /// The Wiener filter (spec 7.17.4) of one rectangle.
-fn wiener(win: &[i32], r: Rect, coef: &[[i32; 3]; 2], bd: u32, out: &mut Plane) {
+fn wiener(win: &[i32], r: Rect, coef: &[[i32; 3]; 2], bd: u32, out: &mut Band) {
     let (round_h, round_v) = if bd == 12 { (5, 9) } else { (3, 11) };
     let offset = 1i32 << (bd + 7 - round_h - 1);
     let limit = (1i32 << (bd + 1 + 7 - round_h)) - 1;
@@ -221,7 +222,7 @@ fn box_ab(ig: &Integral, r: Rect, rad: usize, s: u32, bd: u32) -> (Vec<i64>, Vec
 }
 
 /// The self-guided filter (spec 7.17.3) of one rectangle, with the weights of its unit.
-fn self_guided(win: &[i32], r: Rect, u: &Unit, bd: u32, out: &mut Plane) {
+fn self_guided(win: &[i32], r: Rect, u: &Unit, bd: u32, out: &mut Band) {
     let set = SGR_PARAMS[u.set];
     let (r0, s0, r1, s1) = (set[0] as usize, set[1], set[2] as usize, set[3]);
     let aw = r.w + 2;
@@ -275,50 +276,71 @@ fn self_guided(win: &[i32], r: Rect, u: &Unit, bd: u32, out: &mut Plane) {
 }
 
 /// Applies loop restoration to the planes of `f` (which hold the CDEF output); `pre` holds the
-/// deblocked planes from before CDEF, which the stripe boundaries read.
-pub fn loop_restore(f: &mut FrameDec, pre: &[Plane; 3]) {
-    let bd = f.bd;
+/// deblocked planes from before CDEF, which the stripe boundaries read. Each 64-row stripe of a
+/// plane reads the input and writes its own rows of the output, so the stripes run in parallel.
+pub fn loop_restore(f: &mut FrameDec, pre: &[Plane; 3], threads: usize) {
     let mut out = f.planes.clone();
-    for plane in 0..f.num_planes {
-        if f.h.lr_type[plane] == RESTORE_NONE {
-            continue;
-        }
-        let (sx, sy) = if plane == 0 { (0, 0) } else { (f.ss[0], f.ss[1]) };
-        let pw = (f.h.upscaled_width as usize + sx) >> sx;
-        let ph = (f.h.height as usize + sy) >> sy;
-        let unit = f.h.lr_size[plane] as usize;
-        let lr = &f.lr[plane];
-        let mut src = Source { cdef: &f.planes[plane], pre: &pre[plane], pw: pw as isize, ph: ph as isize, ss: 0, se: 0 };
-        for m in 0.. {
-            // StripeStartY is 64 luma rows (offset by 8) per stripe; the first stripe starts above the frame.
-            let ss = (64 * m as isize - 8) >> sy;
-            if ss >= ph as isize {
-                break;
+    {
+        let f: &FrameDec = f;
+        let mut jobs = Vec::new();
+        for (plane, pl) in out.iter_mut().enumerate().take(f.num_planes) {
+            if f.h.lr_type[plane] == RESTORE_NONE {
+                continue;
             }
-            src.ss = ss;
-            src.se = ss + (64 >> sy) as isize - 1;
-            let y0 = ss.max(0) as usize;
-            let y1 = (src.se.min(ph as isize - 1)) as usize;
-            // Stripes never straddle a unit row (unit rows are offset by 8 luma rows too).
-            let ur = (lr.rows - 1).min((y0 + (8 >> sy)) / unit);
-            for uc in 0..lr.cols {
-                let x0 = uc * unit;
-                let x1 = if uc + 1 == lr.cols { pw } else { (uc + 1) * unit };
-                if x0 >= x1 {
-                    continue;
+            let sy = if plane == 0 { 0 } else { f.ss[1] };
+            let ph = (f.h.height as usize + sy) >> sy;
+            let stride = pl.stride;
+            // Consecutive stripes cover consecutive rows, so each takes the next rows of the plane.
+            let mut rest: &mut [u16] = &mut pl.data;
+            for m in 0.. {
+                let ss = (64 * m as isize - 8) >> sy;
+                if ss >= ph as isize {
+                    break;
                 }
-                let u = lr.u[ur * lr.cols + uc];
-                if u.typ == RESTORE_NONE {
-                    continue;
-                }
-                let r = Rect { x0, y0, w: x1 - x0, h: y1 + 1 - y0 };
-                let win = window(&src, r);
-                match u.typ {
-                    RESTORE_WIENER => wiener(&win, r, &u.wiener, bd, &mut out[plane]),
-                    _ => self_guided(&win, r, &u, bd, &mut out[plane]),
-                }
+                let y0 = ss.max(0) as usize;
+                let y1 = ((ss + (64 >> sy) as isize - 1).min(ph as isize - 1)) as usize;
+                let (head, tail) = std::mem::take(&mut rest).split_at_mut((y1 + 1 - y0) * stride);
+                rest = tail;
+                jobs.push((plane, m, Band { data: head, stride, row0: y0 }));
             }
         }
+        for_each_par(jobs, threads, |(plane, m, mut band)| lr_stripe(f, pre, plane, m, &mut band));
     }
     f.planes = out;
+}
+
+/// The restoration of stripe `m` of one plane, written to `out` (the rows of the stripe).
+fn lr_stripe(f: &FrameDec, pre: &[Plane; 3], plane: usize, m: usize, out: &mut Band) {
+    let bd = f.bd;
+    let (sx, sy) = if plane == 0 { (0, 0) } else { (f.ss[0], f.ss[1]) };
+    let pw = (f.h.upscaled_width as usize + sx) >> sx;
+    let ph = (f.h.height as usize + sy) >> sy;
+    let unit = f.h.lr_size[plane] as usize;
+    let lr = &f.lr[plane];
+    let mut src = Source { cdef: &f.planes[plane], pre: &pre[plane], pw: pw as isize, ph: ph as isize, ss: 0, se: 0 };
+    // StripeStartY is 64 luma rows (offset by 8) per stripe; the first stripe starts above the frame.
+    let ss = (64 * m as isize - 8) >> sy;
+    src.ss = ss;
+    src.se = ss + (64 >> sy) as isize - 1;
+    let y0 = ss.max(0) as usize;
+    let y1 = (src.se.min(ph as isize - 1)) as usize;
+    // Stripes never straddle a unit row (unit rows are offset by 8 luma rows too).
+    let ur = (lr.rows - 1).min((y0 + (8 >> sy)) / unit);
+    for uc in 0..lr.cols {
+        let x0 = uc * unit;
+        let x1 = if uc + 1 == lr.cols { pw } else { (uc + 1) * unit };
+        if x0 >= x1 {
+            continue;
+        }
+        let u = lr.u[ur * lr.cols + uc];
+        if u.typ == RESTORE_NONE {
+            continue;
+        }
+        let r = Rect { x0, y0, w: x1 - x0, h: y1 + 1 - y0 };
+        let win = window(&src, r);
+        match u.typ {
+            RESTORE_WIENER => wiener(&win, r, &u.wiener, bd, out),
+            _ => self_guided(&win, r, &u, bd, out),
+        }
+    }
 }

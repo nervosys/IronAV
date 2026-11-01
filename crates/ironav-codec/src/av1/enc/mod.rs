@@ -298,7 +298,7 @@ impl Av1Encoder {
         self.bases = bases;
 
         // the post filters, as the decoder runs them on the frame
-        postfilter(&mut f);
+        postfilter(&mut f, 1);
         let state = RefState {
             frame_type: f.h.frame_type,
             order_hint: f.h.order_hint,

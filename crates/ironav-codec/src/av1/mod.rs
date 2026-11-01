@@ -43,19 +43,52 @@ fn unsupported(msg: &str) -> Error {
 /// The post filters of a decoded frame, in the spec's order: deblocking, CDEF on the frame at its
 /// downscaled width, superres upscaling, then loop restoration on the upscaled frame. Restoration
 /// reads the deblocked planes beside each stripe, so they are kept (and upscaled) before CDEF.
-pub(crate) fn postfilter(f: &mut FrameDec) {
+pub(crate) fn postfilter(f: &mut FrameDec, threads: usize) {
     if f.h.lf_level[0] != 0 || f.h.lf_level[1] != 0 {
-        lf::deblock(f);
+        lf::deblock(f, threads);
     }
     let mut deblocked = f.h.uses_lr.then(|| f.planes.clone());
-    cdef::cdef(f);
+    cdef::cdef(f, threads);
     if let Some(pre) = deblocked.as_mut() {
         superres::upscale(f, pre);
     }
     superres::upscale_in_place(f);
     if let Some(pre) = deblocked {
-        lr::loop_restore(f, &pre);
+        lr::loop_restore(f, &pre, threads);
     }
+}
+
+/// A plane's rows from `row0` on, for one thread to filter: `data` holds whole rows of `stride`.
+pub(crate) struct Band<'a> {
+    pub data: &'a mut [u16],
+    pub stride: usize,
+    pub row0: usize,
+}
+
+/// Splits a plane into bands of `rows` rows, each with its first row.
+pub(crate) fn bands(p: &mut Plane, rows: usize) -> impl Iterator<Item = Band<'_>> {
+    let stride = p.stride;
+    p.data.chunks_mut(stride * rows).enumerate().map(move |(k, data)| Band { data, stride, row0: k * rows })
+}
+
+/// Runs `job` on every item, sharing the items round-robin over `threads` threads (on the
+/// caller's thread when that is 1).
+pub(crate) fn for_each_par<T: Send>(items: Vec<T>, threads: usize, job: impl Fn(T) + Sync) {
+    let n = threads.min(items.len()).max(1);
+    if n == 1 {
+        items.into_iter().for_each(job);
+        return;
+    }
+    let mut per: Vec<Vec<T>> = (0..n).map(|_| Vec::new()).collect();
+    for (i, it) in items.into_iter().enumerate() {
+        per[i % n].push(it);
+    }
+    std::thread::scope(|s| {
+        let job = &job;
+        for v in per {
+            s.spawn(move || v.into_iter().for_each(job));
+        }
+    });
 }
 
 #[derive(Clone)]
@@ -78,13 +111,22 @@ pub struct Av1Decoder {
     refs: [Option<RefSlot>; 8],
     cur: Option<Current>,
     out: Vec<Frame>,
+    /// The threads the post filters may use (1: the caller's thread).
+    threads: usize,
 }
 
 impl Av1Decoder {
     /// `extradata` is the av1C box (or Matroska CodecPrivate), whose config OBUs may hold the
-    /// sequence header.
+    /// sequence header. The post filters use up to as many threads as the machine has (12 at
+    /// most).
     pub fn new(extradata: &[u8]) -> Self {
-        let mut d = Av1Decoder { seq: None, refs: Default::default(), cur: None, out: Vec::new() };
+        Self::with_threads(extradata, std::thread::available_parallelism().map_or(1, |n| n.get()).min(12))
+    }
+
+    /// As `new`, with the post filters on up to `threads` threads; 1 runs them on the caller's
+    /// thread. The output is the same either way.
+    pub fn with_threads(extradata: &[u8], threads: usize) -> Self {
+        let mut d = Av1Decoder { seq: None, refs: Default::default(), cur: None, out: Vec::new(), threads: threads.max(1) };
         if extradata.len() > 4 && extradata[0] & 0x80 != 0 {
             if let Ok(obus) = split_obus(&extradata[4..]) {
                 for o in obus.iter().filter(|o| o.kind == OBU_SEQUENCE_HEADER) {
@@ -218,7 +260,7 @@ impl Av1Decoder {
     fn finish(&mut self, pts: i64) -> Result<()> {
         let Some(cur) = self.cur.take() else { return Ok(()) };
         let mut f = cur.f;
-        postfilter(&mut f);
+        postfilter(&mut f, self.threads);
         let mut cdfs = if f.h.disable_frame_end_update_cdf { cur.cdf } else { cur.saved.unwrap_or(cur.cdf) };
         cdfs.clear_counts();
         let h = &f.h;
