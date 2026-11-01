@@ -287,3 +287,49 @@ fn ironav_surround_opus_decodes_in_ironav() {
         }
     }
 }
+
+/// The stereo signal for a CELT test, as FFmpeg's lavfi inputs and `amerge` arguments: two tones
+/// (`tones`); one tone in both channels, the right at 70% and 0.5 ms later (`correlated`); and pink
+/// and white noise, each with its own tremolo, so the frames switch between long and short blocks
+/// (`noise`).
+fn stereo_signal(kind: &str) -> Vec<&'static str> {
+    let (left, right) = match kind {
+        "tones" => ("sine=440:d=2,aformat=channel_layouts=mono", "sine=660:d=2,aformat=channel_layouts=mono"),
+        "correlated" => ("sine=440:d=2,aformat=channel_layouts=mono", "sine=440:d=2,aformat=channel_layouts=mono,volume=0.7,adelay=0.5|0.5"),
+        _ => (
+            "anoisesrc=d=2:c=pink:a=0.3:seed=1,tremolo=f=3:d=1,aformat=channel_layouts=mono",
+            "anoisesrc=d=2:c=white:a=0.2:seed=2,tremolo=f=5:d=1,aformat=channel_layouts=mono",
+        ),
+    };
+    vec!["-f", "lavfi", "-i", left, "-f", "lavfi", "-i", right, "-filter_complex", "amerge"]
+}
+
+/// Stereo CELT at each frame size and bitrate, in the three signals above: IronAV's decode of
+/// FFmpeg's libopus CELT stream must match libopus's own decode to 2 LSB in every frame. (The
+/// noise bursts, with dual stereo and collapsed short blocks, were 780 LSB off before the decoder
+/// drew the anti-collapse noise band by band, as libopus does.)
+#[test]
+fn ffmpeg_stereo_celt_decodes_like_libopus() {
+    if !ffmpeg_available() {
+        eprintln!("skipped: ffmpeg is not on PATH");
+        return;
+    }
+    for kind in ["tones", "correlated", "noise"] {
+        for (ms, bitrate) in [("2.5", "64k"), ("5", "64k"), ("10", "64k"), ("20", "64k"), ("20", "32k"), ("20", "128k"), ("20", "256k")] {
+            let name = format!("{kind}-{ms}ms-{bitrate}");
+            let dir = scratch(&name);
+            let enc = dir.join(format!("{name}.opus"));
+            let mut args: Vec<&str> = stereo_signal(kind);
+            args.extend(["-c:a", "libopus", "-application", "lowdelay", "-frame_duration", ms, "-b:a", bitrate, enc.to_str().unwrap()]);
+            ffmpeg(&args);
+            let (channels, got) = ironav_decode(&enc, &dir);
+            assert_eq!(channels, 2, "{name}: IronAV's output channels");
+            let want = ffmpeg_libopus_decode(&enc);
+            let n = got.len().min(want.len());
+            assert!(n > 2 * RATE as usize, "{name}: {n} samples to compare");
+            let worst = got[..n].iter().zip(&want[..n]).map(|(a, b)| (*a as i32 - *b as i32).abs()).max().unwrap_or(0);
+            eprintln!("{name}: worst {worst} LSB against FFmpeg's libopus decode");
+            assert!(worst <= 2, "{name}: {worst} LSB from FFmpeg's libopus decode");
+        }
+    }
+}

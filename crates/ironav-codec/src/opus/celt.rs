@@ -1424,47 +1424,51 @@ impl Celt {
         }
     }
 
-    fn process_anticollapse(&mut self, ch: usize) {
-        let channels = self.p.coded_channels;
+    /// Anti-collapse over the coded channels. As libopus does, the bands are walked in order and,
+    /// within each band, the channels, so the noise generator is shared in that order.
+    fn process_anticollapse(&mut self) {
+        let channels = self.p.coded_channels as usize;
         let (start, end, size) = (self.p.start_band, self.p.end_band, self.p.size);
         for i in start..end {
-            let mut renormalize_needed = false;
             let range = (CELT_FREQ_RANGE[i] as usize) << size;
             // depth in 1/8 bits
             let depth = (1 + self.p.pulses[i]) / range as i32;
             let thresh = (-1.0 - 0.125 * depth as f32).exp2();
             let sqrt_1 = 1.0 / (range as f32).sqrt();
             let xoff = (CELT_FREQ_BANDS[i] as usize) << size;
-
-            let mut prev = [self.block[ch].prev_energy[0][i], self.block[ch].prev_energy[1][i]];
-            if channels == 1 {
-                prev[0] = prev[0].max(self.block[1].prev_energy[0][i]);
-                prev[1] = prev[1].max(self.block[1].prev_energy[1][i]);
-            }
-            let mut ediff = self.block[ch].energy[i] - prev[0].min(prev[1]);
-            ediff = ediff.max(0.0);
-
-            // r needs to be multiplied by 2 or 2*sqrt(2) depending on LM because short blocks don't
-            // have the same energy as long
-            let mut r = (1.0 - ediff).exp2();
-            if size == 3 {
-                r *= std::f32::consts::SQRT_2;
-            }
-            r = thresh.min(r) * sqrt_1;
-            for k in 0..(1usize << size) {
-                // Detect collapse
-                if self.block[ch].collapse_masks[i] & (1 << k) == 0 {
-                    // Fill with noise
-                    for j in 0..CELT_FREQ_RANGE[i] as usize {
-                        let v = if self.p.rng() & 0x8000 != 0 { r } else { -r };
-                        self.block[ch].coeffs[xoff + (j << size) + k] = v;
-                    }
-                    renormalize_needed = true;
+            for ch in 0..channels {
+                let mut renormalize_needed = false;
+                let mut prev = [self.block[ch].prev_energy[0][i], self.block[ch].prev_energy[1][i]];
+                if channels == 1 {
+                    prev[0] = prev[0].max(self.block[1].prev_energy[0][i]);
+                    prev[1] = prev[1].max(self.block[1].prev_energy[1][i]);
                 }
-            }
-            // We just added some energy, so we need to renormalize
-            if renormalize_needed {
-                renormalize(&mut self.block[ch].coeffs[xoff..xoff + range], 1.0);
+                let mut ediff = self.block[ch].energy[i] - prev[0].min(prev[1]);
+                ediff = ediff.max(0.0);
+
+                // r needs to be multiplied by 2 or 2*sqrt(2) depending on LM because short blocks don't
+                // have the same energy as long
+                let mut r = (1.0 - ediff).exp2();
+                if size == 3 {
+                    r *= std::f32::consts::SQRT_2;
+                }
+                r = thresh.min(r) * sqrt_1;
+                for k in 0..(1usize << size) {
+                    // Detect collapse
+                    if self.block[ch].collapse_masks[i] & (1 << k) == 0 {
+                        // Fill with noise
+                        for j in 0..CELT_FREQ_RANGE[i] as usize {
+                            let rnd = self.p.rng();
+                            let v = if rnd & 0x8000 != 0 { r } else { -r };
+                            self.block[ch].coeffs[xoff + (j << size) + k] = v;
+                        }
+                        renormalize_needed = true;
+                    }
+                }
+                // We just added some energy, so we need to renormalize
+                if renormalize_needed {
+                    renormalize(&mut self.block[ch].coeffs[xoff..xoff + range], 1.0);
+                }
             }
         }
     }
@@ -1561,10 +1565,10 @@ impl Celt {
         self.decode_final_energy(rc);
 
         // anti-collapse processing and denormalization of each coded channel
+        if anticollapse {
+            self.process_anticollapse();
+        }
         for i in 0..channels {
-            if anticollapse {
-                self.process_anticollapse(i);
-            }
             self.denormalize(i);
         }
 

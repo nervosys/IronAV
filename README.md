@@ -559,7 +559,7 @@ samples at 8, 12 and 16 kHz).
 
 **Checked against FFmpeg's native Opus decoder** (through PyAV) on fifteen streams made by libopus, plus a pure sine in CELT
 and in SILK: SILK narrow band at 20 ms, medium band at 10 ms and wide band at 20, 40 and 60 ms (mono and stereo); hybrid at 10
-and 20 ms; CELT at 2.5, 5, 10, 20 and 40 ms, mono and stereo. **CELT frames match to float rounding (about 138 dB SNR).**
+and 20 ms; CELT at 2.5, 5, 10, 20 and 40 ms, mono and stereo. **Mono CELT frames match to float rounding (about 138 dB SNR).** On stereo streams with collapsed bands FFmpeg's native decoder orders the anti-collapse noise differently from libopus, so the stereo CELT figures below are against libopus.
 Those SILK figures are from before the resampler was libopus's, and FFmpeg's native decoder is itself a few samples late of
 libopus in SILK, so the libopus comparison below is the one to read.
 
@@ -568,14 +568,11 @@ speech-like signal: narrow, medium and wide band SILK at 10 to 60 ms, hybrid at 
 The output lines up with libopus's sample for sample in every mode. Mono SILK and hybrid differ from libopus by a mean of 1 to
 7 LSB (SNR 45 to 63 dB), with the largest differences, up to 90 LSB, in loud voiced passages: SILK's synthesis is done in
 floating point here and in fixed point in libopus, and those passages are where the difference shows. In quiet passages of the 8 kHz
-stream about two thirds of the samples are exact. Stereo SILK has a mean of 1.5 to 4.6 LSB. **Stereo hybrid does not meet this yet**: its
-peaks reach 3681 LSB, and CELT-only stereo streams made the same way peak at 478 LSB (mono CELT is exact to 1 LSB), so the
-stereo difference is in CELT rather than in the SILK resampler; it is not isolated yet. On a harmonic-tone signal, where
+stream about two thirds of the samples are exact. Stereo SILK has a mean of 1.5 to 4.6 LSB. **Stereo CELT** (2.5 to 20 ms, 32 to 256 kb/s, tones, correlated channels and noise bursts with tremolo) decodes to within 1 LSB of libopus, as mono does. The fault was the order of the anti-collapse noise: libopus draws it band by band, both channels in turn, and this decoder drew it channel by channel (as FFmpeg's native decoder still does). **Stereo hybrid** then matches on its CELT bands: on tonal input it is exact (about 106 dB), and on speech-like input it peaks at 41 LSB (117 LSB on the test asset), a broadband error 35 to 45 dB below the signal that is most likely SILK's (not isolated). On a harmonic-tone signal, where
 each channel has its own pitch (`opus_silk_and_hybrid_in_every_bandwidth_decode_like_libopus`, which runs every mode), tones are
 harder for SILK: mono SILK is 38 to 50 dB against libopus, and stereo SILK 27 to 53 dB, with peaks of 3267 LSB at wide band
 and 40 or 60 ms; the stereo hybrid is exact there (about 100 dB, worst 1 LSB). The stereo SILK case is not isolated (the
-stereo prediction is the suspect). Every mode lines up with libopus at lag 0. The regression tests are FFmpeg's decode of the
-CELT streams (within 3 LSB) and libopus's decode of the SILK and hybrid ones (above 35 dB, 25 dB for stereo).
+stereo prediction is the suspect). Every mode lines up with libopus at lag 0. The regression tests are libopus's decode of the CELT streams (mono and stereo, within 2 LSB; stereo CELT across frame sizes, bitrates and signals in `opus_multichannel.rs`), and libopus's decode of the SILK and hybrid ones (above 35 dB, 25 dB for stereo).
 **Multichannel Opus** (channel-mapping families 1 and 255, in Ogg, Matroska, WebM and MP4 `dOps`): each stream is decoded as
 above and routed by the mapping table; family 1 comes out in WAV and FFmpeg channel order, as the Vorbis decoder does. FFmpeg's
 libopus files of 4, 6 and 8 channels (family 1) decode to within one LSB of libopus where their streams are CELT. A family 255 file

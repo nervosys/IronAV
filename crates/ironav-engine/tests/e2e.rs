@@ -769,8 +769,7 @@ fn aac_matches_ffmpeg(scratch_name: &str, file: &str) {
 /// Decode an Opus file and compare it with a reference decode of the same packets (pre-skip removed
 /// in both; ours keeps the encoder's trailing padding, which the reference trims). Returns the SNR
 /// in dB and the worst difference in LSB. `reference` is the file in tests/data holding the
-/// reference decode as 16-bit samples: libopus's (`ffmpeg -c:a libopus`) for SILK and hybrid, and
-/// FFmpeg's native decoder's for CELT, which agrees with libopus.
+/// reference decode as 16-bit samples: libopus's (`ffmpeg -c:a libopus`) in every mode.
 /// `late` is how many samples (interleaved) the reference runs behind ours.
 fn opus_vs_reference(file: &str, ext: &str, late: usize, reference: &str) -> (f64, i32) {
     let dir = scratch(&format!("opus-{file}-{ext}"));
@@ -836,16 +835,18 @@ fn mp3_decodes_to_what_ffmpeg_decodes() {
 /// The same packets in an Ogg file decode to the same samples as in Matroska.
 #[test]
 fn ogg_opus_decodes_like_the_same_packets_in_matroska() {
-    let (snr, worst) = opus_vs_reference("opus_celt_stereo", "opus", 0, "opus_celt_stereo.ffmpeg.s16");
-    assert!(worst <= 3, "largest difference from FFmpeg is {worst} LSB (SNR {snr:.1} dB)");
+    let (snr, worst) = opus_vs_reference("opus_celt_stereo", "opus", 0, "opus_celt_stereo.libopus.s16");
+    assert!(worst <= 2, "largest difference from libopus is {worst} LSB (SNR {snr:.1} dB)");
     let (snr, _) = opus_vs_reference("opus_silk_mono", "opus", 0, "opus_silk_mono.libopus.s16");
     assert!(snr > 35.0, "SNR against libopus is only {snr:.1} dB");
 }
 
+/// CELT (stereo, with dual stereo, intensity and collapsed bands) decodes to what libopus decodes, to
+/// 2 LSB: the reference is libopus's own decode of the file (`ffmpeg -c:a libopus`).
 #[test]
-fn celt_opus_decodes_to_what_ffmpeg_decodes() {
-    let (snr, worst) = opus_vs_reference("opus_celt_stereo", "mka", 0, "opus_celt_stereo.ffmpeg.s16");
-    assert!(worst <= 3, "largest difference from FFmpeg is {worst} LSB (SNR {snr:.1} dB)");
+fn celt_opus_decodes_to_what_libopus_decodes() {
+    let (snr, worst) = opus_vs_reference("opus_celt_stereo", "mka", 0, "opus_celt_stereo.libopus.s16");
+    assert!(worst <= 2, "largest difference from libopus is {worst} LSB (SNR {snr:.1} dB)");
 }
 
 /// SILK and hybrid frames decode to what libopus decodes, to a few LSB: the resampler is libopus's,
@@ -863,8 +864,8 @@ fn silk_and_hybrid_opus_decode_close_to_what_libopus_decodes() {
 /// harmonic tone mix in each mode, and IronAV's decode of each file is compared with libopus's
 /// decode of the same file. Narrow band is coded from 8 kHz input and medium band from 12 kHz, which
 /// is how libopus picks the bandwidth. The output must be in step with libopus's (least mean
-/// difference at lag 0) and above 35 dB SNR; the stereo hybrid streams above 25 dB, as their CELT
-/// stereo differs from libopus's (see the README). The differences on this tonal signal are larger
+/// difference at lag 0) and above 35 dB SNR (25 dB for stereo, whose SILK is not isolated; see the
+/// README). The differences on this tonal signal are larger
 /// than on speech (SILK's own synthesis, see the README).
 #[test]
 fn opus_silk_and_hybrid_in_every_bandwidth_decode_like_libopus() {
