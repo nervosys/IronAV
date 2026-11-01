@@ -357,7 +357,18 @@ impl<'a> Coder<'a> {
     /// the eight half-sample neighbours of the best. Returns the vector and its cost.
     fn search(&mut self, refp: &Pic, mbx: usize, mby: usize, pred: [i32; 2]) -> ([i32; 2], u32) {
         let clampv = |m: [i32; 2]| [m[0].clamp(-SEARCH, SEARCH), m[1].clamp(-SEARCH, SEARCH)];
+        // a vector whose block, half-sample taps included, would read outside the picture is not used: the
+        // decoders disagree on such reads (FFmpeg does not clamp them to the edge)
+        let (x0, y0) = (16 * mbx as i32, 16 * mby as i32);
+        let (w, h) = (self.geo.width as i32, self.geo.height as i32);
+        let inside = |m: [i32; 2]| {
+            let (x, y) = (x0 + (m[0] >> 1), y0 + (m[1] >> 1));
+            x >= 0 && y >= 0 && x + 16 + (m[0] & 1) <= w && y + 16 + (m[1] & 1) <= h
+        };
         let mut best = clampv(pred);
+        if !inside(best) {
+            best = [0, 0];
+        }
         let mut bc = self.mv_cost(refp, mbx, mby, pred, best);
         let c = self.mv_cost(refp, mbx, mby, pred, [0, 0]);
         if c < bc {
@@ -368,7 +379,7 @@ impl<'a> Coder<'a> {
             let mut moved = false;
             for d in [[2, 0], [-2, 0], [0, 2], [0, -2]] {
                 let m = clampv([best[0] + d[0], best[1] + d[1]]);
-                if m == best {
+                if m == best || !inside(m) {
                     continue;
                 }
                 let c = self.mv_cost(refp, mbx, mby, pred, m);
@@ -386,7 +397,7 @@ impl<'a> Coder<'a> {
         for dy in -1..=1 {
             for dx in -1..=1 {
                 let m = clampv([centre[0] + dx, centre[1] + dy]);
-                if (dx == 0 && dy == 0) || m == centre {
+                if (dx == 0 && dy == 0) || m == centre || !inside(m) {
                     continue;
                 }
                 let c = self.mv_cost(refp, mbx, mby, pred, m);
