@@ -920,10 +920,10 @@ reconstruction bit for bit, and libaom decodes the same pictures (`inter_frames_
 
 Speed: at 720p (FFmpeg's testsrc2, 60 frames, the default key interval) the encoder runs at about 5 frames a second at qp 20, 30 and 40, against about 1.6 before the open-loop planner, the motion search and the transform bases were made cheaper. Its files are 1 to 3.5 % smaller than before at the same or a slightly higher PSNR.
 
-Checked bit for bit against FFmpeg's libdav1d (through PyAV) on SVT-AV1 output: 27 clips from 128x128 to 3840x2160, including odd sizes, 10-bit, film grain
+The GPU decoder is checked bit for bit against FFmpeg's libdav1d (through PyAV) on SVT-AV1 output: 27 clips from 128x128 to 3840x2160, including odd sizes, 10-bit, film grain
 (8-bit and 10-bit; the grain is applied, and matches libdav1d's), several key frames, hierarchical prediction with overlay frames, screen-content tools,
 loop restoration and CDEF, superres, and WebM, Matroska and MP4 files. All match on every frame. Three small clips are kept as the
-`av1_decodes_on_the_gpu_to_what_dav1d_decodes_or_refuses_precisely` test, which on a machine without a GPU checks the refusal instead.
+`av1_decodes_on_the_gpu_to_what_dav1d_decodes_or_refuses_precisely` test, which on a machine without a GPU checks the software decoder against the same pictures.
 
 ## JPEG
 

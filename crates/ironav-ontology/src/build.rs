@@ -20,7 +20,7 @@ fn codec_meta(c: CodecId) -> (&'static str, &'static str) {
         Alac => ("ALAC", "Apple Lossless audio compression."),
         RawVideo => ("Raw video", "Uncompressed planar or packed video frames."),
         H264 => ("H.264 / AVC", "Lossy video codec (ITU-T H.264); the most widely supported and hardware-accelerated."),
-        Hevc => ("H.265 / HEVC", "Lossy video codec; about 30-50% smaller than H.264 at equal quality."),
+        Hevc => ("H.265 / HEVC", "Lossy video codec; the successor to H.264, with smaller files at equal quality."),
         Av1 => ("AV1", "Royalty-free lossy video codec from AOMedia; best compression, growing hardware support."),
         Vp8 => ("VP8", "Lossy video codec used in early WebM."),
         Vp9 => ("VP9", "Royalty-free lossy video codec from Google; WebM and YouTube."),
