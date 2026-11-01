@@ -2,7 +2,7 @@
 //! with the engine's decoder for the stream to what FFmpeg's decoder makes of the same file. Skipped
 //! without `ffmpeg` on PATH.
 
-use ironav_core::{CodecId, Demuxer, Frame, Packet, StreamParams};
+use ironav_core::{AudioFrame, CodecId, Demuxer, Encoder, Frame, Packet, Rational, StreamInfo, StreamParams};
 use ironav_formats::open_demuxer;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -210,24 +210,121 @@ fn mp4_ac3_matches_ffmpeg() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// AC-3 is read but not written: the MP4 writer refuses it, and the Matroska and raw paths keep working.
-#[test]
-fn ac3_is_not_written_to_mp4() {
-    let dir = scratch();
-    let out = dir.join("refused.mp4");
-    let stream = ironav_core::StreamInfo {
+/// A stream of IronAV's own AC-3 encoder: `seconds` of a tone on each channel, as packets.
+fn ironav_packets(channels: usize, acmod: usize, lfe: bool, kbps: u32) -> (StreamInfo, Vec<Packet>) {
+    let rate = 48000u32;
+    let n = rate as usize * 2;
+    let mut samples = Vec::with_capacity(n * channels);
+    for i in 0..n {
+        for c in 0..channels {
+            let f = 440.0 * (c + 1) as f64;
+            samples.push(0.3 * (2.0 * std::f64::consts::PI * f * i as f64 / rate as f64).sin());
+        }
+    }
+    let mut enc = ironav_codec::ac3::Ac3Encoder::with_mode(rate, acmod, lfe, kbps * 1000).expect("an encoder for the mode");
+    let frame = Frame::Audio(AudioFrame { sample_rate: rate, channels: channels as u16, pts: 0, samples });
+    let mut packets = enc.encode(&frame).expect("encoding");
+    packets.extend(enc.flush().expect("the last frame"));
+    let stream = StreamInfo {
         index: 0,
         codec: CodecId::Ac3,
-        time_base: ironav_core::Rational::new(1, 48000),
+        time_base: Rational::new(1, rate as i64),
         duration: None,
         bits: None,
         extradata: Vec::new(),
         lead_in: 0,
-        params: StreamParams::Audio { sample_rate: 48000, channels: 2 },
+        params: StreamParams::Audio { sample_rate: rate, channels: channels as u16 },
     };
-    let mut muxer = ironav_formats::create_muxer(&out, "mp4").expect("an MP4 writer");
-    let err = muxer.write_header(&[stream]).expect_err("AC-3 is refused");
-    assert_eq!(err.code, ironav_core::ErrorCode::UnsupportedCodec);
+    (stream, packets)
+}
+
+/// The packets of one AC-3 stream written with the formats registry's muxer for `format`.
+fn write_with(file: &Path, format: &str, stream: &StreamInfo, packets: &[Packet]) {
+    let mut muxer = ironav_formats::create_muxer(file, format).expect("a muxer for the format");
+    muxer.write_header(std::slice::from_ref(stream)).expect("the header");
+    for p in packets {
+        muxer.write_packet(p).expect("the packet");
+    }
+    muxer.finish().expect("the trailer");
+}
+
+/// IronAV's AC-3 written into each container: FFmpeg's probe names it AC-3 with the channel count,
+/// our demuxer reads back the packets it was given, byte for byte, and FFmpeg's decode of the file is
+/// what IronAV's decoder makes of those packets. Written as an elementary stream, MP4 (ac-3 with dac3),
+/// Matroska (A_AC3) and MPEG-TS (stream type 0x81 with the AC-3 descriptor).
+#[test]
+fn ac3_written_by_ironav_reads_back_and_plays_in_ffmpeg() {
+    if !ffmpeg_available() {
+        eprintln!("skipped: ffmpeg is not on PATH");
+        return;
+    }
+    let dir = scratch();
+    // (file, format, channels, acmod, lfe, kbit/s)
+    let cases = [
+        ("stereo.ac3", "ac3", 2usize, 2usize, false, 192u32),
+        ("stereo.mkv", "mkv", 2, 2, false, 192),
+        ("stereo.mp4", "mp4", 2, 2, false, 192),
+        ("stereo.ts", "mpegts", 2, 2, false, 192),
+        ("surround.mp4", "mp4", 6, 7, true, 384),
+        ("surround.ts", "mpegts", 6, 7, true, 384),
+    ];
+    for (name, format, channels, acmod, lfe, kbps) in cases {
+        let (stream, packets) = ironav_packets(channels, acmod, lfe, kbps);
+        let file = dir.join(name);
+        write_with(&file, format, &stream, &packets);
+
+        let probe = Command::new("ffprobe")
+            .args(["-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_name,sample_rate,channels", "-of", "csv=p=0"])
+            .arg(&file)
+            .output()
+            .expect("ffprobe runs");
+        // the first CSV line is codec_name,sample_rate,channels (MP4 adds an empty trailing field; FFmpeg's
+        // own AC-3 transport streams list the stream twice, which is why only the first line is taken)
+        let line = String::from_utf8_lossy(&probe.stdout).lines().next().unwrap_or_default().trim().to_string();
+        let text = line.split(',').take(3).collect::<Vec<_>>().join(",");
+        assert_eq!(text, format!("ac3,48000,{channels}"), "{name}: FFmpeg's probe ({line})");
+
+        let mut d = open_demuxer(&file).expect("the file opens");
+        let mut read_back = Vec::new();
+        while let Some(p) = d.read_packet().expect("a packet") {
+            read_back.push(p.data);
+        }
+        let written: Vec<Vec<u8>> = packets.iter().map(|p| p.data.clone()).collect();
+        assert_eq!(read_back.len(), written.len(), "{name}: packet count");
+        assert!(read_back == written, "{name}: the packets read back differ from the packets written");
+
+        let want = reference(&dir, name, &file);
+        let (got, _, _) = demux_and_decode(&file);
+        // IronAV's decoder and FFmpeg's agree to about 1e-4 on these streams (the decoders' float
+        // rounding), which is the bound here; a container that lost or moved a frame misses by far more
+        assert_eq!(got.len(), want.len(), "{name}: sample count");
+        let worst = got.iter().zip(&want).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+        eprintln!("{name:>14}: FFmpeg probe {text}; packets read back exactly; decode worst difference {worst:.2e}");
+        assert!(worst < 2e-4, "{name}: decoded samples differ by {worst}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// AC-3 written to a raw file and read by FFmpeg, which probes it as AC-3 (so the syncframes chain).
+#[test]
+fn ac3_written_raw_plays_in_ffmpeg() {
+    if !ffmpeg_available() {
+        eprintln!("skipped: ffmpeg is not on PATH");
+        return;
+    }
+    let dir = scratch();
+    let (stream, packets) = ironav_packets(2, 2, false, 192);
+    let file = dir.join("raw.ac3");
+    write_with(&file, "ac3", &stream, &packets);
+    let bytes = std::fs::read(&file).unwrap();
+    let total: usize = packets.iter().map(|p| p.data.len()).sum();
+    assert_eq!(bytes.len(), total, "the raw file is the syncframes, nothing between them");
+    let probe = Command::new("ffprobe")
+        .args(["-v", "error", "-show_entries", "format=format_name", "-of", "default=nw=1"])
+        .arg(&file)
+        .output()
+        .expect("ffprobe runs");
+    assert!(String::from_utf8_lossy(&probe.stdout).contains("format_name=ac3"), "FFmpeg's probe of the raw file");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

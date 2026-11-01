@@ -8,11 +8,15 @@
 //!
 //! Not handled: streams that change sample rate or channel count partway (the frames after the
 //! change are dropped).
+//!
+//! Written: the packets are the syncframes, one after another, with nothing between them, which is
+//! what FFmpeg's raw AC-3 muxer writes.
 
 use crate::mp4demux::{Config, Mp4Demuxer, Sample, TrackInfo};
+use crate::WriteSeek;
 use ironav_codec::ac3::frame_info;
-use ironav_core::{CodecId, Error, ErrorCode, Rational, Result, StreamInfo, StreamParams};
-use std::io::{Read, Seek, SeekFrom};
+use ironav_core::{CodecId, Error, ErrorCode, Muxer, Packet, Rational, Result, StreamInfo, StreamParams};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 /// The largest file whose frames are indexed.
 const MAX_SCAN: u64 = 2 << 30;
@@ -81,4 +85,46 @@ pub fn open<R: Read + Seek + Send>(mut r: R) -> Result<Mp4Demuxer<R>> {
     };
     let track = TrackInfo { stream, config: Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma: 1 }, convert: false, swap: 0, unwrap: Vec::new() };
     Ok(Mp4Demuxer::from_parts(r, "ac3", vec![track], samples))
+}
+
+/// Writes a raw AC-3 file: each packet's syncframe bytes, one frame after another.
+pub struct Ac3Muxer {
+    out: Box<dyn WriteSeek>,
+    ready: bool,
+}
+
+impl Ac3Muxer {
+    pub fn new(out: Box<dyn WriteSeek>) -> Self {
+        Self { out, ready: false }
+    }
+}
+
+impl Muxer for Ac3Muxer {
+    fn write_header(&mut self, streams: &[StreamInfo]) -> Result<()> {
+        let [s] = streams else {
+            return Err(Error::invalid_arg("a raw AC-3 file holds exactly one audio stream"));
+        };
+        if s.codec != CodecId::Ac3 {
+            return Err(Error::new(ErrorCode::UnsupportedCodec, format!("a raw AC-3 file can only hold AC-3, not {}", s.codec.name())).alternatives(["ac3"]));
+        }
+        self.ready = true;
+        Ok(())
+    }
+
+    fn write_packet(&mut self, p: &Packet) -> Result<()> {
+        if !self.ready {
+            return Err(Error::new(ErrorCode::Internal, "packet before the header"));
+        }
+        let whole = frame_info(&p.data).is_ok_and(|i| i.offset == 0 && i.frame_size == p.data.len());
+        if !whole {
+            return Err(Error::invalid_input("a raw AC-3 packet must be one AC-3 syncframe"));
+        }
+        self.out.write_all(&p.data)?;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        self.out.flush()?;
+        Ok(())
+    }
 }

@@ -120,6 +120,20 @@ pub fn frame_info(data: &[u8]) -> Result<FrameInfo> {
     Ok(FrameInfo { offset, frame_size: hdr.frame_size, sample_rate: hdr.sample_rate, channels: hdr.channels as u16 })
 }
 
+/// The 3-byte body of the `dac3` box (ETSI TS 102 366, annex F) for the frame at the start of `data`:
+/// fscod (2 bits), bsid (5), bsmod (3), acmod (3), lfeon (1), bit_rate_code (5), reserved (5).
+pub fn dac3_body(data: &[u8]) -> Option<[u8; 3]> {
+    let offset = sync_offset(data).ok()?;
+    let frame = unswapped(&data[offset..]);
+    let hdr = parse_header(&mut BitReader::new(&frame)).ok()?;
+    let fscod = frame[4] >> 6;
+    let bit_rate_code = (frame[4] & 0x3F) >> 1; // frmsizecod, which pairs two frame sizes per bit rate
+    let bsmod = frame[5] & 7;
+    let bits = (fscod as u32) << 22 | hdr.bsid << 17 | (bsmod as u32) << 14 | (hdr.acmod as u32) << 11 | (hdr.lfe_on as u32) << 10 | (bit_rate_code as u32) << 5;
+    let b = bits.to_be_bytes();
+    Some([b[1], b[2], b[3]])
+}
+
 /// Where the sync word of the frame at the start of `data` is: at most 10 bytes in.
 fn sync_offset(data: &[u8]) -> Result<usize> {
     header::find_syncword(data).filter(|&i| i <= 10).ok_or_else(|| Error::invalid_input("AC-3: no sync word at the start of the data"))

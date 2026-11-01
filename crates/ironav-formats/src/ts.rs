@@ -24,8 +24,11 @@
 //! makes; the end trim is the part of a packet that is not shown. FFmpeg's decoder does not apply
 //! the trims, so its output of such a stream keeps the pre-skip samples.
 //!
-//! Not handled: AC-3 and MPEG-2 video (skipped when reading, refused when writing), more than
-//! one program, and PMT changes after the first.
+//! AC-3 is written as stream type 0x81 with the `AC-3` registration descriptor, the way FFmpeg writes
+//! it by default (the DVB descriptor 0x6A form is read, not written), in private_stream_1 PES packets.
+//!
+//! Not handled: MPEG-2 video (skipped when reading, refused when writing), more than one program, and
+//! PMT changes after the first.
 
 use crate::stream::{StreamDemuxer, StreamPacket};
 use crate::{adts, WriteSeek};
@@ -94,6 +97,8 @@ fn codec_of(stream_type: u8) -> Option<CodecId> {
 /// Opus is always 48 kHz in a transport stream, and its PES has stream_id private_stream_1.
 const OPUS_RATE: i64 = 48_000;
 const PRIVATE_STREAM_1: u8 = 0xBD;
+/// The registration descriptor (tag 0x05) that marks an AC-3 stream of stream type 0x81.
+const AC3_REGISTRATION: [u8; 6] = [0x05, 4, b'A', b'C', b'-', b'3'];
 /// The number of streams and coupled streams, and the channel mapping table, of the channel
 /// configuration codes 1 to 8 (indexed by the code), as the descriptor names them.
 const OPUS_STREAMS: [u8; 9] = [1, 1, 1, 2, 2, 3, 4, 4, 5];
@@ -1089,10 +1094,16 @@ impl TsMuxer {
                 CodecId::Hevc => 0x24,
                 CodecId::Aac => 0x0F,
                 CodecId::Opus => 0x06,
+                CodecId::Ac3 => 0x81,
                 _ => 0x03,
             };
-            // Opus: the registration descriptor 'Opus' and the extension descriptor naming the configuration
-            let desc = s.opus.map(|(code, _)| vec![0x05, 4, b'O', b'p', b'u', b's', 0x7F, 2, 0x80, code]).unwrap_or_default();
+            // Opus: the registration descriptor 'Opus' and the extension descriptor naming the configuration;
+            // AC-3: the registration descriptor 'AC-3'
+            let desc = if s.codec == CodecId::Ac3 {
+                AC3_REGISTRATION.to_vec()
+            } else {
+                s.opus.map(|(code, _)| vec![0x05, 4, b'O', b'p', b'u', b's', 0x7F, 2, 0x80, code]).unwrap_or_default()
+            };
             body.extend_from_slice(&[ty, 0xE0 | (s.pid >> 8) as u8, s.pid as u8, 0xF0 | (desc.len() >> 8) as u8, desc.len() as u8]);
             body.extend_from_slice(&desc);
         }
@@ -1113,7 +1124,7 @@ impl Muxer for TsMuxer {
         let video = streams.iter().position(|s| s.params.media_type() == ironav_core::MediaType::Video);
         for (i, s) in streams.iter().enumerate() {
             let (adts, opus) = match s.codec {
-                CodecId::H264 | CodecId::Hevc | CodecId::Mp3 | CodecId::Mp2 => (None, None),
+                CodecId::H264 | CodecId::Hevc | CodecId::Mp3 | CodecId::Mp2 | CodecId::Ac3 => (None, None),
                 CodecId::Aac => {
                     let [a, b, ..] = s.extradata[..] else {
                         return Err(Error::new(ErrorCode::UnsupportedFormat, "AAC in a transport stream needs the AudioSpecificConfig").hint("encode to aac, or copy from a file that carries it"));
@@ -1132,7 +1143,7 @@ impl Muxer for TsMuxer {
                     (None, Some((code, u16::from_le_bytes([s.extradata[10], s.extradata[11]]) as u32)))
                 }
                 c => {
-                    return Err(Error::new(ErrorCode::UnsupportedCodec, format!("a transport stream cannot hold {} here", c.name())).alternatives(["h264", "hevc", "aac", "mp3", "opus", "mp2"]));
+                    return Err(Error::new(ErrorCode::UnsupportedCodec, format!("a transport stream cannot hold {} here", c.name())).alternatives(["h264", "hevc", "aac", "mp3", "opus", "mp2", "ac3"]));
                 }
             };
             // video first, so it gets 0x100 and carries the PCR
@@ -1231,7 +1242,7 @@ impl Muxer for TsMuxer {
         }
         let stream_id = if video {
             0xE0
-        } else if codec == CodecId::Opus {
+        } else if matches!(codec, CodecId::Opus | CodecId::Ac3) {
             PRIVATE_STREAM_1
         } else {
             0xC0

@@ -159,6 +159,15 @@ impl Track {
         matches!(self.kind, Kind::Video { .. })
     }
 
+    /// The `dac3` body of an AC-3 track, taken from the first packet that holds a syncframe.
+    fn ac3_config(&mut self, data: &[u8]) -> Result<()> {
+        if self.codec == CodecId::Ac3 && self.config.is_empty() {
+            let body = ironav_codec::ac3::dac3_body(data).ok_or_else(|| Error::invalid_input("an AC-3 packet holds no syncframe that MP4 can describe"))?;
+            self.config = body.to_vec();
+        }
+        Ok(())
+    }
+
     fn is_hevc(&self) -> bool {
         self.codec == CodecId::Hevc
     }
@@ -168,6 +177,7 @@ impl Track {
             Kind::Video { width, height } => self.video_entry(width, height),
             Kind::Audio { rate, channels, bits } if self.codec == CodecId::Aac => Ok(self.aac_entry(rate, channels, bits)),
             Kind::Audio { rate, channels, bits } if self.codec == CodecId::Mp2 => Ok(self.mp4a_entry(rate, channels, bits, 0x69, &[])),
+            Kind::Audio { rate, channels, bits } if self.codec == CodecId::Ac3 => Ok(self.ac3_entry(rate, channels, bits)),
             Kind::Audio { rate, channels, bits } if self.codec == CodecId::Alac => Ok(self.alac_entry(rate, channels, bits)),
             Kind::Audio { rate, channels, bits } if self.codec.sample_format().is_some() => Ok(self.lpcm_entry(rate, channels, bits)),
             Kind::Audio { rate, channels, bits } => Ok(self.audio_entry(rate, channels, bits)),
@@ -258,6 +268,19 @@ impl Track {
         e.extend_from_slice(&(channels as u32 * bits as u32 / 8).to_be_bytes()); // bytes per frame
         e.extend_from_slice(&1u32.to_be_bytes()); // frames per packet
         bx(b"lpcm", &e)
+    }
+
+    /// `ac-3` sample entry with the `dac3` box that describes the first syncframe (`self.config`).
+    fn ac3_entry(&self, rate: u32, channels: u16, bits: u8) -> Vec<u8> {
+        let mut e = vec![0u8; 6];
+        e.extend_from_slice(&1u16.to_be_bytes()); // data reference index
+        e.extend_from_slice(&[0u8; 8]);
+        e.extend_from_slice(&channels.to_be_bytes());
+        e.extend_from_slice(&(bits as u16).to_be_bytes());
+        e.extend_from_slice(&[0u8; 4]); // pre-defined, reserved
+        e.extend_from_slice(&(rate << 16).to_be_bytes());
+        e.extend_from_slice(&bx(b"dac3", &self.config));
+        bx(b"ac-3", &e)
     }
 
     /// `fLaC` sample entry with a `dfLa` box holding the STREAMINFO metadata block (FLAC in ISO BMFF).
@@ -796,6 +819,7 @@ impl Mp4Muxer {
             if p.duration <= 0 {
                 return Err(Error::new(ErrorCode::Internal, "audio packet has no duration"));
             }
+            tr.ac3_config(&p.data)?;
             (p.data.clone(), true, p.duration as u32, None)
         };
         if sample.len() > u32::MAX as usize {
@@ -907,7 +931,7 @@ impl Muxer for Mp4Muxer {
                     }
                     (Kind::Audio { rate: *sample_rate, channels: *channels, bits: 16 }, *sample_rate, 0)
                 }
-                (StreamParams::Audio { sample_rate, channels }, CodecId::Mp2) => (Kind::Audio { rate: *sample_rate, channels: *channels, bits: 16 }, *sample_rate, 0),
+                (StreamParams::Audio { sample_rate, channels }, CodecId::Mp2 | CodecId::Ac3) => (Kind::Audio { rate: *sample_rate, channels: *channels, bits: 16 }, *sample_rate, 0),
                 (StreamParams::Audio { sample_rate, channels }, c) if self.quicktime && c.sample_format().is_some() => {
                     (Kind::Audio { rate: *sample_rate, channels: *channels, bits: pcm_bits(c) }, *sample_rate, 0)
                 }
@@ -919,8 +943,8 @@ impl Muxer for Mp4Muxer {
                     (Kind::Audio { rate: *sample_rate, channels: *channels, bits: s.bits.unwrap_or(16) }, *sample_rate, 0)
                 }
                 _ => {
-                    return Err(Error::new(ErrorCode::UnsupportedCodec, format!("this MP4 writer holds h264, hevc, vp9 and av1 (copied), aac (copied or encoded), mp2, flac and alac, not {}", s.codec.name()))
-                        .alternatives(["h264", "hevc", "vp9", "av1", "aac", "mp2", "flac", "alac"]));
+                    return Err(Error::new(ErrorCode::UnsupportedCodec, format!("this MP4 writer holds h264, hevc, vp9 and av1 (copied), aac (copied or encoded), mp2, ac3, flac and alac, not {}", s.codec.name()))
+                        .alternatives(["h264", "hevc", "vp9", "av1", "aac", "mp2", "ac3", "flac", "alac"]));
                 }
             };
             // the av1C record's configuration OBUs may hold the sequence header
@@ -947,7 +971,7 @@ impl Muxer for Mp4Muxer {
                 pts: Vec::new(),
                 params: ParamSets::default(),
                 flac: FlacStats::new(),
-                config: if s.codec == CodecId::Vp9 { Vec::new() } else { s.extradata.clone() },
+                config: if matches!(s.codec, CodecId::Vp9 | CodecId::Ac3) { Vec::new() } else { s.extradata.clone() },
                 av1_still,
                 lead_in: s.lead_in.max(0),
                 declared: s.duration,
@@ -1011,6 +1035,7 @@ impl Muxer for Mp4Muxer {
             if p.duration <= 0 {
                 return Err(Error::new(ErrorCode::Internal, "audio packet has no duration"));
             }
+            tr.ac3_config(&p.data)?;
             (p.data.clone(), false, p.duration as u32)
         };
         if sample.len() > u32::MAX as usize {

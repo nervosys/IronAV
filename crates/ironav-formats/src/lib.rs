@@ -94,11 +94,11 @@ pub static FORMATS: &[FormatSpec] = &[
     FormatSpec {
         name: "mp4",
         extensions: &["mp4", "m4a", "m4v"],
-        description: "MP4 (ISO BMFF) with H.264 or HEVC video (or VP9 or AV1 copied from another file, or MPEG-4 Part 2 `mp4v` video, copied or encoded by IronAV) and optionally AAC, MP2, FLAC or ALAC audio (AAC copied or encoded, MP2 encoded or copied). Read as well as written; written with the index first (fast-start), or fragmented (moov, then a moof and mdat per fragment) when a fragment length is given; fragmented files are read too",
+        description: "MP4 (ISO BMFF) with H.264 or HEVC video (or VP9 or AV1 copied from another file, or MPEG-4 Part 2 `mp4v` video, copied or encoded by IronAV) and optionally AAC, MP2, AC-3, FLAC or ALAC audio (AAC copied or encoded, MP2 encoded or copied, AC-3 copied or encoded, with its dac3 box). Read as well as written; written with the index first (fast-start), or fragmented (moov, then a moof and mdat per fragment) when a fragment length is given; fragmented files are read too",
         media: MediaType::Video,
         demux: true,
         mux: true,
-        codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Mpeg4, CodecId::Vp9, CodecId::Av1, CodecId::Aac, CodecId::Mp2, CodecId::Flac, CodecId::Alac],
+        codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Mpeg4, CodecId::Vp9, CodecId::Av1, CodecId::Aac, CodecId::Mp2, CodecId::Ac3, CodecId::Flac, CodecId::Alac],
     },
     FormatSpec {
         name: "mov",
@@ -148,10 +148,10 @@ pub static FORMATS: &[FormatSpec] = &[
     FormatSpec {
         name: "ac3",
         extensions: &["ac3"],
-        description: "Raw AC-3 (Dolby Digital) syncframes; ID3 tags are skipped when reading; E-AC-3 is refused; not written",
+        description: "Raw AC-3 (Dolby Digital) syncframes; ID3 tags are skipped when reading; E-AC-3 is refused",
         media: MediaType::Audio,
         demux: true,
-        mux: false,
+        mux: true,
         codecs: &[CodecId::Ac3],
     },
     FormatSpec {
@@ -202,11 +202,11 @@ pub static FORMATS: &[FormatSpec] = &[
     FormatSpec {
         name: "mpegts",
         extensions: &["ts", "m2ts", "mts"],
-        description: "MPEG transport stream (broadcast, IPTV, HLS segments); 192-byte M2TS packets are read too; AC-3 is read (stream type 0x81, or 0x06 with the AC-3 descriptor) but not written",
+        description: "MPEG transport stream (broadcast, IPTV, HLS segments); 192-byte M2TS packets are read too; AC-3 is read (stream type 0x81, or 0x06 with the AC-3 descriptor) and written as 0x81 with the AC-3 registration descriptor",
         media: MediaType::Video,
         demux: true,
         mux: true,
-        codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Aac, CodecId::Mp3, CodecId::Opus, CodecId::Mp2],
+        codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Aac, CodecId::Mp3, CodecId::Opus, CodecId::Mp2, CodecId::Ac3],
     },
 ];
 
@@ -312,6 +312,7 @@ pub fn create_muxer_with(path: &Path, format: &str, fragment_seconds: Option<f64
         })),
         "aac" => Ok(Box::new(adts::AdtsMuxer::new(out))),
         "mp3" => Ok(Box::new(mp3::Mp3Muxer::new(out))),
+        "ac3" => Ok(Box::new(ac3::Ac3Muxer::new(out))),
         "mkv" => Ok(Box::new(mkvwrite::MatroskaWriter::new(out))),
         "ogg" => Ok(Box::new(oggwrite::OggWriter::new(out))),
         "webm" => Ok(Box::new(mkvwrite::MatroskaWriter::webm(out))),
