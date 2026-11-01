@@ -472,26 +472,24 @@ impl<'a> S<'a> {
                 if sym == T::RL_SYMBOLS + 1 {
                     break;
                 }
-                let level;
-                let j;
-                if sym == T::RL_SYMBOLS {
+                let (j, level) = if sym == T::RL_SYMBOLS {
                     i += self.br.read(6) as i32 + 1;
                     if i > 63 {
                         return Err(bad("coefficients run off the block"));
                     }
-                    j = scan[i as usize] as usize;
+                    let j = scan[i as usize] as usize;
                     let lv = ((self.br.read(12) as i32) << 20) >> 20;
                     let mag = (lv.abs() * q * m[j] as i32) >> 4;
-                    level = if lv < 0 { -mag } else { mag };
+                    (j, if lv < 0 { -mag } else { mag })
                 } else {
                     i += T::RUN[sym] as i32 + 1;
                     if i > 63 {
                         return Err(bad("coefficients run off the block"));
                     }
-                    j = scan[i as usize] as usize;
+                    let j = scan[i as usize] as usize;
                     let mag = (T::LEVEL[sym] as i32 * q * m[j] as i32) >> 4;
-                    level = if self.br.bit() { -mag } else { mag };
-                }
+                    (j, if self.br.bit() { -mag } else { mag })
+                };
                 mismatch ^= level;
                 blk[j] = level as i16;
             }
@@ -575,36 +573,38 @@ impl<'a> S<'a> {
                 done = true;
             }
         }
-        while !done {
-            let sym = e.t.rl1.read(&mut self.br).ok_or_else(|| bad("bad coefficient code"))?;
-            if sym == T::RL_SYMBOLS + 1 {
-                break;
+        if !done {
+            loop {
+                let sym = e.t.rl1.read(&mut self.br).ok_or_else(|| bad("bad coefficient code"))?;
+                if sym == T::RL_SYMBOLS + 1 {
+                    break;
+                }
+                let (run, lv) = if sym == T::RL_SYMBOLS {
+                    let run = self.br.read(6) as i32 + 1;
+                    let lv = if e.mpeg2 { ((self.br.read(12) as i32) << 20) >> 20 } else { self.escape1() };
+                    (run, Some(lv))
+                } else {
+                    (T::RUN[sym] as i32 + 1, None)
+                };
+                i += run;
+                if i > 63 {
+                    return Err(bad("coefficients run off the block"));
+                }
+                let j = scan[i as usize] as usize;
+                let (mag, neg) = match lv {
+                    Some(lv) => (lv.abs(), lv < 0),
+                    None => (T::LEVEL[sym] as i32, self.br.bit()),
+                };
+                let mut v = ((mag * 2 + 1) * q * m[j] as i32) >> 5;
+                if !e.mpeg2 {
+                    v = (v - 1) | 1;
+                }
+                if neg {
+                    v = -v;
+                }
+                mismatch ^= v;
+                blk[j] = v as i16;
             }
-            let (run, lv) = if sym == T::RL_SYMBOLS {
-                let run = self.br.read(6) as i32 + 1;
-                let lv = if e.mpeg2 { ((self.br.read(12) as i32) << 20) >> 20 } else { self.escape1() };
-                (run, Some(lv))
-            } else {
-                (T::RUN[sym] as i32 + 1, None)
-            };
-            i += run;
-            if i > 63 {
-                return Err(bad("coefficients run off the block"));
-            }
-            let j = scan[i as usize] as usize;
-            let (mag, neg) = match lv {
-                Some(lv) => (lv.abs(), lv < 0),
-                None => (T::LEVEL[sym] as i32, self.br.bit()),
-            };
-            let mut v = ((mag * 2 + 1) * q * m[j] as i32) >> 5;
-            if !e.mpeg2 {
-                v = (v - 1) | 1;
-            }
-            if neg {
-                v = -v;
-            }
-            mismatch ^= v;
-            blk[j] = v as i16;
         }
         if e.mpeg2 {
             blk[63] ^= (mismatch & 1) as i16;

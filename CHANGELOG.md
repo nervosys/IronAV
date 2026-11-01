@@ -26,6 +26,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - **Codecs (ProRes):** Apple ProRes decoder and encoder in MOV: 4:2:2 at 10 bits (Proxy, LT, Standard, HQ) and 4:4:4 at
   12 bits (4444, 4444 XQ), progressive only. Decoding matches FFmpeg's bit for bit; `--vcodec prores` writes HQ, and
   `--prores-profile` (or `prores_profile` in a job) picks any of the six, keeping 4:4:4 chroma under 4444 and 4444 XQ.
+- **Codecs (MPEG-1 and MPEG-2 video):** software decoder for MPEG-1 and MPEG-2 video (`mpeg1video`, `mpeg2video`), a translation of FFmpeg's `mpeg12dec.c`: I, P and B pictures, frame and field pictures, field and frame DCT, field, 16x8 and dual-prime motion, the alternate scan, non-linear quantiser scale, custom matrices, 4:2:0 and 4:2:2, MPEG-1 full-pel vectors. Read from raw elementary streams (`.m2v`, `.mpv`, `.m1v`), MPEG program streams (`.mpg`, `.mpeg`, `.vob`, `.ps`), MPEG-TS, Matroska and MP4. The output matches FFmpeg's byte for byte; tests in `crates/ironav-engine/tests/mpeg2.rs`, with streams from `tools/gen_mpeg2_synth.py`. Not decoded: 4:4:4 and the scalable profiles. Decode only: no encoder, and no MPEG-1/2 video in output containers.
 - **Codecs (MPEG-4 Part 2):** software decoder for Simple and Advanced Simple profile video in MP4 (`mp4v`) and
   Matroska (`V_MPEG4/*`): I, P and B pictures, half- and quarter-sample motion, four vectors, direct mode, H.263 and
   MPEG quantisation with custom matrices, resync markers. Decoding matches FFmpeg's bit for bit. Interlaced, sprite
@@ -165,6 +166,10 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   SP and SI slices and bit depths above 10.
 - **VP9:** reference frames of another size (spatial resampling) are refused; scaled motion compensation is not implemented,
   because no available encoder makes such a stream to test it against.
+- **MPEG-1 and MPEG-2 video:** 4:4:4 (High profile), the scalable profiles and data partitioning are refused; concealment
+  vectors are parsed and ignored; damaged slices are skipped, not concealed, so a damaged stream can differ from FFmpeg's
+  decode; program streams give the first video stream only; the video is decoded but not encoded or copied into other
+  containers; coefficients outside the range of real streams follow FFmpeg's C transform, not its SIMD one.
 - **MPEG-4 Part 2:** interlaced, sprite and global-motion pictures, data partitioning and scalable layers are refused;
   the encoder writes Simple profile I and P pictures, and B pictures as an option (`with_bframes`, Advanced Simple profile), but not quarter-sample motion or interlaced video.
 - **AAC:** HE-AAC v2 (parametric stereo) is refused, as are Main prediction, LTP, gain control, coupling channels, 960-sample frames, SBR that is only signalled implicitly and
@@ -177,8 +182,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   decode but have no FFmpeg reference; JPEG arithmetic-coded and 12-bit files are refused, and so are four-component CMYK and YCCK files and progressive or lossless files over 67 megapixels (lossless JPEG decodes, but not with restart intervals);
   ProRes interlaced pictures are refused.
 - **Containers:** Matroska tracks with encryption, bzip2 or lzo content encodings are refused (header stripping and zlib are read;
-  the live reader refuses any content encoding); MPEG-TS does not carry AC-3 or
-  MPEG-2 video; Ogg refuses files
+  the live reader refuses any content encoding); MPEG-TS does not carry AC-3; Ogg refuses files
   holding only Speex or Theora (other streams in a file are passed over).
 - **Live:** servers that speak only TLS 1.2 cannot be reached; cameras and microphones are read on Windows and Linux
   only (no AVFoundation).

@@ -244,7 +244,7 @@ impl<R: Read + Send> MpegVideoDemuxer<R> {
                     }
                 }
                 0xB9 => Some(4),
-                0xBB..=0xBF | 0xC0..=0xEF | 0xF0..=0xFF => {
+                0xBB..=0xFF => {
                     if rest.len() < 6 {
                         None
                     } else {

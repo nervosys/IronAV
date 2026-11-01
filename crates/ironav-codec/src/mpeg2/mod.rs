@@ -512,7 +512,9 @@ impl Mpeg2Decoder {
             if self.geo != Some(g) {
                 // a new picture size or format: what is held goes out, the references are dropped
                 let saved = self.pic.take();
+                let ff = self.first_field;
                 self.drain(out);
+                self.first_field = ff;
                 self.pic = saved;
                 self.geo = Some(g);
                 self.gray = None;
