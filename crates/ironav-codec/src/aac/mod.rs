@@ -5,7 +5,7 @@
 //! streams that need them are refused with an error rather than decoded wrongly.
 
 mod enc;
-mod imdct;
+pub(crate) mod imdct;
 mod sbr;
 mod sbr_tables;
 mod tables;

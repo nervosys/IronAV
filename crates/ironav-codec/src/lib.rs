@@ -4,6 +4,7 @@
 //! "what can IronAV actually do"; the ontology and the planner both read them.
 
 pub mod aac;
+pub mod ac3;
 pub mod av1;
 pub mod alac;
 pub mod change;
@@ -61,6 +62,9 @@ pub fn implemented() -> Vec<CodecImpl> {
             }
             if c == CodecId::Mp2 {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-mp2" });
+            }
+            if c == CodecId::Ac3 {
+                return Some(CodecImpl { codec: c, decode: true, encode: false, implementation: "ironav-ac3" });
             }
             if c == CodecId::Alac {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-alac" });
@@ -240,6 +244,7 @@ pub fn new_decoder_for(s: &ironav_core::StreamInfo) -> Result<Box<dyn Decoder>> 
             })
         }
         CodecId::Mp2 => Ok(kept_span(s, Box::new(mp3::Mp2Decoder::new(&s.params)?))),
+        CodecId::Ac3 => Ok(Box::new(ac3::Ac3Decoder::new())),
         CodecId::Alac => Ok(Box::new(alac::AlacDecoder::new(&s.extradata, &s.params)?)),
         CodecId::Opus => Ok(trimmed(s, opus::new_decoder(&s.extradata, &s.params)?)),
         CodecId::Vorbis => Ok(trimmed(s, Box::new(vorbis::VorbisDecoder::new(&s.extradata, &s.params)?))),
