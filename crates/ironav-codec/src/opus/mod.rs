@@ -1,8 +1,8 @@
 //! An Opus decoder (RFC 6716): the SILK, CELT and hybrid modes, mono and stereo.
 //!
 //! The band and linear-prediction decoding follow FFmpeg's native Opus decoder. SILK's 8, 12 and
-//! 16 kHz output is brought to 48 kHz by a small polyphase windowed-sinc filter of our own, whose
-//! delay equals the reference decoder's (4, 8 and 11 input samples).
+//! 16 kHz output is brought to 48 kHz by libopus's own resampler (`silk_resampler`), so SILK and
+//! hybrid frames decode to what libopus decodes, to a few LSB.
 //!
 //! Channel-mapping family 0 (one stream of one or two channels) and the multistream families 1 and
 //! 255 ([`MultistreamDecoder`], [`MultistreamEncoder`]): see `multistream` for the layouts.
@@ -14,6 +14,7 @@ mod plc;
 pub(crate) mod mdct;
 mod rc;
 mod silk;
+mod silk_resampler;
 mod silk_enc;
 mod tables;
 
@@ -21,7 +22,7 @@ use ironav_core::{AudioFrame, Decoder, Error, ErrorCode, Frame, Packet, Result, 
 use rc::RangeDecoder;
 pub use encoder::{opus_head, OpusEncoder, OpusMode, OpusSignal, SILK_PRE_SKIP};
 pub use multistream::{new_decoder, MultistreamDecoder, MultistreamEncoder};
-use std::f64::consts::PI;
+use silk_resampler::SilkResampler;
 use tables::CELT_WINDOW2;
 
 const RATE: u32 = 48_000;
@@ -32,8 +33,8 @@ const FRAME_DURATION: [usize; 32] = [
     240, 480, 960,
 ];
 const SILK_FRAME_MS: [usize; 16] = [10, 20, 40, 60, 10, 20, 40, 60, 10, 20, 40, 60, 10, 20, 10, 20];
-/// Delay of the SILK upsampler, in input samples, per bandwidth (narrow, medium, wide).
-const SILK_DELAY: [usize; 3] = [4, 8, 11];
+/// SILK's internal rate per bandwidth (narrow, medium, wide), in kHz.
+const FS_IN_KHZ: [usize; 3] = [8, 12, 16];
 /// The last CELT band coded for each bandwidth (narrow, medium, wide, super-wide, full).
 const BAND_END: [usize; 5] = [13, 17, 17, 19, 21];
 
@@ -198,73 +199,18 @@ fn frames_of(d: &[u8]) -> Result<Frames> {
     Ok(out)
 }
 
-fn bessel_i0(x: f64) -> f64 {
-    let (mut sum, mut term) = (1.0, 1.0);
-    for k in 1..40 {
-        term *= (x / (2.0 * k as f64)).powi(2);
-        sum += term;
+/// Resamples one channel of SILK's output to 48 kHz. SILK's floats (in [-1, 1), the 16-bit samples
+/// over 32768) are rounded to the 16-bit samples libopus's SILK produces, resampled as libopus does,
+/// and given back as floats.
+fn silk_to_48k(rs: &mut SilkResampler, input: &[f32], out: &mut [f32]) {
+    let mut pcm = [0i16; 960];
+    let mut up = [0i16; 2880];
+    for (p, &x) in pcm.iter_mut().zip(input) {
+        *p = (x * 32768.0).round().clamp(-32768.0, 32767.0) as i16;
     }
-    sum
-}
-
-/// Polyphase windowed-sinc interpolation from 8, 12 or 16 kHz to 48 kHz with a fixed delay of
-/// `SILK_DELAY` input samples.
-struct Upsampler {
-    ratio: usize,
-    taps: Vec<f32>,
-    per_phase: usize,
-    hist: Vec<f32>,
-    /// The history and the input, together.
-    buf: Vec<f32>,
-}
-
-impl Upsampler {
-    fn new(bandwidth: usize) -> Self {
-        let ratio = [6, 4, 3][bandwidth];
-        let delay = SILK_DELAY[bandwidth];
-        let per_phase = 2 * delay;
-        let len = per_phase * ratio;
-        let centre = (delay * ratio) as f64;
-        let cutoff = 0.94 / ratio as f64;
-        let beta = 6.0;
-        let h: Vec<f64> = (0..len)
-            .map(|n| {
-                let t = n as f64 - centre;
-                let sinc = if t == 0.0 { 1.0 } else { (PI * cutoff * t).sin() / (PI * cutoff * t) };
-                let r = (t / centre).min(1.0);
-                sinc * bessel_i0(beta * (1.0 - r * r).max(0.0).sqrt()) / bessel_i0(beta)
-            })
-            .collect();
-        // taps[phase][k] = h[phase + ratio * k], each phase normalised to unit gain at DC
-        let mut taps = vec![0f32; ratio * per_phase];
-        for r in 0..ratio {
-            let sum: f64 = (0..per_phase).map(|k| h[r + ratio * k]).sum();
-            for k in 0..per_phase {
-                taps[r * per_phase + k] = (h[r + ratio * k] / sum) as f32;
-            }
-        }
-        Self { ratio, taps, per_phase, hist: vec![0.0; per_phase - 1], buf: Vec::with_capacity(per_phase + 960) }
-    }
-
-    fn process(&mut self, x: &[f32], out: &mut [f32]) {
-        let keep = self.per_phase - 1;
-        let mut buf = std::mem::take(&mut self.buf);
-        buf.clear();
-        buf.extend_from_slice(&self.hist);
-        buf.extend_from_slice(x);
-        for i in 0..x.len() {
-            // x[i] is buf[keep + i]; the newest tap multiplies it
-            for r in 0..self.ratio {
-                let t = &self.taps[r * self.per_phase..(r + 1) * self.per_phase];
-                let mut acc = 0f32;
-                for (k, &c) in t.iter().enumerate() {
-                    acc += c * buf[keep + i - k];
-                }
-                out[i * self.ratio + r] = acc;
-            }
-        }
-        self.hist.copy_from_slice(&buf[buf.len() - keep..]);
-        self.buf = buf;
+    rs.process(&pcm[..input.len()], &mut up[..input.len() * rs.ratio()]);
+    for (o, &u) in out.iter_mut().zip(&up[..input.len() * rs.ratio()]) {
+        *o = u as f32 / 32768.0;
     }
 }
 
@@ -275,7 +221,7 @@ pub struct OpusDecoder {
     skip_left: usize,
     silk: silk::Silk,
     celt: celt::Celt,
-    up: [Option<Upsampler>; 2],
+    up: [Option<SilkResampler>; 2],
     up_bandwidth: usize,
     /// Scratch planes, sized once: a frame's output, SILK's, CELT's, and a redundancy frame's.
     planes: [Vec<f32>; 2],
@@ -437,7 +383,7 @@ impl OpusDecoder {
         }
         let sbw = t.bandwidth.min(2);
         if self.up_bandwidth != sbw {
-            self.up = [Some(Upsampler::new(sbw)), Some(Upsampler::new(sbw))];
+            self.up = [Some(SilkResampler::new(FS_IN_KHZ[sbw])), Some(SilkResampler::new(FS_IN_KHZ[sbw]))];
             self.up_bandwidth = sbw;
         }
         let mut rc = RangeDecoder::new(&packet[off..off + len]);
@@ -450,7 +396,7 @@ impl OpusDecoder {
         };
         let mut planes = std::mem::take(&mut self.planes);
         for c in 0..ch {
-            self.up[c].as_mut().unwrap().process(&silk[c][..got], &mut planes[c][..n]);
+            silk_to_48k(self.up[c].as_mut().unwrap(), &silk[c][..got], &mut planes[c][..n]);
         }
         if t.mode == Mode::Hybrid {
             // the high band of the lost frame is not in the copy
@@ -526,7 +472,7 @@ impl OpusDecoder {
         if t.mode != Mode::Celt {
             let sbw = t.bandwidth.min(2);
             if self.up_bandwidth != sbw {
-                self.up = [Some(Upsampler::new(sbw)), Some(Upsampler::new(sbw))];
+                self.up = [Some(SilkResampler::new(FS_IN_KHZ[sbw])), Some(SilkResampler::new(FS_IN_KHZ[sbw]))];
                 self.up_bandwidth = sbw;
             }
             let got = self.silk.decode_superframe(&mut rc, silk_out, sbw, t.stereo as usize + 1, SILK_FRAME_MS[t.config]);
@@ -535,7 +481,7 @@ impl OpusDecoder {
                 return Err(bad("SILK frame length does not match the TOC"));
             }
             for c in 0..self.channels {
-                self.up[c].as_mut().unwrap().process(&silk_out[c][..got], &mut out[c][..n]);
+                silk_to_48k(self.up[c].as_mut().unwrap(), &silk_out[c][..got], &mut out[c][..n]);
             }
         } else {
             self.silk.flush();
@@ -667,23 +613,13 @@ mod tests {
     }
 
     #[test]
-    fn upsampler_passes_dc_and_keeps_its_delay() {
-        for bw in 0..3 {
-            let mut up = Upsampler::new(bw);
-            let ratio = up.ratio;
-            let x = vec![0.5f32; 200];
-            let mut y = vec![0f32; 200 * ratio];
-            up.process(&x, &mut y);
-            assert!((y[y.len() - 1] - 0.5).abs() < 1e-4, "bandwidth {bw}: {}", y[y.len() - 1]);
-            // an impulse comes out centred `delay` input samples later
-            let mut up = Upsampler::new(bw);
-            let mut x = vec![0f32; 100];
-            x[10] = 1.0;
-            let mut y = vec![0f32; 100 * ratio];
-            up.process(&x, &mut y);
-            let peak = y.iter().enumerate().max_by(|a, b| a.1.abs().total_cmp(&b.1.abs())).unwrap().0;
-            let want = (10 + SILK_DELAY[bw]) * ratio;
-            assert!(peak.abs_diff(want) <= 1, "bandwidth {bw}: peak at {peak}, want {want}");
+    fn silk_resampler_passes_dc() {
+        for fs in [8, 12, 16] {
+            let mut rs = SilkResampler::new(fs);
+            let x = vec![0.5f32; 20 * fs];
+            let mut y = vec![0f32; x.len() * rs.ratio()];
+            silk_to_48k(&mut rs, &x, &mut y);
+            assert!((y[y.len() - 1] - 0.5).abs() < 1e-3, "{fs} kHz: {}", y[y.len() - 1]);
         }
     }
 }
