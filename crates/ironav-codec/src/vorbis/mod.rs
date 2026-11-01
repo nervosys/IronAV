@@ -808,7 +808,7 @@ fn slope(len: usize) -> Vec<f32> {
 }
 
 /// Order in which Vorbis channels fill the output layout (`out[i] = vorbis[ORDER[n - 1][i]]`).
-const ORDER: [&[usize]; 8] = [
+pub(crate) const ORDER: [&[usize]; 8] = [
     &[0],
     &[0, 1],
     &[0, 2, 1],

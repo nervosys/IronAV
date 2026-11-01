@@ -4,10 +4,12 @@
 //! 16 kHz output is brought to 48 kHz by a small polyphase windowed-sinc filter of our own, whose
 //! delay equals the reference decoder's (4, 8 and 11 input samples).
 //!
-//! Channel-mapping family 0 only: one stream of one or two channels.
+//! Channel-mapping family 0 (one stream of one or two channels) and the multistream families 1 and
+//! 255 ([`MultistreamDecoder`], [`MultistreamEncoder`]): see `multistream` for the layouts.
 
 mod celt;
 mod encoder;
+mod multistream;
 mod plc;
 pub(crate) mod mdct;
 mod rc;
@@ -18,6 +20,7 @@ mod tables;
 use ironav_core::{AudioFrame, Decoder, Error, ErrorCode, Frame, Packet, Result, StreamParams};
 use rc::RangeDecoder;
 pub use encoder::{opus_head, OpusEncoder, OpusMode, OpusSignal, SILK_PRE_SKIP};
+pub use multistream::{new_decoder, MultistreamDecoder, MultistreamEncoder};
 use std::f64::consts::PI;
 use tables::CELT_WINDOW2;
 
@@ -302,8 +305,8 @@ fn parse_head(extradata: &[u8], channels: u16) -> Result<(usize, usize, f32)> {
     let pre_skip = u16::from_le_bytes([extradata[10], extradata[11]]) as usize;
     let gain_q8 = i16::from_le_bytes([extradata[16], extradata[17]]);
     if extradata[18] != 0 || !(1..=2).contains(&ch) {
-        return Err(Error::new(ErrorCode::UnsupportedCodec, "Opus: only mono and stereo streams (channel-mapping family 0) are decoded")
-            .hint("surround Opus needs the multistream layout, which is not implemented"));
+        return Err(Error::new(ErrorCode::UnsupportedCodec, "Opus: the single-stream decoder takes mono and stereo (channel-mapping family 0)")
+            .hint("a multichannel or mapped stream is decoded by opus::new_decoder"));
     }
     Ok((ch, pre_skip, 10f32.powf(gain_q8 as f32 / (20.0 * 256.0))))
 }
@@ -314,7 +317,17 @@ impl OpusDecoder {
             return Err(Error::invalid_arg("Opus decoder needs an audio stream"));
         };
         let (ch, pre_skip, gain) = parse_head(extradata, *channels)?;
-        Ok(Self {
+        Ok(Self::with_channels(ch, pre_skip, gain))
+    }
+
+    /// A decoder of one stream of `channels` channels, whose output is not trimmed or scaled (a
+    /// multistream decoder does that for all its streams).
+    fn stream(channels: usize) -> Self {
+        Self::with_channels(channels, 0, 1.0)
+    }
+
+    fn with_channels(ch: usize, pre_skip: usize, gain: f32) -> Self {
+        Self {
             channels: ch,
             pre_skip,
             gain,
@@ -331,7 +344,7 @@ impl OpusDecoder {
             prev_mode: None,
             prev_red: false,
             plc: plc::Plc::new(ch),
-        })
+        }
     }
 
     pub fn channels(&self) -> usize {

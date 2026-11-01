@@ -280,6 +280,9 @@ pub fn opus_head(channels: usize) -> Vec<u8> {
 }
 
 fn head_with(channels: usize, pre_skip: usize) -> Vec<u8> {
+    if (3..=8).contains(&channels) {
+        return super::multistream::family1_head(channels, pre_skip);
+    }
     let mut v = b"OpusHead".to_vec();
     v.push(1);
     v.push(channels as u8);

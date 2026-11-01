@@ -548,7 +548,7 @@ SNR (checked by hand; the committed tests compare our decoder with FFmpeg's on a
 
 ## Opus
 
-Opus **decoder** (RFC 6716): SILK, CELT and hybrid frames, every frame size from 2.5 to 60 ms, mono and stereo, packets of
+Opus **decoder** (RFC 6716): SILK, CELT and hybrid frames, every frame size from 2.5 to 60 ms, mono and stereo (and multichannel, see below), packets of
 all four framing codes, CELT redundancy frames, SILK in-band FEC (LBRR) copies, and the output gain and pre-skip from the `OpusHead` (the pre-skip is
 dropped, so a file starts where its audio does). The band-energy, bit-allocation, pulse-vector, inverse-MDCT, linear-prediction
 and excitation stages follow FFmpeg's native Opus decoder, with its tables (`tools/gen_opus_tables.py` reads them from
@@ -564,7 +564,13 @@ SILK and hybrid frames match at 42-48 dB for wide and medium band and **only 24 
 from our upsampling filter (FFmpeg's resampler is longer than a filter with a fixed delay of 8 taps per phase can be), though
 I did not isolate it further. Three of those streams are committed with FFmpeg's decode as regression tests (CELT to within 3
 LSB, SILK and hybrid above 35 dB).
-Not covered: multichannel Opus (channel-mapping families 1 and 255 are refused), and the way the reference decoder flushes its resampler when the stream switches between SILK
+**Multichannel Opus** (channel-mapping families 1 and 255, in Ogg, Matroska, WebM and MP4 `dOps`): each stream is decoded as
+above and routed by the mapping table; family 1 comes out in WAV and FFmpeg channel order, as the Vorbis decoder does. FFmpeg's
+libopus files of 4, 6 and 8 channels (family 1) decode to within one LSB of libopus where their streams are CELT. A family 255 file
+(6 channels) matches its source tones at about 40 dB; FFmpeg's libopus wrapper reorders family 255 channels, which RFC 7845 does
+not ask for, so its decode is not the reference there. Its SILK and hybrid streams run as the mono ones do (see above).
+
+Not covered: the way the reference decoder flushes its resampler when the stream switches between SILK
 and CELT, which our fixed-delay filter does not reproduce, so the few samples at such a switch can differ. The libopus encoder
 only produced streams in one mode at a time; mode switches and their redundant CELT frames are covered by IronAV's own
 automatic-mode streams instead, which this decoder and libopus both decode (see the encoder's automatic mode below).
@@ -583,7 +589,7 @@ window (48 samples in the test file) long, because Matroska does not record wher
 
 ### Opus encoder
 
-`--acodec opus` writes CELT-mode Opus by default: 48 kHz mono or stereo (other rates are resampled first, with a warning), 20 ms
+`--acodec opus` writes CELT-mode Opus by default: 48 kHz mono, stereo or 3 to 8 channels (channel-mapping family 1, with the RFC 7845 stream layouts and the bit rate shared among the streams by channel count; other rates are resampled first, with a warning), 20 ms
 frames, constant bit rate (64 kb/s per channel). `--opus-mode celt|silk|hybrid|auto`, `--opus-signal auto|voice|music`
 (for auto), `--opus-frame-ms N` (2.5 to 60), `--opus-fec PCT` and `--opus-dtx` select the other modes, frame lengths,
 in-band FEC and DTX (the job JSON takes them as `audio.opus`, with the same names as `mode`, `signal`, `frame_ms`,

@@ -172,7 +172,7 @@ pub fn new_decoder_for(s: &ironav_core::StreamInfo) -> Result<Box<dyn Decoder>> 
             })
         }
         CodecId::Alac => Ok(Box::new(alac::AlacDecoder::new(&s.extradata, &s.params)?)),
-        CodecId::Opus => Ok(trimmed(s, Box::new(opus::OpusDecoder::new(&s.extradata, &s.params)?))),
+        CodecId::Opus => Ok(trimmed(s, opus::new_decoder(&s.extradata, &s.params)?)),
         CodecId::Vorbis => Ok(trimmed(s, Box::new(vorbis::VorbisDecoder::new(&s.extradata, &s.params)?))),
         CodecId::Vp8 => Ok(Box::new(vp8::Vp8Decoder::new())),
         CodecId::H264 => Ok(Box::new(h264::H264Decoder::new())),
@@ -349,6 +349,13 @@ pub fn new_encoder_with_opts(codec: CodecId, params: &StreamParams, bits: Option
         (CodecId::Alac, StreamParams::Audio { sample_rate, channels }) => Ok(Box::new(alac::AlacEncoder::new(*sample_rate, *channels, bits)?)),
         (CodecId::Opus, StreamParams::Audio { sample_rate, channels }) => {
             let bitrate = bitrate_kbps.map_or(opus::OpusEncoder::default_bitrate(*channels as usize), |k| k * 1000);
+            if *channels > 2 {
+                let enc = opus::MultistreamEncoder::new(*sample_rate, *channels as usize, bitrate)?;
+                return Ok(Box::new(match opus_opts {
+                    Some(o) => enc.map_streams(|e| o.apply(e))?,
+                    None => enc,
+                }));
+            }
             let enc = opus::OpusEncoder::new(*sample_rate, *channels as usize, bitrate)?;
             Ok(Box::new(match opus_opts {
                 Some(o) => o.apply(enc)?,
@@ -389,6 +396,10 @@ pub fn new_encoder_with_opts(codec: CodecId, params: &StreamParams, bits: Option
 /// `encoder_extradata`, but an Opus head carries the pre-skip of the mode asked for.
 pub fn encoder_extradata_with_opts(codec: CodecId, params: &StreamParams, bitrate_kbps: Option<u32>, opus_opts: Option<&OpusOptions>, prores_profile: Option<prores::Profile>) -> Result<Vec<u8>> {
     match (codec, params, opus_opts) {
+        (CodecId::Opus, StreamParams::Audio { sample_rate, channels }, Some(o)) if *channels > 2 => {
+            let bitrate = bitrate_kbps.map_or(opus::OpusEncoder::default_bitrate(*channels as usize), |k| k * 1000);
+            Ok(opus::MultistreamEncoder::new(*sample_rate, *channels as usize, bitrate)?.map_streams(|e| o.apply(e))?.head())
+        }
         (CodecId::Opus, StreamParams::Audio { sample_rate, channels }, Some(o)) => {
             let bitrate = bitrate_kbps.map_or(opus::OpusEncoder::default_bitrate(*channels as usize), |k| k * 1000);
             Ok(o.apply(opus::OpusEncoder::new(*sample_rate, *channels as usize, bitrate)?)?.head())

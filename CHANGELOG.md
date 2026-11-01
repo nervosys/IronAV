@@ -9,7 +9,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Added
 
-- **Codecs (decoders):** software decoders for H.264 (8- and 10-bit, 4:2:0, 4:2:2, 4:4:4 and monochrome,
+- **Codecs (decoders):** multichannel Opus (channel-mapping families 1 and 255: several mono and coupled-stereo streams in one packet, self-delimited as RFC 6716 Appendix B, routed by the mapping table; family 1 in WAV and FFmpeg channel order), read from Ogg, Matroska, WebM and MP4 (`dOps`); software decoders for H.264 (8- and 10-bit, 4:2:0, 4:2:2, 4:4:4 and monochrome,
   CAVLC and CABAC P and B slices, lossless, several pictures decoded at once), HEVC (Main, Main 10, 4:2:2, 4:4:4, 12-bit), VP8, VP9
   (profiles 0-3, tile columns and a multi-threaded loop filter), baseline and progressive JPEG and
   Motion-JPEG, AAC-LC with HE-AAC v1, MP3 (MPEG-1/2/2.5 Layer III), Vorbis, Opus (SILK, CELT and hybrid)
@@ -17,7 +17,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - **Codecs (encoders):** software HEVC (Main profile, 8-bit 4:2:0: 64x64 coding tree units, CABAC, intra and P pictures with merge and skip, AMVP motion, quarter-sample search, deblocking, rate control by QP or bit rate; MP4 and Matroska), software H.264 (Constrained Baseline, then Main with CABAC and High with the 8x8
   transform, B pictures, rate-distortion mode decisions), VP8 (key and inter frames, quarter-pixel motion, rate control), VP9 (key and inter frames with coefficient probability updates, profile 0, WebM, Matroska and MP4), AAC-LC with an ADTS writer (one to six and eight channels, 5.1 and 7.1 included), MP3 Layer III with
   an MP3 writer, Vorbis, Opus (CELT, wideband SILK, hybrid, DTX, in-band FEC, automatic mode switching,
-  2.5 to 60 ms frames; the CLI and job JSON select the mode, signal, frame size, FEC and DTX), JPEG and Motion-JPEG, FLAC, and
+  2.5 to 60 ms frames, and 3 to 8 channels in channel-mapping family 1 with the RFC 7845 stream layouts; the CLI and job JSON select the mode, signal, frame size, FEC and DTX), JPEG and Motion-JPEG, FLAC, and
   ALAC (16 and 24 bits, one to eight channels). `--keyint N` (or `keyint` in a job) sets the key frame interval of H.264, HEVC, VP8, VP9 and AV1.
 - **Codecs (voice link):** a playout buffer, a streaming resampler, speech detection with push-to-talk
   trimming, automatic gain control, noise suppression, and Opus packet-loss concealment.
@@ -134,7 +134,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   there is no encoder.
 - **AAC:** HE-AAC v2 (parametric stereo) is refused, as are Main prediction, LTP, gain control, coupling channels and
   program-config layouts. The encoder writes one to six and eight channels; seven has no standard layout and is refused.
-- **Opus and Vorbis:** multichannel Opus (channel-mapping families 1 and 255) is refused. Vorbis floor type 0 and
+- **Opus and Vorbis:** Opus is encoded in mono, stereo and 3 to 8 channels (channel-mapping family 1); 9 or more channels,
+  and family 255 streams, are refused by the encoder (the decoder reads both families). Vorbis floor type 0 and
   streams over eight channels are refused, and the Vorbis encoder writes at most two channels.
 - **MP3, JPEG, ProRes:** MP3 layers I and II are refused; JPEG arithmetic-coded, 12-bit and lossless files are refused;
   ProRes interlaced pictures are refused.

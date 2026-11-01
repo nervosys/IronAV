@@ -623,6 +623,13 @@ fn parse_trak(trak: &[u8], index: usize, samples: &mut Vec<Sample>) -> Result<Op
         if codec == CodecId::Aac {
             extradata = aac_config(sound_child(kids, b"esds", "the mp4a entry")?)?;
         }
+        if codec == CodecId::Opus {
+            // the dOps box carries the OpusHead's fields, big-endian and without its magic; the
+            // channel count is its own, as the sample entry's may be capped
+            let d = need(e.get(kids_at..).unwrap_or(&[]), b"dOps", "the Opus entry")?;
+            extradata = opus_head_from_dops(d)?;
+            channels = d.get(1).copied().unwrap_or(0) as u16;
+        }
         if codec == CodecId::Alac {
             // the box holds a version and flags, then the 24-byte ALACSpecificConfig, which has the true rate, channels and depth
             let body = need(e.get(kids_at..).unwrap_or(&[]), b"alac", "the alac entry")?;
@@ -644,6 +651,22 @@ fn parse_trak(trak: &[u8], index: usize, samples: &mut Vec<Sample>) -> Result<Op
     let lead_in = edit_lead_in(trak)?;
     let stream = StreamInfo { index, codec, time_base, duration: Some(duration), bits, extradata, lead_in, params };
     Ok(Some(TrackInfo { stream, config, convert, swap, unwrap: Vec::new() }))
+}
+
+/// The OpusHead for a `dOps` box (RFC 7845 section 5.1 in ISO BMFF form): the same fields, with
+/// the multi-byte ones big-endian and no magic, so they are swapped into the OpusHead's order.
+fn opus_head_from_dops(d: &[u8]) -> Result<Vec<u8>> {
+    if d.len() < 11 || d[0] != 0 {
+        return Err(corrupt("the dOps box is too short or has an unknown version"));
+    }
+    let mut h = b"OpusHead".to_vec();
+    h.push(1);
+    h.push(d[1]);
+    h.extend_from_slice(&[d[3], d[2]]);
+    h.extend_from_slice(&[d[7], d[6], d[5], d[4]]);
+    h.extend_from_slice(&[d[9], d[8]]);
+    h.extend_from_slice(&d[10..]);
+    Ok(h)
 }
 
 /// Media time at which the track's first non-empty edit starts, from `edts/elst`; 0 without one.
