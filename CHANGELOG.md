@@ -10,7 +10,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 ### Added
 
 - **Codecs (decoders):** multichannel Opus (channel-mapping families 1 and 255: several mono and coupled-stereo streams in one packet, self-delimited as RFC 6716 Appendix B, routed by the mapping table; family 1 in WAV and FFmpeg channel order), read from Ogg, Matroska, WebM and MP4 (`dOps`); software decoders for H.264 (8- and 10-bit, 4:2:0, 4:2:2, 4:4:4 and monochrome,
-  CAVLC and CABAC P and B slices, lossless, several pictures decoded at once), HEVC (Main, Main 10, 4:2:2, 4:4:4, 12-bit), VP8, VP9
+  CAVLC and CABAC P and B slices, lossless, interlaced MBAFF frames, several pictures decoded at once), HEVC (Main, Main 10, 4:2:2, 4:4:4, 12-bit), VP8, VP9
   (profiles 0-3, tile columns and a multi-threaded loop filter), baseline and progressive JPEG and
   Motion-JPEG, AAC-LC with HE-AAC v1, MP3 (MPEG-1/2/2.5 Layer III), Vorbis, Opus (SILK, CELT and hybrid)
   FLAC (4 to 32 bits) and ALAC (16, 20 and 24 bits, and 32-bit mono; one to eight channels).
@@ -124,7 +124,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - **HEVC decoder:** the range extension coding tools (RDPCM, cross-component prediction, extended precision, persistent
   Rice adaptation and the rest) are refused by name, as are unequal luma and chroma bit depths (10-bit luma with 9-bit
   chroma, for instance).
-- **H.264:** the decoder refuses interlaced coding (field pictures and MBAFF), slice groups, separate colour planes,
+- **H.264:** the decoder refuses field pictures (PAFF; MBAFF frames are decoded), slice groups, separate colour planes,
   SP and SI slices and bit depths above 10. The encoder has one reference picture, no partitions below 8x8 and no
   10-bit output.
 - **VP9:** reference frames of another size (spatial resampling) are refused; scaled motion compensation is not implemented,
