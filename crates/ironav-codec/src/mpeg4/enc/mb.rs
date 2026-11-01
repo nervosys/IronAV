@@ -17,6 +17,9 @@ const CHROMA_ROUND: [i32; 16] = [0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1]
 const MV_LAMBDA: u32 = 2;
 /// What four vectors cost beyond one, in summed absolute differences.
 const FOUR_MV_PENALTY: u32 = 40;
+/// Intra is chosen over inter only when its cost, plus this much per quantiser step, is lower: an intra
+/// macroblock codes a DC and six blocks, where a skipped one codes almost nothing.
+const INTRA_PENALTY: u32 = 16;
 
 /// The run-level codes of both tables, with a lookup from (last, run, level) to the symbol.
 struct Rls {
@@ -76,6 +79,17 @@ fn scan_for(ac_pred: bool, top: bool) -> &'static [u8; 64] {
 fn quant(f: f32, q: i32) -> i32 {
     let qadd = ((q - 1) | 1) as f32;
     let l = ((f.abs() - qadd) / (2.0 * q as f32)).round().max(0.0) as i32;
+    if f < 0.0 {
+        -l
+    } else {
+        l
+    }
+}
+
+/// The inter quantiser: a dead zone of half a quantiser step, so small residuals quantise to zero and the
+/// macroblock can be skipped. Level `l` covers `[(2l + 0.5) q, (2l + 2.5) q)`.
+fn quant_inter(f: f32, q: i32) -> i32 {
+    let l = ((f.abs() - q as f32 / 2.0) / (2.0 * q as f32)).floor().max(0.0) as i32;
     if f < 0.0 {
         -l
     } else {
@@ -677,7 +691,7 @@ impl<'a> Coder<'a> {
             }
             let f = self.fdct(&d);
             for k in 0..64 {
-                lv[k] = quant(f[k], self.q);
+                lv[k] = quant_inter(f[k], self.q);
             }
         }
         out
@@ -707,7 +721,7 @@ impl<'a> Coder<'a> {
         if !four {
             self.set_mb_mv(mbx, mby, mv16);
         }
-        if self.intra_cost(mbx, mby) < if four { c4 } else { c16 } {
+        if self.intra_cost(mbx, mby) + (INTRA_PENALTY * self.q as u32) < if four { c4 } else { c16 } {
             return self.intra_mb(mbx, mby, true);
         }
         let (mut py, mut pu, mut pv) = ([0u8; 256], [0u8; 64], [0u8; 64]);
