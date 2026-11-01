@@ -40,7 +40,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   default, `--keyint`): LAST_FRAME prediction with quarter-sample motion, the reference MV stack's modes, skip and intra blocks
   inside inter frames, deblocking and CDEF on every frame, and rate-distortion mode decisions from the CDF bit costs. It runs
   the decoder's own reconstruction, so the decoder's pictures equal the encoder's references bit for bit, and libaom decodes the
-  same pictures.
+  same pictures. About 5 frames a second at 720p (testsrc2, 60 frames, qp 20 to 40), up from about 1.6: the open-loop planner
+  and the motion search are cheaper, and the transform bases are built once per stream. Files are 1 to 4 % smaller.
 - **Containers:** WAV, FLAC, Y4M, MP4, QuickTime MOV, Matroska and WebM (read and write), Ogg (Opus, Vorbis and FLAC),
   ADTS, MP3, JPEG, and MPEG transport streams (read and write), and raw H.264 and HEVC (Annex B, write only).
 - **Containers (MP4):** fragmented MP4 is read as it arrives; the writer is constant-frame-rate and

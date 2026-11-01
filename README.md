@@ -916,7 +916,9 @@ block is intra or inter by squared error plus lambda times the bits its syntax c
 modes and their angle deltas the same way. Deblocking and CDEF run on every frame, at levels that follow the quantiser. The encoder reconstructs
 through the decoder's own state, so every picture it keeps as a reference is the one the decoder makes: the decoder's output equals the encoder's
 reconstruction bit for bit, and libaom decodes the same pictures (`inter_frames_decode_identically_and_are_smaller_than_key_frames` in
-`tests/av1_enc.rs`). Not yet: compound prediction, more than one reference, rate control by bit rate, and tuning the search for speed.
+`tests/av1_enc.rs`). The motion search reaches half samples only, for speed. Not yet: compound prediction, more than one reference, and rate control by bit rate.
+
+Speed: at 720p (FFmpeg's testsrc2, 60 frames, the default key interval) the encoder runs at about 5 frames a second at qp 20, 30 and 40, against about 1.6 before the open-loop planner, the motion search and the transform bases were made cheaper. Its files are 1 to 4 % smaller than before at the same or a slightly higher PSNR.
 
 Checked bit for bit against FFmpeg's libdav1d (through PyAV) on SVT-AV1 output: 27 clips from 128x128 to 3840x2160, including odd sizes, 10-bit, film grain
 (8-bit and 10-bit; the grain is applied, and matches libdav1d's), several key frames, hierarchical prediction with overlay frames, screen-content tools,
