@@ -622,6 +622,7 @@ fn audio_codec(id: &str) -> Option<CodecId> {
         "A_FLAC" => CodecId::Flac,
         "A_MPEG/L3" => CodecId::Mp3,
         "A_MPEG/L2" => CodecId::Mp2,
+        "A_AC3" => CodecId::Ac3,
         "A_ALAC" => CodecId::Alac,
         s if s == "A_AAC" || s.starts_with("A_AAC/") => CodecId::Aac,
         _ => return None,
@@ -660,6 +661,7 @@ fn audio_frame_len(t: &MkTrack, codec: CodecId) -> Option<u32> {
         CodecId::Aac => Some(1024),
         CodecId::Mp3 => Some(if t.rate >= 32000.0 { 1152 } else { 576 }),
         CodecId::Mp2 => Some(1152),
+        CodecId::Ac3 => Some(1536),
         _ => None,
     }
 }
@@ -786,7 +788,7 @@ fn build_track(t: &MkTrack, index: usize, frames: &[&Frame], scale: u64, samples
                 // AAC's codec delay is its priming, and its discard padding (the last block's) the end
                 // padding: the stream is the samples between them, as FFmpeg reads it
                 // (MPEG audio's codec delay is its encoder's priming, which FFmpeg drops too)
-                if matches!(codec, CodecId::Aac | CodecId::Mp2 | CodecId::Mp3) {
+                if matches!(codec, CodecId::Aac | CodecId::Mp2 | CodecId::Mp3 | CodecId::Ac3) {
                     let to_samples = |ns: i64| ((ns.max(0) as i128 * rate as i128 + 500_000_000) / 1_000_000_000) as i64;
                     let delay = to_samples(t.delay_ns.min(i64::MAX as u64) as i64);
                     if delay > 0 {

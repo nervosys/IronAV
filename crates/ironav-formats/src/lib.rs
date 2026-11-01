@@ -116,7 +116,7 @@ pub static FORMATS: &[FormatSpec] = &[
         media: MediaType::Video,
         demux: true,
         mux: true,
-        codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Vp8, CodecId::Vp9, CodecId::Av1, CodecId::Mjpeg, CodecId::Mpeg4, CodecId::Aac, CodecId::Mp3, CodecId::Mp2, CodecId::Opus, CodecId::Vorbis, CodecId::Flac, CodecId::PcmU8, CodecId::PcmS16Le, CodecId::PcmS24Le, CodecId::PcmS32Le, CodecId::PcmF32Le, CodecId::PcmF64Le],
+        codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Vp8, CodecId::Vp9, CodecId::Av1, CodecId::Mjpeg, CodecId::Mpeg4, CodecId::Aac, CodecId::Mp3, CodecId::Mp2, CodecId::Ac3, CodecId::Opus, CodecId::Vorbis, CodecId::Flac, CodecId::PcmU8, CodecId::PcmS16Le, CodecId::PcmS24Le, CodecId::PcmS32Le, CodecId::PcmF32Le, CodecId::PcmF64Le],
     },
     FormatSpec {
         name: "mp3",
