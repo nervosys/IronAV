@@ -1,6 +1,9 @@
-//! A software MPEG-4 Part 2 video encoder for the Simple profile: I and P pictures of a rectangular,
-//! progressive video object layer, with half-sample motion (one vector or four per macroblock),
-//! intra DC and AC prediction, H.263 quantisation, and run-level escapes 1 to 3.
+//! A software MPEG-4 Part 2 video encoder: I and P pictures of the Simple profile, and with
+//! `with_bframes(n)` B pictures too, as the Advanced Simple profile. The video object layer is
+//! rectangular and progressive, with half-sample motion (one vector or four per macroblock), intra DC
+//! and AC prediction, H.263 quantisation, and run-level escapes 1 to 3. B pictures take forward,
+//! backward, bidirectional or direct macroblocks, and the anchor pictures (I and P) are coded ahead
+//! of the pictures between them, so the stream is reordered and the B pictures carry their own times.
 //!
 //! The bit syntax is the one the decoder in `mpeg4/mb.rs` reads, and the headers and VLC tables are
 //! the decoder's (from FFmpeg's `mpeg4data.h` and `h263data.c`; Michael Niedermayer, Fabrice Bellard
@@ -8,9 +11,9 @@
 //! own half-sample motion compensation and inverse transform, so the decoder's output is the
 //! encoder's reconstruction, and the references the encoder predicts from are exactly those.
 //!
-//! Not written: B-pictures, quarter-sample motion, MPEG quantisation, interlaced pictures, resync
-//! markers and data partitioning. The layer is progressive, so the frames are as the decoder writes
-//! them: cropped to the picture size, with the macroblock-aligned padding coded but not shown.
+//! Not written: quarter-sample motion, MPEG quantisation, interlaced pictures, resync markers and
+//! data partitioning. The layer is progressive, so the frames are as the decoder writes them: cropped
+//! to the picture size, with the macroblock-aligned padding coded but not shown.
 
 mod mb;
 
@@ -27,6 +30,12 @@ const DEFAULT_QSCALE: i32 = 5;
 const START_QSCALE: f64 = 6.0;
 /// The motion search's range in half samples: vectors lie within plus or minus this.
 pub(super) const SEARCH: i32 = 30;
+/// The most B pictures between anchor pictures.
+const MAX_BFRAMES: usize = 3;
+/// The picture kinds, as the `vop_coding_type` codes them: I, P and B.
+const KIND_I: u8 = 0;
+const KIND_P: u8 = 1;
+const KIND_B: u8 = 2;
 
 /// The macroblock-aligned planes of a source frame.
 pub(super) struct Source {
@@ -73,18 +82,39 @@ impl BitW {
 /// The start codes and the video object layer that describe a stream of `width` by `height` at the
 /// frame rate `num / den`: the visual object sequence, the visual object, and the layer header.
 /// The bytes are the stream's codec configuration (the `esds` decoder specific info or Matroska's
-/// CodecPrivate), and a key picture carries them in front of it.
+/// CodecPrivate), and a key picture carries them in front of it. This is the Simple profile's layer.
 pub fn config(width: u32, height: u32, num: i64) -> Vec<u8> {
+    layer_config(width, height, num, false)
+}
+
+/// The start codes and the layer header as `config` writes them, in the Simple profile, or in the
+/// Advanced Simple profile when `advanced` is set, which B pictures need: its layer carries a version
+/// and its profile is the one FFmpeg writes for B pictures (level 1).
+fn layer_config(width: u32, height: u32, num: i64, advanced: bool) -> Vec<u8> {
     let res = num.clamp(1, 65535) as u32;
-    let mut out = vec![0, 0, 1, 0xB0, 0x01]; // visual object sequence, simple profile at level 1
+    let (profile, vo_type) = if advanced { (0xF1u8, 17u32) } else { (0x01, 1) };
+    let mut out = vec![0, 0, 1, 0xB0, profile]; // visual object sequence, at level 1
     out.extend_from_slice(&[0, 0, 1, 0xB5, 0x08]); // visual object: video, no signal type
     out.extend_from_slice(&[0, 0, 1, 0x20]); // video object layer 0
     let mut b = BitW::default();
     b.put(0, 1); // random accessible
-    b.put(1, 8); // video object type: simple
-    b.put(0, 1); // no layer identifier
+    b.put(vo_type, 8); // video object type: simple, or advanced simple
+    b.put(advanced as u32, 1); // a layer identifier, with its version and priority, when advanced
+    if advanced {
+        b.put(5, 4); // version 5: advanced simple
+        b.put(1, 3); // priority
+    }
     b.put(1, 4); // aspect ratio 1:1
-    b.put(0, 1); // no vol control parameters
+    if advanced {
+        // vol control parameters: 4:2:0, not low delay (with B pictures, a decoder that thinks the stream
+        // is low delay outputs each anchor at once and repeats it later), no VBV parameters
+        b.put(1, 1);
+        b.put(1, 2);
+        b.put(0, 1);
+        b.put(0, 1);
+    } else {
+        b.put(0, 1); // no vol control parameters
+    }
     b.put(0, 2); // rectangular
     b.put(1, 1);
     b.put(res, 16); // time increment resolution
@@ -97,15 +127,37 @@ pub fn config(width: u32, height: u32, num: i64) -> Vec<u8> {
     b.put(1, 1);
     b.put(0, 1); // progressive
     b.put(1, 1); // no OBMC
-    b.put(0, 1); // no sprites
+    if advanced {
+        b.put(0, 2); // no sprites
+    } else {
+        b.put(0, 1); // no sprites
+    }
     b.put(0, 1); // 8-bit quantiser precision
     b.put(0, 1); // H.263 quantisation
+    if advanced {
+        b.put(0, 1); // no quarter-sample motion
+    }
     b.put(1, 1); // no complexity estimation
     b.put(1, 1); // no resync markers
     b.put(0, 1); // no data partitioning
+    if advanced {
+        b.put(0, 2); // no new prediction, no reduced resolution
+    }
     b.put(0, 1); // no scalability
     out.extend(b.finish());
     out
+}
+
+/// Where a picture sits in the stream: its kind; its time, `modulo` whole seconds after the anchor it
+/// is timed from and `inc` ticks past the second; and, for B pictures, the ticks between their anchors
+/// (`pp`) and from the past anchor to the picture (`pb`), which the decoder scales direct vectors by.
+#[derive(Clone, Copy)]
+struct Slot {
+    kind: u8,
+    modulo: i64,
+    inc: i64,
+    pp: i64,
+    pb: i64,
 }
 
 pub struct Mpeg4Encoder {
@@ -114,20 +166,29 @@ pub struct Mpeg4Encoder {
     num: i64,
     den: i64,
     fcode: i32,
-    /// Pictures coded so far, and the second of the last one (the time base of the next).
+    /// Frames received: the display index of the next one.
     frames: u64,
-    last_sec: i64,
+    /// The time, in ticks of the layer's time base, of the last anchor picture and of the one before.
+    anchor_t: i64,
+    prev_anchor_t: i64,
+    /// B pictures between anchor pictures (0 for none).
+    bframes: usize,
+    /// Frames waiting for the anchor picture they are coded with: source, time stamp and display index.
+    pending: Vec<(Source, i64, u64)>,
+    /// The display index of the last key picture, and the pictures between key pictures.
+    key_at: u64,
     keyint: u64,
-    /// Pictures since the last key picture; 0 before the first.
-    since_key: u64,
     /// The quantiser when it is fixed, else the rate control's (fractional) quantiser.
     fixed: Option<i32>,
     qscale: f64,
     /// Bits per picture to average when rate controlled, and the bits over (or under) that lately.
     target: Option<f64>,
     debt: f64,
-    /// The last reconstructed picture, which the next one predicts from.
+    /// The last anchor picture as the decoder reconstructs it: the next anchor predicts from it.
     refp: Option<Arc<Pic>>,
+    /// Every picture's reconstruction with its time stamp, in coding order.
+    #[cfg(test)]
+    recon: Vec<(i64, Arc<Pic>)>,
 }
 
 impl Mpeg4Encoder {
@@ -181,20 +242,34 @@ impl Mpeg4Encoder {
             den,
             fcode,
             frames: 0,
-            last_sec: 0,
+            anchor_t: 0,
+            prev_anchor_t: 0,
+            bframes: 0,
+            pending: Vec::new(),
+            key_at: 0,
             keyint: KEYINT,
-            since_key: 0,
             fixed,
             qscale: fixed.map_or(START_QSCALE, f64::from),
             target: bitrate.map(|b| b as f64 / fps),
             debt: 0.0,
             refp: None,
+            #[cfg(test)]
+            recon: Vec::new(),
         })
     }
 
     /// Key pictures every `n` pictures (1 for key pictures only).
     pub fn with_keyint(mut self, n: u64) -> Self {
         self.keyint = n.max(1);
+        self
+    }
+
+    /// `n` B pictures between anchor pictures (0 for none, up to 3). The stream is then the Advanced
+    /// Simple profile, and its layer header says so. Each B picture refers to the anchors on either
+    /// side of it, and the anchors are coded ahead of the pictures between them.
+    pub fn with_bframes(mut self, n: usize) -> Self {
+        self.bframes = n.min(MAX_BFRAMES);
+        self.config = layer_config(self.vol.width as u32, self.vol.height as u32, self.num, self.bframes > 0);
         self
     }
 
@@ -231,35 +306,48 @@ impl Mpeg4Encoder {
         })
     }
 
+    /// Display index `d` in ticks of the layer's time base: `d * den / num` seconds.
+    fn ticks(&self, d: u64) -> i64 {
+        (d as i128 * self.den as i128 * self.vol.time_res as i128 / self.num as i128) as i64
+    }
+
+    /// The quantiser of the next picture.
+    fn quant(&self) -> i32 {
+        self.fixed.unwrap_or(self.qscale.round() as i32).clamp(1, 31)
+    }
+
     /// Codes one picture: its header, then every macroblock, which are reconstructed as they go.
-    /// Returns the picture's bytes (start code included) and its reconstruction.
-    fn code_picture(&self, src: &Source, key: bool, q: i32, modulo: i64, inc: i64) -> (Vec<u8>, Pic) {
+    /// `refs` are its forward and backward references. Returns the picture's bytes (start code
+    /// included) and its reconstruction.
+    fn code_picture(&self, src: &Source, slot: Slot, q: i32, refs: [Option<Arc<Pic>>; 2]) -> (Vec<u8>, Pic) {
         let mut bw = BitW::default();
-        bw.put(if key { 0 } else { 1 }, 2); // vop_coding_type
-        for _ in 0..modulo.max(0) {
-            bw.put(1, 1); // whole seconds since the last picture
+        bw.put(slot.kind as u32, 2); // vop_coding_type
+        for _ in 0..slot.modulo.max(0) {
+            bw.put(1, 1); // whole seconds since the anchor
         }
         bw.put(0, 1);
         bw.put(1, 1);
-        bw.put(inc as u32, self.vol.time_bits);
+        bw.put(slot.inc as u32, self.vol.time_bits);
         bw.put(1, 1);
         bw.put(1, 1); // vop_coded
-        if !key {
+        if slot.kind == KIND_P {
             bw.put(0, 1); // rounding type
         }
         bw.put(0, 3); // intra_dc_vlc_thr 0: the DC is always coded with its VLC
         bw.put(q as u32, 5);
-        if !key {
-            bw.put(self.fcode as u32, 3);
+        if slot.kind != KIND_I {
+            bw.put(self.fcode as u32, 3); // forward f_code
         }
-        let refp = if key { None } else { self.refp.clone() };
-        let mut c = Coder::new(&self.vol, src, refp, q, self.fcode, bw);
+        if slot.kind == KIND_B {
+            bw.put(self.fcode as u32, 3); // backward f_code
+        }
+        let mut c = Coder::new(&self.vol, src, refs, (slot.pp, slot.pb), q, self.fcode, bw);
         for mby in 0..self.vol.mbh {
             for mbx in 0..self.vol.mbw {
-                if key {
-                    c.intra_mb(mbx, mby, false);
-                } else {
-                    c.p_mb(mbx, mby);
+                match slot.kind {
+                    KIND_I => c.intra_mb(mbx, mby, false),
+                    KIND_P => c.p_mb(mbx, mby),
+                    _ => c.b_mb(mbx, mby),
                 }
             }
         }
@@ -280,6 +368,68 @@ impl Mpeg4Encoder {
             self.qscale = (self.qscale + step).clamp(1.0, 31.0);
         }
     }
+
+    /// Codes an anchor picture at display index `d`: a key picture, or a P picture from the last anchor.
+    /// Its time is whole seconds past the last anchor, and it becomes the last anchor.
+    fn code_anchor(&mut self, src: &Source, pts: i64, d: u64, key: bool) -> Packet {
+        let (res, t) = (self.vol.time_res, self.ticks(d));
+        let kind = if key { KIND_I } else { KIND_P };
+        let slot = Slot { kind, modulo: t / res - self.anchor_t / res, inc: t % res, pp: 0, pb: 0 };
+        let refs = [if key { None } else { self.refp.clone() }, None];
+        let (body, pic) = self.code_picture(src, slot, self.quant(), refs);
+        self.adapt(body.len() as f64 * 8.0, key);
+        let mut data = if key { self.config.clone() } else { Vec::new() };
+        data.extend_from_slice(&body);
+        self.prev_anchor_t = self.anchor_t;
+        self.anchor_t = t;
+        let pic = Arc::new(pic);
+        #[cfg(test)]
+        self.recon.push((pts, pic.clone()));
+        self.refp = Some(pic);
+        Packet { stream: 0, pts, duration: 1, data }
+    }
+
+    /// Codes a B picture at display index `d` between the last two anchors: `fwd` is the past one and
+    /// `bwd` the future one. Its time is whole seconds past the past anchor.
+    fn code_b(&mut self, src: &Source, pts: i64, d: u64, fwd: Arc<Pic>, bwd: Arc<Pic>) -> Packet {
+        let (res, t) = (self.vol.time_res, self.ticks(d));
+        let slot = Slot {
+            kind: KIND_B,
+            modulo: t / res - self.prev_anchor_t / res,
+            inc: t % res,
+            pp: self.anchor_t - self.prev_anchor_t,
+            pb: t - self.prev_anchor_t,
+        };
+        #[cfg_attr(not(test), allow(unused_variables))]
+        let (body, pic) = self.code_picture(src, slot, self.quant(), [Some(fwd), Some(bwd)]);
+        self.adapt(body.len() as f64 * 8.0, false);
+        #[cfg(test)]
+        self.recon.push((pts, Arc::new(pic)));
+        Packet { stream: 0, pts, duration: 1, data: body }
+    }
+
+    /// Codes the frames waiting for an anchor as P pictures, each from the one before. This is for the
+    /// frames before a key picture, and for the end of the stream.
+    fn code_pending(&mut self) -> Vec<Packet> {
+        let waiting = std::mem::take(&mut self.pending);
+        waiting.into_iter().map(|(src, pts, d)| self.code_anchor(&src, pts, d, false)).collect()
+    }
+
+    /// Codes the frames waiting with the newest one as an anchor: a P picture from the last anchor,
+    /// then the others as B pictures between the two anchors, in display order.
+    fn code_gop(&mut self) -> Vec<Packet> {
+        let mut waiting = std::mem::take(&mut self.pending);
+        let Some((src, pts, d)) = waiting.pop() else {
+            return Vec::new();
+        };
+        let fwd = self.refp.clone().expect("a key picture precedes the anchors");
+        let mut out = vec![self.code_anchor(&src, pts, d, false)];
+        let bwd = self.refp.clone().expect("the anchor was just coded");
+        for (src, pts, d) in waiting {
+            out.push(self.code_b(&src, pts, d, fwd.clone(), bwd.clone()));
+        }
+        out
+    }
 }
 
 impl Encoder for Mpeg4Encoder {
@@ -288,21 +438,24 @@ impl Encoder for Mpeg4Encoder {
             return Err(Error::invalid_input("the MPEG-4 encoder received an audio frame"));
         };
         let src = self.source(v)?;
-        let key = self.since_key == 0 || self.since_key >= self.keyint;
-        let q = self.fixed.unwrap_or(self.qscale.round() as i32).clamp(1, 31);
-        // the picture's time in ticks of the layer's resolution: frame n is n * den / num seconds
-        let res = self.vol.time_res;
-        let ticks = (self.frames as i128 * self.den as i128 * res as i128 / self.num as i128) as i64;
-        let (sec, inc) = (ticks / res, ticks % res);
-        let (body, pic) = self.code_picture(&src, key, q, sec - self.last_sec, inc);
-        self.adapt(body.len() as f64 * 8.0, key);
-        let mut data = if key { self.config.clone() } else { Vec::new() };
-        data.extend_from_slice(&body);
-        self.refp = Some(Arc::new(pic));
-        self.last_sec = sec;
+        let d = self.frames;
         self.frames += 1;
-        self.since_key = if key { 1 } else { self.since_key + 1 };
-        Ok(vec![Packet { stream: 0, pts: v.pts, duration: 1, data }])
+        if d == 0 || d - self.key_at >= self.keyint {
+            // a key picture: the frames waiting before it are coded first, as P pictures
+            let mut out = self.code_pending();
+            self.key_at = d;
+            out.push(self.code_anchor(&src, v.pts, d, true));
+            return Ok(out);
+        }
+        self.pending.push((src, v.pts, d));
+        if self.pending.len() > self.bframes {
+            return Ok(self.code_gop());
+        }
+        Ok(Vec::new())
+    }
+
+    fn flush(&mut self) -> Result<Vec<Packet>> {
+        Ok(self.code_pending())
     }
 }
 
@@ -352,35 +505,50 @@ mod tests {
         StreamParams::Video { width: w, height: h, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational::new(fps, 1) }
     }
 
-    /// Encodes `n` pictures and decodes them with the IronAV decoder. Checks that the decoder's
-    /// pictures are the encoder's reconstructions bit for bit, and returns the packet sizes and the
-    /// mean luma PSNR against the source.
-    fn round_trip(w: usize, h: usize, n: usize, qp: Option<u8>, bitrate: Option<u32>, keyint: u64) -> (Vec<usize>, f64) {
-        let mut enc = Mpeg4Encoder::new(&params(w as u32, h as u32, 25), qp, bitrate).unwrap().with_keyint(keyint);
+    /// Encodes `n` pictures with `bframes` B pictures between anchors and decodes them with the IronAV
+    /// decoder. Checks that the decoder's pictures, in display order, are the encoder's reconstructions
+    /// bit for bit. Returns the packet sizes in coding order, the mean luma PSNR against the source, and
+    /// the time stamps in coding order.
+    fn round_trip_b(w: usize, h: usize, n: usize, qp: Option<u8>, bitrate: Option<u32>, keyint: u64, bframes: usize) -> (Vec<usize>, f64, Vec<i64>) {
+        let mut enc = Mpeg4Encoder::new(&params(w as u32, h as u32, 25), qp, bitrate).unwrap().with_keyint(keyint).with_bframes(bframes);
         let mut dec = Mpeg4Decoder::new(&[]);
-        let (mut sizes, mut recs, mut srcs) = (Vec::new(), Vec::new(), Vec::new());
-        let mut out = Vec::new();
+        let mut srcs = Vec::new();
+        let mut pkts = Vec::new();
         for t in 0..n {
             let src = scene(w, h, t);
-            let pkt = enc.encode(&Frame::Video(src.clone())).unwrap().remove(0);
-            sizes.push(pkt.data.len());
-            out.extend(dec.decode(&Packet { stream: 0, pts: t as i64, duration: 1, data: pkt.data }).unwrap());
-            recs.push(enc.refp.clone().unwrap());
+            pkts.extend(enc.encode(&Frame::Video(src.clone())).unwrap());
             srcs.push(src);
+        }
+        pkts.extend(enc.flush().unwrap());
+        assert_eq!(pkts.len(), n, "every frame is coded once");
+        let sizes = pkts.iter().map(|p| p.data.len()).collect();
+        let order = pkts.iter().map(|p| p.pts).collect();
+        let mut out = Vec::new();
+        for p in pkts {
+            out.extend(dec.decode(&p).unwrap());
         }
         out.extend(dec.flush().unwrap());
         assert_eq!(out.len(), n, "the decoder returns every picture");
+        enc.recon.sort_by_key(|r| r.0);
         let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
         let mut p = 0.0;
         for (t, f) in out.iter().enumerate() {
             let Frame::Video(v) = f else { unreachable!() };
-            let rec = &recs[t];
+            assert_eq!(v.pts, t as i64, "picture {t} is shown in display order");
+            let rec = &enc.recon[t].1;
             let (lw, cs) = (enc.vol.mbw * 16, enc.vol.mbw * 8);
             let want = [crop(&rec.planes[0], lw, w, h), crop(&rec.planes[1], cs, cw, ch), crop(&rec.planes[2], cs, cw, ch)];
             assert!(v.planes == want, "picture {t}: the decoder's picture differs from the encoder's reconstruction");
             p += psnr(&v.planes[0], &srcs[t].planes[0]);
         }
-        (sizes, p / n as f64)
+        (sizes, p / n as f64, order)
+    }
+
+    /// Encodes `n` pictures and decodes them with the IronAV decoder (no B pictures). Returns the packet
+    /// sizes and the mean luma PSNR against the source.
+    fn round_trip(w: usize, h: usize, n: usize, qp: Option<u8>, bitrate: Option<u32>, keyint: u64) -> (Vec<usize>, f64) {
+        let (sizes, p, _) = round_trip_b(w, h, n, qp, bitrate, keyint, 0);
+        (sizes, p)
     }
 
     #[test]
@@ -423,5 +591,45 @@ mod tests {
         }
         let kbps = bits as f64 * 30.0 / n as f64 / 1000.0;
         assert!((150.0..450.0).contains(&kbps), "{kbps:.0} kbit/s for a 300 kbit/s target");
+    }
+
+    /// B pictures: the anchors are coded ahead of the pictures between them, so the packets come out
+    /// in the order the stream is decoded in, each with its display time, and the decoder shows them
+    /// in display order, bit for bit as the encoder reconstructed them.
+    #[test]
+    fn b_pictures_decode_to_the_encoder_reconstruction() {
+        let (sizes, p, order) = round_trip_b(64, 48, 9, Some(4), None, 250, 2);
+        // the last two frames wait for an anchor that never comes, so they are flushed as P pictures
+        assert_eq!(order, vec![0, 3, 1, 2, 6, 4, 5, 7, 8], "anchors first, then the pictures between them");
+        assert!(p > 28.0, "PSNR {p:.1}");
+        assert_eq!(sizes.len(), 9);
+    }
+
+    #[test]
+    fn one_b_picture_between_anchors_at_odd_sizes() {
+        round_trip_b(177, 99, 7, Some(8), None, 250, 1);
+        round_trip_b(178, 100, 7, Some(8), None, 250, 1);
+    }
+
+    /// A key picture with B pictures waiting before it: those are coded as P pictures ahead of it.
+    #[test]
+    fn key_pictures_with_frames_waiting_for_an_anchor() {
+        let (_, _, order) = round_trip_b(64, 48, 12, Some(6), None, 5, 2);
+        assert_eq!(order.len(), 12);
+        let mut sorted = order.clone();
+        sorted.sort();
+        assert_eq!(sorted, (0..12).collect::<Vec<i64>>(), "every frame is coded once");
+    }
+
+    #[test]
+    fn b_pictures_under_rate_control() {
+        let (w, h, n) = (176, 144, 20);
+        let mut enc = Mpeg4Encoder::new(&params(w as u32, h as u32, 25), None, Some(400_000)).unwrap().with_bframes(2);
+        let mut pkts = Vec::new();
+        for t in 0..n {
+            pkts.extend(enc.encode(&Frame::Video(scene(w, h, t))).unwrap());
+        }
+        pkts.extend(enc.flush().unwrap());
+        assert_eq!(pkts.len(), n);
     }
 }

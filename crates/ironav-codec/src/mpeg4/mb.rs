@@ -22,11 +22,11 @@ fn bad(msg: &str) -> Error {
 /// The motion of a macroblock: the directions it predicts from, and each direction's vector per
 /// 8x8 block (all four equal unless `four` is set, which also selects the 8x8 filter).
 #[derive(Clone, Copy, Default)]
-struct Plan {
-    fwd: bool,
-    bwd: bool,
-    four: bool,
-    mv: [[[i32; 2]; 4]; 2],
+pub(crate) struct Plan {
+    pub fwd: bool,
+    pub bwd: bool,
+    pub four: bool,
+    pub mv: [[[i32; 2]; 4]; 2],
 }
 
 /// The grid (0 luma, 1 and 2 chroma) and the block coordinates in it of block `n` of a macroblock.
@@ -411,26 +411,7 @@ impl<'a> Vop<'a> {
     /// vector of the future anchor scaled by the time distances, plus the coded delta (mx, my).
     fn direct_plan(&self, mb: usize, mbx: usize, mby: usize, mx: i32, my: i32) -> Plan {
         let fut = self.bwd_ref.as_ref().expect("checked by the caller");
-        let gw = 2 * self.vol.mbw;
-        let (pp, pb) = (self.pp_time, self.pb_time);
-        let four = fut.mbf[mb] & FOUR_MV != 0;
-        let mut plan = Plan { fwd: true, bwd: true, four: four || self.vol.quarter, ..Plan::default() };
-        let scale = |p: i32, num: i64| (p as i64 * num / pp) as i32;
-        for i in 0..4 {
-            // a macroblock that is not four-vector takes its first block's vector for all four
-            let src = if four { i } else { 0 };
-            let (bx, by) = (2 * mbx + (src & 1), 2 * mby + (src >> 1));
-            let p = fut.mv[by * gw + bx];
-            let (px, py) = (p[0] as i32, p[1] as i32);
-            let f0 = [scale(px, pb) + mx, scale(py, pb) + my];
-            let b1 = [
-                if mx != 0 { f0[0] - px } else { scale(px, pb - pp) },
-                if my != 0 { f0[1] - py } else { scale(py, pb - pp) },
-            ];
-            plan.mv[0][i] = f0;
-            plan.mv[1][i] = b1;
-        }
-        plan
+        direct_motion(fut, self.vol, mb, mbx, mby, mx, my, self.pp_time, self.pb_time)
     }
 
     fn b_mb(&mut self, mb: usize, mbx: usize, mby: usize) -> Result<()> {
@@ -714,104 +695,107 @@ impl<'a> Vop<'a> {
         idct::put(&mut blk, &mut self.cur.planes[plane][off..], stride);
     }
 
-    /// Motion compensation of a macroblock from its references into the picture. The second
-    /// direction of a B-VOP is averaged into the first, and always rounds.
     fn mc_mb(&mut self, mbx: usize, mby: usize, plan: &Plan) {
-        let quarter = self.vol.quarter;
-        let (lw, lh) = (self.vol.mbw * 16, self.vol.mbh * 16);
-        let (cw, ch) = (self.vol.mbw * 8, self.vol.mbh * 8);
-        let (w, h) = (self.vol.width as i32, self.vol.height as i32);
-        let (mx0, my0) = (mbx as i32 * 16, mby as i32 * 16);
-        for d in 0..2 {
-            if (d == 0 && !plan.fwd) || (d == 1 && !plan.bwd) {
-                continue;
-            }
-            let refp = if d == 0 { self.fwd_ref.clone() } else { self.bwd_ref.clone() };
-            let Some(refp) = refp else { continue };
-            let avg = d == 1 && plan.fwd;
-            let nr = self.nr && !avg;
-            let lp = Plane { d: &refp.planes[0], stride: lw, w: lw as i32, h: lh as i32 };
-            let mv = plan.mv[d];
-            if plan.four {
-                for i in 0..4 {
-                    let (mvx, mvy) = (mv[i][0], mv[i][1]);
-                    let (bx, by) = (mx0 + (i as i32 & 1) * 8, my0 + (i as i32 >> 1) * 8);
-                    let dst = &mut self.cur.planes[0][by as usize * lw + bx as usize..];
-                    if quarter {
-                        let mut dxy = (((mvy & 3) << 2) | (mvx & 3)) as u32;
-                        let sx = (bx + (mvx >> 2)).clamp(-16, w);
-                        if sx == w {
-                            dxy &= !3;
-                        }
-                        let sy = (by + (mvy >> 2)).clamp(-16, h);
-                        if sy == h {
-                            dxy &= !12;
-                        }
-                        mc::qpel(dst, lw, 8, &lp, sx, sy, dxy, nr, avg);
-                    } else {
-                        let mut dxy = 0u32;
-                        let sx = (bx + (mvx >> 1)).clamp(-16, w);
-                        if sx != w {
-                            dxy |= (mvx & 1) as u32;
-                        }
-                        let sy = (by + (mvy >> 1)).clamp(-16, h);
-                        if sy != h {
-                            dxy |= ((mvy & 1) << 1) as u32;
-                        }
-                        mc::hpel(dst, lw, 8, 8, &lp, sx, sy, dxy, nr, avg);
+        motion_comp(&mut self.cur, self.vol, [self.fwd_ref.as_deref(), self.bwd_ref.as_deref()], self.nr, mbx, mby, plan);
+    }
+}
+
+/// Motion compensation of a macroblock from its references into `cur`: each direction of `plan` predicts
+/// from `refs[d]`. The second direction of a B-VOP is averaged into the first, and always rounds.
+pub(crate) fn motion_comp(cur: &mut Pic, vol: &Vol, refs: [Option<&Pic>; 2], nr: bool, mbx: usize, mby: usize, plan: &Plan) {
+    let quarter = vol.quarter;
+    let (lw, lh) = (vol.mbw * 16, vol.mbh * 16);
+    let (cw, ch) = (vol.mbw * 8, vol.mbh * 8);
+    let (w, h) = (vol.width as i32, vol.height as i32);
+    let (mx0, my0) = (mbx as i32 * 16, mby as i32 * 16);
+    for d in 0..2 {
+        if (d == 0 && !plan.fwd) || (d == 1 && !plan.bwd) {
+            continue;
+        }
+        let Some(refp) = refs[d] else { continue };
+        let avg = d == 1 && plan.fwd;
+        let nr = nr && !avg;
+        let lp = Plane { d: &refp.planes[0], stride: lw, w: lw as i32, h: lh as i32 };
+        let mv = plan.mv[d];
+        if plan.four {
+            for i in 0..4 {
+                let (mvx, mvy) = (mv[i][0], mv[i][1]);
+                let (bx, by) = (mx0 + (i as i32 & 1) * 8, my0 + (i as i32 >> 1) * 8);
+                let dst = &mut cur.planes[0][by as usize * lw + bx as usize..];
+                if quarter {
+                    let mut dxy = (((mvy & 3) << 2) | (mvx & 3)) as u32;
+                    let sx = (bx + (mvx >> 2)).clamp(-16, w);
+                    if sx == w {
+                        dxy &= !3;
                     }
+                    let sy = (by + (mvy >> 2)).clamp(-16, h);
+                    if sy == h {
+                        dxy &= !12;
+                    }
+                    mc::qpel(dst, lw, 8, &lp, sx, sy, dxy, nr, avg);
+                } else {
+                    let mut dxy = 0u32;
+                    let sx = (bx + (mvx >> 1)).clamp(-16, w);
+                    if sx != w {
+                        dxy |= (mvx & 1) as u32;
+                    }
+                    let sy = (by + (mvy >> 1)).clamp(-16, h);
+                    if sy != h {
+                        dxy |= ((mvy & 1) << 1) as u32;
+                    }
+                    mc::hpel(dst, lw, 8, 8, &lp, sx, sy, dxy, nr, avg);
                 }
-                // the chroma vector of a four-vector macroblock: the rounded sum of the four
-                let (mut sx, mut sy) = (0i32, 0i32);
-                for m in mv {
-                    let (a, b) = if quarter { (m[0] / 2, m[1] / 2) } else { (m[0], m[1]) };
-                    sx += a;
-                    sy += b;
-                }
-                let (mx, my) = (round_chroma(sx), round_chroma(sy));
-                let mut dxy = (((my & 1) << 1) | (mx & 1)) as u32;
-                let (cx, cy) = (mx >> 1, my >> 1);
-                let px = (mbx as i32 * 8 + cx).clamp(-8, w >> 1);
-                if px == w >> 1 {
-                    dxy &= !1;
-                }
-                let py = (mby as i32 * 8 + cy).clamp(-8, h >> 1);
-                if py == h >> 1 {
-                    dxy &= !2;
-                }
-                for p in 1..3 {
-                    let cp = Plane { d: &refp.planes[p], stride: cw, w: cw as i32, h: ch as i32 };
-                    let dst = &mut self.cur.planes[p][mby * 8 * cw + mbx * 8..];
-                    mc::hpel(dst, cw, 8, 8, &cp, px, py, dxy, nr, avg);
-                }
-            } else if quarter {
-                let (mvx, mvy) = (mv[0][0], mv[0][1]);
-                let (sx, sy) = (mx0 + (mvx >> 2), my0 + (mvy >> 2));
-                let dxy = (((mvy & 3) << 2) | (mvx & 3)) as u32;
-                let dst = &mut self.cur.planes[0][my0 as usize * lw + mx0 as usize..];
-                mc::qpel(dst, lw, 16, &lp, sx, sy, dxy, nr, avg);
-                let cx = mvx / 2;
-                let cy = mvy / 2;
-                let cx = (cx >> 1) | (cx & 1);
-                let cy = (cy >> 1) | (cy & 1);
-                let uvdxy = ((cx & 1) | ((cy & 1) << 1)) as u32;
-                for p in 1..3 {
-                    let cp = Plane { d: &refp.planes[p], stride: cw, w: cw as i32, h: ch as i32 };
-                    let dst = &mut self.cur.planes[p][mby * 8 * cw + mbx * 8..];
-                    mc::hpel(dst, cw, 8, 8, &cp, mbx as i32 * 8 + (cx >> 1), mby as i32 * 8 + (cy >> 1), uvdxy, nr, avg);
-                }
-            } else {
-                let (mvx, mvy) = (mv[0][0], mv[0][1]);
-                let (sx, sy) = (mx0 + (mvx >> 1), my0 + (mvy >> 1));
-                let dxy = (((mvy & 1) << 1) | (mvx & 1)) as u32;
-                let dst = &mut self.cur.planes[0][my0 as usize * lw + mx0 as usize..];
-                mc::hpel(dst, lw, 16, 16, &lp, sx, sy, dxy, nr, avg);
-                let uvdxy = dxy | (mvy & 2) as u32 | ((mvx & 2) >> 1) as u32;
-                for p in 1..3 {
-                    let cp = Plane { d: &refp.planes[p], stride: cw, w: cw as i32, h: ch as i32 };
-                    let dst = &mut self.cur.planes[p][mby * 8 * cw + mbx * 8..];
-                    mc::hpel(dst, cw, 8, 8, &cp, sx >> 1, sy >> 1, uvdxy, nr, avg);
-                }
+            }
+            // the chroma vector of a four-vector macroblock: the rounded sum of the four
+            let (mut sx, mut sy) = (0i32, 0i32);
+            for m in mv {
+                let (a, b) = if quarter { (m[0] / 2, m[1] / 2) } else { (m[0], m[1]) };
+                sx += a;
+                sy += b;
+            }
+            let (mx, my) = (round_chroma(sx), round_chroma(sy));
+            let mut dxy = (((my & 1) << 1) | (mx & 1)) as u32;
+            let (cx, cy) = (mx >> 1, my >> 1);
+            let px = (mbx as i32 * 8 + cx).clamp(-8, w >> 1);
+            if px == w >> 1 {
+                dxy &= !1;
+            }
+            let py = (mby as i32 * 8 + cy).clamp(-8, h >> 1);
+            if py == h >> 1 {
+                dxy &= !2;
+            }
+            for p in 1..3 {
+                let cp = Plane { d: &refp.planes[p], stride: cw, w: cw as i32, h: ch as i32 };
+                let dst = &mut cur.planes[p][mby * 8 * cw + mbx * 8..];
+                mc::hpel(dst, cw, 8, 8, &cp, px, py, dxy, nr, avg);
+            }
+        } else if quarter {
+            let (mvx, mvy) = (mv[0][0], mv[0][1]);
+            let (sx, sy) = (mx0 + (mvx >> 2), my0 + (mvy >> 2));
+            let dxy = (((mvy & 3) << 2) | (mvx & 3)) as u32;
+            let dst = &mut cur.planes[0][my0 as usize * lw + mx0 as usize..];
+            mc::qpel(dst, lw, 16, &lp, sx, sy, dxy, nr, avg);
+            let cx = mvx / 2;
+            let cy = mvy / 2;
+            let cx = (cx >> 1) | (cx & 1);
+            let cy = (cy >> 1) | (cy & 1);
+            let uvdxy = ((cx & 1) | ((cy & 1) << 1)) as u32;
+            for p in 1..3 {
+                let cp = Plane { d: &refp.planes[p], stride: cw, w: cw as i32, h: ch as i32 };
+                let dst = &mut cur.planes[p][mby * 8 * cw + mbx * 8..];
+                mc::hpel(dst, cw, 8, 8, &cp, mbx as i32 * 8 + (cx >> 1), mby as i32 * 8 + (cy >> 1), uvdxy, nr, avg);
+            }
+        } else {
+            let (mvx, mvy) = (mv[0][0], mv[0][1]);
+            let (sx, sy) = (mx0 + (mvx >> 1), my0 + (mvy >> 1));
+            let dxy = (((mvy & 1) << 1) | (mvx & 1)) as u32;
+            let dst = &mut cur.planes[0][my0 as usize * lw + mx0 as usize..];
+            mc::hpel(dst, lw, 16, 16, &lp, sx, sy, dxy, nr, avg);
+            let uvdxy = dxy | (mvy & 2) as u32 | ((mvx & 2) >> 1) as u32;
+            for p in 1..3 {
+                let cp = Plane { d: &refp.planes[p], stride: cw, w: cw as i32, h: ch as i32 };
+                let dst = &mut cur.planes[p][mby * 8 * cw + mbx * 8..];
+                mc::hpel(dst, cw, 8, 8, &cp, sx >> 1, sy >> 1, uvdxy, nr, avg);
             }
         }
     }
@@ -819,4 +803,31 @@ impl<'a> Vop<'a> {
 
 fn round_chroma(x: i32) -> i32 {
     CHROMA_ROUND[(x & 15) as usize] + (x >> 3)
+}
+
+/// The motion of a B-VOP direct macroblock: each block's forward vector is the co-located vector of
+/// the future anchor `fut` scaled by the time distances (`pb` from the past anchor, `pp` between the
+/// anchors, in ticks), plus the coded delta (`mx`, `my`). The backward vector is the forward one less
+/// the co-located vector, or the scaled one when there is no delta.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn direct_motion(fut: &Pic, vol: &Vol, mb: usize, mbx: usize, mby: usize, mx: i32, my: i32, pp: i64, pb: i64) -> Plan {
+    let gw = 2 * vol.mbw;
+    let four = fut.mbf[mb] & FOUR_MV != 0;
+    let mut plan = Plan { fwd: true, bwd: true, four: four || vol.quarter, ..Plan::default() };
+    let scale = |p: i32, num: i64| (p as i64 * num / pp) as i32;
+    for i in 0..4 {
+        // a macroblock that is not four-vector takes its first block's vector for all four
+        let src = if four { i } else { 0 };
+        let (bx, by) = (2 * mbx + (src & 1), 2 * mby + (src >> 1));
+        let p = fut.mv[by * gw + bx];
+        let (px, py) = (p[0] as i32, p[1] as i32);
+        let f0 = [scale(px, pb) + mx, scale(py, pb) + my];
+        let b1 = [
+            if mx != 0 { f0[0] - px } else { scale(px, pb - pp) },
+            if my != 0 { f0[1] - py } else { scale(py, pb - pp) },
+        ];
+        plan.mv[0][i] = f0;
+        plan.mv[1][i] = b1;
+    }
+    plan
 }

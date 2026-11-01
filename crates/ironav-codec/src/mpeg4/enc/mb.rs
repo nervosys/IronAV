@@ -6,6 +6,7 @@
 use super::{BitW, Source, SEARCH};
 use crate::mpeg4::bits::Rl;
 use crate::mpeg4::idct;
+use crate::mpeg4::mb::{direct_motion, motion_comp, Plan};
 use crate::mpeg4::mc::{self, Plane};
 use crate::mpeg4::tables as T;
 use crate::mpeg4::{Pic, Vol, FOUR_MV, INTER_LAST, INTRA_LAST, NOT_CODED, INTRA};
@@ -188,7 +189,14 @@ fn chroma_4(refp: &Pic, vol: &Vol, mbx: usize, mby: usize, mvs: &[[i32; 2]; 4], 
 pub(super) struct Coder<'a> {
     vol: &'a Vol,
     src: &'a Source,
+    /// The forward reference: a P picture's last anchor, a B picture's past anchor.
     refp: Option<Arc<Pic>>,
+    /// A B picture's backward reference, the anchor after it.
+    bref: Option<Arc<Pic>>,
+    /// A B picture's times in ticks: the distance between its anchors, and from its past anchor to it.
+    times: (i64, i64),
+    /// The last forward and backward vectors coded in B pictures, which their vectors are predicted from.
+    last_mv: [[i32; 2]; 2],
     cur: Pic,
     bw: BitW,
     q: i32,
@@ -201,7 +209,8 @@ pub(super) struct Coder<'a> {
 }
 
 impl<'a> Coder<'a> {
-    pub fn new(vol: &'a Vol, src: &'a Source, refp: Option<Arc<Pic>>, q: i32, fcode: i32, bw: BitW) -> Self {
+    pub fn new(vol: &'a Vol, src: &'a Source, refs: [Option<Arc<Pic>>; 2], times: (i64, i64), q: i32, fcode: i32, bw: BitW) -> Self {
+        let [refp, bref] = refs;
         let n = vol.mbw * vol.mbh;
         let mut cos = [[0f32; 8]; 8];
         for (k, row) in cos.iter_mut().enumerate() {
@@ -214,6 +223,9 @@ impl<'a> Coder<'a> {
             vol,
             src,
             refp,
+            bref,
+            times,
+            last_mv: [[0; 2]; 2],
             cur: Pic::new(vol, 0),
             bw,
             q,
@@ -369,12 +381,17 @@ impl<'a> Coder<'a> {
 
     /// Writes a motion vector difference with the picture's f_code.
     fn put_mv(&mut self, diff: i32) {
+        self.put_mv_f(diff, self.fcode);
+    }
+
+    /// Writes a motion vector difference with f_code `fcode`.
+    fn put_mv_f(&mut self, diff: i32, fcode: i32) {
         if diff == 0 {
             self.bw.put(T::MV_CODE[0] as u32, T::MV_BITS[0] as u32);
             return;
         }
         let a = diff.unsigned_abs() - 1;
-        let shift = self.fcode as u32 - 1;
+        let shift = fcode as u32 - 1;
         let code = ((a >> shift) + 1) as usize;
         self.bw.put(T::MV_CODE[code] as u32, T::MV_BITS[code] as u32);
         self.bw.bit(diff < 0);
@@ -758,6 +775,135 @@ impl<'a> Coder<'a> {
         self.reset_pred(mbx, mby);
         self.cur.mbf[mb] = if four { FOUR_MV } else { 0 };
         self.store_pred(mbx, mby, &py, &pu, &pv);
+        for n in 0..6 {
+            if cbp[n] {
+                let mut blk = dequant(&lv[n], false, self.q, 0);
+                let (plane, off, stride) = self.block_dst(mbx, mby, n);
+                idct::add(&mut blk, &mut self.cur.planes[plane][off..], stride);
+            }
+        }
+    }
+
+    /// The prediction the macroblock now holds in `cur`: its 16 by 16 luma and two 8 by 8 chroma blocks.
+    fn read_pred(&self, mbx: usize, mby: usize) -> ([u8; 256], [u8; 64], [u8; 64]) {
+        let (lw, cw) = (self.vol.mbw * 16, self.vol.mbw * 8);
+        let (mut py, mut pu, mut pv) = ([0u8; 256], [0u8; 64], [0u8; 64]);
+        for y in 0..16 {
+            let o = (mby * 16 + y) * lw + mbx * 16;
+            py[y * 16..y * 16 + 16].copy_from_slice(&self.cur.planes[0][o..o + 16]);
+        }
+        for y in 0..8 {
+            let o = (mby * 8 + y) * cw + mbx * 8;
+            pu[y * 8..y * 8 + 8].copy_from_slice(&self.cur.planes[1][o..o + 8]);
+            pv[y * 8..y * 8 + 8].copy_from_slice(&self.cur.planes[2][o..o + 8]);
+        }
+        (py, pu, pv)
+    }
+
+    /// Predicts the macroblock with `plan` into `cur`, and returns the summed absolute luma difference
+    /// from the source.
+    fn plan_cost(&mut self, plan: &Plan, mbx: usize, mby: usize) -> u32 {
+        let (fwd, bwd) = (self.refp.clone(), self.bref.clone());
+        motion_comp(&mut self.cur, self.vol, [fwd.as_deref(), bwd.as_deref()], false, mbx, mby, plan);
+        let lw = self.vol.mbw * 16;
+        let mut s = 0u32;
+        for y in 0..16 {
+            let o = (mby * 16 + y) * lw + mbx * 16;
+            for x in 0..16 {
+                s += (self.cur.planes[0][o + x] as i32 - self.src.y[o + x] as i32).unsigned_abs();
+            }
+        }
+        s
+    }
+
+    /// A B-picture macroblock. The anchor after the picture decides whether it is skipped (no bits, a
+    /// forward prediction with a zero vector). Otherwise it is whichever of direct mode (with a delta
+    /// of up to a half sample), bidirectional, backward and forward prediction costs least, and its
+    /// residual is coded as a P picture's is. B pictures have no intra macroblocks.
+    pub fn b_mb(&mut self, mbx: usize, mby: usize) {
+        if mbx == 0 {
+            self.last_mv = [[0; 2]; 2];
+        }
+        let mb = mby * self.vol.mbw + mbx;
+        let (x0, y0) = (mbx as i32 * 16, mby as i32 * 16);
+        let fwd = self.refp.clone().expect("a B picture has a past anchor");
+        let bwd = self.bref.clone().expect("a B picture has a future anchor");
+        let (pp, pb) = self.times;
+        if bwd.mbf[mb] & NOT_CODED != 0 {
+            self.cur.mbf[mb] = NOT_CODED;
+            let plan = Plan { fwd: true, ..Plan::default() };
+            motion_comp(&mut self.cur, self.vol, [Some(&*fwd), Some(&*bwd)], false, mbx, mby, &plan);
+            return;
+        }
+        self.cur.mbf[mb] = 0;
+        // direct mode: the delta (in half samples) that predicts best of the nine around none
+        let mut direct = (u32::MAX, [0i32; 2]);
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                let plan = direct_motion(&bwd, self.vol, mb, mbx, mby, dx, dy, pp, pb);
+                let c = self.plan_cost(&plan, mbx, mby) + MV_LAMBDA * (dx.unsigned_abs() + dy.unsigned_abs());
+                if c < direct.0 {
+                    direct = (c, [dx, dy]);
+                }
+            }
+        }
+        let (last0, last1) = (self.last_mv[0], self.last_mv[1]);
+        let (mf, _) = self.search(&fwd, x0, y0, 16, last0, false);
+        let (mv_b, _) = self.search(&bwd, x0, y0, 16, last1, false);
+        let fwd_plan = Plan { fwd: true, mv: [[mf; 4], [[0; 2]; 4]], ..Plan::default() };
+        let bwd_plan = Plan { bwd: true, mv: [[[0; 2]; 4], [mv_b; 4]], ..Plan::default() };
+        let bi_plan = Plan { fwd: true, bwd: true, mv: [[mf; 4], [mv_b; 4]], ..Plan::default() };
+        let vec_cost = |v: [i32; 2], p: [i32; 2]| MV_LAMBDA * ((v[0] - p[0]).unsigned_abs() + (v[1] - p[1]).unsigned_abs());
+        let c_fwd = self.plan_cost(&fwd_plan, mbx, mby) + vec_cost(mf, last0);
+        let c_bwd = self.plan_cost(&bwd_plan, mbx, mby) + vec_cost(mv_b, last1);
+        let c_bi = self.plan_cost(&bi_plan, mbx, mby) + vec_cost(mf, last0) + vec_cost(mv_b, last1);
+        // the bitstream's types of B macroblock: 0 direct, 1 bidirectional, 2 backward, 3 forward
+        let mt = [(direct.0, 0usize), (c_bi, 1), (c_bwd, 2), (c_fwd, 3)].into_iter().min_by_key(|c| c.0).map_or(0, |c| c.1);
+        let plan = match mt {
+            0 => direct_motion(&bwd, self.vol, mb, mbx, mby, direct.1[0], direct.1[1], pp, pb),
+            1 => bi_plan,
+            2 => bwd_plan,
+            _ => fwd_plan,
+        };
+        motion_comp(&mut self.cur, self.vol, [Some(&*fwd), Some(&*bwd)], false, mbx, mby, &plan);
+        let (py, pu, pv) = self.read_pred(mbx, mby);
+        let lv = self.inter_levels(mbx, mby, &py, &pu, &pv);
+        let cbp: [bool; 6] = std::array::from_fn(|n| lv[n].iter().any(|&v| v != 0));
+        let cbp6 = (0..6).fold(0usize, |acc, n| acc | ((cbp[n] as usize) << (5 - n)));
+        let delta = direct.1;
+        if mt == 0 && delta == [0, 0] && cbp6 == 0 {
+            self.bw.bit(true); // a direct macroblock with no delta and no residual: nothing else is coded
+        } else {
+            self.bw.bit(false);
+            self.bw.bit(cbp6 == 0); // no coded block pattern
+            self.bw.put(1, [1, 2, 3, 4][mt]); // direct 1, bidirectional 01, backward 001, forward 0001
+            if cbp6 != 0 {
+                self.bw.put(cbp6 as u32, 6);
+                if mt != 0 {
+                    self.bw.bit(false); // the quantiser is not changed
+                }
+            }
+            if mt == 0 {
+                self.put_mv_f(delta[0], 1);
+                self.put_mv_f(delta[1], 1);
+            } else {
+                if mt == 1 || mt == 3 {
+                    self.put_mv(mf[0] - last0[0]);
+                    self.put_mv(mf[1] - last0[1]);
+                    self.last_mv[0] = mf;
+                }
+                if mt == 1 || mt == 2 {
+                    self.put_mv(mv_b[0] - last1[0]);
+                    self.put_mv(mv_b[1] - last1[1]);
+                    self.last_mv[1] = mv_b;
+                }
+            }
+        }
+        for n in 0..6 {
+            if cbp[n] {
+                self.put_block(true, &T::ZIGZAG, -1, &lv[n]);
+            }
+        }
         for n in 0..6 {
             if cbp[n] {
                 let mut blk = dequant(&lv[n], false, self.q, 0);

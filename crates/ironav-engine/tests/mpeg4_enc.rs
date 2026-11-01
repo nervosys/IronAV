@@ -5,7 +5,10 @@
 //!
 //! `cargo test -p ironav-engine --test mpeg4_enc -- --ignored --nocapture` prints the 720p table.
 
+use ironav_codec::mpeg4::enc::Mpeg4Encoder;
+use ironav_core::{CodecId, Encoder, Frame, PixelFormat, Rational, StreamInfo, StreamParams, VideoFrame};
 use ironav_engine::{run, Job};
+use ironav_formats::create_muxer;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
@@ -232,5 +235,116 @@ fn qp_outside_the_mpeg4_range_is_refused_by_name() {
     for qp in [1u8, 31] {
         let out = dir.join(format!("ok{qp}.mp4"));
         encode(&src, &out, Some(qp), None, None);
+    }
+}
+
+/// A y4m source of `frames` pictures of an FFmpeg lavfi source (`filter`) at `w` by `h`, 25 frames a second.
+fn lavfi_source(dir: &Path, filter: &str, w: usize, h: usize, frames: usize) -> PathBuf {
+    let src = dir.join(format!("{filter}.y4m"));
+    let size = format!("{filter}=size={w}x{h}:rate=25");
+    let n = frames.to_string();
+    assert!(ffmpeg(&["-f", "lavfi", "-i", &size, "-frames:v", &n, "-pix_fmt", "yuv420p", src.to_str().unwrap()]), "ffmpeg could not make the source");
+    src
+}
+
+/// Encodes the frames of the y4m file `src` at `qp` with `bframes` B pictures between anchors, through
+/// IronAV's encoder and muxer, into `out` (MP4 or Matroska by its extension). Returns the file's size.
+fn encode_with_bframes(src: &Path, out: &Path, qp: u8, bframes: usize) -> u64 {
+    let frames = y4m_frames(src);
+    let (w, h) = y4m_dims(&std::fs::read(src).unwrap());
+    let params = StreamParams::Video { width: w as u32, height: h as u32, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational::new(25, 1) };
+    let mut enc = Mpeg4Encoder::new(&params, Some(qp), None).unwrap().with_bframes(bframes);
+    let info = StreamInfo {
+        index: 0,
+        codec: CodecId::Mpeg4,
+        time_base: Rational::new(1, 25),
+        duration: Some(frames.len() as i64),
+        bits: None,
+        extradata: enc.config().to_vec(),
+        lead_in: 0,
+        params,
+    };
+    let format = out.extension().and_then(|e| e.to_str()).unwrap();
+    let mut mux = create_muxer(out, format).unwrap();
+    mux.write_header(&[info]).unwrap();
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let (ys, cs) = (w * h, cw * ch);
+    let mut pkts = Vec::new();
+    for (t, f) in frames.iter().enumerate() {
+        let planes = vec![f[..ys].to_vec(), f[ys..ys + cs].to_vec(), f[ys + cs..].to_vec()];
+        let frame = Frame::Video(VideoFrame { width: w as u32, height: h as u32, pix_fmt: PixelFormat::Yuv420p, pts: t as i64, planes });
+        pkts.extend(enc.encode(&frame).unwrap());
+    }
+    pkts.extend(enc.flush().unwrap());
+    for p in &pkts {
+        mux.write_packet(p).unwrap();
+    }
+    mux.finish().unwrap();
+    std::fs::metadata(out).unwrap().len()
+}
+
+/// IronAV's B pictures, in MP4 and in Matroska, decode with FFmpeg to exactly what IronAV's decoder
+/// decodes, and the pictures are close to the source.
+#[test]
+fn b_pictures_decode_to_what_ffmpeg_decodes() {
+    if !ffmpeg_available() {
+        eprintln!("skipped: ffmpeg is not on PATH");
+        return;
+    }
+    let dir = scratch("bframes-dec");
+    let src = source(&dir, 176, 144, 10, 25);
+    let frames = y4m_frames(&src);
+    for bframes in [1usize, 2] {
+        for ext in ["mp4", "mkv"] {
+            let enc = dir.join(format!("b{bframes}.{ext}"));
+            encode_with_bframes(&src, &enc, 5, bframes);
+            let ours = decode_ironav(&enc, &dir);
+            let theirs = decode_ffmpeg(&enc, &dir);
+            assert_eq!(ours.len(), frames.len(), "{bframes} B pictures, {ext}: picture count");
+            assert!(ours.concat() == theirs, "{bframes} B pictures, {ext}: IronAV's decode differs from FFmpeg's");
+            let p = mean_psnr(&ours, &frames, 176 * 144);
+            assert!(p > 30.0, "{bframes} B pictures, {ext}: PSNR {p:.1} dB at qscale 5");
+        }
+    }
+}
+
+/// The B-picture table: IronAV at qscale 5, 10 and 20 with 0, 1 and 2 B pictures between anchors, and
+/// FFmpeg's `-c:v mpeg4 -bf 1 -qscale:v N` (and with `-g 250`, the key picture interval IronAV uses).
+/// Each file's size and PSNR (decoded, against the source) for testsrc2 and mandelbrot at 352x288,
+/// 60 frames. Run it with `--ignored --nocapture`; it is not a pass/fail test.
+#[test]
+#[ignore]
+fn report_bframes_table() {
+    if !ffmpeg_available() {
+        eprintln!("skipped: ffmpeg is not on PATH");
+        return;
+    }
+    let dir = scratch("report-b");
+    let (w, h, n) = (352, 288, 60);
+    println!("| source | qscale | encoder | bytes | PSNR dB |");
+    println!("|---|---|---|---|---|");
+    for filter in ["testsrc2", "mandelbrot"] {
+        let src = lavfi_source(&dir, filter, w, h, n);
+        let frames = y4m_frames(&src);
+        for qp in [5u8, 10, 20] {
+            for bframes in 0..=2usize {
+                let enc = dir.join(format!("ours-{filter}-{qp}-{bframes}.mp4"));
+                let size = encode_with_bframes(&src, &enc, qp, bframes);
+                let p = mean_psnr(&decode_ironav(&enc, &dir), &frames, w * h);
+                println!("| {filter} | {qp} | IronAV, {bframes} B pictures | {size} | {p:.2} |");
+            }
+            for (label, extra) in [("FFmpeg `-bf 1`", &[][..]), ("FFmpeg `-bf 1 -g 250`", &["-g", "250"][..])] {
+                let theirs = dir.join(format!("ff-{filter}-{qp}-{}.mp4", extra.len()));
+                let q = qp.to_string();
+                let mut args = vec!["-i", src.to_str().unwrap(), "-c:v", "mpeg4", "-bf", "1", "-qscale:v", &q, "-pix_fmt", "yuv420p"];
+                args.extend_from_slice(extra);
+                args.push(theirs.to_str().unwrap());
+                let size = if ffmpeg(&args) { std::fs::metadata(&theirs).unwrap().len() } else { 0 };
+                let raw = decode_ffmpeg(&theirs, &dir);
+                let fframes: Vec<Vec<u8>> = raw.chunks(w * h * 3 / 2).map(|c| c.to_vec()).collect();
+                let p = mean_psnr(&fframes, &frames, w * h);
+                println!("| {filter} | {qp} | {label} | {size} | {p:.2} |");
+            }
+        }
     }
 }
