@@ -296,6 +296,21 @@ impl<R: Read + Seek + Send> Mp4Demuxer<R> {
                 }
             }
         }
+        // An MPEG audio entry is taken as MP3 (object types 0x69 and 0x6B both), but its first frame says
+        // whether it is Layer II, which is MP2 (FFmpeg writes MP2 as 0x69 too).
+        for (i, t) in tracks.iter_mut().enumerate() {
+            if t.stream.codec != CodecId::Mp3 {
+                continue;
+            }
+            let Some(first) = samples.iter().find(|s| s.stream as usize == i) else { continue };
+            let mut head = [0u8; 4];
+            r.seek(SeekFrom::Start(first.offset))?;
+            if r.read_exact(&mut head).is_ok() {
+                if let Some(h) = ironav_codec::mp3::parse_frame(&head) {
+                    t.stream.codec = h.codec();
+                }
+            }
+        }
         if tracks.is_empty() {
             return Err(Error::new(ErrorCode::UnsupportedCodec, "the MP4 has no audio or video track IronAV recognises"));
         }

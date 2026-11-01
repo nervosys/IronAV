@@ -4,7 +4,7 @@
 //! own decoder should decode it to the same samples FFmpeg does. Skipped without `ffmpeg` on PATH.
 
 use ironav_codec::mp3::{parse_frame, Mp2Decoder, Mp2Encoder, MP2_LEAD_IN};
-use ironav_core::{AudioFrame, Decoder, Encoder, Frame, Packet, StreamParams};
+use ironav_core::{AudioFrame, CodecId, Decoder, Encoder, Frame, Packet, StreamParams};
 use ironav_engine::{run, Job};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -253,6 +253,25 @@ fn mpeg_audio_in_matroska_has_its_codec_delay_trimmed() {
         run(&job(&out, &back), &mut |_| {}).unwrap();
         let (lag, _) = best_lag(&input, &wav_data_i16(&back), 2);
         assert_eq!(lag, 0, "{codec}: IronAV's reading of the Matroska file starts {lag} frames after the input");
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// FFmpeg's MP2 in MP4 (an `mp4a` entry with object type 0x69) is read as MP2, and its MP3 as MP3.
+#[test]
+fn mp4_mpeg_audio_is_labelled_by_its_layer() {
+    if !ffmpeg_available() {
+        eprintln!("skipped: ffmpeg is not on PATH");
+        return;
+    }
+    let d = scratch("mp4-labels");
+    let raw = d.join("in.s16le");
+    std::fs::write(&raw, to_bytes(&sweep(44100, 2, 0.4))).unwrap();
+    for (codec, want) in [("mp2", CodecId::Mp2), ("libmp3lame", CodecId::Mp3)] {
+        let out = d.join(format!("{codec}.mp4"));
+        ffmpeg(&["-f", "s16le", "-ar", "44100", "-ac", "2", "-i", raw.to_str().unwrap(), "-c:a", codec, out.to_str().unwrap()]);
+        let demux = ironav_formats::open_demuxer(&out).unwrap();
+        assert_eq!(demux.streams()[0].codec, want, "{codec} in MP4");
     }
     let _ = std::fs::remove_dir_all(&d);
 }

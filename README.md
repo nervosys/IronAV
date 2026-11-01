@@ -970,8 +970,8 @@ MPEG-1, MPEG-2 and MPEG-2.5 Layer III are decoded (mono, stereo, joint stereo wi
 skipped, a leading Xing/Info frame not played) and from Matroska. The Huffman and band tables and the scale-factor, stereo and
 short-block handling follow FFmpeg's decoder; the filterbank is written from the standard's definitions in `f64`.
 
-MPEG-1 and MPEG-2 Layer II (MP2) is decoded as the `mp2` codec, from raw `.mp2` files, Matroska `A_MPEG/L2` and any
-stream labelled MP3 that carries Layer II frames (the Layer III decoder hands them to the same code). Checked against
+MPEG-1 and MPEG-2 Layer II (MP2) is decoded as the `mp2` codec, from raw `.mp2` files, Matroska `A_MPEG/L2`, and MP4 (an `mp4a` entry, object type 0x69 or 0x6B, is labelled by its first frame's layer, so FFmpeg's MP2 in MP4 reads as MP2 and its MP3 as MP3).
+Any other stream labelled MP3 that carries Layer II frames is decoded by the same code. Checked against
 FFmpeg's `mp2float` decoder on eleven encoded streams (16 to 48 kHz, mono and stereo, each of the four MPEG-1 allocation
 tables, the MPEG-2 tables) and a full-scale noise stream: they agree to float32 rounding. Joint-stereo (intensity) Layer II
 is decoded from the standard but has no FFmpeg reference (its encoder writes none, and patched streams do not decode to
