@@ -1,6 +1,7 @@
-//! An AAC-LC encoder: long windows only (sine shape), mono or stereo, per-band mid/side, Huffman
-//! codebooks chosen per band for the fewest bits, and a feedback loop on the quantiser's step to hold
-//! the bit rate. The tables are the decoder's own, so what is written is what its parser reads.
+//! An AAC-LC encoder: long windows only (sine shape), one to six or eight channels, per-band mid/side
+//! in each channel pair, Huffman codebooks chosen per band for the fewest bits, and a feedback loop on
+//! the quantiser's step to hold the bit rate. The tables are the decoder's own, so what is written is
+//! what its parser reads.
 //! Attacks switch a block to eight short windows (with start and stop windows around it), one frame
 //! of lookahead telling the previous block to prepare.
 //!
@@ -8,6 +9,12 @@
 //! compromise as the Vorbis encoder: noise is shaped, not hidden, since there is no psychoacoustic
 //! model. Short blocks put each of their eight windows in a group of its own. No TNS, no PNS, no
 //! intensity stereo, no prediction.
+//!
+//! Channels arrive in the decoder's output order (front left, front right, front centre, LFE, back
+//! left, back right, side left, side right, as FFmpeg and WAVE_FORMAT_EXTENSIBLE number them). The
+//! standard channel configurations (ISO/IEC 14496-3 table 1.19) say which elements carry them: 3 is
+//! a centre and a pair, 4 adds a back centre, 5 and 6 add a back pair and LFE, and 8 (7.1, configuration
+//! 7) has side and back pairs. Seven channels have no standard configuration and are refused.
 
 use super::imdct::Imdct;
 use super::tables::*;
@@ -25,6 +32,33 @@ const MAX_Q: i32 = 8191;
 /// The AAC-LC object type.
 const AOT_LC: u32 = 2;
 const SHORT: usize = 128;
+
+/// Element types by their ID in the bitstream.
+const SCE: u32 = 0;
+const CPE: u32 = 1;
+const LFE: u32 = 3;
+
+/// The elements of a channel layout in bitstream order: the element ID and the input channels it
+/// carries (one for a single channel element or LFE, two for a pair).
+type Layout = &'static [(u32, &'static [usize])];
+
+fn layout(channels: usize) -> Option<Layout> {
+    Some(match channels {
+        1 => &[(SCE, &[0])],
+        2 => &[(CPE, &[0, 1])],
+        3 => &[(SCE, &[2]), (CPE, &[0, 1])],
+        4 => &[(SCE, &[2]), (CPE, &[0, 1]), (SCE, &[3])],
+        5 => &[(SCE, &[2]), (CPE, &[0, 1]), (CPE, &[3, 4])],
+        6 => &[(SCE, &[2]), (CPE, &[0, 1]), (CPE, &[4, 5]), (LFE, &[3])],
+        8 => &[(SCE, &[2]), (CPE, &[0, 1]), (CPE, &[6, 7]), (CPE, &[4, 5]), (LFE, &[3])],
+        _ => return None,
+    })
+}
+
+/// The channel configuration number that goes in the AudioSpecificConfig (7 is 7.1, eight channels).
+fn channel_configuration(channels: usize) -> u32 {
+    if channels == 8 { 7 } else { channels as u32 }
+}
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Kind {
@@ -165,6 +199,11 @@ struct Quantised {
     book: Vec<usize>,
     sf: Vec<i32>,
     q: Vec<i32>,
+}
+
+/// Root mean square of a band, never zero.
+fn level(s: &[f32]) -> f64 {
+    (s.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / s.len() as f64).sqrt().max(1e-9)
 }
 
 fn quantise(x: f32, inv_step: f32) -> i32 {
@@ -309,7 +348,7 @@ struct Pending {
 /// The two-byte AudioSpecificConfig of an AAC-LC stream.
 pub fn audio_specific_config(sample_rate: u32, channels: usize) -> Vec<u8> {
     let sfi = SAMPLE_RATES.iter().position(|&r| r == sample_rate).unwrap_or(4) as u32;
-    let bits = (AOT_LC << 11) | (sfi << 7) | ((channels as u32) << 3);
+    let bits = (AOT_LC << 11) | (sfi << 7) | (channel_configuration(channels) << 3);
     vec![(bits >> 8) as u8, bits as u8]
 }
 
@@ -318,6 +357,7 @@ pub const PRIMING: i64 = N as i64;
 
 pub struct AacEncoder {
     channels: usize,
+    layout: Layout,
     swb: &'static [u16],
     /// The short scalefactor bands of all eight windows laid end to end, one group per window.
     swb_short: Vec<u16>,
@@ -344,9 +384,10 @@ pub struct AacEncoder {
 
 impl AacEncoder {
     pub fn new(sample_rate: u32, channels: usize, bitrate: u32) -> Result<Self> {
-        if !(1..=2).contains(&channels) {
-            return Err(Error::new(ErrorCode::UnsupportedCodec, format!("the AAC encoder takes mono or stereo audio, not {channels} channels")));
-        }
+        let Some(layout) = layout(channels) else {
+            return Err(Error::new(ErrorCode::UnsupportedCodec, format!("the AAC encoder takes 1 to 6 or 8 channels, not {channels}"))
+                .hint("AAC's standard layouts have no 7-channel form; downmix or upmix to 6 or 8 channels"));
+        };
         let Some(sfi) = SAMPLE_RATES.iter().position(|&r| r == sample_rate) else {
             return Err(Error::new(ErrorCode::UnsupportedCodec, format!("AAC has no sampling frequency index for {sample_rate} Hz"))
                 .hint("resample to one of 96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000 or 7350 Hz"));
@@ -372,6 +413,7 @@ impl AacEncoder {
         swb_short.push(N as u16);
         Ok(Self {
             channels,
+            layout,
             swb: SWB_OFFSET_1024[sfi],
             swb_short,
             imdct: Imdct::new(N),
@@ -433,63 +475,70 @@ impl AacEncoder {
             .collect()
     }
 
+    /// One channel pair after its element ID and tag: the window info, mid/side per band where that
+    /// looks cheaper, then the two spectra.
+    fn write_pair(&self, w: &mut BitWriter, swb: &[u16], groups: usize, kind: Kind, l: &[f32], r: &[f32]) {
+        let bands = swb.len() - 1;
+        // mid/side per band where it looks cheaper
+        let mut ms = vec![false; bands];
+        let (mut a, mut b) = (l.to_vec(), r.to_vec());
+        let (cl, cr) = (level(l), level(r));
+        let cost = |x: &[f32], step: f64| x.iter().map(|&v| (1.0 + (v.abs() as f64) / step).log2()).sum::<f64>();
+        let (sl, sr) = (self.steps(swb, l, cl), self.steps(swb, r, cr));
+        let mid: Vec<f32> = l.iter().zip(r).map(|(x, y)| (x + y) * 0.5).collect();
+        let side: Vec<f32> = l.iter().zip(r).map(|(x, y)| (x - y) * 0.5).collect();
+        let (sm, ss) = (self.steps(swb, &mid, level(&mid).max(cl.min(cr) * 0.5)), self.steps(swb, &side, level(&side).max(cl.min(cr) * 0.5)));
+        for k in 0..bands {
+            let (lo, hi) = (swb[k] as usize, swb[k + 1] as usize);
+            let lr = cost(&l[lo..hi], sl[k]) + cost(&r[lo..hi], sr[k]);
+            let m_s = cost(&mid[lo..hi], sm[k]) + cost(&side[lo..hi], ss[k]);
+            if m_s < lr * 0.9 {
+                ms[k] = true;
+                a[lo..hi].copy_from_slice(&mid[lo..hi]);
+                b[lo..hi].copy_from_slice(&side[lo..hi]);
+            }
+        }
+        // steps from the transformed bands, with the common level of the original pair
+        let common = (cl * cl + cr * cr).sqrt() / std::f64::consts::SQRT_2;
+        let (steps_a, steps_b) = (self.steps(swb, &a, common), self.steps(swb, &b, common));
+        let (qa, qb) = (Quantised::new(&a, swb, &steps_a), Quantised::new(&b, swb, &steps_b));
+        let max_sfb = qa.max_sfb(groups).max(qb.max_sfb(groups));
+        w.put(1, 1); // one set of window info for both
+        write_ics_info(w, max_sfb, kind);
+        let per = bands / groups;
+        let used: Vec<bool> = (0..groups).flat_map(|g| ms[g * per..g * per + max_sfb].to_vec()).collect();
+        let any_ms = used.iter().any(|&m| m);
+        w.put(any_ms as u32, 2); // 1: a mask follows, 0: no mid/side
+        if any_ms {
+            for &m in &used {
+                w.put(m as u32, 1);
+            }
+        }
+        qa.write(w, swb, max_sfb, groups, None);
+        qb.write(w, swb, max_sfb, groups, None);
+    }
+
     fn encode_block(&mut self, blocks: &[Vec<f32>], kind: Kind, adapt: bool) -> Vec<u8> {
         let spec: Vec<Vec<f32>> = blocks.iter().map(|b| self.forward(b, kind)).collect();
         let (swb, groups): (Vec<u16>, usize) = if kind == Kind::Short { (self.swb_short.clone(), 8) } else { (self.swb.to_vec(), 1) };
         let swb = &swb[..];
-        let bands = swb.len() - 1;
-        let level = |s: &[f32]| (s.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / s.len() as f64).sqrt().max(1e-9);
-
         let mut w = BitWriter::default();
-        if self.channels == 1 {
-            let common = level(&spec[0]);
-            let steps = self.steps(swb, &spec[0], common);
-            let qz = Quantised::new(&spec[0], swb, &steps);
-            let max_sfb = qz.max_sfb(groups);
-            w.put(0, 3); // a single channel element
-            w.put(0, 4);
-            qz.write(&mut w, swb, max_sfb, groups, Some(kind));
-        } else {
-            let (l, r) = (spec[0].clone(), spec[1].clone());
-            // mid/side per band where it looks cheaper
-            let mut ms = vec![false; bands];
-            let (mut a, mut b) = (l.clone(), r.clone());
-            let (cl, cr) = (level(&l), level(&r));
-            let cost = |x: &[f32], step: f64| x.iter().map(|&v| (1.0 + (v.abs() as f64) / step).log2()).sum::<f64>();
-            let (sl, sr) = (self.steps(swb, &l, cl), self.steps(swb, &r, cr));
-            let mid: Vec<f32> = l.iter().zip(&r).map(|(x, y)| (x + y) * 0.5).collect();
-            let side: Vec<f32> = l.iter().zip(&r).map(|(x, y)| (x - y) * 0.5).collect();
-            let (sm, ss) = (self.steps(swb, &mid, level(&mid).max(cl.min(cr) * 0.5)), self.steps(swb, &side, level(&side).max(cl.min(cr) * 0.5)));
-            for k in 0..bands {
-                let (lo, hi) = (swb[k] as usize, swb[k + 1] as usize);
-                let lr = cost(&l[lo..hi], sl[k]) + cost(&r[lo..hi], sr[k]);
-                let m_s = cost(&mid[lo..hi], sm[k]) + cost(&side[lo..hi], ss[k]);
-                if m_s < lr * 0.9 {
-                    ms[k] = true;
-                    a[lo..hi].copy_from_slice(&mid[lo..hi]);
-                    b[lo..hi].copy_from_slice(&side[lo..hi]);
-                }
+        // instance tags count the elements of each type within the block
+        let mut tags = [0u32; 4];
+        for &(id, chans) in self.layout {
+            let tag = tags[id as usize];
+            tags[id as usize] += 1;
+            w.put(id, 3);
+            w.put(tag, 4);
+            if id == CPE {
+                self.write_pair(&mut w, swb, groups, kind, &spec[chans[0]], &spec[chans[1]]);
+            } else {
+                let x = &spec[chans[0]];
+                let steps = self.steps(swb, x, level(x));
+                let qz = Quantised::new(x, swb, &steps);
+                let max_sfb = qz.max_sfb(groups);
+                qz.write(&mut w, swb, max_sfb, groups, Some(kind));
             }
-            // steps from the transformed bands, with the common level of the original pair
-            let common = (cl * cl + cr * cr).sqrt() / std::f64::consts::SQRT_2;
-            let (steps_a, steps_b) = (self.steps(swb, &a, common), self.steps(swb, &b, common));
-            let (qa, qb) = (Quantised::new(&a, swb, &steps_a), Quantised::new(&b, swb, &steps_b));
-            let max_sfb = qa.max_sfb(groups).max(qb.max_sfb(groups));
-            w.put(1, 3); // a channel pair element
-            w.put(0, 4);
-            w.put(1, 1); // one set of window info for both
-            write_ics_info(&mut w, max_sfb, kind);
-            let per = bands / groups;
-            let used: Vec<bool> = (0..groups).flat_map(|g| ms[g * per..g * per + max_sfb].to_vec()).collect();
-            let any_ms = used.iter().any(|&m| m);
-            w.put(any_ms as u32, 2); // 1: a mask follows, 0: no mid/side
-            if any_ms {
-                for &m in &used {
-                    w.put(m as u32, 1);
-                }
-            }
-            qa.write(&mut w, swb, max_sfb, groups, None);
-            qb.write(&mut w, swb, max_sfb, groups, None);
         }
         w.put(7, 3); // end of the block
         let bytes = w.finish();
@@ -661,6 +710,39 @@ mod tests {
             let db = snr(&input, &out[..input.len()]);
             eprintln!("{rate} Hz {ch} ch {kbps} kb/s: {db:.1} dB at {} kb/s", bytes * 8 / 2000);
             assert!(db > 12.0, "{rate} {ch}: {db}");
+        }
+    }
+
+    /// The layouts' configuration numbers, and which channel counts are refused.
+    #[test]
+    fn channel_configurations_match_the_layouts() {
+        for (ch, cfg) in [(1usize, 1u8), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6), (8, 7)] {
+            let asc = audio_specific_config(48_000, ch);
+            assert_eq!((asc[1] >> 3) & 15, cfg, "{ch} channels");
+            assert!(AacEncoder::new(48_000, ch, 64_000).is_ok(), "{ch} channels");
+        }
+        for ch in [0usize, 7, 9] {
+            assert!(AacEncoder::new(48_000, ch, 64_000).is_err(), "{ch} channels");
+        }
+    }
+
+    /// Each channel of a 3 to 8 channel stream carries its own tone, and it comes back on that channel:
+    /// the decoder's output order is the encoder's input order.
+    #[test]
+    fn multichannel_tones_come_back_on_their_own_channels() {
+        for ch in [3usize, 4, 5, 6, 8] {
+            let rate = 48_000u32;
+            let n = rate as usize / 2;
+            let make = |t: usize, c: usize| 0.25 * (2.0 * std::f64::consts::PI * (300.0 + 190.0 * c as f64) * t as f64 / rate as f64).sin();
+            let (input, out, bytes) = run(rate, ch, 48 * ch as u32, n, make);
+            for c in 0..ch {
+                let want: Vec<f64> = input.iter().skip(c).step_by(ch).copied().collect();
+                let got: Vec<f64> = out.iter().skip(c).step_by(ch).take(want.len()).copied().collect();
+                let db = snr(&want, &got);
+                eprintln!("{ch} channels, channel {c}: {db:.1} dB");
+                assert!(db > 12.0, "{ch} channels, channel {c}: {db:.1} dB");
+            }
+            eprintln!("{ch} channels: {} kb/s", bytes * 8 * rate as usize / n / 1000);
         }
     }
 

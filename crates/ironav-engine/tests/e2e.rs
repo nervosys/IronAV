@@ -664,6 +664,72 @@ fn aac_in_matroska_decodes_to_what_ffmpeg_decodes() {
     aac_matches_ffmpeg("aac-mka", "aac_stereo_tools.mka");
 }
 
+/// Six and eight channels (5.1 in MP4 and 7.1 in ADTS, encoded by our encoder from one tone per channel
+/// at 16 kHz): our decoder gives what FFmpeg's decodes, with the layouts in FFmpeg's order (front left,
+/// front right, centre, LFE, back left, back right, then the side pair for 7.1).
+#[test]
+fn aac_multichannel_decodes_to_what_ffmpeg_decodes() {
+    let dir = scratch("aac-multichannel");
+    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    for (file, reference, channels) in [("aac_51.m4a", "aac_51.ffmpeg.s16", 6usize), ("aac_71.aac", "aac_71.ffmpeg.s16", 8)] {
+        let out = dir.join(format!("{file}.wav"));
+        let mut j = job(&data.join(file), &out);
+        j.audio.codec = Some("pcm_s16le".into());
+        run(&j, &mut |_| {}).unwrap();
+        let s16 = |b: Vec<u8>| -> Vec<i16> { b.as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes([b[0], b[1]])).collect() };
+        let got = s16(wav_data(&out));
+        let want = s16(std::fs::read(data.join(reference)).unwrap());
+        // FFmpeg trims the last frame's padding to the stream's length; ours keeps it (as the Opus
+        // path does), so compare the samples both have
+        assert!(got.len() >= want.len() && got.len() < want.len() + 2 * 1024 * channels, "{file}: {} samples against {}", got.len(), want.len());
+        assert_eq!(got.len() % channels, 0, "{file}");
+        let worst = got.iter().zip(&want).map(|(a, b)| (*a as i32 - *b as i32).abs()).max().unwrap();
+        assert!(worst <= 2, "{file}: largest difference from FFmpeg's decode is {worst} LSB");
+    }
+}
+
+/// AAC encoding of six and eight channels into MP4, ADTS and Matroska: each channel's tone comes back on
+/// that channel from our decoder (the MP4 edit list removes the encoder's priming frame; ADTS and
+/// Matroska keep it).
+#[test]
+fn aac_encoder_multichannel_output_decodes_to_its_own_channels() {
+    let dir = scratch("aac-enc-multi");
+    let rate = 44_100u32;
+    let n = rate as usize / 2;
+    for ch in [6usize, 8] {
+        let samples: Vec<i16> = (0..n * ch)
+            .map(|i| {
+                let (t, c) = ((i / ch) as f64 / rate as f64, (i % ch) as f64);
+                (6000.0 * (2.0 * std::f64::consts::PI * (300.0 + 190.0 * c) * t).sin()) as i16
+            })
+            .collect();
+        let wav = dir.join(format!("in{ch}.wav"));
+        write_wav(&wav, &samples, ch as u16, rate);
+        for (ext, lead) in [("m4a", 0usize), ("aac", 1024), ("mka", 1024)] {
+            let out = dir.join(format!("out{ch}.{ext}"));
+            let mut j = job(&wav, &out);
+            j.audio.codec = Some("aac".into());
+            run(&j, &mut |_| {}).unwrap();
+            let back = dir.join(format!("back{ch}.{ext}.wav"));
+            let mut j = job(&out, &back);
+            j.audio.codec = Some("pcm_s16le".into());
+            run(&j, &mut |_| {}).unwrap();
+            let got: Vec<f64> = wav_data(&back).as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes([b[0], b[1]]) as f64).collect();
+            assert!(got.len() >= (n + lead) * ch, "{ch} channels in {ext}: {} samples", got.len());
+            for c in 0..ch {
+                let (mut sig, mut err) = (0.0, 0.0);
+                for t in 0..n {
+                    let (x, y) = (samples[t * ch + c] as f64, got[(t + lead) * ch + c]);
+                    sig += x * x;
+                    err += (x - y) * (x - y);
+                }
+                let db = 10.0 * (sig / err.max(1e-9)).log10();
+                assert!(db > 18.0, "{ch} channels in {ext}, channel {c}: {db:.1} dB");
+            }
+        }
+    }
+}
+
 fn aac_matches_ffmpeg(scratch_name: &str, file: &str) {
     let dir = scratch(scratch_name);
     let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");

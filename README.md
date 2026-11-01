@@ -524,8 +524,10 @@ is a few times slower than FFmpeg's.
 
 ### AAC encoder
 
-`--acodec aac` (`--abitrate 8` to `512`, default 64 per channel) writes AAC-LC into MP4/M4A, ADTS (`.aac`) or Matroska, mono or
-stereo at any of AAC's sampling rates (others are refused with the list). Sine windows, with **window switching**: a block whose
+`--acodec aac` (`--abitrate 8` to `512`, default 64 per channel) writes AAC-LC into MP4/M4A, ADTS (`.aac`) or Matroska, with one to
+six or eight channels at any of AAC's sampling rates (others are refused with the list). The channels are in FFmpeg's order (front
+left, front right, centre, LFE, back left, back right, then side left and side right for 7.1), and they go into the standard
+channel configurations: 5.1 is six channels, 7.1 is eight, and seven has no standard layout, so it is refused. Sine windows, with **window switching**: a block whose
 first difference jumps (a 128-sample piece with 8x the energy of the four before it) becomes eight short windows, each in a group of
 its own, with start and stop windows around it, which costs one frame of look-ahead. On a noise burst over a quiet tone the error in
 the 900 samples before the attack fell to a third (test), and FFmpeg decodes a stereo file with four such attacks to the same samples as
@@ -533,12 +535,15 @@ ours (136 dB). The detector is a simple energy rule, not tuned on music, and sho
 information than they might. The decoder's own Huffman
 and scalefactor-band tables, the cheapest of the eleven spectral codebooks chosen per band, sections merged, and mid/side per band
 where it looks cheaper. A feedback loop on the quantiser's step holds the bit rate (the first frames search for the right step), and the
-step follows each band's level partway (exponent 0.6), so noise is shaped but there is no psychoacoustic model. No TNS, PNS, intensity stereo or prediction, no bit reservoir, no more than two channels.
+step follows each band's level partway (exponent 0.6), so noise is shaped but there is no psychoacoustic model. No TNS, PNS, intensity stereo or prediction, no bit reservoir. Each channel pair gets its own mid/side choice, and the LFE is coded
+like any other channel, without a low-pass.
 
 The stream starts with one frame of priming: in MP4 an edit list says so (our reader and FFmpeg skip it), in ADTS and Matroska it
 stays as 1024 leading samples, as with most encoders. MP4's edit list also ends the audio at the input's length, but players that ignore it
 (FFmpeg does) show up to one padded frame at the end. FFmpeg (through PyAV) decodes all three containers; on a 4 s stereo test signal
-(two tones and a little noise) 128 kb/s gives 16 dB SNR and 256 kb/s 25 dB, with white noise taking its share of the bits. A 120 s MP3 becomes
+(two tones and a little noise) 128 kb/s gives 16 dB SNR and 256 kb/s 25 dB, with white noise taking its share of the bits. On one tone per channel at 48 kHz
+(1 s), FFmpeg decodes our 5.1 MP4 and 5.1 and 7.1 ADTS files with the matching layouts, each tone on its own channel, at 33 to 36 dB
+SNR (checked by hand; the committed tests compare our decoder with FFmpeg's on a 16 kHz 5.1 and 7.1 pair). A 120 s MP3 becomes
 128 kb/s AAC in about 1 s.
 
 ## Opus
