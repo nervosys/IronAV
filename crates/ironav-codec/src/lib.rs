@@ -58,7 +58,7 @@ pub fn implemented() -> Vec<CodecImpl> {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-mp3" });
             }
             if c == CodecId::Mp2 {
-                return Some(CodecImpl { codec: c, decode: true, encode: false, implementation: "ironav-mp2" });
+                return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-mp2" });
             }
             if c == CodecId::Alac {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-alac" });
@@ -323,6 +323,7 @@ pub fn audio_bitrate_range(codec: CodecId) -> Option<(u32, u32)> {
         CodecId::Vorbis => Some((16, 500)),
         CodecId::Aac => Some((8, 512)),
         CodecId::Mp3 => Some((32, 320)),
+        CodecId::Mp2 => Some((32, 384)),
         _ => None,
     }
 }
@@ -392,6 +393,10 @@ pub fn new_encoder_with_opts(codec: CodecId, params: &StreamParams, bits: Option
             let bitrate = bitrate_kbps.map_or(mp3::Mp3Encoder::default_bitrate(*channels as usize), |k| k * 1000);
             Ok(Box::new(mp3::Mp3Encoder::new(*sample_rate, *channels as usize, bitrate)?))
         }
+        (CodecId::Mp2, StreamParams::Audio { sample_rate, channels }) => {
+            let bitrate = bitrate_kbps.map_or(mp3::Mp2Encoder::default_bitrate(*channels as usize), |k| k * 1000);
+            Ok(Box::new(mp3::Mp2Encoder::new(*sample_rate, *channels as usize, bitrate)?))
+        }
         (CodecId::RawVideo, StreamParams::Video { .. }) => Ok(Box::new(rawvideo::RawVideoEncoder)),
         (CodecId::Mjpeg, StreamParams::Video { .. }) => Ok(Box::new(jpeg::JpegEncoder::new(jpeg::JpegEncoder::default_quality()))),
         (CodecId::ProRes, StreamParams::Video { .. }) => Ok(Box::new(prores::ProResEncoder::new(params, prores_profile.unwrap_or(prores::Profile::Hq))?)),
@@ -448,6 +453,7 @@ pub fn encoder_lead_in(codec: CodecId) -> i64 {
     match codec {
         CodecId::Aac => aac::PRIMING,
         CodecId::Mp3 => mp3::LEAD_IN,
+        CodecId::Mp2 => mp3::MP2_LEAD_IN,
         _ => 0,
     }
 }

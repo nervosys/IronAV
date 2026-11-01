@@ -13,10 +13,12 @@
 
 mod enc;
 mod layer2;
+mod layer2_enc;
 mod tables;
 
 pub use enc::{Mp3Encoder, DECODER_DELAY, LEAD_IN};
 pub use layer2::Mp2Decoder;
+pub use layer2_enc::{Mp2Encoder, LEAD_IN as MP2_LEAD_IN};
 
 use ironav_core::{AudioFrame, CodecId, Decoder, Error, ErrorCode, Frame, Packet, Result, StreamParams};
 use std::f64::consts::PI;

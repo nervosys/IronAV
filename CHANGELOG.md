@@ -19,6 +19,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   an MP3 writer, Vorbis, Opus (CELT, wideband SILK, hybrid, DTX, in-band FEC, automatic mode switching,
   2.5 to 60 ms frames, and 3 to 8 channels in channel-mapping family 1 with the RFC 7845 stream layouts; the CLI and job JSON select the mode, signal, frame size, FEC and DTX), JPEG and Motion-JPEG, FLAC, and
   ALAC (16 and 24 bits, one to eight channels). `--keyint N` (or `keyint` in a job) sets the key frame interval of H.264, HEVC, VP8, VP9, AV1 and MPEG-4.
+- **Codecs (MP2 encoder):** MPEG-1 Layer II encoder, a translation of FFmpeg's `mpegaudioenc.c`: mono or stereo at 32, 44.1 or 48 kHz, 32 to 384 kbit/s (`--acodec mp2`, default 96 per channel), written to `.mp2`, Matroska, MP4 (`mp4a`) and MPEG-TS. The frames match FFmpeg's byte for byte for the same 16-bit input, and FFmpeg decodes them to within 0.1 dB of the SNR its own stream gives (23 dB at 192 kb/s stereo, 9 dB at 64 kb/s stereo at 32 kHz); tests in `crates/ironav-engine/tests/mp2_encode.rs`.
 - **Codecs (voice link):** a playout buffer, a streaming resampler, speech detection with push-to-talk
   trimming, automatic gain control, noise suppression, and Opus packet-loss concealment.
 - **Codecs (ProRes):** Apple ProRes decoder and encoder in MOV: 4:2:2 at 10 bits (Proxy, LT, Standard, HQ) and 4:4:4 at
@@ -170,7 +171,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   (no encoder writes it, and no local file has it to test with), and streams over eight channels are refused. The Vorbis
   encoder writes one to eight channels; only a stereo pair is coupled, so three or more channels are coded one by one.
 - **MP3, MP2, JPEG, ProRes:** MPEG audio Layer I is refused (no encoder makes a test stream); MP2 joint-stereo (intensity) streams
-  decode but have no FFmpeg reference; MP2 is not encoded; JPEG arithmetic-coded and 12-bit files are refused, and so are four-component CMYK and YCCK files and progressive or lossless files over 67 megapixels (lossless JPEG decodes, but not with restart intervals);
+  decode but have no FFmpeg reference; JPEG arithmetic-coded and 12-bit files are refused, and so are four-component CMYK and YCCK files and progressive or lossless files over 67 megapixels (lossless JPEG decodes, but not with restart intervals);
   ProRes interlaced pictures are refused.
 - **Containers:** Matroska tracks with encryption, bzip2 or lzo content encodings are refused (header stripping and zlib are read;
   the live reader refuses any content encoding); MPEG-TS does not carry AC-3 or

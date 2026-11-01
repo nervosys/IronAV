@@ -12,14 +12,14 @@ use super::{bad, conceal, parse_frame, statics, synth, Bits, Header};
 use ironav_core::{AudioFrame, Decoder, Error, ErrorCode, Frame, Packet, Result, StreamParams};
 
 /// The number of subbands in use, per allocation table (FFmpeg's `ff_mpa_sblimit_table`).
-const SBLIMIT: [usize; 5] = [27, 30, 8, 12, 30];
+pub(super) const SBLIMIT: [usize; 5] = [27, 30, 8, 12, 30];
 
 /// Per quantizer class: the number of levels (2^bits - 1, or 3, 5, 9 for the grouped classes).
-const QUANT_STEPS: [u32; 17] = [3, 5, 7, 9, 15, 31, 63, 127, 255, 511, 1023, 2047, 4095, 8191, 16383, 32767, 65535];
+pub(super) const QUANT_STEPS: [u32; 17] = [3, 5, 7, 9, 15, 31, 63, 127, 255, 511, 1023, 2047, 4095, 8191, 16383, 32767, 65535];
 
 /// Per quantizer class: the bits of a code; negative for a grouped class, whose code holds three
 /// values in that many bits (FFmpeg's `ff_mpa_quant_bits`).
-const QUANT_BITS: [i32; 17] = [-5, -7, 3, -10, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+pub(super) const QUANT_BITS: [i32; 17] = [-5, -7, 3, -10, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
 
 /// The allocation tables, flattened as FFmpeg has them: for each subband, the bits of its allocation
 /// index followed by the quantizer class for each allocation index (`1 << bits` entries).
@@ -68,20 +68,25 @@ const ALLOC_4: &[u8] = &[
     2, 0, 1, 3, 2, 0, 1, 3, 2, 0, 1, 3, 2, 0, 1, 3,
     2, 0, 1, 3,
 ];
-const ALLOC: [&[u8]; 5] = [ALLOC_1, ALLOC_1, ALLOC_3, ALLOC_3, ALLOC_4];
+pub(super) const ALLOC: [&[u8]; 5] = [ALLOC_1, ALLOC_1, ALLOC_3, ALLOC_3, ALLOC_4];
 
 /// The allocation table for a frame, from its bit rate per channel, sample rate and version
 /// (FFmpeg's `ff_mpa_l2_select_table`).
 fn select_table(h: &Header) -> usize {
-    if h.lsf {
+    select_table_for(h.bitrate, h.channels() as u32, h.sample_rate, h.lsf)
+}
+
+/// The allocation table for a bit rate in kbit/s over `channels`, at `sample_rate`, for MPEG-2 LSF or not.
+pub(super) fn select_table_for(bitrate: u32, channels: u32, sample_rate: u32, lsf: bool) -> usize {
+    if lsf {
         return 4;
     }
-    let per_channel = h.bitrate / h.channels() as u32;
-    if (h.sample_rate == 48000 && per_channel >= 56) || (56..=80).contains(&per_channel) {
+    let per_channel = bitrate / channels;
+    if (sample_rate == 48000 && per_channel >= 56) || (56..=80).contains(&per_channel) {
         0
-    } else if h.sample_rate != 48000 && per_channel >= 96 {
+    } else if sample_rate != 48000 && per_channel >= 96 {
         1
-    } else if h.sample_rate != 32000 && per_channel <= 48 {
+    } else if sample_rate != 32000 && per_channel <= 48 {
         2
     } else {
         3

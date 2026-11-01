@@ -568,11 +568,11 @@ impl TsParser {
         // the PES's time belongs to the first frame that starts in it
         let mut synced = false;
         while i < data.len() {
-            let (len, hdr, rate, channels, samples, asc) = if codec == CodecId::Aac {
+            let (len, hdr, rate, channels, samples, asc, frame_codec) = if codec == CodecId::Aac {
                 match adts::parse(&data[i..]) {
                     Some(h) => {
                         let asc = ((h.profile as u16 + 1) << 11) | ((h.sfi as u16) << 7) | ((h.channels as u16) << 3);
-                        (h.frame, h.len, adts::RATES[h.sfi as usize], h.channels as u16, 1024, asc.to_be_bytes().to_vec())
+                        (h.frame, h.len, adts::RATES[h.sfi as usize], h.channels as u16, 1024, asc.to_be_bytes().to_vec(), CodecId::Aac)
                     }
                     None if data.len() - i < 9 && !last => break,
                     None => {
@@ -581,8 +581,9 @@ impl TsParser {
                     }
                 }
             } else {
-                match ironav_codec::mp3::parse_header(&data[i..]) {
-                    Some(h) => (h.frame_len, 0, h.sample_rate, h.channels(), h.samples(), Vec::new()),
+                // MPEG audio is labelled MP3, but a Layer II (MP2) frame is MP2: the frame says which
+                match ironav_codec::mp3::parse_frame(&data[i..]) {
+                    Some(h) => (h.frame_len, 0, h.sample_rate, h.channels(), h.samples(), Vec::new(), h.codec()),
                     None if data.len() - i < 4 && !last => break,
                     None => {
                         i += 1;
@@ -609,7 +610,7 @@ impl TsParser {
             if e.info.is_none() {
                 e.info = Some(StreamInfo {
                     index: 0,
-                    codec,
+                    codec: frame_codec,
                     time_base: Rational::new(1, rate as i64),
                     duration: None,
                     bits: None,
@@ -1055,7 +1056,7 @@ impl Muxer for TsMuxer {
         let video = streams.iter().position(|s| s.params.media_type() == ironav_core::MediaType::Video);
         for (i, s) in streams.iter().enumerate() {
             let (adts, opus) = match s.codec {
-                CodecId::H264 | CodecId::Hevc | CodecId::Mp3 => (None, None),
+                CodecId::H264 | CodecId::Hevc | CodecId::Mp3 | CodecId::Mp2 => (None, None),
                 CodecId::Aac => {
                     let [a, b, ..] = s.extradata[..] else {
                         return Err(Error::new(ErrorCode::UnsupportedFormat, "AAC in a transport stream needs the AudioSpecificConfig").hint("encode to aac, or copy from a file that carries it"));
@@ -1074,7 +1075,7 @@ impl Muxer for TsMuxer {
                     (None, Some((code, u16::from_le_bytes([s.extradata[10], s.extradata[11]]) as u32)))
                 }
                 c => {
-                    return Err(Error::new(ErrorCode::UnsupportedCodec, format!("a transport stream cannot hold {} here", c.name())).alternatives(["h264", "hevc", "aac", "mp3", "opus"]));
+                    return Err(Error::new(ErrorCode::UnsupportedCodec, format!("a transport stream cannot hold {} here", c.name())).alternatives(["h264", "hevc", "aac", "mp3", "opus", "mp2"]));
                 }
             };
             // video first, so it gets 0x100 and carries the PCR

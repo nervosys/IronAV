@@ -5,7 +5,7 @@ A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so 
 
 > **Status: foundation (v0.1).** The architecture, agent interface, ontology, hardware model, CLI, MCP server
 > and both GUIs are working and tested. Containers: **WAV, FLAC, Y4M, MP4, QuickTime MOV (read and write), Matroska/WebM (read and write), Ogg, ADTS, MP3, JPEG and MPEG transport streams (read and write); raw H.264 and HEVC (Annex B: write only as files, read as live sources).**
-> Audio codecs, each decoded and encoded: **PCM, FLAC, ALAC, AAC-LC (plus HE-AAC v1 decode), MP3, Opus and Vorbis.** MP2 is decoded only.
+> Audio codecs, each decoded and encoded: **PCM, FLAC, ALAC, AAC-LC (plus HE-AAC v1 decode), MP3, MP2, Opus and Vorbis.**
 > Video: **software decoders for H.264, HEVC (including 4:2:2 and 4:4:4), VP8 and VP9; a software H.264 encoder (High profile: CABAC and the 8x8 transform), a software HEVC encoder (Main profile, 8-bit 4:2:0, merge and skip, SAO), a software VP8 encoder, and a software VP9 encoder (key and inter frames), and a software AV1 encoder (key and inter frames, profile 0, 8-bit 4:2:0); JPEG/Motion-JPEG and Apple ProRes decoded and encoded in software; MPEG-4 Part 2 (Simple and Advanced Simple profiles) decoded in software, and Simple profile I and P pictures encoded in software (MP4 and Matroska).**
 > NVIDIA GPUs encode H.264 and HEVC (NVENC, preferred when usable) and decode H.264, HEVC and AV1 (NVDEC).
 > AV1 is decoded on NVIDIA GPUs (NVDEC) or in software (key, intra-only and inter frames, superres included). VP9 and AV1 copy between WebM, Matroska and MP4.
@@ -975,7 +975,7 @@ stream labelled MP3 that carries Layer II frames (the Layer III decoder hands th
 FFmpeg's `mp2float` decoder on eleven encoded streams (16 to 48 kHz, mono and stereo, each of the four MPEG-1 allocation
 tables, the MPEG-2 tables) and a full-scale noise stream: they agree to float32 rounding. Joint-stereo (intensity) Layer II
 is decoded from the standard but has no FFmpeg reference (its encoder writes none, and patched streams do not decode to
-FFmpeg's samples), so it is unverified. Layer I has no encoder to make a test stream with and is refused. MP2 is not encoded.
+FFmpeg's samples), so it is unverified. Layer I has no encoder to make a test stream with and is refused. The MP2 encoder is described below.
 
 Checked against FFmpeg's `mp3float` decoder on twelve LAME-encoded files (44.1, 48, 32, 22.05, 24, 16, 11.025 and 8 kHz;
 mono and stereo; 16 to 320 kb/s, CBR and VBR; long, start, short and stop blocks): **116 to 124 dB SNR**, largest sample
@@ -1014,6 +1014,18 @@ and know its length; the tag carries the `Lavc` prefix because FFmpeg only reads
 PyAV) decodes the files and trims them to exactly the input's length. On a 4 s stereo test signal (two tones and a little noise) 64 kb/s
 gives 16 dB SNR, 128 kb/s 23 dB and 320 kb/s 28 dB (libmp3lame at 128 kb/s: 21 dB, though it aims at hearing, not SNR). A 120 s stereo file
 becomes 160 kb/s MP3 in about 2 s. Converting an MP3 to MP3 is a copy unless a bit rate is given, which re-encodes it (with a warning); the same holds for the other lossy codecs.
+
+### MP2 encoder
+
+`--acodec mp2` (`--abitrate 32` to `384`, snapped to the nearest Layer II rate; default 96 per channel) writes MPEG-1 Layer II to `.mp2`,
+Matroska, MP4 (`mp4a`, object type 0x69) or MPEG transport streams, mono or stereo at 32, 44.1 or 48 kHz (other rates are resampled, with a
+warning). It is a translation of FFmpeg's `mpegaudioenc.c` (LGPL-2.1+): the same integer polyphase analysis, the same fixed masking table
+and greedy bit allocation, and the same scale factor codes. For the same 16-bit input the frames are byte for byte FFmpeg's
+(`crates/ironav-engine/tests/mp2_encode.rs`, which skips without `ffmpeg` on the PATH, checks this for five configurations and a full-scale
+sweep). The stream carries one more frame than FFmpeg's, so that the decoder's 481-sample delay is flushed. On a 3 s sweep, FFmpeg decodes
+our 192 kb/s 44.1 kHz stereo stream to 23.1 dB SNR (its own stream: 23.1 dB), 128 kb/s 48 kHz stereo to 16.3 dB, 64 kb/s 32 kHz stereo to
+9.2 dB, and 96 kb/s 48 kHz mono to 21.9 dB. Layer II has no psychoacoustic model here, so the SNR is what the bit rate buys. MP4 has an
+edit list that skips the delay; `.mp2`, Matroska and MPEG-TS files do not, so FFmpeg plays them 481 samples late, as it does MP3 in those.
 
 ## Matroska output
 

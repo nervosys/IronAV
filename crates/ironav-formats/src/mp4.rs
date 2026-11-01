@@ -167,6 +167,7 @@ impl Track {
         match self.kind {
             Kind::Video { width, height } => self.video_entry(width, height),
             Kind::Audio { rate, channels, bits } if self.codec == CodecId::Aac => Ok(self.aac_entry(rate, channels, bits)),
+            Kind::Audio { rate, channels, bits } if self.codec == CodecId::Mp2 => Ok(self.mp4a_entry(rate, channels, bits, 0x69, &[])),
             Kind::Audio { rate, channels, bits } if self.codec == CodecId::Alac => Ok(self.alac_entry(rate, channels, bits)),
             Kind::Audio { rate, channels, bits } if self.codec.sample_format().is_some() => Ok(self.lpcm_entry(rate, channels, bits)),
             Kind::Audio { rate, channels, bits } => Ok(self.audio_entry(rate, channels, bits)),
@@ -204,6 +205,12 @@ impl Track {
 
     /// `mp4a` sample entry with an `esds` box carrying the AudioSpecificConfig.
     fn aac_entry(&self, rate: u32, channels: u16, bits: u8) -> Vec<u8> {
+        self.mp4a_entry(rate, channels, bits, 0x40, &self.config)
+    }
+
+    /// `mp4a` sample entry whose `esds` names object type `object` and carries `dsi` as the decoder
+    /// specific info (none, for MPEG audio: FFmpeg writes MP2 as object type 0x69, with none).
+    fn mp4a_entry(&self, rate: u32, channels: u16, bits: u8, object: u8, dsi: &[u8]) -> Vec<u8> {
         let mut e = vec![0u8; 6];
         e.extend_from_slice(&1u16.to_be_bytes()); // data reference index
         e.extend_from_slice(&[0u8; 8]);
@@ -211,11 +218,12 @@ impl Track {
         e.extend_from_slice(&(bits as u16).to_be_bytes());
         e.extend_from_slice(&[0u8; 4]);
         e.extend_from_slice(&(rate.min(65535) << 16).to_be_bytes());
-        let asc = &self.config;
-        let mut config = vec![0x40, 0x15, 0, 0, 0]; // AAC, audio stream, buffer size unknown
+        let mut config = vec![object, 0x15, 0, 0, 0]; // the object, audio stream, buffer size unknown
         config.extend_from_slice(&[0u8; 8]); // maximum and average bit rate unknown
-        config.extend_from_slice(&[5, asc.len() as u8]);
-        config.extend_from_slice(asc);
+        if !dsi.is_empty() {
+            config.extend_from_slice(&[5, dsi.len() as u8]);
+            config.extend_from_slice(dsi);
+        }
         let mut es = vec![0, 0, 0]; // ES_ID, no optional fields
         es.extend_from_slice(&[4, config.len() as u8]);
         es.extend_from_slice(&config);
@@ -899,6 +907,7 @@ impl Muxer for Mp4Muxer {
                     }
                     (Kind::Audio { rate: *sample_rate, channels: *channels, bits: 16 }, *sample_rate, 0)
                 }
+                (StreamParams::Audio { sample_rate, channels }, CodecId::Mp2) => (Kind::Audio { rate: *sample_rate, channels: *channels, bits: 16 }, *sample_rate, 0),
                 (StreamParams::Audio { sample_rate, channels }, c) if self.quicktime && c.sample_format().is_some() => {
                     (Kind::Audio { rate: *sample_rate, channels: *channels, bits: pcm_bits(c) }, *sample_rate, 0)
                 }
@@ -910,8 +919,8 @@ impl Muxer for Mp4Muxer {
                     (Kind::Audio { rate: *sample_rate, channels: *channels, bits: s.bits.unwrap_or(16) }, *sample_rate, 0)
                 }
                 _ => {
-                    return Err(Error::new(ErrorCode::UnsupportedCodec, format!("this MP4 writer holds h264, hevc, vp9 and av1 (copied), aac (copied), flac and alac, not {}", s.codec.name()))
-                        .alternatives(["h264", "hevc", "vp9", "av1", "aac", "flac", "alac"]));
+                    return Err(Error::new(ErrorCode::UnsupportedCodec, format!("this MP4 writer holds h264, hevc, vp9 and av1 (copied), aac (copied or encoded), mp2, flac and alac, not {}", s.codec.name()))
+                        .alternatives(["h264", "hevc", "vp9", "av1", "aac", "mp2", "flac", "alac"]));
                 }
             };
             // the av1C record's configuration OBUs may hold the sequence header

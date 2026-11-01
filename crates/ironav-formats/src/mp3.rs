@@ -147,9 +147,10 @@ pub fn open<R: Read + Seek + Send>(mut r: R) -> Result<Mp4Demuxer<R>> {
 }
 
 /// Writes MP3 frames, with an Info frame in front when the stream says how much of its start and end
-/// is not audio.
+/// is not audio. MP2 frames (Layer II) are written as they are, with no Info frame.
 pub struct Mp3Muxer {
     out: Box<dyn WriteSeek>,
+    layer2: bool,
     /// Decoded samples to skip at the start (the decoder's own 529 included), if the stream says.
     start: Option<u32>,
     /// The decoded position where the audio ends, when the stream says (a copied LAME tag does).
@@ -166,7 +167,7 @@ pub struct Mp3Muxer {
 
 impl Mp3Muxer {
     pub fn new(out: Box<dyn WriteSeek>) -> Self {
-        Self { out, start: None, end: None, info_at: None, frames: 0, bytes: 0, samples: 0, delay_at: 0, xing_at: 0 }
+        Self { out, layer2: false, start: None, end: None, info_at: None, frames: 0, bytes: 0, samples: 0, delay_at: 0, xing_at: 0 }
     }
 
     /// The Info frame for a stream whose frames look like `first`: all zeros but the header and the tag.
@@ -192,8 +193,12 @@ impl Muxer for Mp3Muxer {
         let [s] = streams else {
             return Err(Error::invalid_arg("mp3 holds exactly one audio stream"));
         };
-        if s.codec != CodecId::Mp3 {
-            return Err(Error::new(ErrorCode::UnsupportedCodec, format!("mp3 can only hold MP3 audio, not {}", s.codec.name())).alternatives(["mp3"]));
+        if !matches!(s.codec, CodecId::Mp3 | CodecId::Mp2) {
+            return Err(Error::new(ErrorCode::UnsupportedCodec, format!("mp3 can only hold MP3 or MP2 audio, not {}", s.codec.name())).alternatives(["mp3", "mp2"]));
+        }
+        self.layer2 = s.codec == CodecId::Mp2;
+        if self.layer2 {
+            return Ok(());
         }
         if let [a, b, c, d, e, f, g, h] = s.extradata[..] {
             self.start = Some(u32::from_le_bytes([a, b, c, d]));
@@ -205,7 +210,7 @@ impl Muxer for Mp3Muxer {
     }
 
     fn write_packet(&mut self, p: &Packet) -> Result<()> {
-        if self.info_at.is_none() {
+        if self.info_at.is_none() && !self.layer2 {
             let Some(h) = parse_header(&p.data) else {
                 return Err(Error::invalid_input("mp3: a packet is not a Layer III frame"));
             };

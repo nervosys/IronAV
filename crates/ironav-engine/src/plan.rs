@@ -244,8 +244,8 @@ pub fn plan(job: &Job) -> Result<Plan> {
                 .alternatives(spec.codecs.iter().map(|c| c.name())));
         }
 
-        // Opus is coded at 48 kHz only, MP3 (MPEG-1) at 32, 44.1 or 48: bring other rates there rather than refuse
-        if media == MediaType::Audio && matches!(to, CodecId::Opus | CodecId::Mp3) {
+        // Opus is coded at 48 kHz only, MP3 and MP2 (MPEG-1) at 32, 44.1 or 48: bring other rates there rather than refuse
+        if media == MediaType::Audio && matches!(to, CodecId::Opus | CodecId::Mp3 | CodecId::Mp2) {
             let from = if let StreamParams::Audio { sample_rate, .. } = &params { *sample_rate } else { 0 };
             let want: &[u32] = if to == CodecId::Opus { &[48_000] } else { &[32_000, 44_100, 48_000] };
             if from > 0 && !want.contains(&from) {
