@@ -664,6 +664,27 @@ fn aac_in_matroska_decodes_to_what_ffmpeg_decodes() {
     aac_matches_ffmpeg("aac-mka", "aac_stereo_tools.mka");
 }
 
+/// Where an audio edit ends: FFmpeg's AAC in MP4 (an edit list, whose segment is shorter than the padded
+/// frames) and the same frames in Matroska (a codec delay and discard padding) both decode to the 8000
+/// samples FFmpeg gives, and MP3 in MP4 (an `mp4a` entry with an MPEG audio object type) to its 24000.
+#[test]
+fn audio_edits_and_codec_delays_end_where_ffmpeg_ends() {
+    let dir = scratch("audio-edits");
+    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    for (file, reference, worst_allowed) in [("aac_sine16k.m4a", "aac_sine16k.ffmpeg.s16", 2), ("aac_sine16k.mka", "aac_sine16k.ffmpeg.s16", 2), ("mp3_sine48k.mp4", "mp3_sine48k.ffmpeg.s16", 1)] {
+        let out = dir.join(format!("{file}.wav"));
+        let mut j = job(&data.join(file), &out);
+        j.audio.codec = Some("pcm_s16le".into());
+        run(&j, &mut |_| {}).unwrap();
+        let s16 = |b: Vec<u8>| -> Vec<i32> { b.as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes([b[0], b[1]]) as i32).collect() };
+        let got = s16(pcm(&out));
+        let want = s16(std::fs::read(data.join(reference)).unwrap());
+        assert_eq!(got.len(), want.len(), "{file}: sample count against FFmpeg's decode");
+        let worst = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).max().unwrap();
+        assert!(worst <= worst_allowed, "{file}: largest difference from FFmpeg's decode is {worst} LSB");
+    }
+}
+
 /// Six and eight channels (5.1 in MP4 and 7.1 in ADTS, encoded by our encoder from one tone per channel
 /// at 16 kHz): our decoder gives what FFmpeg's decodes, with the layouts in FFmpeg's order (front left,
 /// front right, centre, LFE, back left, back right, then the side pair for 7.1).
@@ -679,9 +700,7 @@ fn aac_multichannel_decodes_to_what_ffmpeg_decodes() {
         let s16 = |b: Vec<u8>| -> Vec<i16> { b.as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes([b[0], b[1]])).collect() };
         let got = s16(wav_data(&out));
         let want = s16(std::fs::read(data.join(reference)).unwrap());
-        // FFmpeg trims the last frame's padding to the stream's length; ours keeps it (as the Opus
-        // path does), so compare the samples both have
-        assert!(got.len() >= want.len() && got.len() < want.len() + 2 * 1024 * channels, "{file}: {} samples against {}", got.len(), want.len());
+        assert_eq!(got.len(), want.len(), "{file}: sample count against FFmpeg's decode");
         assert_eq!(got.len() % channels, 0, "{file}");
         let worst = got.iter().zip(&want).map(|(a, b)| (*a as i32 - *b as i32).abs()).max().unwrap();
         assert!(worst <= 2, "{file}: largest difference from FFmpeg's decode is {worst} LSB");
@@ -689,8 +708,9 @@ fn aac_multichannel_decodes_to_what_ffmpeg_decodes() {
 }
 
 /// AAC encoding of six and eight channels into MP4, ADTS and Matroska: each channel's tone comes back on
-/// that channel from our decoder (the MP4 edit list removes the encoder's priming frame; ADTS and
-/// Matroska keep it).
+/// that channel from our decoder. MP4 (edit list) and Matroska (codec delay and discard padding) remove the
+/// encoder's priming and end padding, so they hold exactly the input's samples; ADTS keeps the priming
+/// frame and every frame whole, as FFmpeg reads it.
 #[test]
 fn aac_encoder_multichannel_output_decodes_to_its_own_channels() {
     let dir = scratch("aac-enc-multi");
@@ -705,7 +725,7 @@ fn aac_encoder_multichannel_output_decodes_to_its_own_channels() {
             .collect();
         let wav = dir.join(format!("in{ch}.wav"));
         write_wav(&wav, &samples, ch as u16, rate);
-        for (ext, lead) in [("m4a", 0usize), ("aac", 1024), ("mka", 1024)] {
+        for (ext, lead) in [("m4a", 0usize), ("aac", 1024), ("mka", 0)] {
             let out = dir.join(format!("out{ch}.{ext}"));
             let mut j = job(&wav, &out);
             j.audio.codec = Some("aac".into());
@@ -715,7 +735,8 @@ fn aac_encoder_multichannel_output_decodes_to_its_own_channels() {
             j.audio.codec = Some("pcm_s16le".into());
             run(&j, &mut |_| {}).unwrap();
             let got: Vec<f64> = wav_data(&back).as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes([b[0], b[1]]) as f64).collect();
-            assert!(got.len() >= (n + lead) * ch, "{ch} channels in {ext}: {} samples", got.len());
+            let decoded = if ext == "aac" { (n + 1024).div_ceil(1024) * 1024 } else { n };
+            assert_eq!(got.len(), decoded * ch, "{ch} channels in {ext}: sample count");
             for c in 0..ch {
                 let (mut sig, mut err) = (0.0, 0.0);
                 for t in 0..n {
@@ -1417,11 +1438,11 @@ fn vorbis_encoder_output_decodes_close_to_its_input() {
 
 /// AAC encoding into MP4, ADTS and Matroska: the bit rate steers the size, our decoder gets back
 /// something close to the input, and the encoder's priming frame is skipped where the container says so
-/// (the MP4 edit list) and left where it does not (ADTS, Matroska).
+/// (the MP4 edit list, the Matroska codec delay) and left where it does not (ADTS). The lengths are exact.
 #[test]
 fn aac_encoder_output_decodes_close_to_its_input() {
     let dir = scratch("aac-enc");
-    let n = 44_100 * 3 + 321;
+    let n: usize = 44_100 * 3 + 321;
     let samples: Vec<i16> = (0..n * 2)
         .map(|i| {
             let (t, c) = ((i / 2) as f64 / 44_100.0, (i % 2) as f64);
@@ -1432,7 +1453,7 @@ fn aac_encoder_output_decodes_close_to_its_input() {
     write_wav(&wav, &samples, 2, 44_100);
     let want = pcm(&wav);
     let mut sizes = Vec::new();
-    for (ext, kbps, lead) in [("m4a", 48u32, 0usize), ("m4a", 160, 0), ("aac", 160, 1024), ("mka", 160, 1024)] {
+    for (ext, kbps, lead) in [("m4a", 48u32, 0usize), ("m4a", 160, 0), ("aac", 160, 1024), ("mka", 160, 0)] {
         let out = dir.join(format!("out{kbps}.{ext}"));
         let mut j = job(&wav, &out);
         j.audio.codec = Some("aac".into());
@@ -1444,7 +1465,8 @@ fn aac_encoder_output_decodes_close_to_its_input() {
         run(&j, &mut |_| {}).unwrap();
         let got = pcm(&back);
         let frames = got.len() / 4;
-        assert!(frames >= n + lead && frames < n + lead + 2048, "{ext} {kbps}: {frames} frames for {n}");
+        let decoded = if ext == "aac" { (n + 1024).div_ceil(1024) * 1024 } else { n };
+        assert_eq!(frames, decoded, "{ext} {kbps}: frames decoded for {n}");
         let snr = snr_db(&want, &got[lead * 4..lead * 4 + want.len()]);
         assert!(snr > if kbps == 48 { 10.0 } else { 18.0 }, "{ext} {kbps}: {snr:.1} dB");
         if ext == "m4a" {

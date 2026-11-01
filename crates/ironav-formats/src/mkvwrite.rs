@@ -73,6 +73,9 @@ struct Track {
     seen: u64,
     /// The first packet's duration in stream time units, for DefaultDuration.
     first_duration: i64,
+    /// The decoded length of all packets so far, in stream time units (AAC's discard padding is what
+    /// is left over once the codec delay and the stream's length are taken off).
+    duration_sum: i64,
     /// The AV1 sequence header's `reduced_still_picture_header`.
     av1_still: bool,
 }
@@ -88,6 +91,17 @@ fn pcm_depth(codec: CodecId) -> Option<u8> {
         CodecId::PcmF64Le => 64,
         _ => return None,
     })
+}
+
+/// Whether a track is AAC at its sample rate with a priming (lead-in), so its last packet may carry the
+/// end padding (a discard padding) and is held back until the padding is known.
+fn holds_aac_end(t: &Track) -> bool {
+    let s = &t.stream;
+    let samples = match s.params {
+        StreamParams::Audio { sample_rate, .. } => s.time_base.num == 1 && s.time_base.den == sample_rate as i64,
+        _ => false,
+    };
+    s.codec == CodecId::Aac && s.lead_in > 0 && samples && !t.video
 }
 
 fn self_contained(codec: CodecId) -> bool {
@@ -254,6 +268,10 @@ impl MatroskaWriter {
                         let ns = t.first_duration as u128 * 1_000_000_000 * s.time_base.num as u128 / s.time_base.den as u128;
                         e.extend(uint(0x23_E383, ns as u64));
                     }
+                    // AAC's priming is its codec delay, which the decoder drops (FFmpeg does too)
+                    if s.codec == CodecId::Aac && s.lead_in > 0 && s.time_base.num == 1 && s.time_base.den == *sample_rate as i64 {
+                        e.extend(uint(0x56AA, s.lead_in as u64 * 1_000_000_000 / *sample_rate as u64));
+                    }
                     if s.codec == CodecId::Opus && s.extradata.len() >= 12 {
                         let skip = u16::from_le_bytes([s.extradata[10], s.extradata[11]]) as u64;
                         e.extend(uint(0x56AA, skip * 1_000_000_000 / 48_000)); // CodecDelay
@@ -365,7 +383,7 @@ impl MatroskaWriter {
         if !self.tracks[t].video && self.tracks[t].stream.codec == CodecId::Flac {
             self.tracks[t].flac.record(p);
         }
-        if !self.tracks[t].video && self.tracks[t].stream.codec == CodecId::Opus {
+        if !self.tracks[t].video && (self.tracks[t].stream.codec == CodecId::Opus || holds_aac_end(&self.tracks[t])) {
             // the last packet is held back: it may carry the end padding
             if let Some(prev) = self.opus_last.replace(p.clone()) {
                 return self.write_block(&prev, prev.data.clone(), true, None);
@@ -432,7 +450,7 @@ impl Muxer for MatroskaWriter {
             if s.codec == CodecId::Av1 {
                 let _ = av1_sample(&s.extradata[4..], &mut av1_still);
             }
-            self.tracks.push(Track { stream: s.clone(), video, params: ParamSets::default(), flac: FlacStats::new(), seen: 0, first_duration: 0, av1_still });
+            self.tracks.push(Track { stream: s.clone(), video, params: ParamSets::default(), flac: FlacStats::new(), seen: 0, first_duration: 0, duration_sum: 0, av1_still });
         }
         Ok(())
     }
@@ -444,6 +462,9 @@ impl Muxer for MatroskaWriter {
             tr.first_duration = p.duration;
         }
         tr.seen += 1;
+        // what the packets decode to: an AAC-LC frame is 1024 samples, whatever the source's timeline says
+        // (FFmpeg's MP4 timeline can end before its last frame does)
+        tr.duration_sum += if tr.stream.codec == CodecId::Aac { 1024 } else { p.duration };
         if self.started {
             return self.put(p);
         }
@@ -472,11 +493,23 @@ impl Muxer for MatroskaWriter {
         }
         if let Some(last) = self.opus_last.take() {
             let t = last.stream;
-            let tb = self.tracks[t].stream.time_base;
-            let have = ironav_codec::opus::packet_samples(&last.data).unwrap_or(0) as i128;
-            let kept = if last.duration > 0 { last.duration as i128 * 48_000 * tb.num as i128 / tb.den as i128 } else { have };
-            let pad = (have - kept).max(0) as i64 * 1_000_000_000 / 48_000;
-            let d = (pad > 0).then_some(pad);
+            let d = if self.tracks[t].stream.codec == CodecId::Aac {
+                // the packets hold more samples than the stream's length and priming leave: the rest is padding
+                let s = &self.tracks[t].stream;
+                let rate = match s.params {
+                    StreamParams::Audio { sample_rate, .. } => sample_rate as i128,
+                    _ => 0,
+                };
+                let declared = s.duration.unwrap_or(self.tracks[t].duration_sum);
+                let pad = self.tracks[t].duration_sum as i128 - s.lead_in as i128 - declared as i128;
+                (pad > 0 && rate > 0).then(|| (pad * 1_000_000_000 / rate) as i64)
+            } else {
+                let tb = self.tracks[t].stream.time_base;
+                let have = ironav_codec::opus::packet_samples(&last.data).unwrap_or(0) as i128;
+                let kept = if last.duration > 0 { last.duration as i128 * 48_000 * tb.num as i128 / tb.den as i128 } else { have };
+                let pad = (have - kept).max(0) as i64 * 1_000_000_000 / 48_000;
+                (pad > 0).then_some(pad)
+            };
             self.write_block(&last, last.data.clone(), true, d)?;
         }
         self.close_cluster()?;

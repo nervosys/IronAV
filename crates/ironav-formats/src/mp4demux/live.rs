@@ -103,6 +103,7 @@ impl Mp4Stream {
     }
 
     fn moov(&mut self, moov: &[u8]) -> Result<()> {
+        let movie_ts = super::movie_timescale(moov)?;
         let mut samples = Vec::new();
         for b in boxes(moov) {
             let (kind, body) = b?;
@@ -114,7 +115,7 @@ impl Mp4Stream {
             if stsz.is_some_and(|z| be32(z, 8).unwrap_or(0) != 0) {
                 return Err(Error::new(ErrorCode::UnsupportedFormat, "the MP4's 'moov' lists samples, so it is not a fragmented stream's initialization segment").hint("read it as a file"));
             }
-            if let Some(t) = parse_trak(body, self.tracks.len(), &mut samples)? {
+            if let Some(t) = parse_trak(body, self.tracks.len(), &mut samples, movie_ts)? {
                 let tkhd = need(body, b"tkhd", "trak")?;
                 self.ids.push(if tkhd.first() == Some(&1) { be32(tkhd, 20)? } else { be32(tkhd, 12)? });
                 self.tracks.push(t);

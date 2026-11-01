@@ -64,6 +64,7 @@ const BLOCK_GROUP: u32 = 0xA0;
 const BLOCK: u32 = 0xA1;
 const BLOCK_DURATION: u32 = 0x9B;
 const DISCARD_PADDING: u32 = 0x75A2;
+const CODEC_DELAY: u32 = 0x56AA;
 const REFERENCE_BLOCK: u32 = 0xFB;
 
 /// Sanity cap on the Tracks element we are willing to hold in memory.
@@ -480,6 +481,8 @@ struct MkTrack {
     codec: String,
     private: Vec<u8>,
     default_ns: u64,
+    /// The CodecDelay in nanoseconds: an AAC track's priming, which the decoder drops.
+    delay_ns: u64,
     width: u32,
     height: u32,
     rate: f64,
@@ -554,7 +557,7 @@ fn parse_tracks(body: &[u8]) -> Result<Vec<MkTrack>> {
         if id != TRACK_ENTRY {
             continue;
         }
-        let mut t = MkTrack { number: 0, kind: 0, codec: String::new(), private: Vec::new(), default_ns: 0, width: 0, height: 0, rate: 8000.0, channels: 1, bits: None, encoded: false, encodings: Vec::new() };
+        let mut t = MkTrack { number: 0, kind: 0, codec: String::new(), private: Vec::new(), default_ns: 0, delay_ns: 0, width: 0, height: 0, rate: 8000.0, channels: 1, bits: None, encoded: false, encodings: Vec::new() };
         for e in Elems(entry) {
             let (id, v) = e?;
             match id {
@@ -563,6 +566,7 @@ fn parse_tracks(body: &[u8]) -> Result<Vec<MkTrack>> {
                 CODEC_ID => t.codec = String::from_utf8_lossy(v).trim_end_matches('\0').to_string(),
                 CODEC_PRIVATE => t.private = v.to_vec(),
                 DEFAULT_DURATION => t.default_ns = be_uint(v)?,
+                CODEC_DELAY => t.delay_ns = be_uint(v)?,
                 CONTENT_ENCODINGS => {
                     t.encoded = true;
                     t.encodings = content_encodings(v)?;
@@ -709,6 +713,8 @@ fn build_track(t: &MkTrack, index: usize, frames: &[&Frame], scale: u64, samples
     let stream_no = index as u16;
     let mut extradata = Vec::new();
     let mut bits = None;
+    // AAC's codec delay (priming) and the samples its discard padding and delay take off the end
+    let (mut lead_in, mut trim) = (0i64, 0i64);
     let (time_base, params, config, convert);
 
     if video {
@@ -773,6 +779,17 @@ fn build_track(t: &MkTrack, index: usize, frames: &[&Frame], scale: u64, samples
         match fixed.filter(|_| rate > 0).or(if opus { Some(0) } else { None }) {
             Some(len) => {
                 time_base = Rational::new(1, rate as i64);
+                // AAC's codec delay is its priming, and its discard padding (the last block's) the end
+                // padding: the stream is the samples between them, as FFmpeg reads it
+                if codec == CodecId::Aac {
+                    let to_samples = |ns: i64| ((ns.max(0) as i128 * rate as i128 + 500_000_000) / 1_000_000_000) as i64;
+                    let delay = to_samples(t.delay_ns.min(i64::MAX as u64) as i64);
+                    if delay > 0 {
+                        let discard: i64 = frames.iter().map(|f| to_samples(f.discard)).sum();
+                        lead_in = delay;
+                        trim = delay + discard;
+                    }
+                }
                 let tolerance = rate as i64 / 500 + 1; // the file's ticks are coarser than a sample
                 let mut next: Option<i64> = None;
                 for f in frames {
@@ -810,8 +827,8 @@ fn build_track(t: &MkTrack, index: usize, frames: &[&Frame], scale: u64, samples
         }
         params = StreamParams::Audio { sample_rate: rate, channels: t.channels };
     }
-    let duration: i64 = samples[first..].iter().map(|s| s.duration as i64).sum();
-    let stream = StreamInfo { index, codec, time_base, duration: Some(duration), bits, extradata, lead_in: 0, params };
+    let duration: i64 = samples[first..].iter().map(|s| s.duration as i64).sum::<i64>() - trim;
+    let stream = StreamInfo { index, codec, time_base, duration: Some(duration.max(0)), bits, extradata, lead_in, params };
     Ok(Some(TrackInfo { stream, config, convert, swap, unwrap: t.encodings.clone() }))
 }
 

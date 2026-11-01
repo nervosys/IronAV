@@ -159,16 +159,14 @@ pub fn new_decoder_for(s: &ironav_core::StreamInfo) -> Result<Box<dyn Decoder>> 
     match s.codec {
         CodecId::Aac => {
             let d: Box<dyn Decoder> = Box::new(aac::AacDecoder::new(&s.extradata, &s.params)?);
-            // an MP4 edit list that starts after the encoder's priming samples says where the audio begins
-            let in_samples = matches!(s.params, StreamParams::Audio { sample_rate, .. } if s.time_base.num == 1 && s.time_base.den == sample_rate as i64);
-            Ok(if s.lead_in > 0 && in_samples { Box::new(Gapless { inner: d, start: s.lead_in as u64, end: u64::MAX, pos: 0 }) } else { d })
+            Ok(kept_span(s, d))
         }
         CodecId::Mp3 => {
             let d: Box<dyn Decoder> = Box::new(mp3::Mp3Decoder::new(&s.params)?);
             // extradata from the MP3 reader: where the LAME tag says the audio starts and ends
             Ok(match s.extradata[..] {
                 [a, b, c, d2, e, f, g, h] => Box::new(Gapless { inner: d, start: u32::from_le_bytes([a, b, c, d2]) as u64, end: u32::from_le_bytes([e, f, g, h]) as u64, pos: 0 }),
-                _ => d,
+                _ => kept_span(s, d),
             })
         }
         CodecId::Alac => Ok(Box::new(alac::AlacDecoder::new(&s.extradata, &s.params)?)),
@@ -184,6 +182,22 @@ pub fn new_decoder_for(s: &ironav_core::StreamInfo) -> Result<Box<dyn Decoder>> 
         CodecId::Av1 => Ok(Box::new(av1::Av1Decoder::new(&s.extradata))),
         _ => new_decoder(s.codec, &s.params, s.bits),
     }
+}
+
+/// Keeps the samples a container's audio edit keeps: from the stream's `lead_in` (the decoder's
+/// priming, in samples of the stream's rate) to `lead_in` plus its duration, which the container
+/// set (an MP4 edit's segment, or a Matroska codec delay less its discard padding). A stream with no
+/// lead-in, or whose time base is not its sample rate, is left whole.
+fn kept_span(s: &ironav_core::StreamInfo, d: Box<dyn Decoder>) -> Box<dyn Decoder> {
+    let in_samples = matches!(s.params, StreamParams::Audio { sample_rate, .. } if s.time_base.num == 1 && s.time_base.den == sample_rate as i64);
+    if s.lead_in <= 0 || !in_samples {
+        return d;
+    }
+    let end = match s.duration {
+        Some(n) if n > 0 => (s.lead_in + n) as u64,
+        _ => u64::MAX,
+    };
+    Box::new(Gapless { inner: d, start: s.lead_in as u64, end, pos: 0 })
 }
 
 /// Cuts a packet's audio to the packet's duration. The Ogg reader shortens the last packet's

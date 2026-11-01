@@ -296,8 +296,8 @@ impl Track {
     }
 
     /// Track duration in the movie's millisecond time scale.
-    fn movie_ms(&self) -> u64 {
-        self.duration * 1000 / self.timescale as u64
+    fn movie_units(&self, movie_ts: u64) -> u64 {
+        self.duration * movie_ts / self.timescale as u64
     }
 
     /// A packet time in this track's media time units (rounded to nearest).
@@ -346,8 +346,8 @@ impl Track {
     }
 
     /// `shift` is added to every chunk offset (used when the movie box is moved in front of the data).
-    fn trak(&self, id: u32, shift: u64) -> Result<Vec<u8>> {
-        let ms = self.movie_ms() as u32;
+    fn trak(&self, id: u32, shift: u64, movie_ts: u64) -> Result<Vec<u8>> {
+        let ms = self.movie_units(movie_ts) as u32;
         let mut tkhd = u32s(&[0, 0, id, 0, ms]); // created, modified, track id, reserved, duration
         tkhd.extend_from_slice(&[0u8; 8]); // reserved
         tkhd.extend_from_slice(&0u32.to_be_bytes()); // layer, alternate group
@@ -417,7 +417,7 @@ impl Track {
             let start = self.media_time(self.lead_in) + self.frag_shift;
             if let (true, Some(d)) = (start > 0, self.declared.filter(|&d| d > 0)) {
                 let start = start as u64;
-                let shown = (self.media_time(d) as u64).saturating_sub(start) * 1000 / self.timescale as u64;
+                let shown = (self.media_time(d) as u64).saturating_sub(start) * movie_ts / self.timescale as u64;
                 let mut elst = u32s(&[1, shown as u32, start as u32]);
                 elst.extend_from_slice(&0x0001_0000u32.to_be_bytes());
                 edts = bx(b"edts", &full(b"elst", 0, 0, &elst));
@@ -432,17 +432,17 @@ impl Track {
             // The source's own edit (if any), moved by the shift that keeps offsets non-negative.
             let start = self.media_time(self.lead_in) + shift;
             if start > 0 {
-                let mut elst = u32s(&[1, self.movie_ms() as u32, start as u32]);
+                let mut elst = u32s(&[1, self.movie_units(movie_ts) as u32, start as u32]);
                 elst.extend_from_slice(&0x0001_0000u32.to_be_bytes()); // media rate 1.0
                 edts = bx(b"edts", &full(b"elst", 0, 0, &elst));
             }
         }
         if !self.fragmented && !self.is_video() && self.lead_in > 0 {
             let lead = self.media_time(self.lead_in) as u64;
-            let lead_ms = lead * 1000 / self.timescale as u64;
+            let lead_units = lead * movie_ts / self.timescale as u64;
             // the audio ends where the stream says, not at the end of the last (padded) frame
-            let shown = self.movie_ms().saturating_sub(lead_ms);
-            let shown = self.declared.filter(|&d| d > 0).map_or(shown, |d| shown.min(self.media_time(d) as u64 * 1000 / self.timescale as u64));
+            let shown = self.movie_units(movie_ts).saturating_sub(lead_units);
+            let shown = self.declared.filter(|&d| d > 0).map_or(shown, |d| shown.min(self.media_time(d) as u64 * movie_ts / self.timescale as u64));
             let mut elst = u32s(&[1, shown as u32, lead as u32]);
             elst.extend_from_slice(&0x0001_0000u32.to_be_bytes());
             edts = bx(b"edts", &full(b"elst", 0, 0, &elst));
@@ -661,9 +661,19 @@ impl Mp4Muxer {
         Self { quicktime: true, faststart: path.map(std::path::Path::to_path_buf), ..Self::new(out) }
     }
 
+    /// The movie's time scale: a lone audio track's own, so that its edit list lengths are exact (as
+    /// FFmpeg writes them), and milliseconds otherwise.
+    fn movie_timescale(&self) -> u64 {
+        match self.tracks.as_slice() {
+            [t] if !t.is_video() => t.timescale as u64,
+            _ => 1000,
+        }
+    }
+
     fn moov(&self, shift: u64) -> Result<Vec<u8>> {
-        let ms = self.tracks.iter().map(Track::movie_ms).max().unwrap_or(0) as u32;
-        let mut mvhd = u32s(&[0, 0, 1000, ms]);
+        let movie_ts = self.movie_timescale();
+        let ms = self.tracks.iter().map(|t| t.movie_units(movie_ts)).max().unwrap_or(0) as u32;
+        let mut mvhd = u32s(&[0, 0, movie_ts as u32, ms]);
         mvhd.extend_from_slice(&0x0001_0000u32.to_be_bytes()); // rate 1.0
         mvhd.extend_from_slice(&0x0100u16.to_be_bytes()); // volume
         mvhd.extend_from_slice(&[0u8; 10]);
@@ -672,7 +682,7 @@ impl Mp4Muxer {
         mvhd.extend_from_slice(&(self.tracks.len() as u32 + 1).to_be_bytes()); // next track id
         let mut moov = full(b"mvhd", 0, 0, &mvhd);
         for (i, t) in self.tracks.iter().enumerate() {
-            moov.extend_from_slice(&t.trak(i as u32 + 1, shift)?);
+            moov.extend_from_slice(&t.trak(i as u32 + 1, shift, movie_ts)?);
         }
         if self.fragments.is_some() {
             // trex: the defaults of the fragments' samples are all given in each trun, so they are zero

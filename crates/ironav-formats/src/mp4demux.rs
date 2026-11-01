@@ -251,6 +251,7 @@ impl<R: Read + Seek + Send> Mp4Demuxer<R> {
             return Err(corrupt("the file has fragments but its index does not say so (no 'mvex')"));
         }
 
+        let movie_ts = movie_timescale(&moov)?;
         let mut tracks = Vec::new();
         let mut ids: Vec<u32> = Vec::new();
         let mut samples = Vec::new();
@@ -259,7 +260,7 @@ impl<R: Read + Seek + Send> Mp4Demuxer<R> {
             if &kind != b"trak" {
                 continue;
             }
-            if let Some(t) = parse_trak(body, tracks.len(), &mut samples)? {
+            if let Some(t) = parse_trak(body, tracks.len(), &mut samples, movie_ts)? {
                 let tkhd = need(body, b"tkhd", "trak")?;
                 ids.push(if tkhd.first() == Some(&1) { be32(tkhd, 20)? } else { be32(tkhd, 12)? });
                 tracks.push(t);
@@ -408,7 +409,7 @@ fn parse_moof(moof: &[u8], moof_start: u64, ids: &[u32], defaults: &[[u32; 3]], 
 /// bytes); 2^27 is a month of 48 kHz AAC packets or 50 days of 30 fps video.
 const MAX_TRACK_SAMPLES: usize = 1 << 27;
 
-fn parse_trak(trak: &[u8], index: usize, samples: &mut Vec<Sample>) -> Result<Option<TrackInfo>> {
+fn parse_trak(trak: &[u8], index: usize, samples: &mut Vec<Sample>, movie_ts: u32) -> Result<Option<TrackInfo>> {
     let mdia = need(trak, b"mdia", "trak")?;
     let mdhd = need(mdia, b"mdhd", "mdia")?;
     let timescale = if mdhd.first() == Some(&1) { be32(mdhd, 20)? } else { be32(mdhd, 12)? };
@@ -593,9 +594,15 @@ fn parse_trak(trak: &[u8], index: usize, samples: &mut Vec<Sample>) -> Result<Op
         };
         let kids = e.get(kids_at..).unwrap_or(&[]);
         let pcm = quicktime_pcm(&fourcc, e, kids)?;
+        // an mp4a entry whose object type is MPEG-1 or MPEG-2 audio holds MP3 (FFmpeg writes it so)
+        let mpeg_audio = match child(kids, b"esds")? {
+            Some(e) if &fourcc == b"mp4a" => matches!(esds_parts(e)?.0, 0x69 | 0x6B),
+            _ => false,
+        };
         let codec = match (&pcm, &fourcc) {
             (Some(p), _) => p.codec,
             (None, b"fLaC") => CodecId::Flac,
+            (None, b"mp4a") if mpeg_audio => CodecId::Mp3,
             (None, b"mp4a") => CodecId::Aac,
             (None, b"Opus") => CodecId::Opus,
             (None, b"alac") => CodecId::Alac,
@@ -647,8 +654,12 @@ fn parse_trak(trak: &[u8], index: usize, samples: &mut Vec<Sample>) -> Result<Op
         let params = StreamParams::Audio { sample_rate: rate, channels };
         (codec, params, bits, Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma: 1 }, false)
     };
-    let duration: i64 = samples[first..].iter().map(|s| s.duration as i64).sum();
-    let lead_in = edit_lead_in(trak)?;
+    let mut duration: i64 = samples[first..].iter().map(|s| s.duration as i64).sum();
+    let (lead_in, span) = edit_lead_in(trak, timescale, movie_ts)?;
+    // an audio edit that starts late also ends where its segment does: the samples after it are not shown
+    if let (Some(span), true, StreamParams::Audio { .. }) = (span, lead_in > 0, &params) {
+        duration = span;
+    }
     let stream = StreamInfo { index, codec, time_base, duration: Some(duration), bits, extradata, lead_in, params };
     Ok(Some(TrackInfo { stream, config, convert, swap, unwrap: Vec::new() }))
 }
@@ -669,21 +680,38 @@ fn opus_head_from_dops(d: &[u8]) -> Result<Vec<u8>> {
     Ok(h)
 }
 
-/// Media time at which the track's first non-empty edit starts, from `edts/elst`; 0 without one.
-fn edit_lead_in(trak: &[u8]) -> Result<i64> {
-    let Some(edts) = child(trak, b"edts")? else { return Ok(0) };
-    let Some(elst) = child(edts, b"elst")? else { return Ok(0) };
+/// The movie's time scale (`mvhd`), which the edit segments are counted in; 1000 without an `mvhd`.
+fn movie_timescale(moov: &[u8]) -> Result<u32> {
+    let Some(mvhd) = child(moov, b"mvhd")? else { return Ok(1000) };
+    let ts = if mvhd.first() == Some(&1) { be32(mvhd, 20)? } else { be32(mvhd, 12)? };
+    if ts == 0 {
+        return Err(corrupt("the movie header has a time scale of 0"));
+    }
+    Ok(ts)
+}
+
+/// Media time at which the track's first non-empty edit starts, from `edts/elst`, and that edit's
+/// length in the track's time scale when it has one (`None` otherwise); 0 and `None` without an edit.
+fn edit_lead_in(trak: &[u8], timescale: u32, movie_ts: u32) -> Result<(i64, Option<i64>)> {
+    let Some(edts) = child(trak, b"edts")? else { return Ok((0, None)) };
+    let Some(elst) = child(edts, b"elst")? else { return Ok((0, None)) };
     let wide = elst.first() == Some(&1);
     let width = if wide { 20 } else { 12 };
     let n = be32(elst, 4)? as usize;
     for i in 0..n {
         let entry = elst.get(8 + i * width..8 + (i + 1) * width).ok_or_else(|| corrupt("elst is cut short"))?;
-        let media_time = if wide { i64::from_be_bytes(entry[8..16].try_into().unwrap()) } else { i32::from_be_bytes(entry[4..8].try_into().unwrap()) as i64 };
+        let (segment, media_time) = if wide {
+            (u64::from_be_bytes(entry[0..8].try_into().unwrap()), i64::from_be_bytes(entry[8..16].try_into().unwrap()))
+        } else {
+            (u32::from_be_bytes(entry[0..4].try_into().unwrap()) as u64, i32::from_be_bytes(entry[4..8].try_into().unwrap()) as i64)
+        };
         if media_time >= 0 {
-            return Ok(media_time);
+            // the segment counts the movie's time scale; a segment too long for an i64 is 'to the end'
+            let span = (segment as u128 * timescale as u128 / movie_ts as u128).try_into().ok().filter(|_| segment > 0);
+            return Ok((media_time, span));
         }
     }
-    Ok(0)
+    Ok((0, None))
 }
 
 /// A QuickTime PCM sample entry: its codec, sample size in bits, and whether its samples are big-endian.
@@ -746,6 +774,12 @@ fn aac_config(esds: &[u8]) -> Result<Vec<u8>> {
 /// The object type and the decoder specific info of an `esds` box: ES descriptor (0x03) > decoder
 /// config (0x04) > decoder specific info (0x05). For MPEG-4 Visual the info is the VOS and VOL headers.
 fn esds_config(esds: &[u8]) -> Result<(u8, Vec<u8>)> {
+    let (object, info) = esds_parts(esds)?;
+    Ok((object, info.ok_or_else(|| corrupt("esds has no decoder specific info"))?))
+}
+
+/// The object type of an `esds` box and its decoder specific info, if it has any.
+fn esds_parts(esds: &[u8]) -> Result<(u8, Option<Vec<u8>>)> {
     fn descriptor(d: &[u8], at: &mut usize) -> Result<(u8, usize)> {
         let tag = *d.get(*at).ok_or_else(|| corrupt("esds is cut short"))?;
         *at += 1;
@@ -783,12 +817,15 @@ fn esds_config(esds: &[u8]) -> Result<(u8, Vec<u8>)> {
     }
     let object = *d.get(at).ok_or_else(|| corrupt("esds is cut short"))?;
     at += 13; // object type, stream type, buffer size, max and average bit rate
+    if at >= d.len() {
+        return Ok((object, None));
+    }
     let (tag, len) = descriptor(d, &mut at)?;
     if tag != 5 {
-        return Err(corrupt("esds has no decoder specific info"));
+        return Ok((object, None));
     }
     let info = d.get(at..at + len).map(<[u8]>::to_vec).ok_or_else(|| corrupt("decoder specific info runs past the esds box"))?;
-    Ok((object, info))
+    Ok((object, Some(info)))
 }
 
 fn push_start_coded(out: &mut Vec<u8>, nal: &[u8]) {
