@@ -1,4 +1,9 @@
 //! The in-loop deblocking filter (ITU-T H.264 8.7).
+//!
+//! MBAFF frames are filtered as FFmpeg's h264_loopfilter.c (LGPL-2.1-or-later) does, which this
+//! follows: the left edge between a frame and a field macroblock pair has a strength per line pair
+//! of the current macroblock, and when its first strength is 4 every line of the group is filtered
+//! strongly while otherwise lines of strength 4 are left as they are.
 
 use super::mb::{chroma_qp, Kind, MbInfo, Picture};
 use super::tables::{ALPHA, BETA, TC0};
@@ -116,12 +121,15 @@ fn coded(m: &MbInfo, bx: usize, by: usize) -> bool {
     }
 }
 
-fn far(a: [i16; 2], b: [i16; 2]) -> bool {
-    (a[0] as i32 - b[0] as i32).abs() >= 4 || (a[1] as i32 - b[1] as i32).abs() >= 4
+/// Vectors a whole sample apart; `mvy` is the vertical limit in quarter samples (2 between field
+/// macroblocks, whose rows are frame rows apart).
+fn far(a: [i16; 2], b: [i16; 2], mvy: i32) -> bool {
+    (a[0] as i32 - b[0] as i32).abs() >= 4 || (a[1] as i32 - b[1] as i32).abs() >= mvy
 }
 
 /// Different reference pictures, a different number of vectors or vectors a whole sample apart.
-fn motion_differs(p: &MbInfo, pb: (usize, usize), q: &MbInfo, qb: (usize, usize)) -> bool {
+fn motion_differs(p: &MbInfo, pb: (usize, usize), q: &MbInfo, qb: (usize, usize), mvy: i32) -> bool {
+    let far = |a, b| far(a, b, mvy);
     let (pi, qi) = (pb.1 * 4 + pb.0, qb.1 * 4 + qb.0);
     let (p8, q8) = ((pb.1 >> 1) * 2 + (pb.0 >> 1), (qb.1 >> 1) * 2 + (qb.0 >> 1));
     let pr = [p.ref_id[0][p8], p.ref_id[1][p8]];
@@ -153,7 +161,7 @@ fn motion_differs(p: &MbInfo, pb: (usize, usize), q: &MbInfo, qb: (usize, usize)
 
 /// Boundary strength of each 4-sample segment along edge `e` of the macroblock `m`; `other` is the
 /// macroblock on the far side of a macroblock edge (and `m` itself for inner edges).
-fn strength(m: &MbInfo, other: &MbInfo, dir: usize, e: usize) -> [u8; 4] {
+fn strength(m: &MbInfo, other: &MbInfo, dir: usize, e: usize, mvy: i32) -> [u8; 4] {
     let mb_edge = e == 0;
     if m.kind != Kind::Inter || other.kind != Kind::Inter {
         return [if mb_edge { 4 } else { 3 }; 4];
@@ -163,7 +171,7 @@ fn strength(m: &MbInfo, other: &MbInfo, dir: usize, e: usize) -> [u8; 4] {
         let (q, p) = if dir == 0 { ((e, i), if mb_edge { (3, i) } else { (e - 1, i) }) } else { ((i, e), if mb_edge { (i, 3) } else { (i, e - 1) }) };
         *o = if coded(m, q.0, q.1) || coded(other, p.0, p.1) {
             2
-        } else if motion_differs(other, p, m, q) {
+        } else if motion_differs(other, p, m, q, mvy) {
             1
         } else {
             0
@@ -179,6 +187,10 @@ pub fn deblock_picture(pic: &mut Picture, bd: u32) {
 /// Filters the macroblock rows `rows`; in raster order with the rows above, this filters the picture.
 /// Filtering a row changes up to three luma rows at the bottom of the row above.
 pub fn deblock_rows(pic: &mut Picture, bd: u32, rows: std::ops::Range<usize>) {
+    if pic.mbaff {
+        deblock_mbaff(pic, bd, rows.start / 2..rows.end.div_ceil(2));
+        return;
+    }
     let w = pic.mb_w;
     let ls = w * 16;
     let cs = w * 8;
@@ -203,7 +215,7 @@ pub fn deblock_rows(pic: &mut Picture, bd: u32, rows: std::ops::Range<usize>) {
             for dir in 0..2 {
                 for e in 0..4usize {
                     let other = if e == 0 { edge_mb[dir] } else { m };
-                    bs[dir][e] = strength(m, other, dir, e);
+                    bs[dir][e] = strength(m, other, dir, e, 4);
                 }
             }
             // luma, and Cb and Cr filtered the same way in 4:4:4
@@ -257,6 +269,224 @@ pub fn deblock_rows(pic: &mut Picture, bd: u32, rows: std::ops::Range<usize>) {
                             filter_edge(&mut pic.planes[1 + comp], (y0 + e * 4) * cs + x0, cs, 1, 2, &bs[dir][e], alpha, beta, ia, true, bd, (other.keep, m.keep));
                         } else {
                             filter_edge(&mut pic.planes[1 + comp], (y0 + e * 2) * cs + x0, cs, 1, 2, &bs[dir][e], alpha, beta, ia, true, bd, (other.keep, m.keep));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Filters one sample line across an edge, putting back I_PCM and lossless samples after.
+#[allow(clippy::too_many_arguments)]
+fn filter_one(pl: &mut [u16], q: usize, xs: usize, b: u8, index_a: usize, alpha: i32, beta: i32, chroma: bool, bd: u32, keep: (bool, bool)) {
+    if b == 0 || alpha == 0 || beta == 0 {
+        return;
+    }
+    let tc0 = if b < 4 { (TC0[index_a][b as usize].max(0) as i32) << (bd - 8) } else { 0 };
+    let n = if chroma { 1 } else { 3 };
+    let (mut sp, mut sq) = ([0u16; 3], [0u16; 3]);
+    for i in 0..n {
+        sp[i] = pl[q - (i + 1) * xs];
+        sq[i] = pl[q + i * xs];
+    }
+    filter_line(pl, q, xs, b, tc0, alpha, beta, chroma, bd);
+    for i in 0..n {
+        if keep.0 {
+            pl[q - (i + 1) * xs] = sp[i];
+        }
+        if keep.1 {
+            pl[q + i * xs] = sq[i];
+        }
+    }
+}
+
+/// alpha, beta and indexA for the average QP `qpav`.
+fn thresholds(qpav: i32, sp: &super::mb::SliceParams, bd: u32) -> (i32, i32, usize) {
+    let ia = (qpav + sp.alpha_offset).clamp(0, 51) as usize;
+    let ib = (qpav + sp.beta_offset).clamp(0, 51) as usize;
+    ((ALPHA[ia] as i32) << (bd - 8), (BETA[ib] as i32) << (bd - 8), ia)
+}
+
+/// Filters the macroblock pair rows `pairs` of an MBAFF frame: pair by pair, the top macroblock
+/// and then the bottom one.
+fn deblock_mbaff(pic: &mut Picture, bd: u32, pairs: std::ops::Range<usize>) {
+    let w = pic.mb_w;
+    let (cw, chh) = (pic.cw, pic.ch);
+    let (ls, cs) = (w * 16, w * cw);
+    let ncomp = if pic.cf == 3 { 3 } else { 1 };
+    let chroma = matches!(pic.cf, 1 | 2);
+    let Picture { planes, mbs, slices, .. } = pic;
+    for py in pairs {
+        for mbx in 0..w {
+            for bot in 0..2usize {
+                let mby = 2 * py + bot;
+                let idx = mby * w + mbx;
+                let m = &mbs[idx];
+                if m.slice == 0 {
+                    continue;
+                }
+                let sp = slices[m.slice as usize - 1];
+                if sp.disable_deblocking == 1 {
+                    continue;
+                }
+                let usable = |o: &MbInfo| o.slice != 0 && (sp.disable_deblocking == 0 || o.slice == m.slice);
+                let fld = m.field;
+                let mvy = if fld { 2 } else { 4 };
+                // the macroblock's first sample and the distance between its rows, luma and chroma
+                let (lo, lrs, co, crs) = if fld {
+                    (2 * py * 16 * ls + bot * ls + mbx * 16, 2 * ls, 2 * py * chh * cs + bot * cs + mbx * cw, 2 * cs)
+                } else {
+                    (mby * 16 * ls + mbx * 16, ls, mby * chh * cs + mbx * cw, cs)
+                };
+                let intra = |o: &MbInfo| o.kind != Kind::Inter;
+                let cqp = |q: i8, c: usize| chroma_qp(q as i32, sp.chroma_qp_offset[c], bd);
+                // QP average with `o` for luma-style component `pl`
+                let qpav = |o: &MbInfo, pl: usize| if pl == 0 { (o.qp as i32 + m.qp as i32 + 1) >> 1 } else { (cqp(o.qp, pl - 1) + cqp(m.qp, pl - 1) + 1) >> 1 };
+
+                // ---- left edge
+                let lt = 2 * py * w + mbx;
+                let left_ok = mbx > 0 && usable(&mbs[lt - 1]);
+                let mut first_done = false;
+                if left_ok && mbs[lt - 1].field != fld {
+                    // the left pair is coded the other way: a strength per two lines of the
+                    // current macroblock (one line of 4:2:0 chroma), from the left macroblock
+                    // covering them
+                    first_done = true;
+                    let nb = |i: usize| &mbs[lt - 1 + if fld { i >> 2 } else { i & 1 } * w];
+                    let mut bs8 = [0u8; 8];
+                    for (i, b) in bs8.iter_mut().enumerate() {
+                        let n = nb(i);
+                        let nrow = if fld { i & 3 } else { bot * 2 + (i >> 2) };
+                        *b = if intra(m) || intra(n) { 4 } else { 1 + (coded(m, 0, i >> 1) || coded(n, 3, nrow)) as u8 };
+                    }
+                    // the strength of line pair i, filtered as FFmpeg's groups of lines do
+                    let eff = |i: usize| {
+                        let first = if fld { bs8[i & 4] } else { bs8[i & 1] };
+                        match (first, bs8[i]) {
+                            (4, _) => 4,
+                            (_, 4) => 0,
+                            (_, b) => b,
+                        }
+                    };
+                    // line t of a component whose macroblock has `n` lines: its strength index
+                    let bsi = |t: usize, n: usize| if n == 8 { t } else if fld { t >> 1 } else { 2 * (t >> 2) + (t & 1) };
+                    for pl in 0..ncomp {
+                        for t in 0..16 {
+                            let i = bsi(t, 16);
+                            let n = nb(i);
+                            let (alpha, beta, ia) = thresholds(qpav(n, pl), &sp, bd);
+                            filter_one(&mut planes[pl], lo + t * lrs, 1, eff(i), ia, alpha, beta, false, bd, (n.keep, m.keep));
+                        }
+                    }
+                    if chroma {
+                        for comp in 0..2 {
+                            for t in 0..chh {
+                                let i = bsi(t, chh);
+                                let n = nb(i);
+                                let (alpha, beta, ia) = thresholds((cqp(n.qp, comp) + cqp(m.qp, comp) + 1) >> 1, &sp, bd);
+                                filter_one(&mut planes[1 + comp], co + t * crs, 1, eff(i), ia, alpha, beta, true, bd, (n.keep, m.keep));
+                            }
+                        }
+                    }
+                }
+
+                // ---- top edge: the macroblock above in the same field, or the frame row above
+                let top = if fld {
+                    if py == 0 {
+                        None
+                    } else if bot == 1 || mbs[idx - 2 * w].field {
+                        Some(idx - 2 * w)
+                    } else {
+                        Some(idx - w)
+                    }
+                } else if bot == 1 || py > 0 {
+                    Some(idx - w)
+                } else {
+                    None
+                };
+                let top = top.filter(|&t| usable(&mbs[t]));
+                // a frame macroblock under a field pair: its top edge is filtered once for each field
+                let split = !fld && bot == 0 && top.is_some_and(|t| mbs[t].field);
+
+                // ---- strengths of the other edges
+                let mut bs = [[[0u8; 4]; 4]; 2];
+                for e in 0..4usize {
+                    if e > 0 || (left_ok && !first_done) {
+                        bs[0][e] = strength(m, if e == 0 { &mbs[idx - 1] } else { m }, 0, e, mvy);
+                    }
+                    if e > 0 {
+                        bs[1][e] = strength(m, m, 1, e, mvy);
+                    }
+                }
+                if let (Some(t), false) = (top, split) {
+                    let n = &mbs[t];
+                    bs[1][0] = if intra(m) || intra(n) {
+                        [if fld || n.field { 3 } else { 4 }; 4]
+                    } else if fld != n.field {
+                        std::array::from_fn(|i| 1 + (coded(m, i, 0) || coded(n, i, 3)) as u8)
+                    } else {
+                        strength(m, n, 1, 0, mvy)
+                    };
+                }
+                let edge_mb = [if left_ok { Some(&mbs[idx - 1]) } else { None }, if split { None } else { top.map(|t| &mbs[t]) }];
+                let other = |dir: usize, e: usize| if e == 0 { edge_mb[dir] } else { Some(m) };
+                // the two top edges of a frame macroblock under a field pair, after the vertical edges
+                let split_b = |j: usize| -> (&MbInfo, [u8; 4]) {
+                    let n = &mbs[idx - 2 * w + j * w];
+                    (n, if intra(m) || intra(n) { [3; 4] } else { std::array::from_fn(|i| 1 + (coded(m, i, 0) || coded(n, i, 3)) as u8) })
+                };
+
+                // ---- filtering
+                for pl in 0..ncomp {
+                    for dir in 0..2 {
+                        if dir == 1 && split {
+                            for j in 0..2usize {
+                                let (n, b) = split_b(j);
+                                let (alpha, beta, ia) = thresholds(qpav(n, pl), &sp, bd);
+                                filter_edge(&mut planes[pl], lo + j * ls, 2 * ls, 1, 4, &b, alpha, beta, ia, false, bd, (n.keep, m.keep));
+                            }
+                        }
+                        for e in 0..4usize {
+                            if (dir == 0 && e == 0 && first_done) || (m.t8x8 && e & 1 == 1) {
+                                continue;
+                            }
+                            let Some(o) = other(dir, e) else { continue };
+                            let (alpha, beta, ia) = thresholds(qpav(o, pl), &sp, bd);
+                            if dir == 0 {
+                                filter_edge(&mut planes[pl], lo + e * 4, 1, lrs, 4, &bs[dir][e], alpha, beta, ia, false, bd, (o.keep, m.keep));
+                            } else {
+                                filter_edge(&mut planes[pl], lo + e * 4 * lrs, lrs, 1, 4, &bs[dir][e], alpha, beta, ia, false, bd, (o.keep, m.keep));
+                            }
+                        }
+                    }
+                }
+                if !chroma {
+                    continue;
+                }
+                for comp in 0..2usize {
+                    for dir in 0..2 {
+                        if dir == 1 && split {
+                            for j in 0..2usize {
+                                let (n, b) = split_b(j);
+                                let (alpha, beta, ia) = thresholds((cqp(n.qp, comp) + cqp(m.qp, comp) + 1) >> 1, &sp, bd);
+                                filter_edge(&mut planes[1 + comp], co + j * cs, 2 * cs, 1, 2, &b, alpha, beta, ia, true, bd, (n.keep, m.keep));
+                            }
+                        }
+                        let edges: &[usize] = if dir == 1 && chh == 16 { &[0, 1, 2, 3] } else { &[0, 2] };
+                        for &e in edges {
+                            if dir == 0 && e == 0 && first_done {
+                                continue;
+                            }
+                            let Some(o) = other(dir, e) else { continue };
+                            let (alpha, beta, ia) = thresholds((cqp(o.qp, comp) + cqp(m.qp, comp) + 1) >> 1, &sp, bd);
+                            if dir == 0 {
+                                filter_edge(&mut planes[1 + comp], co + e * 2, 1, crs, chh / 4, &bs[dir][e], alpha, beta, ia, true, bd, (o.keep, m.keep));
+                            } else if chh == 16 {
+                                filter_edge(&mut planes[1 + comp], co + e * 4 * crs, crs, 1, 2, &bs[dir][e], alpha, beta, ia, true, bd, (o.keep, m.keep));
+                            } else {
+                                filter_edge(&mut planes[1 + comp], co + e * 2 * crs, crs, 1, 2, &bs[dir][e], alpha, beta, ia, true, bd, (o.keep, m.keep));
+                            }
                         }
                     }
                 }
