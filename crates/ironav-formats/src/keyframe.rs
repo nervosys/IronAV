@@ -8,7 +8,7 @@ use crate::vpxav1::{av1_sample, vp9_is_key};
 
 /// Whether `data`, a packet of `codec` as the demuxers give it (H.264 and HEVC as Annex B), starts
 /// a picture that needs no earlier one: an IDR or all-intra H.264 picture, an HEVC IRAP picture,
-/// a VP8, VP9 or AV1 key frame, an MPEG-4 I-VOP. Intra-only codecs and audio are always keyframes.
+/// a VP8, VP9 or AV1 key frame, an MPEG-4 I-VOP, an MPEG-1 or MPEG-2 I picture. Intra-only codecs and audio are always keyframes.
 /// `None` when the packet does not parse far enough to say.
 pub fn is_keyframe(codec: CodecId, data: &[u8]) -> Option<bool> {
     match codec {
@@ -45,6 +45,8 @@ pub fn is_keyframe(codec: CodecId, data: &[u8]) -> Option<bool> {
         // a sequence header in the same unit is enough to read the frame header after it
         CodecId::Av1 => av1_sample(data, &mut false).map(|(_, key)| key),
         CodecId::Mpeg4 => data.windows(5).find(|w| w[..4] == [0, 0, 1, 0xB6]).map(|w| w[4] >> 6 == 0),
+        // the first picture header: a 10-bit temporal reference, then the 3-bit picture coding type
+        CodecId::Mpeg2Video | CodecId::Mpeg1Video => data.windows(6).find(|w| w[..4] == [0, 0, 1, 0]).map(|w| w[5] >> 3 & 7 == 1),
         c if c.media_type() == MediaType::Video && !matches!(c, CodecId::RawVideo | CodecId::ProRes | CodecId::Mjpeg) => None,
         _ => Some(true),
     }

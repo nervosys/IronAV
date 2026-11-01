@@ -26,6 +26,8 @@ fn codec_meta(c: CodecId) -> (&'static str, &'static str) {
         Vp8 => ("VP8", "Lossy video codec used in early WebM."),
         Vp9 => ("VP9", "Royalty-free lossy video codec from Google; WebM and YouTube."),
         Mpeg4 => ("MPEG-4 Part 2", "Legacy lossy video codec (DivX/Xvid family)."),
+        Mpeg2Video => ("MPEG-2 video", "Lossy video codec (ITU-T H.262 / ISO 13818-2) of broadcast, DVD and DVB; decoded (progressive and interlaced, 4:2:0 and 4:2:2)."),
+        Mpeg1Video => ("MPEG-1 video", "Legacy lossy video codec (ISO 11172-2) of Video CD; decoded."),
         ProRes => ("Apple ProRes", "Intra-frame mezzanine codec for editing."),
         Mjpeg => ("Motion JPEG", "Video as a sequence of independent JPEG images."),
     }

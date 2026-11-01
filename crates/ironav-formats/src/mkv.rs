@@ -609,6 +609,8 @@ fn video_codec(id: &str) -> Option<CodecId> {
         "V_VP8" => CodecId::Vp8,
         "V_MPEG4/ISO/ASP" | "V_MPEG4/ISO/SP" | "V_MPEG4/ISO/AP" => CodecId::Mpeg4,
         "V_MJPEG" => CodecId::Mjpeg,
+        "V_MPEG2" => CodecId::Mpeg2Video,
+        "V_MPEG1" => CodecId::Mpeg1Video,
         _ => return None,
     })
 }
@@ -727,7 +729,7 @@ fn build_track(t: &MkTrack, index: usize, frames: &[&Frame], scale: u64, samples
                 let (bits, chroma) = vp9.unwrap_or((8, 1));
                 Config { prefix: Vec::new(), nal_length: 0, bits, chroma }
             }
-            CodecId::Mpeg4 => {
+            CodecId::Mpeg4 | CodecId::Mpeg2Video | CodecId::Mpeg1Video => {
                 extradata = t.private.clone();
                 Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma: 1 }
             }

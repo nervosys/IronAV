@@ -9,6 +9,7 @@ mod mkvwrite;
 mod mp4;
 mod mp3;
 mod mp4demux;
+mod mpegvideo;
 pub mod stream;
 mod ogg;
 mod vpxav1;
@@ -171,6 +172,24 @@ pub static FORMATS: &[FormatSpec] = &[
         codecs: &[CodecId::Hevc],
     },
     FormatSpec {
+        name: "m2v",
+        extensions: &["m2v", "mpv", "m1v"],
+        description: "Raw MPEG-1 or MPEG-2 video elementary stream (4:2:0 or 4:2:2, progressive or interlaced); read at the sequence header's frame rate, one packet per frame",
+        media: MediaType::Video,
+        demux: true,
+        mux: false,
+        codecs: &[CodecId::Mpeg2Video, CodecId::Mpeg1Video],
+    },
+    FormatSpec {
+        name: "mpegps",
+        extensions: &["mpg", "mpeg", "vob", "ps"],
+        description: "MPEG program stream (DVD VOB, MPEG-1 system streams, .mpg files): the MPEG-1 or MPEG-2 video is read; audio and other streams in it are not",
+        media: MediaType::Video,
+        demux: true,
+        mux: false,
+        codecs: &[CodecId::Mpeg2Video, CodecId::Mpeg1Video],
+    },
+    FormatSpec {
         name: "mpegts",
         extensions: &["ts", "m2ts", "mts"],
         description: "MPEG transport stream (broadcast, IPTV, HLS segments); 192-byte M2TS packets are read too",
@@ -238,6 +257,8 @@ pub fn open_demuxer(path: &Path) -> Result<Box<dyn Demuxer>> {
         Ok(Box::new(jpeg::JpegDemuxer::open(f)?))
     } else if magic.starts_with(b"YUV4MPEG2") {
         Ok(Box::new(y4m::Y4mDemuxer::open(f)?))
+    } else if mpegvideo::looks_like_es(magic) || mpegvideo::looks_like_ps(magic) {
+        Ok(Box::new(mpegvideo::MpegVideoDemuxer::open(f, mpegvideo::looks_like_ps(magic))?))
     } else if let Some(codec) = annexb::looks_like(magic) {
         // last: a raw stream is recognised by its start code and first NAL unit alone
         Ok(Box::new(annexb::AnnexBDemuxer::open(f, codec)?))

@@ -199,6 +199,8 @@ codecs! {
     Vp8 => "vp8", Video;
     Vp9 => "vp9", Video;
     Mpeg4 => "mpeg4", Video;
+    Mpeg2Video => "mpeg2video", Video;
+    Mpeg1Video => "mpeg1video", Video;
     ProRes => "prores", Video;
     Mjpeg => "mjpeg", Video;
 }

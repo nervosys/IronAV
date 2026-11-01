@@ -81,6 +81,8 @@ fn codec_of(stream_type: u8) -> Option<CodecId> {
     match stream_type {
         0x1B => Some(CodecId::H264),
         0x24 => Some(CodecId::Hevc),
+        0x01 => Some(CodecId::Mpeg1Video),
+        0x02 => Some(CodecId::Mpeg2Video),
         0x0F => Some(CodecId::Aac),
         0x03 | 0x04 => Some(CodecId::Mp3),
         _ => None,
@@ -223,6 +225,31 @@ pub(crate) fn nals(d: &[u8]) -> impl Iterator<Item = &[u8]> {
             e -= 1;
         }
         &d[s..e]
+    })
+}
+
+/// MPEG-1 and MPEG-2 video are not made of NAL units: their pictures are found by start codes.
+fn is_mpeg_video(codec: CodecId) -> bool {
+    matches!(codec, CodecId::Mpeg1Video | CodecId::Mpeg2Video)
+}
+
+/// The stream an MPEG-1 or MPEG-2 video access unit with a sequence header describes.
+fn mpeg_video_info(codec: CodecId, au: &[u8]) -> Option<StreamInfo> {
+    let s = ironav_codec::mpeg2::sequence_info(au)?;
+    Some(StreamInfo {
+        index: 0,
+        codec,
+        time_base: Rational::new(1, CLOCK),
+        duration: None,
+        bits: None,
+        extradata: Vec::new(),
+        lead_in: 0,
+        params: StreamParams::Video {
+            width: s.width,
+            height: s.height,
+            pix_fmt: if s.chroma_format == 2 { PixelFormat::Yuv422p } else { PixelFormat::Yuv420p },
+            frame_rate: Rational::new(25, 1),
+        },
     })
 }
 
@@ -528,8 +555,10 @@ impl TsParser {
         let codec = self.es[k].codec;
         if codec.media_type() == ironav_core::MediaType::Video {
             let Some(pts) = pts.or_else(|| self.es[k].next) else { return };
-            let key = is_keyframe(codec, &payload) || self.es[k].random_access;
-            if self.es[k].info.is_none() {
+            let key = if is_mpeg_video(codec) { crate::keyframe::is_keyframe(codec, &payload) == Some(true) } else { is_keyframe(codec, &payload) } || self.es[k].random_access;
+            if self.es[k].info.is_none() && is_mpeg_video(codec) {
+                self.es[k].info = mpeg_video_info(codec, &payload);
+            } else if self.es[k].info.is_none() {
                 if let Some((w, h)) = nals(&payload).find(|n| !n.is_empty() && nal_type(codec, n) == if codec == CodecId::Hevc { 33 } else { 7 }).and_then(|n| ironav_codec::sps_picture_size(codec, n)) {
                     self.es[k].info = Some(StreamInfo {
                         index: 0,

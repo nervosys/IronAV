@@ -566,6 +566,15 @@ fn parse_trak(trak: &[u8], index: usize, samples: &mut Vec<Sample>, movie_ts: u3
         // a version 1 QuickTime video entry has 16 more bytes before its child boxes
         let kids_at = if be16(e, 8)? == 1 { 94 } else { 78 };
         let kids = e.get(kids_at..).unwrap_or(&[]);
+        // an mp4v entry holds MPEG-4 Part 2, MPEG-2 or MPEG-1 video: the esds object type says which
+        let codec = match (codec, child(kids, b"esds")?) {
+            (CodecId::Mpeg4, Some(es)) => match esds_parts(es)?.0 {
+                0x60..=0x65 => CodecId::Mpeg2Video,
+                0x6A => CodecId::Mpeg1Video,
+                _ => CodecId::Mpeg4,
+            },
+            (c, _) => c,
+        };
         let config = match codec {
             CodecId::H264 => parse_avcc(need(kids, b"avcC", "the avc1 entry")?)?,
             CodecId::Hevc => parse_hvcc(need(kids, b"hvcC", "the hvc1 entry")?)?,
@@ -584,6 +593,11 @@ fn parse_trak(trak: &[u8], index: usize, samples: &mut Vec<Sample>, movie_ts: u3
             CodecId::Mpeg4 => {
                 // the decoder-specific info of the esds box holds the visual object and layer headers
                 extradata = esds_config(need(kids, b"esds", "the mp4v entry")?)?.1;
+                Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma: 1 }
+            }
+            CodecId::Mpeg2Video | CodecId::Mpeg1Video => {
+                // the decoder-specific info, if there is any, holds the sequence header
+                extradata = esds_parts(need(kids, b"esds", "the mp4v entry")?)?.1.unwrap_or_default();
                 Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma: 1 }
             }
             _ => Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma: 1 },

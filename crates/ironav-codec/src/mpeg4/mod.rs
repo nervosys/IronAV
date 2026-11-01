@@ -9,8 +9,8 @@
 //! Fabrice Bellard and the FFmpeg developers, LGPL-2.1-or-later), so that the output matches
 //! FFmpeg's decoder with `-flags +bitexact -idct simple`.
 
-mod bits;
-mod idct;
+pub(crate) mod bits;
+pub(crate) mod idct;
 mod mb;
 mod mc;
 mod tables;
@@ -134,7 +134,7 @@ impl Tables {
 }
 
 /// Each start-code unit of `d`: its code and the payload's byte range.
-fn units(d: &[u8]) -> Vec<(u8, usize, usize)> {
+pub(crate) fn units(d: &[u8]) -> Vec<(u8, usize, usize)> {
     let mut starts = Vec::new();
     let mut i = 0;
     while i + 3 < d.len() {
