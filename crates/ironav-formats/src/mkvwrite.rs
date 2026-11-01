@@ -172,6 +172,20 @@ impl MatroskaWriter {
         ((n * 2 + d).div_euclid(2 * d)) as i64
     }
 
+    /// The ticks a packet's block is stamped with. A video track's presentation times run ahead of its
+    /// decoding times by its lead-in (an Annex B stream's reordering depth, say), and Matroska has no edit
+    /// list to say so, so the lead-in comes off and the first picture is at 0. Audio keeps its times: its
+    /// priming is the codec delay instead. A time before the lead-in (none in a stream that starts there)
+    /// is stamped 0.
+    fn block_ticks(&self, t: usize, pts: i64) -> i64 {
+        let tr = &self.tracks[t];
+        if tr.video {
+            (pts - tr.stream.lead_in).max(0)
+        } else {
+            pts
+        }
+    }
+
     fn pos(&mut self) -> Result<u64> {
         Ok(self.out.stream_position()?)
     }
@@ -330,10 +344,11 @@ impl MatroskaWriter {
 
     fn write_block(&mut self, p: &Packet, sample: Vec<u8>, key: bool, discard_ns: Option<i64>) -> Result<()> {
         let t = p.stream;
-        let ms = self.ms(t, p.pts).max(0);
+        let pts = self.block_ticks(t, p.pts);
+        let ms = self.ms(t, pts).max(0);
         let video = self.tracks[t].video;
         let any_video = self.tracks.iter().any(|t| t.video);
-        self.end_ms = self.end_ms.max(self.ms(t, p.pts + p.duration.max(0)).max(ms));
+        self.end_ms = self.end_ms.max(self.ms(t, pts + p.duration.max(0)).max(ms));
         let new = match &self.cluster {
             None => true,
             Some(c) => {
@@ -724,5 +739,39 @@ mod tests {
         .unwrap();
         m.write_packet(&Packet { stream: 0, pts: 0, duration: 1, data: vec![0, 0, 0, 1, 0x41, 1, 2] }).unwrap();
         assert!(m.finish().unwrap_err().message.contains("parameter sets"));
+    }
+
+    /// A video track whose presentation starts `lead_in` pictures in (reordered Annex B) is written with its
+    /// first picture at 0; the audio keeps its times.
+    #[test]
+    fn video_lead_in_comes_off_the_block_times() {
+        let sink = Arc::new(Mutex::new(Cursor::new(Vec::new())));
+        let mut m = MatroskaWriter::new(Box::new(Shared(sink.clone())));
+        let video = StreamInfo {
+            index: 0,
+            codec: CodecId::H264,
+            time_base: Rational::new(1, 25),
+            duration: None,
+            bits: None,
+            extradata: Vec::new(),
+            lead_in: 2,
+            params: StreamParams::Video { width: 64, height: 48, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational::new(25, 1) },
+        };
+        m.write_header(&[video]).unwrap();
+        let sc = [0, 0, 0, 1];
+        let sps_pps_idr = [&sc[..], &[0x67, 0x42, 0, 0x1E, 0xAA], &sc, &[0x68, 0xCE], &sc, &[0x65, 0x88, 1, 2, 3]].concat();
+        let p = [&sc[..], &[0x41, 0x9A, 4, 5]].concat();
+        m.write_packet(&Packet { stream: 0, pts: 2, duration: 1, data: sps_pps_idr }).unwrap();
+        for i in 1..6 {
+            m.write_packet(&Packet { stream: 0, pts: 2 + i, duration: 1, data: p.clone() }).unwrap();
+        }
+        m.finish().unwrap();
+        let bytes = sink.lock().unwrap().get_ref().clone();
+        let mut d = crate::mkv::open(Cursor::new(bytes)).unwrap();
+        let mut pts = Vec::new();
+        while let Some(p) = d.read_packet().unwrap() {
+            pts.push(p.pts);
+        }
+        assert_eq!(pts, vec![0, 40, 80, 120, 160, 200]);
     }
 }

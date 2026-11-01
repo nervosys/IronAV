@@ -1055,7 +1055,7 @@ as in the source. The `vp9_and_av1_copy_between_webm_matroska_and_mp4` test make
 and decodes the VP9 copies in MP4.
 
 PCM in Matroska is read (`A_PCM/INT/LIT`, `A_PCM/INT/BIG` and `A_PCM/FLOAT/IEEE`, 8 to 64 bits) and written (little-endian, with the sample size as BitDepth); FFmpeg's files decode to the same bytes and FFmpeg reads IronAV's copies to the same bytes. Not done: no SeekHead, tags, chapters or attachments; more than one stream per kind is refused; an MP3's gapless trim (from its LAME tag) is not
-carried over and the Opus pre-skip is carried only as the OpusHead plus CodecDelay. I did not test B-frame video in Matroska: the NVENC files above have none, and the MPEG-TS section covers B-frames.
+carried over and the Opus pre-skip is carried only as the OpusHead plus CodecDelay. B-frame video in Matroska: a raw H.264 or HEVC file with B pictures copies with its presentation times running from 0 (the reordering depth, which the file's frames are ahead of their decoding by, comes off), and FFmpeg decodes the copy to the same pictures; the MPEG-TS section covers B-frames in transport streams.
 
 ## MPEG transport streams
 

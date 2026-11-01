@@ -214,3 +214,28 @@ fn h264_annex_b_joined_mid_gop_is_read_from_its_first_keyframe() {
     assert_eq!(y4m_bytes(&std::fs::read(&out).unwrap()), want[4 * picture..], "a joined stream decodes from its first keyframe");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[test]
+fn h264_b_pictures_copied_to_matroska_start_at_zero() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not on PATH; skipping");
+        return;
+    }
+    // B pictures make presentation times run ahead of decoding times by the reordering depth; the
+    // Matroska copy has no edit list, so its first picture is stamped 0, not at that depth
+    let d = scratch("h264-b-mkv-start");
+    let src = d.join("src.y4m");
+    let size = format!("testsrc2=size={W}x{H}:rate=25");
+    let n = FRAMES.to_string();
+    ffmpeg(&["-f", "lavfi", "-i", &size, "-frames:v", &n, "-pix_fmt", "yuv420p", src.to_str().unwrap()]);
+    let stream = d.join("clip.h264");
+    ffmpeg(&["-i", src.to_str().unwrap(), "-c:v", "libx264", "-bf", "2", "-g", "4", "-preset", "ultrafast", "-f", "h264", stream.to_str().unwrap()]);
+    let out = d.join("copy.mkv");
+    run(&job(&stream, &out), &mut |_| {}).unwrap();
+    let probe = Command::new("ffprobe").args(["-v", "error", "-select_streams", "v:0", "-show_entries", "frame=pts_time", "-of", "csv=p=0"]).arg(&out).output().unwrap();
+    let times: Vec<f64> = String::from_utf8_lossy(&probe.stdout).lines().map(|l| l.trim().trim_end_matches(',').parse().unwrap()).collect();
+    assert_eq!(times.len(), FRAMES, "ffprobe's frames of the copy: {times:?}");
+    let first = times.iter().copied().fold(f64::INFINITY, f64::min);
+    assert_eq!(first, 0.0, "the first picture of the Matroska copy is at 0: {times:?}");
+    let _ = std::fs::remove_dir_all(&d);
+}
