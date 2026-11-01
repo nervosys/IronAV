@@ -1493,16 +1493,80 @@ fn vorbis_encoder_output_decodes_close_to_its_input() {
     }
     assert!(sizes[0] < sizes[1] * 2 / 3, "a lower bit rate makes a smaller file: {sizes:?}");
 
-    // three or more channels are refused with a reason
-    let six = dir.join("six.wav");
-    write_wav(&six, &vec![0i16; 6 * 4410], 6, 44_100);
+    // more than eight channels are refused with a reason
+    let nine = dir.join("nine.wav");
+    write_wav(&nine, &vec![0i16; 9 * 4410], 9, 44_100);
     let e = plan(&{
-        let mut j = job(&six, &dir.join("six.ogg"));
+        let mut j = job(&nine, &dir.join("nine.ogg"));
         j.audio.codec = Some("vorbis".into());
         j
     })
     .unwrap_err();
     assert_eq!(e.code, ErrorCode::UnsupportedCodec, "{e:?}");
+}
+
+/// The SNR of channel `got_c` of interleaved 16-bit audio against channel `want_c` of a reference
+/// with `channels` channels.
+fn channel_snr_db(want: &[u8], got: &[u8], channels: usize, want_c: usize, got_c: usize) -> f64 {
+    let s = |b: &[u8], c: usize| -> Vec<f64> { b.as_chunks::<2>().0.iter().skip(c).step_by(channels).map(|v| i16::from_le_bytes([v[0], v[1]]) as f64).collect() };
+    let (a, b) = (s(want, want_c), s(got, got_c));
+    let (sig, err) = a.iter().zip(&b).fold((0.0, 0.0), |(sg, er), (x, y)| (sg + x * x, er + (x - y) * (x - y)));
+    10.0 * (sig / err.max(1e-9)).log10()
+}
+
+/// Vorbis with 3 to 8 channels: channel `c` carries a tone of its own, and every channel comes back
+/// in its own place, in our decoder's output and in FFmpeg's (which takes the WAV channel order:
+/// front left, front right, front centre, LFE, ...), in Ogg and in Matroska. Each channel is
+/// checked against the others, so a swapped pair fails.
+#[test]
+fn vorbis_multichannel_keeps_each_tone_in_its_channel() {
+    let dir = scratch("vorbis-multi");
+    let n = 44_100 * 2 + 123;
+    let with_ffmpeg = ffmpeg_available();
+    for (channels, ext) in [(3, "ogg"), (4, "ogg"), (5, "webm"), (6, "ogg"), (7, "mka"), (8, "ogg")] {
+        let samples: Vec<i16> = (0..n * channels)
+            .map(|i| {
+                let (t, c) = ((i / channels) as f64 / 44_100.0, (i % channels) as f64);
+                (6000.0 * (2.0 * std::f64::consts::PI * (300.0 + 130.0 * c) * t).sin()) as i16
+            })
+            .collect();
+        let wav = dir.join(format!("in{channels}.wav"));
+        write_wav(&wav, &samples, channels as u16, 44_100);
+        let want = pcm(&wav);
+        let out = dir.join(format!("out{channels}.{ext}"));
+        let mut j = job(&wav, &out);
+        j.audio.codec = Some("vorbis".into());
+        run(&j, &mut |_| {}).unwrap();
+
+        let back = dir.join(format!("back{channels}.wav"));
+        let mut j = job(&out, &back);
+        j.audio.codec = Some("pcm_s16le".into());
+        run(&j, &mut |_| {}).unwrap();
+        let got = pcm(&back);
+        // Ogg keeps the exact length; Matroska and WebM keep the encoder's padding at the end, as the stereo test allows
+        let frames = got.len() / (2 * channels);
+        if ext == "ogg" {
+            assert_eq!(got.len(), want.len(), "{channels} channels: the same length");
+        } else {
+            assert!(frames >= n && frames < n + 2048, "{channels} channels in {ext}: {frames} frames");
+        }
+        let mut decoders = vec![("ironav", got)];
+        if with_ffmpeg {
+            let raw = dir.join(format!("ff{channels}.raw"));
+            let st = std::process::Command::new("ffmpeg").args(["-v", "error", "-y", "-i"]).arg(&out).args(["-f", "s16le"]).arg(&raw).status().unwrap();
+            assert!(st.success(), "ffmpeg could not decode {channels} channels");
+            decoders.push(("ffmpeg", std::fs::read(&raw).unwrap()));
+        }
+        for (who, pcm_out) in &decoders {
+            for c in 0..channels {
+                // output channel c should be input channel c, and no other input channel
+                let own = channel_snr_db(&want, pcm_out, channels, c, c);
+                let other = (0..channels).filter(|&d| d != c).map(|d| channel_snr_db(&want, pcm_out, channels, d, c)).fold(f64::MIN, f64::max);
+                assert!(own > 12.0, "{who} {channels} channels, channel {c}: {own:.1} dB");
+                assert!(own > other + 20.0, "{who} {channels} channels, channel {c}: {own:.1} dB against {other:.1} dB for another input channel");
+            }
+        }
+    }
 }
 
 /// AAC encoding into MP4, ADTS and Matroska: the bit rate steers the size, our decoder gets back

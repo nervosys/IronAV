@@ -150,8 +150,9 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - **AAC:** HE-AAC v2 (parametric stereo) is refused, as are Main prediction, LTP, gain control, coupling channels and
   program-config layouts. The encoder writes one to six and eight channels; seven has no standard layout and is refused.
 - **Opus and Vorbis:** Opus is encoded in mono, stereo and 3 to 8 channels (channel-mapping family 1); 9 or more channels,
-  and family 255 streams, are refused by the encoder (the decoder reads both families). Vorbis floor type 0 and
-  streams over eight channels are refused, and the Vorbis encoder writes at most two channels.
+  and family 255 streams, are refused by the encoder (the decoder reads both families). Vorbis floor type 0 is refused
+  (no encoder writes it, and no local file has it to test with), and streams over eight channels are refused. The Vorbis
+  encoder writes one to eight channels; only a stereo pair is coupled, so three or more channels are coded one by one.
 - **MP3, MP2, JPEG, ProRes:** MPEG audio Layer I is refused (no encoder makes a test stream); MP2 joint-stereo (intensity) streams
   decode but have no FFmpeg reference; MP2 is not encoded; JPEG arithmetic-coded and 12-bit files are refused (lossless JPEG decodes, but not with restart intervals);
   ProRes interlaced pictures are refused.

@@ -1,6 +1,7 @@
 //! A Vorbis I encoder: two block sizes (2048 and 256), floor 1 with 24 posts (12 for the short
 //! blocks), residue type 1 coded with a two-dimensional lattice codebook, square-polar channel
-//! coupling for stereo, mono or stereo only.
+//! coupling for a stereo pair. Up to eight channels: a stream of three or more has no coupling
+//! steps, so each channel is coded on its own, in the Vorbis channel order.
 //!
 //! The headers are written by hand and then read back with the decoder's own parser, so the
 //! decoder's idea of every table (codebooks, floor curve) is the one the encoder uses: the floor
@@ -334,10 +335,10 @@ pub struct VorbisEncoder {
 }
 
 impl VorbisEncoder {
-    /// An encoder for `channels` (1 or 2) at about `bitrate` bits per second.
+    /// An encoder for `channels` (1 to 8) at about `bitrate` bits per second.
     pub fn new(sample_rate: u32, channels: usize, bitrate: u32) -> Result<Self> {
-        if !(1..=2).contains(&channels) {
-            return Err(Error::new(ErrorCode::UnsupportedCodec, format!("the Vorbis encoder takes mono or stereo audio, not {channels} channels")));
+        if !(1..=8).contains(&channels) {
+            return Err(Error::new(ErrorCode::UnsupportedCodec, format!("the Vorbis encoder takes 1 to 8 channels, not {channels}")));
         }
         if !(2000..=200_000).contains(&sample_rate) {
             return Err(Error::new(ErrorCode::UnsupportedCodec, format!("the Vorbis encoder takes 2000 to 200000 Hz audio, not {sample_rate} Hz")));
@@ -739,10 +740,14 @@ impl Encoder for VorbisEncoder {
         if a.channels as usize != self.channels {
             return Err(Error::invalid_input("the audio changed channel count mid-stream"));
         }
+        // the input is in the output layout (WAV and FFmpeg order): channel `c` of the stream is the
+        // input channel that the decoder will put back in that place
+        let order = super::ORDER[self.channels - 1];
+        let source: Vec<usize> = (0..self.channels).map(|c| order.iter().position(|&o| o == c).unwrap_or(c)).collect();
         let n = a.samples.len() / self.channels;
         for i in 0..n {
             for c in 0..self.channels {
-                self.buf[c].push(a.samples[i * self.channels + c] as f32);
+                self.buf[c].push(a.samples[i * self.channels + source[c]] as f32);
             }
         }
         self.input += n as u64;
