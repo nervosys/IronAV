@@ -1028,7 +1028,8 @@ FFmpeg decodes all 50 frames of each video. IronAV's own tests copy audio throug
 configuration, and decode FLAC through Matroska to the PCM it was made from.
 
 Several tracks of one kind are written as separate tracks, in input order: ffprobe lists them all, and IronAV's reader returns each
-track's packets. Other formats keep the first stream of each kind. The `mkv_multi` test copies a file with two audio tracks and one
+track's packets. They come from one input: with `extra_inputs`, the first file that has a kind supplies all of that kind,
+so a separate audio file still replaces, not joins, the audio of a file that has some. Other formats keep the first stream of each kind. The `mkv_multi` test copies a file with two audio tracks and one
 video track, and one with two video tracks, and checks the result with ffprobe and with IronAV's reader.
 
 `.webm` is written with VP8, VP9 or AV1 video and Opus or Vorbis audio (document type `webm`; FFmpeg opens the files and decodes them).

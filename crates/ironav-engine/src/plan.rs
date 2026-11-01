@@ -165,7 +165,8 @@ pub fn plan(job: &Job) -> Result<Plan> {
     let mut out_streams: Vec<StreamInfo> = Vec::new();
     let mut used = vec![false; job.filters.len()];
 
-    let mut taken: Vec<MediaType> = Vec::new();
+    // (media, the file that supplied it): formats that hold several of a kind take them all from that one file
+    let mut taken: Vec<(MediaType, usize)> = Vec::new();
     for (file, s) in demuxes.iter().enumerate().flat_map(|(f, d)| d.streams().iter().map(move |s| (f, s))) {
         let media = s.params.media_type();
         let at = if demuxes.len() > 1 { format!("input {file} stream {}", s.index) } else { format!("input stream {}", s.index) };
@@ -173,11 +174,13 @@ pub fn plan(job: &Job) -> Result<Plan> {
             warnings.push(format!("{at} ({media:?}) dropped: '{}' cannot hold {media:?}", spec.name));
             continue;
         }
-        if taken.contains(&media) && !spec.holds_several() {
+        if taken.iter().any(|&(m, f)| m == media && !(spec.holds_several() && f == file)) {
             warnings.push(format!("{at} ({media:?}) dropped: '{}' holds one {media:?} stream here and an earlier one was used", spec.name));
             continue;
         }
-        taken.push(media);
+        if !taken.iter().any(|&(m, _)| m == media) {
+            taken.push((media, file));
+        }
         if (if media == MediaType::Audio { &job.audio } else { &job.video }).codec.as_deref() == Some("none") {
             warnings.push(format!("{at} ({media:?}) dropped: its codec is \"none\""));
             continue;
