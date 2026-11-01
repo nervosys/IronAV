@@ -37,7 +37,13 @@ fn ptl(w: &mut BitWriter, level: u8) {
     w.put(8, level as u32);
 }
 
-pub fn vps(level: u8) -> Vec<u8> {
+/// The DPB size and reordering the stream declares: `reorder` pictures may precede any picture in
+/// decoding order and follow it in output order (one with flat B pictures, none without them).
+fn dpb_params(reorder: u32) -> (u32, u32) {
+    (if reorder > 0 { 2 } else { 1 }, reorder)
+}
+
+pub fn vps(level: u8, reorder: u32) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.put(4, 0); // vps_video_parameter_set_id
     w.put(2, 3); // base layer internal and available
@@ -47,8 +53,9 @@ pub fn vps(level: u8) -> Vec<u8> {
     w.put(16, 0xffff);
     ptl(&mut w, level);
     w.put(1, 1); // vps_sub_layer_ordering_info_present_flag
-    w.ue(1); // vps_max_dec_pic_buffering_minus1
-    w.ue(0); // vps_max_num_reorder_pics
+    let (dpb, reorder_pics) = dpb_params(reorder);
+    w.ue(dpb); // vps_max_dec_pic_buffering_minus1
+    w.ue(reorder_pics); // vps_max_num_reorder_pics
     w.ue(0); // vps_max_latency_increase_plus1
     w.put(6, 0); // vps_max_layer_id
     w.ue(0); // vps_num_layer_sets_minus1
@@ -58,7 +65,7 @@ pub fn vps(level: u8) -> Vec<u8> {
 }
 
 /// The SPS for a `pw` x `ph` (padded to 8) picture cropped by `crop` (luma samples: left, right, top, bottom).
-pub fn sps(pw: usize, ph: usize, crop: [usize; 4], level: u8) -> Vec<u8> {
+pub fn sps(pw: usize, ph: usize, crop: [usize; 4], level: u8, reorder: u32) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.put(4, 0); // sps_video_parameter_set_id
     w.put(3, 0); // sps_max_sub_layers_minus1
@@ -80,8 +87,9 @@ pub fn sps(pw: usize, ph: usize, crop: [usize; 4], level: u8) -> Vec<u8> {
     w.ue(0); // bit_depth_chroma_minus8
     w.ue(4); // log2_max_pic_order_cnt_lsb_minus4: 8 bits
     w.flag(true); // sps_sub_layer_ordering_info_present_flag
-    w.ue(1); // sps_max_dec_pic_buffering_minus1
-    w.ue(0); // sps_max_num_reorder_pics
+    let (dpb, reorder_pics) = dpb_params(reorder);
+    w.ue(dpb); // sps_max_dec_pic_buffering_minus1
+    w.ue(reorder_pics); // sps_max_num_reorder_pics
     w.ue(0); // sps_max_latency_increase_plus1
     w.ue(LOG2_MIN_CB - 3);
     w.ue(LOG2_CTB - LOG2_MIN_CB);
@@ -93,11 +101,7 @@ pub fn sps(pw: usize, ph: usize, crop: [usize; 4], level: u8) -> Vec<u8> {
     w.flag(false); // amp_enabled_flag
     w.flag(true); // sample_adaptive_offset_enabled_flag
     w.flag(false); // pcm_enabled_flag
-    w.ue(1); // num_short_term_ref_pic_sets: the previous picture
-    w.ue(1); // num_negative_pics
-    w.ue(0); // num_positive_pics
-    w.ue(0); // delta_poc_s0_minus1
-    w.flag(true); // used_by_curr_pic_s0_flag
+    w.ue(0); // num_short_term_ref_pic_sets: each slice header carries its set
     w.flag(false); // long_term_ref_pics_present_flag
     w.flag(false); // sps_temporal_mvp_enabled_flag
     w.flag(true); // strong_intra_smoothing_enabled_flag
@@ -144,9 +148,19 @@ fn addr_bits(nctb: usize) -> u32 {
     usize::BITS - (nctb - 1).leading_zeros()
 }
 
-/// A slice segment header for a slice of an IDR picture or of a P picture that refers to the
-/// picture before it (its POC is `poc` modulo 256), ending with byte_alignment().
-pub fn slice_header(first: bool, addr: usize, nctb: usize, idr: bool, poc: u32, qp: i32) -> Vec<u8> {
+/// The short-term reference picture set of a picture: the POC deltas of the pictures it refers to,
+/// all of them used by it. `before` are negative, nearest first; `after` are positive, nearest first.
+#[derive(Clone, Default, Debug, PartialEq)]
+pub struct Rps {
+    pub before: Vec<i32>,
+    pub after: Vec<i32>,
+}
+
+/// A slice segment header of an IDR picture, or of a P or B picture with the reference picture set
+/// `rps` (its POC is `poc` modulo 256), ending with byte_alignment(). A B slice takes one picture
+/// from each list, the PPS defaults, and five merge candidates.
+#[allow(clippy::too_many_arguments)]
+pub fn slice_header(first: bool, addr: usize, nctb: usize, idr: bool, b: bool, poc: u32, rps: &Rps, qp: i32) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.flag(first);
     if idr {
@@ -156,15 +170,39 @@ pub fn slice_header(first: bool, addr: usize, nctb: usize, idr: bool, poc: u32, 
     if !first {
         w.put(addr_bits(nctb), addr as u32);
     }
-    w.ue(if idr { 2 } else { 1 }); // slice_type: I or P
+    w.ue(if idr {
+        2 // I
+    } else if b {
+        0 // B
+    } else {
+        1 // P
+    });
     if !idr {
         w.put(8, poc & 255); // slice_pic_order_cnt_lsb
-        w.flag(true); // short_term_ref_pic_set_sps_flag; the one set takes no index bits
+        w.flag(false); // short_term_ref_pic_set_sps_flag: the set is in the header
+        // st_ref_pic_set(0): the SPS has no sets, so there is nothing to predict from
+        w.ue(rps.before.len() as u32);
+        w.ue(rps.after.len() as u32);
+        let mut prev = 0;
+        for &d in &rps.before {
+            w.ue((prev - d - 1) as u32); // delta_poc_s0_minus1
+            w.flag(true); // used_by_curr_pic_s0_flag
+            prev = d;
+        }
+        prev = 0;
+        for &d in &rps.after {
+            w.ue((d - prev - 1) as u32); // delta_poc_s1_minus1
+            w.flag(true); // used_by_curr_pic_s1_flag
+            prev = d;
+        }
     }
     w.flag(true); // slice_sao_luma_flag
     w.flag(true); // slice_sao_chroma_flag: the CTBs choose their offsets
     if !idr {
-        w.flag(false); // num_ref_idx_active_override_flag
+        w.flag(false); // num_ref_idx_active_override_flag: one picture per list, as the PPS says
+        if b {
+            w.flag(false); // mvd_l1_zero_flag
+        }
         w.ue(0); // five_minus_max_num_merge_cand
     }
     w.se(qp - 26); // slice_qp_delta

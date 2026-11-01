@@ -38,8 +38,11 @@ pub struct Cu {
     pub luma_mode: u32,
     pub chroma_idc: u32,
     pub chroma_mode: u32,
-    pub mvp: usize,
-    pub mvd: [i32; 2],
+    /// Per list: the AMVP predictor index and the vector difference.
+    pub mvp: [usize; 2],
+    pub mvd: [[i32; 2]; 2],
+    /// The inter prediction direction: 0 list 0, 1 list 1, 2 both (B slices).
+    pub idc: u8,
     /// A skipped unit (merge, no residual), or a merged unit with its candidate index.
     pub skip: bool,
     pub merge_idx: Option<u32>,
@@ -51,6 +54,21 @@ pub struct Cu {
 pub enum Node {
     Split(Vec<Node>),
     Leaf(Box<Cu>),
+}
+
+/// The motion of a prediction unit with its syntax: the merge index, or the AMVP predictors,
+/// differences and direction.
+struct Pu {
+    mvf: MvField,
+    merge: Option<u32>,
+    mvp: [usize; 2],
+    mvd: [[i32; 2]; 2],
+    idc: u8,
+}
+
+/// Two motion fields that predict the same way (the decoder's pruning of merge candidates).
+fn same_motion(a: &MvField, b: &MvField) -> bool {
+    a.pred & 3 == b.pred & 3 && (!a.uses(0) || a.mv[0] == b.mv[0]) && (!a.uses(1) || a.mv[1] == b.mv[1])
 }
 
 /// The per-4x4 state of a region, saved while a candidate is tried.
@@ -143,15 +161,20 @@ pub struct SliceCoder<'a> {
     pps: &'a Pps,
     geo: &'a Geometry,
     src: &'a Source,
-    refp: Option<&'a Frame>,
+    /// The pictures of list 0 and list 1: none in an I slice, list 0 in a P slice, both in a B slice.
+    refs: [Option<&'a Frame>; 2],
     poc: i32,
-    ref_poc: i32,
+    /// The POCs of the list pictures.
+    ref_pocs: [i32; 2],
     pub pic: CurPic,
     qp: i32,
     lambda: f64,
     slice_addr: i32,
     slice_idx: u16,
-    p_slice: bool,
+    /// A P or B slice.
+    inter: bool,
+    /// A B slice.
+    b: bool,
     w: usize,
     h: usize,
     w4: usize,
@@ -159,22 +182,22 @@ pub struct SliceCoder<'a> {
 
 impl<'a> SliceCoder<'a> {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(sps: &'a Sps, pps: &'a Pps, geo: &'a Geometry, src: &'a Source, refp: Option<&'a Frame>, poc: i32, qp: i32, slice_addr: i32, slice_idx: u16) -> Self {
-        let ref_poc = refp.map_or(0, |r| r.poc);
+    pub fn new(sps: &'a Sps, pps: &'a Pps, geo: &'a Geometry, src: &'a Source, refs: [Option<&'a Frame>; 2], poc: i32, qp: i32, slice_addr: i32, slice_idx: u16) -> Self {
         SliceCoder {
             sps,
             pps,
             geo,
             src,
-            refp,
+            refs,
             poc,
-            ref_poc,
+            ref_pocs: [refs[0].map_or(0, |r| r.poc), refs[1].map_or(0, |r| r.poc)],
             pic: CurPic::new(sps, 0, poc),
             qp,
             lambda: lambda_for(qp),
             slice_addr,
             slice_idx,
-            p_slice: refp.is_some(),
+            inter: refs[0].is_some(),
+            b: refs[1].is_some(),
             w: sps.width,
             h: sps.height,
             w4: sps.width.div_ceil(4),
@@ -556,7 +579,7 @@ impl<'a> SliceCoder<'a> {
         let n = 1usize << log2;
         let before = self.save(x, y, n);
         let (ci, cu_i) = self.eval_intra(x, y, log2, depth);
-        if !self.p_slice {
+        if !self.inter {
             return (ci, cu_i);
         }
         let after_intra = self.save(x, y, n);
@@ -624,17 +647,32 @@ impl<'a> SliceCoder<'a> {
         let cb = chroma.pop().unwrap_or_default();
         (
             cost,
-            Cu { log2, intra: true, split_tu: split, prev_flag, mpm_idx, rem, luma_mode: mode, chroma_idc: cidc, chroma_mode: cmode, mvp: 0, mvd: [0, 0], skip: false, merge_idx: None, luma, cb, cr },
+            Cu { log2, intra: true, split_tu: split, prev_flag, mpm_idx, rem, luma_mode: mode, chroma_idc: cidc, chroma_mode: cmode, mvp: [0, 0], mvd: [[0, 0]; 2], idc: 0, skip: false, merge_idx: None, luma, cb, cr },
         )
     }
 
     // ------------------------------------------------------------ inter prediction
 
-    /// The motion vector predictor candidates for the block at (`x`, `y`) of width `w` (8.5.3.2.6, without
-    /// the temporal candidate, which the stream turns off).
-    fn amvp(&self, x: usize, y: usize, w: usize) -> [[i16; 2]; 2] {
+    /// The motion of a block: the lists in `pred` (bit 0 list 0, bit 1 list 1) with their vectors, each
+    /// from the one picture the slice has in that list. Unused lists stay as the decoder leaves them.
+    fn motion(&self, pred: u8, mv: [[i16; 2]; 2]) -> MvField {
+        let mut m = MvField { mv: [[0, 0]; 2], ref_idx: [-1, -1], ref_poc: [0, 0], pred: 0 };
+        for l in 0..2 {
+            if pred & (1 << l) != 0 {
+                m.mv[l] = mv[l];
+                m.ref_idx[l] = 0;
+                m.ref_poc[l] = self.ref_pocs[l];
+                m.pred |= 1 << l;
+            }
+        }
+        m
+    }
+
+    /// The motion vector predictor candidates of list `l` for the block at (`x`, `y`) of width `w`
+    /// (8.5.3.2.6, without the temporal candidate, which the stream turns off).
+    fn amvp(&self, x: usize, y: usize, w: usize, l: usize) -> [[i16; 2]; 2] {
         let (xi, yi, wi) = (x as i32, y as i32, w as i32);
-        let cur_poc = self.ref_poc;
+        let cur_poc = self.ref_pocs[l];
         let nb = |xn: i32, yn: i32| -> Option<MvField> {
             if self.avail(x, y, xn, yn) && self.pic.pred_mode[self.i4(xn as usize, yn as usize)] == PRED_INTER {
                 Some(self.pic.frame.mv[self.i4(xn as usize, yn as usize)])
@@ -645,14 +683,10 @@ impl<'a> SliceCoder<'a> {
         let a = [nb(xi - 1, yi + wi), nb(xi - 1, yi + wi - 1)];
         let b = [nb(xi + wi, yi - 1), nb(xi + wi - 1, yi - 1), nb(xi - 1, yi - 1)];
         let is_scaled = a[0].is_some() || a[1].is_some();
-        let direct = |m: &MvField| -> Option<[i16; 2]> { (m.uses(0) && m.ref_poc[0] == cur_poc).then_some(m.mv[0]) };
-        let scaled = |m: &MvField| -> Option<[i16; 2]> {
-            if m.uses(0) && !m.long_term(0) {
-                Some(scale_mv(m.mv[0], self.poc - m.ref_poc[0], self.poc - cur_poc))
-            } else {
-                None
-            }
-        };
+        // a candidate pointing at the very same picture, from list l first and then the other list
+        let direct = |m: &MvField| -> Option<[i16; 2]> { [l, 1 - l].into_iter().find(|&ll| m.uses(ll) && m.ref_poc[ll] == cur_poc).map(|ll| m.mv[ll]) };
+        // any other candidate, scaled by the POC distances
+        let scaled = |m: &MvField| -> Option<[i16; 2]> { [l, 1 - l].into_iter().find(|&ll| m.uses(ll)).map(|ll| scale_mv(m.mv[ll], self.poc - m.ref_poc[ll], self.poc - cur_poc)) };
         let mut mva = a.iter().flatten().find_map(direct);
         if mva.is_none() {
             mva = a.iter().flatten().find_map(scaled);
@@ -676,10 +710,10 @@ impl<'a> SliceCoder<'a> {
         [cands.first().copied().unwrap_or([0, 0]), cands.get(1).copied().unwrap_or([0, 0])]
     }
 
-    /// The cost of predicting the `n` square at (`x`, `y`) with `mv`: the SAD of the rounded
-    /// interpolation, and a penalty for the vector difference.
-    fn motion_cost(&self, x: usize, y: usize, n: usize, mv: [i16; 2], pred: [i16; 2]) -> u64 {
-        let refp = self.refp.expect("inter prediction has a reference");
+    /// The cost of predicting the `n` square at (`x`, `y`) from list `l` with `mv`: the SAD of the
+    /// rounded interpolation, and a penalty for the vector difference.
+    fn motion_cost(&self, x: usize, y: usize, n: usize, l: usize, mv: [i16; 2], pred: [i16; 2]) -> u64 {
+        let refp = self.refs[l].expect("inter prediction has a reference");
         let src = &self.src.planes[0];
         let mut s = 0u64;
         if mv[0] & 3 == 0 && mv[1] & 3 == 0 {
@@ -706,13 +740,14 @@ impl<'a> SliceCoder<'a> {
         s + (pen / 2) as u64
     }
 
-    /// Motion search: integer positions around zero and the predictors, then half and quarter samples.
-    fn motion_search(&self, x: usize, y: usize, n: usize, cands: &[[i16; 2]; 2]) -> [i16; 2] {
+    /// Motion search in list `l`: integer positions around zero and the predictors, then half and
+    /// quarter samples.
+    fn motion_search(&self, x: usize, y: usize, n: usize, l: usize, cands: &[[i16; 2]; 2]) -> [i16; 2] {
         let pred = cands[0];
         let mut best = [0i16, 0];
-        let mut bc = self.motion_cost(x, y, n, best, pred);
+        let mut bc = self.motion_cost(x, y, n, l, best, pred);
         let try_mv = |mv: [i16; 2], best: &mut [i16; 2], bc: &mut u64| {
-            let c = self.motion_cost(x, y, n, mv, pred);
+            let c = self.motion_cost(x, y, n, l, mv, pred);
             if c < *bc {
                 *bc = c;
                 *best = mv;
@@ -748,29 +783,49 @@ impl<'a> SliceCoder<'a> {
         best
     }
 
-    /// Writes the motion-compensated prediction of the `n` square at (`x`, `y`) with `mv` into the picture.
-    fn inter_pred(&mut self, x: usize, y: usize, n: usize, mv: [i16; 2]) {
-        let refp = self.refp.expect("inter prediction has a reference");
-        let mut out = [0i16; 32 * 32];
+    /// Writes the motion-compensated prediction of the `n` square at (`x`, `y`) with motion `m` into
+    /// the picture: one list is rounded from its 14-bit samples, two lists are averaged (8.5.3.3.4.2).
+    fn inter_pred(&mut self, x: usize, y: usize, n: usize, m: &MvField) {
+        let bi = m.uses(0) && m.uses(1);
         for c in 0..3 {
             let (bx, by, bn) = if c == 0 { (x, y, n) } else { (x / 2, y / 2, n / 2) };
-            if c == 0 {
-                luma_mc(&refp.planes[0], self.w, self.h, bx as i32, by as i32, mv, bn, bn, 8, &mut out);
-            } else {
-                chroma_mc(&refp.planes[c], self.w / 2, self.h / 2, bx as i32, by as i32, mv, (1, 1), bn, bn, 8, &mut out);
+            let mut pred: [Vec<i16>; 2] = [Vec::new(), Vec::new()];
+            for l in 0..2 {
+                if !m.uses(l) {
+                    continue;
+                }
+                let refp = self.refs[l].expect("inter prediction has a reference");
+                let mut out = vec![0i16; bn * bn];
+                if c == 0 {
+                    luma_mc(&refp.planes[0], self.w, self.h, bx as i32, by as i32, m.mv[l], bn, bn, 8, &mut out);
+                } else {
+                    chroma_mc(&refp.planes[c], self.w / 2, self.h / 2, bx as i32, by as i32, m.mv[l], (1, 1), bn, bn, 8, &mut out);
+                }
+                pred[l] = out;
             }
-            let block: Vec<u16> = out[..bn * bn].iter().map(|&o| ((o as i32 + 32) >> 6).clamp(0, 255) as u16).collect();
+            let block: Vec<u16> = (0..bn * bn)
+                .map(|i| {
+                    let v = if bi {
+                        (pred[0][i] as i32 + pred[1][i] as i32 + 64) >> 7
+                    } else {
+                        let l = if m.uses(0) { 0 } else { 1 };
+                        (pred[l][i] as i32 + 32) >> 6
+                    };
+                    v.clamp(0, 255) as u16
+                })
+                .collect();
             self.put(c, bx, by, bn.trailing_zeros(), &block);
         }
     }
 
-    /// The merge candidates' motion vectors for the `n` square at (`x`, `y`): for a P slice of one
-    /// reference, the spatial candidates (8.5.3.2.3 to 8.5.3.2.5) then zero candidates, five in all.
-    fn merge_mvs(&self, x: usize, y: usize, n: usize) -> Vec<[i16; 2]> {
+    /// The merge candidates of the `n` square at (`x`, `y`) (8.5.3.2.2 to 8.5.3.2.5 without the
+    /// temporal candidate): the spatial ones, then in a B slice the combined bi-predictive ones, then
+    /// zero candidates, five in all.
+    fn merge_cands(&self, x: usize, y: usize, n: usize) -> Vec<MvField> {
         let (xi, yi, ni) = (x as i32, y as i32, n as i32);
-        let get = |xn: i32, yn: i32| -> Option<[i16; 2]> {
+        let get = |xn: i32, yn: i32| -> Option<MvField> {
             if self.avail(x, y, xn, yn) && self.pic.pred_mode[self.i4(xn as usize, yn as usize)] == PRED_INTER {
-                Some(self.pic.frame.mv[self.i4(xn as usize, yn as usize)].mv[0])
+                Some(self.pic.frame.mv[self.i4(xn as usize, yn as usize)])
             } else {
                 None
             }
@@ -780,30 +835,54 @@ impl<'a> SliceCoder<'a> {
         let b0 = get(xi + ni, yi - 1);
         let a0 = get(xi - 1, yi + ni);
         let b2 = get(xi - 1, yi - 1);
-        let mut list: Vec<[i16; 2]> = Vec::with_capacity(5);
+        let same = |p: &Option<MvField>, c: &MvField| p.as_ref().is_some_and(|p| same_motion(p, c));
+        let mut list: Vec<MvField> = Vec::with_capacity(5);
         list.extend(a1);
-        if let Some(c) = b1.filter(|&c| a1 != Some(c)) {
-            list.push(c);
+        if let Some(c) = b1 {
+            if !same(&a1, &c) {
+                list.push(c);
+            }
         }
-        if let Some(c) = b0.filter(|&c| b1 != Some(c)) {
-            list.push(c);
+        if let Some(c) = b0 {
+            if !same(&b1, &c) {
+                list.push(c);
+            }
         }
-        if let Some(c) = a0.filter(|&c| a1 != Some(c)) {
-            list.push(c);
+        if let Some(c) = a0 {
+            if !same(&a1, &c) {
+                list.push(c);
+            }
         }
-        if let Some(c) = b2.filter(|&c| list.len() < 4 && a1 != Some(c) && b1 != Some(c)) {
-            list.push(c);
+        if let Some(c) = b2 {
+            if list.len() < 4 && !same(&a1, &c) && !same(&b1, &c) {
+                list.push(c);
+            }
         }
-        list.resize(5, [0, 0]);
+        if self.b && list.len() > 1 && list.len() < 5 {
+            // pairs of candidates, one's list 0 and the other's list 1, where the pictures or vectors differ
+            const COMB: [(usize, usize); 12] = [(0, 1), (1, 0), (0, 2), (2, 0), (1, 2), (2, 1), (0, 3), (3, 0), (1, 3), (3, 1), (2, 3), (3, 2)];
+            let orig = list.len();
+            for &(i0, i1) in COMB.iter().take(orig * (orig - 1)) {
+                let (l0, l1) = (list[i0], list[i1]);
+                if l0.uses(0) && l1.uses(1) && (l0.ref_poc[0] != l1.ref_poc[1] || l0.mv[0] != l1.mv[1]) {
+                    list.push(self.motion(3, [l0.mv[0], l1.mv[1]]));
+                    if list.len() == 5 {
+                        break;
+                    }
+                }
+            }
+        }
+        while list.len() < 5 {
+            list.push(if self.b { self.motion(3, [[0, 0]; 2]) } else { self.motion(1, [[0, 0]; 2]) });
+        }
         list
     }
 
-    /// Motion-compensated prediction and residual of a unit with motion `mvf`, costed. `merge` is the
-    /// merge index; otherwise the AMVP predictor index `mvp`, difference `mvd` and their `mvbits`.
-    #[allow(clippy::too_many_arguments)]
-    fn code_inter(&mut self, x: usize, y: usize, log2: u32, depth: u32, mvf: MvField, merge: Option<u32>, mvp: usize, mvd: [i32; 2], mvbits: f64) -> (f64, Cu) {
+    /// Motion-compensated prediction and residual of a unit with the motion of `pu`, costed. `mvbits`
+    /// estimates the bits of the motion syntax.
+    fn code_inter(&mut self, x: usize, y: usize, log2: u32, depth: u32, pu: Pu, mvbits: f64) -> (f64, Cu) {
         let n = 1usize << log2;
-        self.inter_pred(x, y, n, mvf.mv[0]);
+        self.inter_pred(x, y, n, &pu.mvf);
         let (mut dist, mut bits) = (0.0, 0.0);
         let (lb, d, r) = self.residual_block(0, x, y, log2, false);
         dist += d;
@@ -817,28 +896,31 @@ impl<'a> SliceCoder<'a> {
         }
         let cr = chroma.pop().unwrap_or_default();
         let cb = chroma.pop().unwrap_or_default();
-        let skip = merge.is_some() && !(lb.cbf || cb.cbf || cr.cbf);
+        let skip = pu.merge.is_some() && !(lb.cbf || cb.cbf || cr.cbf);
         let tus = [(x, y, log2, lb.cbf)];
-        self.set_meta(x, y, log2, depth, false, 1, mvf, &tus, skip);
+        self.set_meta(x, y, log2, depth, false, 1, pu.mvf, &tus, skip);
         let cost = dist + self.lambda * (bits + mvbits + SIDE_INTER);
-        (cost, Cu { log2, intra: false, split_tu: false, prev_flag: false, mpm_idx: 0, rem: 0, luma_mode: 1, chroma_idc: 4, chroma_mode: 1, mvp, mvd, skip, merge_idx: merge, luma: vec![lb], cb, cr })
+        (
+            cost,
+            Cu { log2, intra: false, split_tu: false, prev_flag: false, mpm_idx: 0, rem: 0, luma_mode: 1, chroma_idc: 4, chroma_mode: 1, mvp: pu.mvp, mvd: pu.mvd, idc: pu.idc, skip, merge_idx: pu.merge, luma: vec![lb], cb, cr },
+        )
     }
 
-    /// The best inter unit at (`x`, `y`) among the merge candidates and the AMVP motion search, with
-    /// its reconstruction saved.
+    /// The best inter unit at (`x`, `y`) among the merge candidates and the motion searches (list 0,
+    /// list 1 and both in a B slice), with its reconstruction saved.
     fn eval_inter(&mut self, x: usize, y: usize, log2: u32, depth: u32) -> Option<(f64, Cu, Saved)> {
-        self.refp?;
+        self.refs[0]?;
         let n = 1usize << log2;
         let mut best: Option<(f64, Cu, Saved)> = None;
-        let mut tried: Vec<[i16; 2]> = Vec::with_capacity(5);
-        for (k, mv) in self.merge_mvs(x, y, n).into_iter().enumerate() {
-            if tried.contains(&mv) {
+        let mut tried: Vec<MvField> = Vec::with_capacity(5);
+        for (k, mvf) in self.merge_cands(x, y, n).into_iter().enumerate() {
+            if tried.contains(&mvf) {
                 continue;
             }
-            tried.push(mv);
-            let mvf = MvField { mv: [mv, [0, 0]], ref_idx: [0, -1], ref_poc: [self.ref_poc, 0], pred: 1 };
+            tried.push(mvf);
             let mvbits = if k == 0 { 1.0 } else { k as f64 + 1.0 };
-            let (c, cu) = self.code_inter(x, y, log2, depth, mvf, Some(k as u32), 0, [0, 0], mvbits);
+            let pu = Pu { mvf, merge: Some(k as u32), mvp: [0, 0], mvd: [[0, 0]; 2], idc: 0 };
+            let (c, cu) = self.code_inter(x, y, log2, depth, pu, mvbits);
             if best.as_ref().is_none_or(|b| c < b.0) {
                 best = Some((c, cu, self.save(x, y, n)));
             }
@@ -847,16 +929,42 @@ impl<'a> SliceCoder<'a> {
         if best.as_ref().is_some_and(|b| b.1.skip) {
             return best;
         }
-        let cands = self.amvp(x, y, n);
-        let mv = self.motion_search(x, y, n, &cands);
-        let dist_to = |c: [i16; 2]| (mv[0] as i32 - c[0] as i32).abs() + (mv[1] as i32 - c[1] as i32).abs();
-        let mvp = if dist_to(cands[0]) <= dist_to(cands[1]) { 0 } else { 1 };
-        let mvd = [mv[0] as i32 - cands[mvp][0] as i32, mv[1] as i32 - cands[mvp][1] as i32];
-        let mvbits: f64 = mvd.iter().map(|&v| if v == 0 { 1.0 } else { 2.0 + 2.0 * (v.unsigned_abs() as f64).log2() }).sum();
-        let mvf = MvField { mv: [mv, [0, 0]], ref_idx: [0, -1], ref_poc: [self.ref_poc, 0], pred: 1 };
-        let (c, cu) = self.code_inter(x, y, log2, depth, mvf, None, mvp, mvd, mvbits);
-        if best.as_ref().is_none_or(|b| c < b.0) {
-            best = Some((c, cu, self.save(x, y, n)));
+        // the motion search of each list: its vector, the predictor index and difference
+        let lists = if self.b { 2 } else { 1 };
+        let mut mv = [[0i16; 2]; 2];
+        let mut mvp = [0usize; 2];
+        let mut mvd = [[0i32; 2]; 2];
+        for l in 0..lists {
+            let cands = self.amvp(x, y, n, l);
+            let m = self.motion_search(x, y, n, l, &cands);
+            let dist_to = |c: [i16; 2]| (m[0] as i32 - c[0] as i32).abs() + (m[1] as i32 - c[1] as i32).abs();
+            let p = if dist_to(cands[0]) <= dist_to(cands[1]) { 0 } else { 1 };
+            mv[l] = m;
+            mvp[l] = p;
+            mvd[l] = [m[0] as i32 - cands[p][0] as i32, m[1] as i32 - cands[p][1] as i32];
+        }
+        let mvd_bits = |d: [i32; 2]| -> f64 { d.iter().map(|&v| if v == 0 { 1.0 } else { 2.0 + 2.0 * (v.unsigned_abs() as f64).log2() }).sum() };
+        let modes: &[u8] = if self.b { &[1, 2, 3] } else { &[1] };
+        for &pred in modes {
+            let mvf = self.motion(pred, mv);
+            let (mut mp, mut md, mut bits) = ([0usize; 2], [[0i32; 2]; 2], 0.0);
+            for l in 0..2 {
+                if pred & (1 << l) != 0 {
+                    mp[l] = mvp[l];
+                    md[l] = mvd[l];
+                    bits += mvd_bits(mvd[l]);
+                }
+            }
+            let idc = match pred {
+                1 => 0,
+                2 => 1,
+                _ => 2,
+            };
+            let pu = Pu { mvf, merge: None, mvp: mp, mvd: md, idc };
+            let (c, cu) = self.code_inter(x, y, log2, depth, pu, bits);
+            if best.as_ref().is_none_or(|b| c < b.0) {
+                best = Some((c, cu, self.save(x, y, n)));
+            }
         }
         best
     }
@@ -886,7 +994,7 @@ impl<'a> SliceCoder<'a> {
                 if coded {
                     e.decision(SPLIT_CODING_UNIT_FLAG_OFFSET + self.split_inc(x, y, depth), 0);
                 }
-                self.write_cu(e, cu, x, y);
+                self.write_cu(e, cu, x, y, depth);
             }
         }
     }
@@ -928,8 +1036,8 @@ impl<'a> SliceCoder<'a> {
         inc
     }
 
-    fn write_cu(&self, e: &mut CabacEnc, cu: &Cu, x: usize, y: usize) {
-        if self.p_slice {
+    fn write_cu(&self, e: &mut CabacEnc, cu: &Cu, x: usize, y: usize, depth: u32) {
+        if self.inter {
             e.decision(SKIP_FLAG_OFFSET + self.skip_inc(x, y), cu.skip as u32);
             if cu.skip {
                 self.write_merge_idx(e, cu.merge_idx.unwrap_or(0));
@@ -969,8 +1077,22 @@ impl<'a> SliceCoder<'a> {
             self.write_merge_idx(e, idx);
         } else {
             e.decision(MERGE_FLAG_OFFSET, 0);
-            self.write_mvd(e, cu.mvd);
-            e.decision(MVP_LX_FLAG_OFFSET, cu.mvp as u32);
+            if self.b {
+                // inter_pred_idc: bi is one bin in the depth's context; a list is a zero there and
+                // its list in the context after the depths
+                if cu.idc == 2 {
+                    e.decision(INTER_PRED_IDC_OFFSET + depth as usize, 1);
+                } else {
+                    e.decision(INTER_PRED_IDC_OFFSET + depth as usize, 0);
+                    e.decision(INTER_PRED_IDC_OFFSET + 4, cu.idc as u32);
+                }
+            }
+            for l in 0..2 {
+                if cu.idc == 2 || cu.idc as usize == l {
+                    self.write_mvd(e, cu.mvd[l]);
+                    e.decision(MVP_LX_FLAG_OFFSET, cu.mvp[l] as u32);
+                }
+            }
             let rqt = cu.luma[0].cbf || cu.cb.cbf || cu.cr.cbf;
             e.decision(NO_RESIDUAL_DATA_FLAG_OFFSET, rqt as u32);
             if !rqt {
@@ -1063,7 +1185,13 @@ impl<'a> SliceCoder<'a> {
     pub fn write(&self, rows: Range<usize>, nodes: &[Node], sao: &[Sao]) -> Vec<u8> {
         let ctb_w = self.sps.ctb_w;
         let (first, end) = (rows.start * ctb_w, (rows.end * ctb_w).min(self.sps.ctb_w * self.sps.ctb_h));
-        let init = &INIT_VALUES[if self.p_slice { 1 } else { 0 }];
+        let init = &INIT_VALUES[if self.b {
+            2
+        } else if self.inter {
+            1
+        } else {
+            0
+        }];
         let mut e = CabacEnc::new(BitWriter::new(), init, self.qp);
         for (rs, node) in (first..end).zip(nodes) {
             self.write_sao(&mut e, rs, sao, first);

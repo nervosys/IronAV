@@ -14,7 +14,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   (profiles 0-3, tile columns and a multi-threaded loop filter), baseline and progressive JPEG and
   Motion-JPEG, AAC-LC with HE-AAC v1, MP3 (MPEG-1/2/2.5 Layer III), Vorbis, Opus (SILK, CELT and hybrid)
   FLAC (4 to 32 bits) and ALAC (16, 20 and 24 bits, and 32-bit mono; one to eight channels).
-- **Codecs (encoders):** software HEVC (Main profile, 8-bit 4:2:0: 64x64 coding tree units, CABAC, intra and P pictures with merge and skip, AMVP motion, quarter-sample search, deblocking, rate control by QP or bit rate; MP4 and Matroska), software H.264 (Constrained Baseline, then Main with CABAC and High with the 8x8
+- **Codecs (encoders):** software HEVC (Main profile, 8-bit 4:2:0: 64x64 coding tree units, CABAC, intra and P pictures with merge and skip, AMVP motion, quarter-sample search, deblocking, rate control by QP or bit rate, and B pictures as an option (`HevcEncoder::with_bframes`, off by default); MP4 and Matroska), software H.264 (Constrained Baseline, then Main with CABAC and High with the 8x8
   transform, B pictures, rate-distortion mode decisions), VP8 (key and inter frames, quarter-pixel motion, rate control), VP9 (key and inter frames with coefficient probability updates, profile 0, WebM, Matroska and MP4), AAC-LC with an ADTS writer (one to six and eight channels, 5.1 and 7.1 included), MP3 Layer III with
   an MP3 writer, Vorbis, Opus (CELT, wideband SILK, hybrid, DTX, in-band FEC, automatic mode switching,
   2.5 to 60 ms frames, and 3 to 8 channels in channel-mapping family 1 with the RFC 7845 stream layouts; the CLI and job JSON select the mode, signal, frame size, FEC and DTX), JPEG and Motion-JPEG, FLAC, and
@@ -119,7 +119,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   (VA-API, Quick Sync, VideoToolbox, D3D11VA, AMF, Vulkan Video, MediaCodec and OpenCL) are planned.
 - **AV1 encoder:** one reference (the previous frame), no compound prediction, no rate control by bit rate (`--qp`
   only), 8-bit 4:2:0 and one tile; the motion search stops at half samples.
-- **HEVC encoder:** Main profile, 8-bit 4:2:0 only, with no sign data hiding and no B pictures; wider HEVC encoding needs
+- **HEVC encoder:** Main profile, 8-bit 4:2:0 only, with no sign data hiding; B pictures are an option (`with_bframes`), off by default because they cost more bits than P pictures at the same quantiser on the 720p clips measured (see the HEVC section of the README); wider HEVC encoding needs
   an NVIDIA GPU.
 - **HEVC decoder:** the range extension coding tools (RDPCM, cross-component prediction, extended precision, persistent
   Rice adaptation and the rest) are refused by name, as are unequal luma and chroma bit depths (10-bit luma with 9-bit
