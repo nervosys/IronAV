@@ -529,7 +529,7 @@ fn content_encodings(body: &[u8]) -> Result<Vec<Unwrap>> {
         };
         steps.push((order, step));
     }
-    steps.sort_by(|a, b| b.0.cmp(&a.0));
+    steps.sort_by_key(|s| std::cmp::Reverse(s.0));
     Ok(steps.into_iter().map(|s| s.1).collect())
 }
 
