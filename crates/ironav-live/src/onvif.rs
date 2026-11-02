@@ -83,6 +83,8 @@ pub struct Profile {
 /// Sends a WS-Discovery probe for video transmitters to `target` (normally [`DISCOVERY`]) and
 /// collects the answers that come within `wait`, one per device.
 pub fn discover(target: &str, wait: Duration) -> Result<Vec<Discovered>> {
+    // WS-Discovery is a plaintext UDP exchange
+    crate::fips::check_transport("udp")?;
     let target: SocketAddr = target.parse().map_err(|_| Error::invalid_arg(format!("'{target}' is not an address and port")))?;
     let sock = UdpSocket::bind(if target.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" })?;
     let id = format!("uuid:{}", uuid());

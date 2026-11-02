@@ -112,10 +112,11 @@ fn stop(port: u16) {
     let _ = c.read_to_string(&mut s);
 }
 
+#[cfg_attr(feature = "fips", ignore = "FIPS build: exercises plaintext transports or MD5 Digest, which it refuses (tests/fips.rs covers the refusals)")]
 #[test]
 fn profiles_with_the_cameras_clock() {
     let (port, h) = camera();
-    let dev = profiles(&format!("http://127.0.0.1:{port}"), Some("admin"), Some("secret"), &Allow::default()).unwrap();
+    let dev = profiles(&format!("http://127.0.0.1:{port}"), Some("admin"), Some("secret"), &Allow::parse("loopback").unwrap()).unwrap();
     assert_eq!(dev.manufacturer.as_deref(), Some("Acme & Co"));
     assert_eq!(dev.model.as_deref(), Some("Eye-2"));
     assert_eq!(dev.serial.as_deref(), Some("SN1"));
@@ -134,7 +135,7 @@ fn profiles_with_the_cameras_clock() {
     assert_eq!(sub.stream_uri.as_deref(), Some("rtsp://10.9.8.7:554/Streaming/sub?transport=tcp&x=1"));
 
     // a wrong password is the caller's to fix
-    let e = profiles(&format!("http://admin:nope@127.0.0.1:{port}/onvif/device_service"), None, None, &Allow::default()).unwrap_err();
+    let e = profiles(&format!("http://admin:nope@127.0.0.1:{port}/onvif/device_service"), None, None, &Allow::parse("loopback").unwrap()).unwrap_err();
     assert_eq!(e.code, ironav_core::ErrorCode::InvalidArgument, "{e:?}");
     assert!(e.message.contains("Sender not Authorized"), "{}", e.message);
     stop(port);
@@ -143,6 +144,7 @@ fn profiles_with_the_cameras_clock() {
     assert_eq!(seen[0], "/onvif/device_service GetSystemDateAndTime");
 }
 
+#[cfg_attr(feature = "fips", ignore = "FIPS build: exercises plaintext transports or MD5 Digest, which it refuses (tests/fips.rs covers the refusals)")]
 #[test]
 fn discovery_answers() {
     let cam = UdpSocket::bind("127.0.0.1:0").unwrap();

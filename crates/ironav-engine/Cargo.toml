@@ -18,6 +18,10 @@ categories = ["multimedia::encoding", "multimedia::video", "multimedia::audio"]
 [lints]
 workspace = true
 
+[features]
+# FIPS mode in the live sources (see ironav-live's `fips` feature)
+fips = ["ironav-live/fips"]
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true

@@ -519,6 +519,11 @@ fn main() {
     };
     let pretty = take("--pretty") || std::io::stdout().is_terminal();
     let progress = take("--progress");
+    // FIPS mode must be up before any TLS connection; if IronCrypto's self-tests fail, stop here
+    if let Err(e) = ironav_live::fips::activate() {
+        println!("{}", serde_json::to_string(&json!({ "ok": false, "error": e })).unwrap_or_default());
+        std::process::exit(e.code.exit_code());
+    }
 
     match rest.first().map(String::as_str) {
         Some("mcp") => {

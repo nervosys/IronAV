@@ -138,9 +138,26 @@ installs; the Windows certificate store is not read) and `IRONAV_CA_FILE`, a PEM
 camera maker's or your own CA. Checking cannot be turned off. A redirect from TLS to plain HTTP or RTSP is refused, and so
 is `rtsps://` with `?transport=udp`, which would send the media outside TLS. Servers that only speak TLS 1.2, as some
 older cameras do, cannot be reached.
-Outbound connections go only to loopback, private and link-local addresses (not the cloud metadata endpoints
-169.254.169.254 and 169.254.170.2/.23), checked after the name resolves. Whoever runs IronAV can allow more with `IRONAV_NET_ALLOW`:
-addresses and CIDR ranges separated by commas, or `any`. A request cannot widen it.
+Outbound connections are refused unless whoever runs IronAV allows them with `IRONAV_NET_ALLOW`, checked after the name
+resolves (and again at each redirect). The value is a comma-separated list of:
+- `private` for cameras, encoders and servers on the local network (10/8, 172.16/12, 192.168/16, 100.64/10, 169.254/16,
+  fc00::/7, fe80::/10). A LAN camera needs `IRONAV_NET_ALLOW=private`.
+- `loopback` for this machine (127/8, ::1): `IRONAV_NET_ALLOW=loopback`
+- `public` for internet hosts: `IRONAV_NET_ALLOW=public`
+- `any` for every address, special-purpose ones included. It is the widest setting; prefer the classes above.
+- addresses and CIDR ranges, such as `203.0.113.7, 198.51.100.0/24, 2001:db8::/32`
+
+The cloud metadata endpoints (169.254.169.254, fd00:ec2::254, 169.254.170.2 and .23) are refused whatever is listed, `any`
+included, unless `IRONAV_NET_ALLOW_METADATA=1` is also set. A refusal names the setting that would allow it. A request cannot
+widen the list. A YouTube source is fetched by yt-dlp, which makes its own connections, outside this check.
+
+`IRONAV_FIPS=1`, or a build with the `fips` cargo feature (`cargo build -p ironav-cli --features fips`), turns on FIPS mode. TLS then runs
+IronSocketLayer's FIPS 140-3 profile, narrowed to AES-GCM suites, P-256 and P-384 key exchange, and ECDSA and RSA-PSS
+signatures (RSA PKCS#1 v1.5 stays only for certificate chains). ChaCha20-Poly1305, X25519 and the hybrid groups are not
+offered. Plaintext `http://`, `rtsp://`, `tcp://` and `udp://` sources are refused, as are YouTube sources and MD5 Digest
+authentication (SHA-256 Digest is still used). `ironav capabilities` reports `"fips": true` and the TLS profile in force.
+This restricts the algorithms and transports to FIPS-approved ones. IronCrypto, IronSocketLayer and IronPKI are not
+CMVP-validated, so an IronAV build in FIPS mode is not a FIPS 140-3 validated module, and it should not be described as one.
 Credentials: Basic (a password sent in base64, which any eavesdropper can read) is refused over plain `http://` and `rtsp://`, with a hint to use `https://` or `rtsps://`, or a camera that offers Digest, which does not send the password. Digest over plain HTTP or RTSP is allowed. Only when a camera or proxy on a network you trust needs Basic over plaintext, whoever runs IronAV can set `IRONAV_ALLOW_PLAINTEXT_BASIC=1`; a request cannot.
 Readable as it arrives: MPEG-TS, Matroska/WebM, fragmented MP4 (CMAF), Y4M, WAV, ADTS AAC, MP3, Ogg (Opus, Vorbis, FLAC)
 and raw H.264/HEVC (Annex B: the frame rate is the SPS's VUI timing, else 25, or `fps` when given; presentation times come from picture order, so B-frame streams copy right; the pixel format comes from the SPS). Ogg and MP3 are read the way internet

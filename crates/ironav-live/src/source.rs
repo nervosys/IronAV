@@ -95,8 +95,10 @@ fn open_once(url: &str) -> Result<Box<dyn Source>> {
     let shown = redact(url);
     let unreachable = |e: std::io::Error, what: &str| Error::new(ErrorCode::Io, format!("{what} {shown}: {e}")).hint("check the address, and that the sender is running");
     if let Some(id) = crate::youtube::video_id(&u) {
+        crate::fips::check_youtube()?;
         return crate::youtube::open(&u, &id, shown);
     }
+    crate::fips::check_transport(&u.scheme)?;
     Ok(match u.scheme.as_str() {
         "file" => {
             let f = std::fs::File::open(&u.target).map_err(|e| {
@@ -352,6 +354,7 @@ mod tests {
 
     #[test]
     fn a_device_that_goes_quiet_fails_rather_than_waiting_forever() {
+        crate::net::allow_loopback_for_tests();
         let (tx, rx) = sync_channel(4);
         let info = SourceInfo { url: "device://audio".into(), kind: "device", live: true, synthetic: false };
         let mut s = ThreadSource::from_channel(info, rx).stall_after(Duration::from_millis(150));
@@ -397,6 +400,7 @@ mod tests {
 
     #[test]
     fn a_followed_file_is_read_as_it_grows() {
+        crate::net::allow_loopback_for_tests();
         let d = scratch("follow");
         let p = d.join("grow.bin");
         std::fs::write(&p, b"first ").unwrap();
@@ -417,6 +421,7 @@ mod tests {
 
     #[test]
     fn a_plain_file_ends() {
+        crate::net::allow_loopback_for_tests();
         let d = scratch("plain");
         let p = d.join("a.bin");
         std::fs::write(&p, vec![7u8; 100_000]).unwrap();
@@ -424,8 +429,10 @@ mod tests {
         assert_eq!(drain(s.as_mut(), usize::MAX).len(), 100_000);
     }
 
+    #[cfg_attr(feature = "fips", ignore = "FIPS build: exercises plaintext transports or MD5 Digest, which it refuses (tests/fips.rs covers the refusals)")]
     #[test]
     fn tcp_listen_and_connect() {
+        crate::net::allow_loopback_for_tests();
         // find a free port, then listen on it as a source and send to it
         let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
         let mut s = open_source(&format!("tcp://:{port}")).unwrap();
@@ -449,8 +456,10 @@ mod tests {
         assert_eq!(drain(s.as_mut(), usize::MAX), b"hello");
     }
 
+    #[cfg_attr(feature = "fips", ignore = "FIPS build: exercises plaintext transports or MD5 Digest, which it refuses (tests/fips.rs covers the refusals)")]
     #[test]
     fn udp_datagrams_arrive_whole_and_the_source_waits_for_more() {
+        crate::net::allow_loopback_for_tests();
         let port = UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
         let mut s = open_source(&format!("udp://:{port}")).unwrap();
         let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -465,6 +474,7 @@ mod tests {
 
     #[test]
     fn a_missing_file_is_not_found() {
+        crate::net::allow_loopback_for_tests();
         let e = open_source("no/such/file.y4m").err().unwrap();
         assert_eq!(e.code, ErrorCode::NotFound);
     }

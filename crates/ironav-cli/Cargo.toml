@@ -37,6 +37,8 @@ default = ["native-gui", "audio"]
 audio = ["ironav-player/audio"]
 # Native desktop GUI (egui). Disable for lean agent/server builds: --no-default-features
 native-gui = ["dep:ironav-gui"]
+# FIPS mode: approved TLS algorithms only, plaintext transports and MD5 Digest refused (see ironav-live)
+fips = ["ironav-engine/fips", "ironav-live/fips"]
 
 [[bin]]
 name = "ironav"

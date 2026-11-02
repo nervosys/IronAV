@@ -183,6 +183,9 @@ impl RtspSource {
         }
         let mut target = parse_target(&u.target, None, tls)?;
         for _ in 0..=MAX_REDIRECTS {
+            if !target.tls {
+                crate::fips::check_transport("rtsp")?;
+            }
             let tcp = net::connect(&target.host, target.port, CONNECT_TIMEOUT, &allow, &shown)?;
             let _ = tcp.set_nodelay(true);
             let conn = if target.tls { tls::connect(tcp, &target.host, None, &shown)? } else { Conn::Plain(tcp) };
@@ -598,8 +601,10 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::mpsc;
 
+    #[cfg_attr(feature = "fips", ignore = "FIPS build: exercises plaintext transports or MD5 Digest, which it refuses (tests/fips.rs covers the refusals)")]
     #[test]
     fn targets_and_challenges() {
+        crate::net::allow_loopback_for_tests();
         let t = parse_target("bob:p%40ss@cam.local:8554/live/main?x=1", None, false).unwrap();
         assert_eq!(t, Target { host: "cam.local".into(), port: 8554, url: "rtsp://cam.local:8554/live/main?x=1".into(), user: Some(("bob".into(), "p@ss".into())), tls: false });
         let t = parse_target("[fe80::1]/s", None, false).unwrap();
@@ -737,18 +742,24 @@ mod tests {
         }
     }
 
+    #[cfg_attr(feature = "fips", ignore = "FIPS build: exercises plaintext transports or MD5 Digest, which it refuses (tests/fips.rs covers the refusals)")]
     #[test]
     fn plays_a_camera_with_digest_credentials() {
+        crate::net::allow_loopback_for_tests();
         plays_a_camera("", false);
     }
 
+    #[cfg_attr(feature = "fips", ignore = "FIPS build: exercises plaintext transports or MD5 Digest, which it refuses (tests/fips.rs covers the refusals)")]
     #[test]
     fn plays_a_camera_over_udp() {
+        crate::net::allow_loopback_for_tests();
         plays_a_camera("?transport=udp", false);
     }
 
+    #[cfg_attr(feature = "fips", ignore = "FIPS build: exercises plaintext transports or MD5 Digest, which it refuses (tests/fips.rs covers the refusals)")]
     #[test]
     fn plays_a_camera_over_tls() {
+        crate::net::allow_loopback_for_tests();
         plays_a_camera("", true);
         // the media would leave the TLS connection
         let u = SourceUrl::parse("rtsps://127.0.0.1:1/live?transport=udp").unwrap();
@@ -820,6 +831,7 @@ mod tests {
 
     #[test]
     fn a_camera_outside_the_allow_list_is_not_dialled() {
+        crate::net::allow_loopback_for_tests();
         let u = SourceUrl::parse("rtsp://user:pw@8.8.8.8/live").unwrap();
         let e = RtspSource::open(&u, crate::url::redact("rtsp://user:pw@8.8.8.8/live")).err().unwrap();
         assert_eq!(e.code, ErrorCode::InvalidArgument);

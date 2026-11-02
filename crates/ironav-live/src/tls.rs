@@ -166,6 +166,15 @@ fn roots() -> Result<RootStore> {
     roots.clone().map_err(|e| Error::new(ErrorCode::Io, e).hint(format!("set SSL_CERT_FILE or {CA_FILE_VAR} to a PEM file of trusted roots")))
 }
 
+/// The client configuration: IronSocketLayer's default profile, or FIPS mode's when it is on (see
+/// [`crate::fips`]).
+fn client_config(roots: RootStore) -> Result<ClientConfig> {
+    if crate::fips::enabled() {
+        return crate::fips::client_config(roots);
+    }
+    ClientConfig::new(Profile::Default, roots).map_err(|e| Error::new(ErrorCode::Io, format!("TLS configuration: {e}")))
+}
+
 /// The client configuration for one ALPN protocol (none for RTSP), made once.
 fn config(alpn: Option<&'static [u8]>) -> Result<Arc<ClientConfig>> {
     static HTTP: OnceLock<std::result::Result<Arc<ClientConfig>, String>> = OnceLock::new();
@@ -175,7 +184,7 @@ fn config(alpn: Option<&'static [u8]>) -> Result<Arc<ClientConfig>> {
         return c.clone().map_err(|e| Error::new(ErrorCode::Io, e));
     }
     let roots = roots()?;
-    let made = ClientConfig::new(Profile::Default, roots).map_err(|e| e.to_string()).map(|c| Arc::new(match alpn {
+    let made = client_config(roots).map_err(|e| e.message).map(|c| Arc::new(match alpn {
         Some(p) => c.with_alpn(&[p]),
         None => c,
     }));

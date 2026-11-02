@@ -1317,6 +1317,7 @@ mod tests {
     #[test]
     fn a_tcp_session_reads_what_a_peer_sends() {
         let _turn = turn();
+        ironav_live::net::allow_loopback_for_tests();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let s = open(&args(&format!("tcp://127.0.0.1:{port}"))).unwrap();
@@ -1336,6 +1337,7 @@ mod tests {
     #[test]
     fn a_transport_stream_over_tcp_gives_its_video_and_audio() {
         let _turn = turn();
+        ironav_live::net::allow_loopback_for_tests();
         let data = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../ironav-formats/tests/data/h264_aac.ts")).unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();

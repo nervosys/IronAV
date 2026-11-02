@@ -737,8 +737,10 @@ mod tests {
         std::fs::read(format!("{}/../ironav-formats/tests/data/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()
     }
 
+    #[cfg_attr(feature = "fips", ignore = "FIPS build: exercises plaintext transports or MD5 Digest, which it refuses (tests/fips.rs covers the refusals)")]
     #[test]
     fn a_master_playlist_plays_its_best_variant_through_a_redirect() {
+        crate::net::allow_loopback_for_tests();
         let ts = fixture("h264_aac.ts");
         let packets = ts.len() / 188;
         let cut = [0, packets / 3 * 188, packets * 2 / 3 * 188, ts.len()];
@@ -760,6 +762,7 @@ mod tests {
 
     #[test]
     fn the_variant_is_one_that_decodes_and_fits_the_height() {
+        crate::net::allow_loopback_for_tests();
         let text = "#EXTM3U\n\
 #EXT-X-STREAM-INF:BANDWIDTH=300000,CODECS=\"avc1.4D400C,mp4a.40.2\",RESOLUTION=320x240\nlow.m3u8\n\
 #EXT-X-STREAM-INF:BANDWIDTH=2000000,CODECS=\"avc1.640028,mp4a.40.2\",RESOLUTION=1280x720\nhd.m3u8\n\
@@ -773,8 +776,10 @@ mod tests {
         assert_eq!(uri(Some(100)), "https://h/low.m3u8");
     }
 
+    #[cfg_attr(feature = "fips", ignore = "FIPS build: exercises plaintext transports or MD5 Digest, which it refuses (tests/fips.rs covers the refusals)")]
     #[test]
     fn a_variant_plays_with_its_audio_rendition() {
+        crate::net::allow_loopback_for_tests();
         let ts = fixture("h264_aac.ts");
         let aac = std::fs::read(format!("{}/../ironav-engine/tests/data/aac_stereo_tools.aac", env!("CARGO_MANIFEST_DIR"))).unwrap();
         let routes: Routes = Default::default();
@@ -832,8 +837,10 @@ a0.aac
         assert!(e.alternatives.contains(&"en".to_string()), "{e:?}");
     }
 
+    #[cfg_attr(feature = "fips", ignore = "FIPS build: exercises plaintext transports or MD5 Digest, which it refuses (tests/fips.rs covers the refusals)")]
     #[test]
     fn a_variant_brings_its_captions() -> Result<()> {
+        crate::net::allow_loopback_for_tests();
         let routes: Routes = Default::default();
         {
             let mut r = routes.lock().unwrap();
@@ -901,8 +908,10 @@ s1.vtt
         Ok(())
     }
 
+    #[cfg_attr(feature = "fips", ignore = "FIPS build: exercises plaintext transports or MD5 Digest, which it refuses (tests/fips.rs covers the refusals)")]
     #[test]
     fn byte_ranges_and_an_initialization_section_make_a_fragmented_mp4() {
+        crate::net::allow_loopback_for_tests();
         let mp4 = fixture("h264_aac_frag.mp4");
         let moofs: Vec<usize> = mp4.windows(4).enumerate().filter(|(_, w)| *w == b"moof").map(|(i, _)| i - 4).collect();
         let mut pl = format!("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n#EXT-X-MAP:URI=\"all.mp4\",BYTERANGE=\"{}@0\"\n", moofs[0]);
@@ -924,8 +933,10 @@ s1.vtt
         assert!(got == mp4);
     }
 
+    #[cfg_attr(feature = "fips", ignore = "FIPS build: exercises plaintext transports or MD5 Digest, which it refuses (tests/fips.rs covers the refusals)")]
     #[test]
     fn a_live_playlist_is_followed_without_repeats() {
+        crate::net::allow_loopback_for_tests();
         // a window of three segments that slides by one every time the playlist is fetched
         let routes: Routes = Default::default();
         for k in 0..12 {
@@ -953,8 +964,10 @@ s1.vtt
         assert_eq!(String::from_utf8_lossy(&got), want);
     }
 
+    #[cfg_attr(feature = "fips", ignore = "FIPS build: exercises plaintext transports or MD5 Digest, which it refuses (tests/fips.rs covers the refusals)")]
     #[test]
     fn a_packager_restart_is_followed_and_credentials_reach_every_request() {
+        crate::net::allow_loopback_for_tests();
         // numbering 100.. for two fetches, then back to 0 (the packager restarted)
         let routes: Routes = Default::default();
         for k in (0..4).chain(100..104) {
@@ -1046,8 +1059,10 @@ s1.vtt
         (port, log)
     }
 
+    #[cfg_attr(feature = "fips", ignore = "FIPS build: exercises plaintext transports or MD5 Digest, which it refuses (tests/fips.rs covers the refusals)")]
     #[test]
     fn digest_is_answered_once_and_the_nonce_is_reused() {
+        crate::net::allow_loopback_for_tests();
         let routes: Routes = Default::default();
         {
             let mut r = routes.lock().unwrap();
@@ -1068,8 +1083,10 @@ s1.vtt
         assert_eq!(ncs, (1..=ncs.len()).map(|k| format!("{k:08x}")).collect::<Vec<_>>(), "{log:?}");
     }
 
+    #[cfg_attr(feature = "fips", ignore = "FIPS build: exercises plaintext transports or MD5 Digest, which it refuses (tests/fips.rs covers the refusals)")]
     #[test]
     fn a_stale_nonce_is_answered_with_the_new_one() {
+        crate::net::allow_loopback_for_tests();
         let routes: Routes = Default::default();
         {
             let mut r = routes.lock().unwrap();
@@ -1085,8 +1102,10 @@ s1.vtt
         assert!(log.iter().any(|l| l.starts_with("/d/s1.ts ok n2 00000001")), "{log:?}");
     }
 
+    #[cfg_attr(feature = "fips", ignore = "FIPS build: exercises plaintext transports or MD5 Digest, which it refuses (tests/fips.rs covers the refusals)")]
     #[test]
     fn a_wrong_password_is_refused_without_showing_it() {
+        crate::net::allow_loopback_for_tests();
         let routes: Routes = Default::default();
         routes.lock().unwrap().insert("/d/index.m3u8".into(), b"#EXTM3U\n#EXT-X-ENDLIST\n".to_vec());
         let (port, log) = digest_server(routes, "secret-pass", None);
@@ -1097,8 +1116,10 @@ s1.vtt
         assert!(log.lock().unwrap().iter().all(|l| !l.contains(" ok ")));
     }
 
+    #[cfg_attr(feature = "fips", ignore = "FIPS build: exercises plaintext transports or MD5 Digest, which it refuses (tests/fips.rs covers the refusals)")]
     #[test]
     fn encrypted_and_ftp_playlists_are_refused_and_plain_files_download() {
+        crate::net::allow_loopback_for_tests();
         let routes: Routes = Default::default();
         {
             let mut r = routes.lock().unwrap();
@@ -1118,6 +1139,7 @@ s1.vtt
 
     #[test]
     fn playlist_details() {
+        crate::net::allow_loopback_for_tests();
         assert_eq!(attributes(r#"BANDWIDTH=1280000,CODECS="avc1.4d401f,mp4a.40.2",RESOLUTION=1280x720"#)[1], ("CODECS".into(), "avc1.4d401f,mp4a.40.2".into()));
         assert_eq!(byte_range("100@50", None), Some((50, 149)));
         assert_eq!(byte_range("100", Some(150)), Some((150, 249)));

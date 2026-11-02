@@ -240,8 +240,10 @@ mod tests {
         (got, states, Ok(()))
     }
 
+    #[cfg_attr(feature = "fips", ignore = "FIPS build: exercises plaintext transports or MD5 Digest, which it refuses (tests/fips.rs covers the refusals)")]
     #[test]
     fn a_lost_or_stalled_connection_is_made_again() {
+        crate::net::allow_loopback_for_tests();
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = l.local_addr().unwrap().port();
         std::thread::spawn(move || {
@@ -263,8 +265,10 @@ mod tests {
         assert_eq!(states, [Connected, Reconnecting, Connected, Stalled, Reconnecting, Connected, Stalled], "{got}");
     }
 
+    #[cfg_attr(feature = "fips", ignore = "FIPS build: exercises plaintext transports or MD5 Digest, which it refuses (tests/fips.rs covers the refusals)")]
     #[test]
     fn it_gives_up_after_its_retries() {
+        crate::net::allow_loopback_for_tests();
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = l.local_addr().unwrap().port();
         std::thread::spawn(move || {

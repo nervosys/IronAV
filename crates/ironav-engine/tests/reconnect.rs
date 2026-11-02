@@ -24,6 +24,7 @@ fn events(id: &str, kind: &str) -> Vec<Value> {
 
 #[test]
 fn a_dropped_source_is_reconnected_and_its_time_goes_on() {
+    ironav_live::net::allow_loopback_for_tests();
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
     std::thread::spawn(move || {

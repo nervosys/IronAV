@@ -92,6 +92,7 @@ fn server(id: Identity, routes: Vec<(&'static str, Vec<u8>)>) -> u16 {
 }
 
 fn drain(url: &str) -> ironav_core::Result<Vec<u8>> {
+    ironav_live::net::allow_loopback_for_tests();
     let mut s = open_source(url)?;
     let mut got = Vec::new();
     let mut buf = vec![0u8; 65536];

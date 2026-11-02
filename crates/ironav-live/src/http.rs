@@ -263,6 +263,10 @@ fn answers() -> MutexGuard<'static, BTreeMap<Key, Auth>> {
 
 /// One connection's request, sent with `authz` as its `Authorization`, and the answer's head.
 fn exchange(u: &HttpUrl, shown: &str, method: &str, payload: Option<(&str, &[u8])>, range: Option<(u64, u64)>, authz: Option<&str>, allow: &Allow) -> Result<(u16, Vec<(String, String)>, BufReader<Conn>)> {
+    // a plaintext request (also a redirect's) is refused in FIPS mode, before anything is sent
+    if !u.tls {
+        crate::fips::check_transport("http")?;
+    }
     let tcp = net::connect(&u.host, u.port, CONNECT_TIMEOUT, allow, shown)?;
     let mut conn = if u.tls { tls::connect(tcp, &u.host, Some(b"http/1.1"), shown)? } else { Conn::Plain(tcp) };
     conn.tcp().set_read_timeout(Some(IO_TIMEOUT))?;

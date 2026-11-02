@@ -78,6 +78,7 @@ impl Auth {
         let get = |k: &str| p.iter().find(|(n, _)| n.eq_ignore_ascii_case(k)).map(|(_, v)| v.clone());
         let algorithm = get("algorithm");
         let name = algorithm.clone().unwrap_or_else(|| "MD5".into());
+        crate::fips::check_digest(&name)?;
         let (hash, sess) = match name.to_ascii_lowercase().as_str() {
             "md5" => (Hash::Md5, false),
             "md5-sess" => (Hash::Md5, true),
@@ -243,6 +244,7 @@ fn auth_params(s: &str) -> Vec<(String, String)> {
 mod tests {
     use super::*;
 
+    #[cfg_attr(feature = "fips", ignore = "FIPS build: exercises plaintext transports or MD5 Digest, which it refuses (tests/fips.rs covers the refusals)")]
     #[test]
     fn rfc_7616_md5_example() {
         // RFC 7616 §3.9.1
@@ -257,6 +259,7 @@ mod tests {
         assert!(a.header("GET", "/dir/index.html").contains("nc=00000002"));
     }
 
+    #[cfg_attr(feature = "fips", ignore = "FIPS build: exercises plaintext transports or MD5 Digest, which it refuses (tests/fips.rs covers the refusals)")]
     #[test]
     fn challenges_in_one_value_or_several() {
         assert_eq!(split_challenges(r#"Basic realm="a", Digest realm="r", qop="auth,auth-int", nonce="n""#), vec![r#"Basic realm="a""#, r#"Digest realm="r", qop="auth,auth-int", nonce="n""#]);
@@ -287,6 +290,7 @@ mod tests {
         assert_eq!(d.response("GET", "/x", 1, "cn"), sha256_hex(format!("{ha1}:n:00000001:cn:auth:{ha2}").as_bytes()));
     }
 
+    #[cfg_attr(feature = "fips", ignore = "FIPS build: exercises plaintext transports or MD5 Digest, which it refuses (tests/fips.rs covers the refusals)")]
     #[test]
     fn sha256_is_preferred_to_md5_whichever_comes_first() {
         let md5 = r#"Digest realm="r", nonce="n", qop=auth"#.to_string();
@@ -356,6 +360,7 @@ mod tests {
         assert_ne!(a, [0u8; 16]);
     }
 
+    #[cfg_attr(feature = "fips", ignore = "FIPS build: exercises plaintext transports or MD5 Digest, which it refuses (tests/fips.rs covers the refusals)")]
     #[test]
     fn rfc_2069_form_without_qop() {
         let mut a = Auth::answer(r#"Digest realm="r", nonce="n""#, "u", "p").unwrap();

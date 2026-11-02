@@ -9,6 +9,7 @@
 
 pub mod capture;
 pub mod exe;
+pub mod fips;
 mod auth;
 mod hls;
 mod http;
@@ -26,7 +27,7 @@ mod url;
 pub mod webvtt;
 mod youtube;
 
-pub use net::{Allow, ALLOW_VAR};
+pub use net::{Allow, ALLOW_VAR, METADATA_VAR};
 pub use reconnect::{Health, HealthState, Policy};
 pub use source::{open_source, Caption, Chunk, Source, SourceInfo};
 pub use tls::CA_FILE_VAR;
