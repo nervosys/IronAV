@@ -5,8 +5,21 @@
 use crate::http::base64;
 use crate::md5::md5_hex;
 use crate::sha256::sha256_hex;
+use ironav_core::{Error, ErrorCode};
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
+
+/// The environment variable that lets Basic credentials go over plaintext (`http://`, `rtsp://`).
+pub const ALLOW_PLAINTEXT_BASIC_VAR: &str = "IRONAV_ALLOW_PLAINTEXT_BASIC";
+
+/// Whether whoever runs IronAV set [`ALLOW_PLAINTEXT_BASIC_VAR`] to `1`. A request cannot.
+pub(crate) fn plaintext_basic_opted_in() -> bool {
+    opt_in(std::env::var(ALLOW_PLAINTEXT_BASIC_VAR).ok().as_deref())
+}
+
+fn opt_in(value: Option<&str>) -> bool {
+    value == Some("1")
+}
 
 /// The answer to a host's challenge, kept so that later requests to it need no round trip.
 pub(crate) enum Auth {
@@ -130,11 +143,19 @@ impl Digest {
 /// Digest is preferred, since it does not send the password, and SHA-256 Digest over MD5. When Digest
 /// is offered only in a form IronAV does not speak, the password is not sent in the clear instead,
 /// even if Basic is offered too.
-pub(crate) fn choose(challenges: &[String], user: &str, pass: &str) -> Result<Auth, String> {
+///
+/// Basic sends the password in every request, reversibly encoded, so it is refused unless the connection
+/// is TLS (`tls`) or the operator allowed it (`basic_in_clear`, from [`plaintext_basic_opted_in`]).
+pub(crate) fn choose(challenges: &[String], user: &str, pass: &str, tls: bool, basic_in_clear: bool) -> ironav_core::Result<Auth> {
     let all: Vec<String> = challenges.iter().flat_map(|c| split_challenges(c)).collect();
     let digest: Vec<&String> = all.iter().filter(|c| scheme_is(c, "digest")).collect();
     if digest.is_empty() {
-        return all.iter().find_map(|c| Auth::answer(c, user, pass).ok()).ok_or_else(|| format!("asks for an authentication scheme IronAV does not speak: {}", challenges.join("; ")));
+        return match all.iter().find_map(|c| Auth::answer(c, user, pass).ok()) {
+            Some(Auth::Basic(_)) if !tls && !basic_in_clear => Err(Error::new(ErrorCode::InvalidArgument, "asks for Basic authentication over a connection that is not encrypted, which would send the password in the clear")
+                .hint(format!("use https:// or rtsps:// so the password is encrypted, or a camera that offers Digest; to allow Basic over plaintext anyway, set {ALLOW_PLAINTEXT_BASIC_VAR}=1"))),
+            Some(a) => Ok(a),
+            None => Err(Error::new(ErrorCode::UnsupportedFormat, format!("asks for an authentication scheme IronAV does not speak: {}", challenges.join("; ")))),
+        };
     }
     let (mut answers, mut why) = (Vec::new(), Vec::new());
     for c in digest {
@@ -144,7 +165,12 @@ pub(crate) fn choose(challenges: &[String], user: &str, pass: &str) -> Result<Au
         }
     }
     answers.sort_by_key(|a| !a.is_sha256());
-    answers.into_iter().next().ok_or_else(|| format!("asks for Digest authentication IronAV does not implement ({}), and the password is not sent in the clear instead", why.join(", ")))
+    answers.into_iter().next().ok_or_else(|| Error::new(ErrorCode::UnsupportedFormat, format!("asks for Digest authentication IronAV does not implement ({}), and the password is not sent in the clear instead", why.join(", "))))
+}
+
+/// `e` with the connection's (redacted) URL in front of its message, as the callers report it.
+pub(crate) fn at(e: Error, shown: &str) -> Error {
+    Error { message: format!("{shown} {}", e.message), ..e }
 }
 
 fn scheme_is(challenge: &str, scheme: &str) -> bool {
@@ -228,11 +254,11 @@ mod tests {
     fn challenges_in_one_value_or_several() {
         assert_eq!(split_challenges(r#"Basic realm="a", Digest realm="r", qop="auth,auth-int", nonce="n""#), vec![r#"Basic realm="a""#, r#"Digest realm="r", qop="auth,auth-int", nonce="n""#]);
         assert_eq!(split_challenges("Basic"), vec!["Basic"]);
-        let picked = choose(&[r#"Basic realm="a""#.into(), r#"Digest realm="r", nonce="n", qop=auth"#.into()], "u", "p").unwrap();
+        let picked = choose(&[r#"Basic realm="a""#.into(), r#"Digest realm="r", nonce="n", qop=auth"#.into()], "u", "p", false, false).unwrap();
         assert!(matches!(picked, Auth::Digest(_)));
-        let picked = choose(&[r#"Basic realm="a", Digest realm="r", nonce="n""#.into()], "u", "p").unwrap();
+        let picked = choose(&[r#"Basic realm="a", Digest realm="r", nonce="n""#.into()], "u", "p", false, false).unwrap();
         assert!(matches!(picked, Auth::Digest(_)));
-        let picked = choose(&[r#"Basic realm="a""#.into()], "Aladdin", "open sesame").unwrap();
+        let picked = choose(&[r#"Basic realm="a""#.into()], "Aladdin", "open sesame", true, false).unwrap();
         assert!(matches!(picked, Auth::Basic(h) if h == "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ=="));
     }
 
@@ -259,18 +285,46 @@ mod tests {
         let md5 = r#"Digest realm="r", nonce="n", qop=auth"#.to_string();
         let sha = r#"Digest realm="r", nonce="n", qop=auth, algorithm=SHA-256"#.to_string();
         for offered in [[md5.clone(), sha.clone()], [sha.clone(), md5.clone()]] {
-            let mut picked = choose(&offered, "u", "p").unwrap();
+            let mut picked = choose(&offered, "u", "p", false, false).unwrap();
             assert!(picked.header("GET", "/x").contains("algorithm=SHA-256"));
         }
-        let mut picked = choose(&[md5], "u", "p").unwrap();
+        let mut picked = choose(&[md5], "u", "p", false, false).unwrap();
         assert!(!picked.header("GET", "/x").contains("algorithm="));
     }
 
     #[test]
     fn unsupported_digest_is_named_and_not_downgraded() {
-        let e = choose(&[r#"Digest realm="r", nonce="n", algorithm=SHA-512-256"#.into(), r#"Basic realm="r""#.into()], "u", "p").err().unwrap();
-        assert!(e.contains("SHA-512-256") && e.contains("not sent in the clear"), "{e}");
-        assert!(choose(&[r#"Digest realm="r", nonce="n", qop="auth-int""#.into()], "u", "p").is_err());
+        let e = choose(&[r#"Digest realm="r", nonce="n", algorithm=SHA-512-256"#.into(), r#"Basic realm="r""#.into()], "u", "p", true, false).err().unwrap();
+        assert!(e.message.contains("SHA-512-256") && e.message.contains("not sent in the clear"), "{e}");
+        assert!(choose(&[r#"Digest realm="r", nonce="n", qop="auth-int""#.into()], "u", "p", false, false).is_err());
+    }
+
+    #[test]
+    fn basic_is_refused_over_plaintext_unless_opted_in() {
+        let basic = [r#"Basic realm="cam""#.to_string()];
+        let e = choose(&basic, "Aladdin", "open sesame", false, false).err().unwrap();
+        assert_eq!(e.code, ErrorCode::InvalidArgument);
+        let hint = e.hint.clone().unwrap_or_default();
+        assert!(hint.contains("https://") && hint.contains("rtsps://") && hint.contains("Digest") && hint.contains("IRONAV_ALLOW_PLAINTEXT_BASIC=1"), "{hint}");
+        assert!(!e.message.contains("open sesame"));
+        // over TLS, or with the operator's opt-in, Basic is answered as before
+        assert!(matches!(choose(&basic, "Aladdin", "open sesame", true, false), Ok(Auth::Basic(_))));
+        assert!(matches!(choose(&basic, "Aladdin", "open sesame", false, true), Ok(Auth::Basic(_))));
+    }
+
+    #[test]
+    fn digest_is_allowed_over_plaintext() {
+        let offered = [r#"Basic realm="cam""#.to_string(), r#"Digest realm="cam", nonce="n", qop=auth"#.to_string()];
+        assert!(matches!(choose(&offered, "u", "p", false, false), Ok(Auth::Digest(_))));
+        assert!(matches!(choose(&offered[1..], "u", "p", false, false), Ok(Auth::Digest(_))));
+    }
+
+    #[test]
+    fn only_the_value_one_opts_in() {
+        assert!(opt_in(Some("1")));
+        for v in [None, Some(""), Some("0"), Some("true"), Some("yes"), Some(" 1")] {
+            assert!(!opt_in(v), "{v:?}");
+        }
     }
 
     #[test]

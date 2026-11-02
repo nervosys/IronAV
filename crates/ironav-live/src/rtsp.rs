@@ -11,7 +11,7 @@
 //! frame as it arrived. RTSP replies on the same connection are taken out. While playing it sends
 //! a keepalive at half the session timeout, and TEARDOWN when it is dropped.
 
-use crate::auth::{choose, Auth};
+use crate::auth::{at, choose, plaintext_basic_opted_in, Auth};
 use crate::net::{self, Allow};
 use crate::source::{Chunk, Source, SourceInfo};
 use crate::url::{percent_decode, split_authority, SourceUrl};
@@ -127,6 +127,8 @@ pub(crate) struct RtspSource {
     cseq: u32,
     auth: Option<Auth>,
     user: Option<(String, String)>,
+    /// Whether this connection is TLS (`rtsps://`), which decides whether Basic may be sent.
+    tls: bool,
     session: Option<String>,
     /// The URL aggregate requests (PLAY, keepalives, TEARDOWN) go to.
     control: String,
@@ -194,6 +196,7 @@ impl RtspSource {
                 cseq: 0,
                 auth: None,
                 user: target.user.clone(),
+                tls: target.tls,
                 session: None,
                 control: target.url.clone(),
                 keepalive: Duration::from_secs(30),
@@ -373,7 +376,7 @@ impl RtspSource {
                 return Err(Error::new(ErrorCode::InvalidArgument, format!("{shown} asks for credentials")).hint("put them in the URL: rtsp://user:password@host/path"));
             };
             let challenges: Vec<String> = r.all("www-authenticate").map(str::to_string).collect();
-            self.auth = Some(choose(&challenges, &user, &pass).map_err(|why| Error::new(ErrorCode::UnsupportedFormat, format!("{shown} {why}")))?);
+            self.auth = Some(choose(&challenges, &user, &pass, self.tls, plaintext_basic_opted_in()).map_err(|e| at(e, shown))?);
             answered = true;
         }
     }
@@ -619,8 +622,8 @@ mod tests {
         assert!(Auth::answer("Digest realm=\"r\", nonce=\"n\", algorithm=SHA-512-256", "u", "p").is_err());
         // Digest in a form we do not speak does not fall back to Basic
         let offered = ["Digest realm=\"r\", nonce=\"n\", algorithm=SHA-512-256".to_string(), "Basic realm=\"r\"".to_string()];
-        assert!(choose(&offered, "u", "p").is_err());
-        assert!(matches!(choose(&offered[1..], "u", "p"), Ok(Auth::Basic(_))));
+        assert!(choose(&offered, "u", "p", true, false).is_err());
+        assert!(matches!(choose(&offered[1..], "u", "p", true, false), Ok(Auth::Basic(_))));
         assert_eq!(param("RTP/AVP/TCP;unicast;Interleaved=4-5", "interleaved"), Some("4-5"));
 
         // a password with an unescaped '/' is taken whole, and redirects keep credentials only on the same server

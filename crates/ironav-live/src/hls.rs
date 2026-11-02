@@ -669,8 +669,8 @@ mod tests {
                     if r.read_line(&mut h).unwrap_or(0) == 0 || h.trim().is_empty() {
                         break;
                     }
-                    // u:p
-                    authorized |= h.trim() == "Authorization: Basic dTpw";
+                    // u:p, answered with Digest: Basic would send the password in the clear over this plain HTTP
+                    authorized |= h.trim_start().starts_with("Authorization: Digest ") && h.contains("username=\"u\"");
                     if let Some(v) = h.strip_prefix("Range: bytes=") {
                         let (a, b) = v.trim().split_once('-').unwrap();
                         range = Some((a.parse::<usize>().unwrap(), b.parse::<usize>().unwrap()));
@@ -679,7 +679,7 @@ mod tests {
                 let mut c = c;
                 // everything under /r/ needs credentials, asked for by a challenge
                 if path.starts_with("/r/") && !authorized {
-                    let _ = write!(c, "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"r\"\r\nContent-Length: 0\r\n\r\n");
+                    let _ = write!(c, "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Digest realm=\"r\", qop=\"auth\", nonce=\"n\"\r\nContent-Length: 0\r\n\r\n");
                     continue;
                 }
                 on_get(&path, &routes);

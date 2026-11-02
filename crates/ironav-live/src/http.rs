@@ -3,7 +3,7 @@
 //! the connection closes, byte ranges, and timeouts on every read and write. HTTPS goes through
 //! [`tls`](crate::tls), and a redirect from it to plain HTTP is refused.
 
-use crate::auth::{choose, Auth};
+use crate::auth::{at, choose, plaintext_basic_opted_in, Auth};
 use crate::net::{self, Allow};
 use crate::tls::{self, Conn};
 use crate::url::{percent_decode, redact, split_authority};
@@ -317,7 +317,7 @@ fn request(url: &str, method: &str, payload: Option<(&str, &[u8])>, range: Optio
         if let (401, Some(k), Some((user, pass))) = (status, &key, &u.user) {
             let challenges: Vec<String> = headers.iter().filter(|(n, _)| n.eq_ignore_ascii_case("www-authenticate")).map(|(_, v)| v.clone()).collect();
             if !challenges.is_empty() {
-                let mut auth = choose(&challenges, user, pass).map_err(|why| Error::new(ErrorCode::Io, format!("{shown} {why}")))?;
+                let mut auth = choose(&challenges, user, pass, u.tls, plaintext_basic_opted_in()).map_err(|e| at(e, &shown))?;
                 let authz = auth.header(method, &u.path);
                 answers().insert(k.clone(), auth);
                 (status, headers, conn) = exchange(&u, &shown, method, payload, range, Some(&authz), allow)?;
