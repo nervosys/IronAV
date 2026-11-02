@@ -220,6 +220,22 @@ fn a_sidecar_removed_while_starting_is_stopped_and_never_joins() {
     let _ = call_tool("stream_close", &json!({ "session": id }));
 }
 
+/// Whether process `pid` is still running: unlike `alive`, a process that has ended but not been
+/// waited for (a zombie) has stopped.
+#[cfg(any(windows, target_os = "linux"))]
+fn running(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // the state is the field after the parenthesised program name
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .is_ok_and(|s| s.rsplit_once(')').is_some_and(|(_, rest)| !rest.trim_start().starts_with('Z')))
+    }
+    #[cfg(windows)]
+    {
+        alive(pid)
+    }
+}
+
 /// A sidecar that touches a gigabyte, with a 64 MB memory limit, is stopped at the limit: a job
 /// object on Windows, `RLIMIT_AS` on Linux (where the allocation fails and the program aborts). Without
 /// the limit the process would hold its gigabyte and still be alive when the test gives up.
@@ -234,7 +250,7 @@ fn a_sidecar_over_its_memory_limit_is_stopped() {
     let pending = ironav_engine::sidecar::Pending::start("hog", &cfg, false).expect("hog says hello");
     let pid: u32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
     let t0 = std::time::Instant::now();
-    while alive(pid) {
+    while running(pid) {
         assert!(t0.elapsed().as_secs() < 20, "the sidecar ran past its 64 MB limit");
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
