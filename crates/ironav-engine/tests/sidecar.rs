@@ -171,8 +171,13 @@ fn alive(pid: u32) -> bool {
     }
     #[cfg(not(windows))]
     {
-        // a zombie still has its /proc entry, so this also tells whether it was waited for
-        Path::new(&format!("/proc/{pid}")).exists()
+        // a zombie still has its /proc entry (and a `ps` line), so this also tells whether it was waited for;
+        // macOS has no /proc
+        if Path::new("/proc/self").exists() {
+            Path::new(&format!("/proc/{pid}")).exists()
+        } else {
+            std::process::Command::new("ps").args(["-p", &pid.to_string()]).output().is_ok_and(|o| o.status.success())
+        }
     }
 }
 
