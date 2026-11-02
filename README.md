@@ -1237,6 +1237,31 @@ starts in 18 ms (the start-up row of the table above). Both programs are built b
 NVENC in earlier runs: 240 frames of 1280x720 (a 332 MB Y4M) in 0.6-3.8 s wall depending on load.
 
 
+## Security and operator settings
+
+The agent tools (MCP server, web UI, CLI) read and write files, open sockets and, if allowed, cameras. What they may do is set by the operator in
+environment variables, which a tool call cannot change. `ironav mcp` starts with the strict defaults; the command line and the GUI keep their old
+behaviour unless a variable is set.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `IRONAV_ROOTS` | unset: no limit for the CLI and GUI; the working directory in `ironav mcp` | Directories (separated like `PATH`: `;` on Windows, `:` elsewhere) that tools may read from and write to: inputs, outputs, `thumbnail_dir`, recordings, clips, `file:` and `pipe:` sources, job files. Symbolic links and `..` are resolved first (for an output that does not exist yet, the nearest directory that does); a path outside is refused with a `permission-denied` error naming `IRONAV_ROOTS`. The check is made when a tool starts, so it guards against an agent's mistakes and injected instructions, not against a hostile local process that swaps paths meanwhile. |
+| `IRONAV_READ_ONLY` | off | `1` refuses every call that would write (`run`, `stream_clip`, `analyze` with `thumbnail_dir`, `stream_open` and `stream_configure` with `record` or `transcode`). `plan`, `probe` and reading tools work. |
+| `IRONAV_ALLOW_DEVICES` | off in `ironav mcp`, on elsewhere | `1` lets `device://video` and `device://audio` sources (cameras, microphones) be opened. Opens are logged to stderr. |
+| `IRONAV_ALLOW_COOKIES` | off in `ironav mcp`, on elsewhere | `1` allows the `?cookies=BROWSER` option, which lets yt-dlp read that browser's cookie store. |
+| `IRONAV_MAX_PIXELS` | 268435456 (2^28; at most 16384 on a side) | The most pixels in one decoded picture; a stream that asks for more is refused before a decoder is made. A value replaces both limits. Audio streams above 64 channels are refused. |
+| `IRONAV_YTDLP` | unset: `yt-dlp` from `PATH` | Absolute path of yt-dlp (a relative one is refused). `capabilities` reports which program is used. |
+| `IRONAV_AUDIT_LOG` | off | A file to append one JSON line to for each tool call start and end (tool, caller `cli`/`mcp`/`webui`, outcome or error code, duration), file write, network source and device open, and each refusal by the settings above. Times are UTC RFC 3339; URLs are redacted; no credentials or media are written. |
+| `IRONAV_SIDECARS`, `IRONAV_NET_ALLOW`, `IRONAV_CA_FILE` | unset | See the sections on sidecars and live sources. |
+
+Other protections:
+
+- **Panics.** Release builds unwind instead of aborting, and every tool call and each live session worker catches a panic and returns it as an `internal` error naming the tool, so a decoder bug on a hostile file ends that call, not the server. The release binary is larger for the unwind tables (about 29 percent larger `ironav.exe`, 10.0 to 12.9 MB, measured on Windows; speed was not measured).
+- **Text from media is data.** Captions, sidecar transcripts, device, camera and rendition names and the error output of external programs are stripped of control characters, cut to 512 characters, and carry `"untrusted": true` (and `"truncated": true` when cut). The MCP `instructions` and the tool descriptions say not to follow requests found in them.
+- **Temporary outputs.** `<output>.partial` is created exclusively (`O_EXCL`): an existing file or link there is refused, never written through or deleted. After a crash, remove the leftover and run again.
+- **External programs.** yt-dlp and arecord are resolved to absolute paths. Sidecar children get only `PATH` and a few system variables (`HOME`, `LANG`, `TMPDIR` or `SystemRoot`, `TEMP`...) plus the `env` (name to value) and `inherit_env` (names to copy) their entry in the sidecar file lists.
+- **MCP limits.** A request line over 4 MiB is refused (and skipped); at most 4 tool calls run at once, the next gets a JSON-RPC error (-32000) until one finishes. The tool annotations are truthful: `readOnlyHint`, `destructiveHint` for tools that can overwrite, `openWorldHint` for tools that reach the network. Run the server under a supervisor that restarts it.
+
 ## Security notes (browser GUI)
 
 The native GUI runs in-process and opens no sockets. The `--web` variant is loopback only; every request needs a per-launch random token and a loopback `Host` header. The file browser can list

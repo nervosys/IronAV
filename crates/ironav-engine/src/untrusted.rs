@@ -12,14 +12,12 @@ const NOTE: &str = "...[truncated]";
 /// zero-width marks, cut to [`MAX_FIELD`] characters. The flag says it was cut.
 pub fn clean(s: &str) -> (String, bool) {
     let mut out = String::with_capacity(s.len().min(MAX_FIELD + 16));
-    let mut n = 0;
-    for c in s.chars().filter(|c| !hidden(*c)) {
+    for (n, c) in s.chars().filter(|c| !hidden(*c)).enumerate() {
         if n == MAX_FIELD {
             out.push_str(NOTE);
             return (out, true);
         }
         out.push(c);
-        n += 1;
     }
     (out, false)
 }

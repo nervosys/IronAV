@@ -140,6 +140,10 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - **Build and test:** a workspace test suite, and a GitHub Actions workflow for Linux, macOS and Windows
   (not yet run on hosted runners).
 
+### Security
+
+- **Security (agent tools):** release builds unwind and every tool call and live session worker contains a panic as an `internal` error; `IRONAV_ROOTS` (default: the working directory in `ironav mcp`), `IRONAV_READ_ONLY`, `IRONAV_ALLOW_DEVICES` and `IRONAV_ALLOW_COOKIES` limit paths, writes, cameras and browser cookies; `IRONAV_MAX_PIXELS` and a 64-channel cap bound decoders; `IRONAV_AUDIT_LOG` writes an audit trail; text from media is cleaned, cut and marked `"untrusted"`; `<output>.partial` is created exclusively; yt-dlp and arecord resolve to absolute paths and sidecars get a minimal environment; MCP request lines are capped at 4 MiB and tool calls in flight at 4; MCP tool annotations are truthful. New error code `permission-denied`. See "Security and operator settings" in the README.
+
 ### Changed
 
 - **MPEG-2 in MP4 and Matroska:** a 4:2:2 stream is declared `yuv422p` (it was declared 4:2:0; the decoded frames were already right). FFmpeg writes no sequence header into those containers, so the chroma format is read from the first picture's sequence header and extension.

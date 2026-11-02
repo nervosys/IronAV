@@ -113,44 +113,6 @@ pub fn panic_error(what: &str, p: &(dyn std::any::Any + Send)) -> Error {
         .hint("this is a bug in IronAV, probably triggered by the input; the server is still running. Try another input, and report this one")
 }
 
-#[cfg(test)]
-mod containment_tests {
-    use super::*;
-
-    #[test]
-    fn a_panicking_tool_is_an_internal_error_and_the_next_call_works() {
-        let boom = Tool {
-            name: "boom",
-            description: "",
-            cli: "",
-            input_schema: json!({}),
-            read_only: true,
-            handler: Handler::Plain(|a| if a["panic"] == "str" { panic!("decoder fell over at 0x{:x}", 255) } else { std::panic::panic_any(7u8) }),
-        };
-        let e = boom.call(&json!({ "panic": "str" })).unwrap_err();
-        assert_eq!(e.code, ErrorCode::Internal);
-        assert!(e.message.contains("boom panicked: decoder fell over at 0xff"), "{}", e.message);
-        let e = boom.call(&json!({ "panic": "other" })).unwrap_err();
-        assert_eq!(e.code, ErrorCode::Internal);
-        assert!(e.message.contains("(no message)"));
-        // the process, and the registry, carry on
-        assert!(call_tool("ontology_search", &json!({ "query": "h264" })).is_ok());
-        assert_eq!(contain("x", || -> Result<()> { Err(Error::invalid_arg("plain")) }).unwrap_err().code, ErrorCode::InvalidArgument);
-    }
-
-    #[test]
-    fn annotations_tell_the_truth() {
-        let t = |n: &str| tools().iter().find(|t| t.name == n).unwrap();
-        for n in ["run", "stream_clip", "stream_open", "analyze", "stream_configure"] {
-            assert!(!t(n).read_only && t(n).destructive(), "{n}");
-        }
-        for n in ["probe", "plan", "stream_events", "ontology_search", "capabilities"] {
-            assert!(t(n).read_only && !t(n).destructive(), "{n}");
-        }
-        assert!(t("stream_open").open_world() && t("onvif_discover").open_world() && !t("run").open_world());
-    }
-}
-
 pub fn call_tool(name: &str, args: &Value) -> Result<Value> {
     call_tool_with(name, args, &Ctx::default())
 }
@@ -893,4 +855,42 @@ pub fn ontology() -> &'static Ontology {
         }
         o
     })
+}
+
+#[cfg(test)]
+mod containment_tests {
+    use super::*;
+
+    #[test]
+    fn a_panicking_tool_is_an_internal_error_and_the_next_call_works() {
+        let boom = Tool {
+            name: "boom",
+            description: "",
+            cli: "",
+            input_schema: json!({}),
+            read_only: true,
+            handler: Handler::Plain(|a| if a["panic"] == "str" { panic!("decoder fell over at 0x{:x}", 255) } else { std::panic::panic_any(7u8) }),
+        };
+        let e = boom.call(&json!({ "panic": "str" })).unwrap_err();
+        assert_eq!(e.code, ErrorCode::Internal);
+        assert!(e.message.contains("boom panicked: decoder fell over at 0xff"), "{}", e.message);
+        let e = boom.call(&json!({ "panic": "other" })).unwrap_err();
+        assert_eq!(e.code, ErrorCode::Internal);
+        assert!(e.message.contains("(no message)"));
+        // the process, and the registry, carry on
+        assert!(call_tool("ontology_search", &json!({ "query": "h264" })).is_ok());
+        assert_eq!(contain("x", || -> Result<()> { Err(Error::invalid_arg("plain")) }).unwrap_err().code, ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn annotations_tell_the_truth() {
+        let t = |n: &str| tools().iter().find(|t| t.name == n).unwrap();
+        for n in ["run", "stream_clip", "stream_open", "analyze", "stream_configure"] {
+            assert!(!t(n).read_only && t(n).destructive(), "{n}");
+        }
+        for n in ["probe", "plan", "stream_events", "ontology_search", "capabilities"] {
+            assert!(t(n).read_only && !t(n).destructive(), "{n}");
+        }
+        assert!(t("stream_open").open_world() && t("onvif_discover").open_world() && !t("run").open_world());
+    }
 }
