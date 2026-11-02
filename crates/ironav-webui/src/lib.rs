@@ -218,7 +218,9 @@ fn url_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>> {
+/// The request line and headers, and the bytes read past them. The body is read after the head has been
+/// checked, so a request that is refused costs no more than its head.
+fn read_head(stream: &mut TcpStream) -> std::io::Result<Option<(Request, Vec<u8>)>> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     let header_end = loop {
@@ -242,19 +244,6 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>> {
         .filter_map(|l| l.split_once(':'))
         .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
         .collect();
-    let len: usize = headers.get("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
-    if len > MAX_BODY {
-        return Ok(None);
-    }
-    let mut body = buf[header_end + 4..].to_vec();
-    while body.len() < len {
-        let n = stream.read(&mut chunk)?;
-        if n == 0 {
-            return Ok(None);
-        }
-        body.extend_from_slice(&chunk[..n]);
-    }
-    body.truncate(len);
     let (path, q) = target.split_once('?').unwrap_or((&target, ""));
     let query = q
         .split('&')
@@ -264,7 +253,28 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>> {
             (url_decode(k), url_decode(v))
         })
         .collect();
-    Ok(Some(Request { method, path: url_decode(path), query, headers, body }))
+    let past = buf[header_end + 4..].to_vec();
+    Ok(Some((Request { method, path: url_decode(path), query, headers, body: Vec::new() }, past)))
+}
+
+/// The rest of a body of `len` bytes, of which `body` has come already. None when the peer stops early.
+fn read_body(stream: &mut TcpStream, mut body: Vec<u8>, len: usize) -> std::io::Result<Option<Vec<u8>>> {
+    let mut chunk = [0u8; 4096];
+    while body.len() < len {
+        let n = stream.read(&mut chunk)?;
+        if n == 0 {
+            return Ok(None);
+        }
+        body.extend_from_slice(&chunk[..n]);
+    }
+    body.truncate(len);
+    Ok(Some(body))
+}
+
+/// The Content-Length of a request, or None when it is over the cap.
+fn body_len(req: &Request) -> Option<usize> {
+    let len: usize = req.headers.get("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
+    (len <= MAX_BODY).then_some(len)
 }
 
 fn respond(stream: &mut TcpStream, status: &str, ctype: &str, body: &[u8]) -> std::io::Result<()> {
@@ -290,15 +300,18 @@ fn envelope(r: Result<Value>) -> Vec<u8> {
 fn handle(mut stream: TcpStream, st: &State) -> std::io::Result<()> {
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
-    let Some(req) = read_request(&mut stream)? else {
+    let Some((mut req, past)) = read_head(&mut stream)? else {
         return respond(&mut stream, "400 Bad Request", "text/plain", b"bad request");
     };
-    let host_ok = req
-        .headers
-        .get("host")
-        .is_some_and(|h| *h == format!("127.0.0.1:{}", st.port) || *h == format!("localhost:{}", st.port));
-    if !host_ok {
+    // Every check that needs no body is made before one is read.
+    let hosts = [format!("127.0.0.1:{}", st.port), format!("localhost:{}", st.port)];
+    if !req.headers.get("host").is_some_and(|h| hosts.contains(h)) {
         return respond(&mut stream, "403 Forbidden", "text/plain", b"bad host");
+    }
+    // A browser sends Origin on a cross-site request, and a page from anywhere else is not ours to serve.
+    let origins = [format!("http://127.0.0.1:{}", st.port), format!("http://localhost:{}", st.port)];
+    if req.headers.get("origin").is_some_and(|o| !origins.contains(o)) {
+        return respond(&mut stream, "403 Forbidden", "text/plain", b"bad origin");
     }
 
     if req.method == "GET" && req.path == "/" {
@@ -312,6 +325,13 @@ fn handle(mut stream: TcpStream, st: &State) -> std::io::Result<()> {
     if !req.headers.get("x-ironav-token").is_some_and(|t| token_eq(t, &st.token)) {
         return respond(&mut stream, "403 Forbidden", "application/json", &envelope(Err(Error::new(ErrorCode::InvalidArgument, "bad token"))));
     }
+    let Some(len) = body_len(&req) else {
+        return respond(&mut stream, "413 Payload Too Large", "text/plain", b"the body is over the 4 MiB limit");
+    };
+    let Some(body) = read_body(&mut stream, past, len)? else {
+        return respond(&mut stream, "400 Bad Request", "text/plain", b"bad request");
+    };
+    req.body = body;
     let body: Value = if req.body.is_empty() { json!({}) } else { serde_json::from_slice(&req.body).unwrap_or(Value::Null) };
 
     let out = match (req.method.as_str(), req.path.as_str()) {
@@ -490,6 +510,48 @@ mod tests {
         let mut buf = [0u8; 16];
         assert!(matches!(extra.read(&mut buf), Ok(0)), "the connection beyond the cap gets no answer and is closed");
         drop(idle);
+    }
+
+    fn test_server() -> (u16, String) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let state = Arc::new(State::new(port));
+        let token = state.token.clone();
+        std::thread::spawn(move || accept_loop(listener, state));
+        (port, token)
+    }
+
+    /// Sends `request` and returns whatever comes back before the server closes or the read times out.
+    fn raw_request(port: u16, request: &str) -> String {
+        let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        c.write_all(request.as_bytes()).unwrap();
+        let mut out = String::new();
+        let _ = c.read_to_string(&mut out);
+        out
+    }
+
+    #[test]
+    fn headers_are_checked_before_the_body_is_read() {
+        let (port, token) = test_server();
+        // a body of 1000 bytes is promised and never sent: a refused head must not wait for it
+        let wrong_host = raw_request(port, "POST /api/jobs HTTP/1.1\r\nHost: evil.example\r\nContent-Length: 1000\r\n\r\n");
+        assert!(wrong_host.starts_with("HTTP/1.1 403"), "{wrong_host}");
+        let no_token = raw_request(port, &format!("POST /api/jobs HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 1000\r\n\r\n"));
+        assert!(no_token.starts_with("HTTP/1.1 403"), "{no_token}");
+        // a body over the cap is refused without being read, with the token
+        let too_big = raw_request(port, &format!("POST /api/jobs HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-IronAV-Token: {token}\r\nContent-Length: 999999999\r\n\r\n"));
+        assert!(too_big.starts_with("HTTP/1.1 413"), "{too_big}");
+    }
+
+    #[test]
+    fn a_foreign_origin_is_refused_even_with_the_token() {
+        let (port, token) = test_server();
+        let with = |origin: &str| format!("GET /api/fs HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{origin}X-IronAV-Token: {token}\r\n\r\n");
+        assert!(raw_request(port, &with("")).starts_with("HTTP/1.1 200"));
+        assert!(raw_request(port, &with(&format!("Origin: http://127.0.0.1:{port}\r\n"))).starts_with("HTTP/1.1 200"));
+        assert!(raw_request(port, &with("Origin: http://evil.example\r\n")).starts_with("HTTP/1.1 403"));
+        assert!(raw_request(port, &with("Origin: null\r\n")).starts_with("HTTP/1.1 403"));
     }
 
     #[test]
