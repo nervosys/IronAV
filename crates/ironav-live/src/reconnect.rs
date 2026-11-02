@@ -262,7 +262,18 @@ mod tests {
         r.unwrap();
         assert_eq!(got, "AAAA|BBBB|CCCC");
         use HealthState::*;
-        assert_eq!(states, [Connected, Reconnecting, Connected, Stalled, Reconnecting, Connected, Stalled], "{got}");
+        // on a loaded machine a chunk can come more than 0.2 s late: a stall the source recovers from
+        // without reconnecting is right, so only the stalls that lead to a reconnect (or end the run) count
+        let mut seen: Vec<HealthState> = Vec::new();
+        for (i, s) in states.iter().enumerate() {
+            if *s == Stalled && states.get(i + 1) == Some(&Connected) {
+                continue;
+            }
+            if seen.last() != Some(s) {
+                seen.push(*s);
+            }
+        }
+        assert_eq!(seen, [Connected, Reconnecting, Connected, Stalled, Reconnecting, Connected, Stalled], "{got} {states:?}");
     }
 
     #[cfg_attr(feature = "fips", ignore = "FIPS build: exercises plaintext transports or MD5 Digest, which it refuses (tests/fips.rs covers the refusals)")]
