@@ -36,6 +36,11 @@ impl RecordOptions {
     /// Checks what can be checked before any media arrives.
     pub fn check(&self) -> Result<()> {
         crate::policy::check_write(&self.path)?;
+        let partial = format!("{}.partial", self.path);
+        if std::fs::symlink_metadata(&partial).is_ok() {
+            return Err(Error::new(ErrorCode::OutputExists, format!("{partial} exists"))
+                .hint("it is the playlist's temporary name, left by an earlier run that did not finish (or put there by someone else); remove it and try again"));
+        }
         let path = Path::new(&self.path);
         if path.file_stem().is_none_or(|s| s.is_empty()) {
             return Err(Error::invalid_arg(format!("'{}' is not a file path", self.path)));
@@ -286,7 +291,13 @@ impl Recorder {
         }
         // replaced whole, so a reader never sees half a playlist
         let tmp = format!("{}.partial", self.opts.path);
-        let r = std::fs::write(&tmp, m).and_then(|_| ironav_core::replace_file(Path::new(&tmp), Path::new(&self.opts.path)));
+        // exclusive: a name that is taken is refused, and not deleted
+        let mut f = ironav_core::create_new(Path::new(&tmp))?;
+        let r = (|| {
+            std::io::Write::write_all(&mut f, m.as_bytes())?;
+            drop(f);
+            ironav_core::replace_file(Path::new(&tmp), Path::new(&self.opts.path))
+        })();
         if r.is_err() {
             let _ = std::fs::remove_file(&tmp);
         }

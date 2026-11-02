@@ -11,7 +11,7 @@ use ironav_codec::av1::enc::Av1Encoder;
 use ironav_codec::{build_filter, new_encoder_with_opts, VideoOptions};
 use ironav_core::{CodecId, Decoder, Encoder, Error, ErrorCode, Filter, Frame, MediaType, Packet, Rational, Result};
 use ironav_hwaccel::{new_video_decoder, new_video_encoder, Direction, RateControl};
-use ironav_formats::{create_muxer_with, open_demuxer};
+use ironav_formats::{create_muxer_new, open_demuxer};
 use serde::Serialize;
 use std::path::Path;
 use std::sync::mpsc::{sync_channel, Receiver};
@@ -107,7 +107,8 @@ pub fn run_with(job: &Job, on_progress: &mut dyn FnMut(&Progress), cancel: Optio
     let plan = plan(job)?;
     let demuxes = std::iter::once(&job.input).chain(&job.extra_inputs).map(|p| open_demuxer(Path::new(p))).collect::<Result<Vec<_>>>()?;
     let partial = format!("{}.partial", job.output);
-    let mux = create_muxer_with(Path::new(&partial), plan.output.format, plan.fragment_seconds)?;
+    // exclusive: a leftover or planted <output>.partial is refused, and then not ours to delete
+    let mux = create_muxer_new(Path::new(&partial), plan.output.format, plan.fragment_seconds)?;
 
     let rate = rate_control(&job.video)?;
     match execute(&plan, rate, demuxes, mux, t0, on_progress, cancel) {

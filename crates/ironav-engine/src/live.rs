@@ -1201,8 +1201,9 @@ impl Session {
             return Err(Error::new(ErrorCode::UnsupportedFormat, format!("{} cannot hold {}", fmt.name, s.codec.name())));
         }
         let partial = format!("{output}.partial");
+        // exclusive: a leftover or planted name is refused, and left alone
+        let mut mux = ironav_formats::create_muxer_new(Path::new(&partial), fmt.name, None)?;
         let written = (|| -> Result<(u64, f64, f64)> {
-            let mut mux = ironav_formats::create_muxer(Path::new(&partial), fmt.name)?;
             mux.write_header(&streams)?;
             // timestamps start at zero in the clip
             let base: BTreeMap<usize, i64> = packets.iter().fold(BTreeMap::new(), |mut m, p| {

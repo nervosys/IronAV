@@ -61,6 +61,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    #[test]
+    fn create_new_refuses_anything_already_there() {
+        let d = std::env::temp_dir().join(format!("ironav-createnew-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("x.partial");
+        create_new(&f).unwrap();
+        let e = create_new(&f).unwrap_err();
+        assert_eq!(e.code, crate::ErrorCode::OutputExists);
+        assert!(e.hint.unwrap().contains("remove it"));
+        // a link there (to a file that exists) is not followed or truncated
+        let victim = d.join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        let link = d.join("link.partial");
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(&victim, &link).is_ok();
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_file(&victim, &link).is_ok();
+        if made {
+            assert_eq!(create_new(&link).unwrap_err().code, crate::ErrorCode::OutputExists);
+            assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[cfg(windows)]
     #[test]
     fn a_reader_holding_the_file_briefly_does_not_fail_the_replace() {

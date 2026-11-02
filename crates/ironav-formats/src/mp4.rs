@@ -865,8 +865,10 @@ impl Mp4Muxer {
         self.out = Box::new(std::io::Cursor::new(Vec::new()));
         let mut src = std::fs::File::open(path)?;
         let tmp = path.with_extension("faststart.tmp");
+        // created new: a name that is taken (left by a crash, or planted) is refused, not written through
+        let tmp_file = ironav_core::create_new(&tmp)?;
         let result = (|| -> Result<()> {
-            let mut dst = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&tmp)?);
+            let mut dst = std::io::BufWriter::with_capacity(1 << 20, tmp_file);
             let mut head = vec![0u8; self.mdat_start as usize];
             src.read_exact(&mut head)?;
             dst.write_all(&head)?;

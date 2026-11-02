@@ -292,11 +292,25 @@ pub fn create_muxer(path: &Path, format: &str) -> Result<Box<dyn Muxer>> {
 /// [`create_muxer`], where `fragment_seconds` makes an MP4 or MOV writer produce a fragmented file, with a
 /// fragment at a key frame once that many seconds have gone by. Other formats refuse it.
 pub fn create_muxer_with(path: &Path, format: &str, fragment_seconds: Option<f64>) -> Result<Box<dyn Muxer>> {
+    build_muxer(path, format, fragment_seconds, |p| Ok(File::create(p)?))
+}
+
+/// [`create_muxer_with`] for a file that must not exist yet: anything at `path`, a file or a link, is
+/// refused (`O_EXCL`). Outputs are written under a temporary name first, and this keeps that name from
+/// being a way to write through a link someone planted there.
+pub fn create_muxer_new(path: &Path, format: &str, fragment_seconds: Option<f64>) -> Result<Box<dyn Muxer>> {
+    build_muxer(path, format, fragment_seconds, ironav_core::create_new)
+}
+
+fn build_muxer(path: &Path, format: &str, fragment_seconds: Option<f64>, create: impl FnOnce(&Path) -> Result<File>) -> Result<Box<dyn Muxer>> {
     let spec = find_format(format)?;
     if fragment_seconds.is_some() && !matches!(spec.name, "mp4" | "mov") {
         return Err(Error::invalid_arg(format!("fragmented output is written to mp4 and mov files, not {}", spec.name)));
     }
-    let out: Box<dyn WriteSeek> = Box::new(BufWriter::with_capacity(1 << 20, File::create(path)?));
+    if !spec.mux {
+        return Err(Error::new(ErrorCode::UnsupportedFormat, format!("format '{format}' cannot be written")));
+    }
+    let out: Box<dyn WriteSeek> = Box::new(BufWriter::with_capacity(1 << 20, create(path)?));
     match spec.name {
         "wav" => Ok(Box::new(wav::WavMuxer::new(out))),
         "y4m" => Ok(Box::new(y4m::Y4mMuxer::new(out))),

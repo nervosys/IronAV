@@ -181,6 +181,11 @@ pub fn plan(job: &Job) -> Result<Plan> {
                 .hint("set \"overwrite\": true to replace it, or choose a new output path"));
         }
     }
+    let partial = format!("{}.partial", job.output);
+    if std::fs::symlink_metadata(&partial).is_ok() {
+        return Err(Error::new(ErrorCode::OutputExists, format!("'{partial}' exists already"))
+            .hint("it is the temporary name run writes to, left by an earlier run that did not finish (or put there by someone else); remove it and try again"));
+    }
     let policy = HwPolicy::parse(&job.hwaccel)?;
     let probes = probe_all();
 
