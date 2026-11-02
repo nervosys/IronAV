@@ -3,6 +3,7 @@
 //! The hashes are for Digest only.
 
 use crate::http::base64;
+#[cfg(not(feature = "fips"))]
 use crate::md5::md5_hex;
 use crate::sha256::sha256_hex;
 use ironav_core::{Error, ErrorCode};
@@ -36,6 +37,7 @@ pub(crate) enum Auth {
 /// The hash a Digest answer is computed with.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Hash {
+    #[cfg(not(feature = "fips"))]
     Md5,
     Sha256,
 }
@@ -43,6 +45,7 @@ enum Hash {
 impl Hash {
     fn hex(self, data: &[u8]) -> String {
         match self {
+            #[cfg(not(feature = "fips"))]
             Hash::Md5 => md5_hex(data),
             Hash::Sha256 => sha256_hex(data),
         }
@@ -80,7 +83,9 @@ impl Auth {
         let name = algorithm.clone().unwrap_or_else(|| "MD5".into());
         crate::fips::check_digest(&name)?;
         let (hash, sess) = match name.to_ascii_lowercase().as_str() {
+            #[cfg(not(feature = "fips"))]
             "md5" => (Hash::Md5, false),
+            #[cfg(not(feature = "fips"))]
             "md5-sess" => (Hash::Md5, true),
             "sha-256" => (Hash::Sha256, false),
             "sha-256-sess" => (Hash::Sha256, true),
@@ -330,6 +335,17 @@ mod tests {
         assert!(matches!(choose(&offered[1..], "u", "p", false, false), Ok(Auth::Digest(_))));
     }
 
+    #[cfg(feature = "fips")]
+    #[test]
+    fn the_fips_build_refuses_an_md5_challenge() {
+        // the MD5 code is compiled out of this build; the challenge gets the same refusal the run-time check gives
+        for challenge in [r#"Digest realm="r", nonce="n", qop=auth"#, r#"Digest realm="r", nonce="n", algorithm=MD5-sess, qop=auth"#] {
+            assert!(Auth::answer(challenge, "u", "p").is_err(), "{challenge}");
+            let e = choose(&[challenge.into()], "u", "p", true, false).err().unwrap();
+            assert!(e.message.contains("MD5") && e.message.contains("FIPS mode refuses"), "{e}");
+        }
+    }
+
     #[test]
     fn only_the_value_one_opts_in() {
         assert!(opt_in(Some("1")));
@@ -360,7 +376,7 @@ mod tests {
         assert_ne!(a, [0u8; 16]);
     }
 
-    #[cfg_attr(feature = "fips", ignore = "FIPS build: exercises plaintext transports or MD5 Digest, which it refuses (tests/fips.rs covers the refusals)")]
+    #[cfg(not(feature = "fips"))]
     #[test]
     fn rfc_2069_form_without_qop() {
         let mut a = Auth::answer(r#"Digest realm="r", nonce="n""#, "u", "p").unwrap();

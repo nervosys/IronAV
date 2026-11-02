@@ -88,7 +88,7 @@ claim of FIPS 140-3 validation.
 |---|---|---|---|
 | TLS 1.3 client (`https://`, `rtsps://`) | AES-128/256-GCM, ChaCha20-Poly1305; ECDHE P-256/P-384, X25519, X25519MLKEM768; ECDSA, RSA-PSS, Ed25519, ML-DSA; SHA-256/384, HKDF | IronSocketLayer 0.7 over IronCrypto, IronPKI for X.509 | No |
 | Random numbers for TLS, tokens and nonces | SP 800-90A CTR_DRBG (AES-256), seeded from BCryptGenRandom or `/dev/urandom` | `ic-drbg` | No |
-| HTTP and RTSP Digest | SHA-256, MD5 (when a server offers only MD5) | In-tree (`ironav-live`) | No |
+| HTTP and RTSP Digest | SHA-256; MD5 (when a server offers only MD5), compiled out of builds with the `fips` feature | In-tree (`ironav-live`) | No |
 | ONVIF WS-Security | SHA-1 PasswordDigest (protocol-mandated) | In-tree | No |
 | Codec noise, dither, test data | LCG, xorshift | In-tree | Not security uses |
 
@@ -102,7 +102,8 @@ SRTP and SRT are not implemented, and such streams are refused.
 - ChaCha20-Poly1305, X25519 and the hybrid groups are not offered.
 - Plaintext `http://`, `rtsp://`, `tcp://` and `udp://` sources are refused, and so are YouTube sources, which yt-dlp
   fetches outside IronAV's control.
-- MD5 Digest is refused; SHA-256 Digest is still used.
+- MD5 Digest is refused, and in builds with the `fips` feature the MD5 code is not compiled in at all. SHA-256 Digest is
+  still used. A default build with `IRONAV_FIPS=1` keeps the MD5 code and refuses it at run time.
 - `ironav capabilities` reports `"fips": true` and the TLS profile in force.
 
 FIPS mode limits IronAV to approved algorithms and transports, implemented by an unvalidated module. Where validated
@@ -158,3 +159,5 @@ update checks, crash upload, or files in the home directory. Test media in the r
 - Sidecars run as the IronAV user, with no CPU or memory limits. Use a job object, cgroup or container to limit them.
 - The H.264 and VP9 concurrency primitives have not yet been run under Miri, loom or ThreadSanitizer.
 - The internals of IronSocketLayer, IronCrypto and IronPKI were not reviewed here.
+- The MD5 code (RFC 1321, for Digest) is in the default build, and refused only at run time when `IRONAV_FIPS=1` is set.
+  Build with the `fips` feature to compile it out. ONVIF WS-Security still uses SHA-1, which the `fips` feature keeps.

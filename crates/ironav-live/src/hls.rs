@@ -640,6 +640,7 @@ impl Read for HlsReader {
 mod tests {
     use super::*;
     use crate::source::Chunk;
+    #[cfg(not(feature = "fips"))]
     use crate::md5::md5_hex;
     use std::collections::HashMap;
     use std::io::{BufRead, BufReader, Write};
@@ -997,6 +998,7 @@ s1.vtt
     /// A Digest server for user "u" (realm "r", MD5, qop auth) with password `pass`, serving `routes`.
     /// The request for `rotate`, if any, first moves it to nonce "n2", which makes the client's nonce
     /// stale. Each request is logged as "path status nonce nc", status being challenge, stale, ok or bad.
+    #[cfg(not(feature = "fips"))]
     fn digest_server(routes: Routes, pass: &'static str, rotate: Option<&'static str>) -> (u16, Arc<Mutex<Vec<String>>>) {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = l.local_addr().unwrap().port();
@@ -1059,7 +1061,7 @@ s1.vtt
         (port, log)
     }
 
-    #[cfg_attr(feature = "fips", ignore = "FIPS build: exercises plaintext transports or MD5 Digest, which it refuses (tests/fips.rs covers the refusals)")]
+    #[cfg(not(feature = "fips"))]
     #[test]
     fn digest_is_answered_once_and_the_nonce_is_reused() {
         crate::net::allow_loopback_for_tests();
@@ -1083,7 +1085,7 @@ s1.vtt
         assert_eq!(ncs, (1..=ncs.len()).map(|k| format!("{k:08x}")).collect::<Vec<_>>(), "{log:?}");
     }
 
-    #[cfg_attr(feature = "fips", ignore = "FIPS build: exercises plaintext transports or MD5 Digest, which it refuses (tests/fips.rs covers the refusals)")]
+    #[cfg(not(feature = "fips"))]
     #[test]
     fn a_stale_nonce_is_answered_with_the_new_one() {
         crate::net::allow_loopback_for_tests();
@@ -1102,7 +1104,7 @@ s1.vtt
         assert!(log.iter().any(|l| l.starts_with("/d/s1.ts ok n2 00000001")), "{log:?}");
     }
 
-    #[cfg_attr(feature = "fips", ignore = "FIPS build: exercises plaintext transports or MD5 Digest, which it refuses (tests/fips.rs covers the refusals)")]
+    #[cfg(not(feature = "fips"))]
     #[test]
     fn a_wrong_password_is_refused_without_showing_it() {
         crate::net::allow_loopback_for_tests();

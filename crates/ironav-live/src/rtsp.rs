@@ -597,11 +597,14 @@ impl Drop for RtspSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(feature = "fips"))]
     use crate::md5::md5_hex;
+    #[cfg(not(feature = "fips"))]
     use std::net::TcpListener;
+    #[cfg(not(feature = "fips"))]
     use std::sync::mpsc;
 
-    #[cfg_attr(feature = "fips", ignore = "FIPS build: exercises plaintext transports or MD5 Digest, which it refuses (tests/fips.rs covers the refusals)")]
+    #[cfg(not(feature = "fips"))]
     #[test]
     fn targets_and_challenges() {
         crate::net::allow_loopback_for_tests();
@@ -642,6 +645,7 @@ mod tests {
         assert!(!e.message.contains("secret") && !e.message.contains("9z"));
     }
 
+    #[cfg(not(feature = "fips"))]
     /// The RTP stream FFmpeg's muxer sent (H.264 with B-frames and AAC), framed as this source frames it.
     fn fixture() -> (String, Vec<u32>, Vec<Vec<u8>>) {
         let d = std::fs::read(format!("{}/../ironav-formats/tests/data/h264_aac.rtp", env!("CARGO_MANIFEST_DIR"))).unwrap();
@@ -656,11 +660,14 @@ mod tests {
         (desc.sdp, desc.tracks.iter().map(|t| t.rtptime.unwrap()).collect(), frames)
     }
 
+    #[cfg(not(feature = "fips"))]
     trait Wire: Read + Write {}
+    #[cfg(not(feature = "fips"))]
     impl<T: Read + Write> Wire for T {}
 
     /// A camera that wants Digest credentials, serves the fixture, and reports the requests it saw;
     /// over TLS when given a server configuration.
+    #[cfg(not(feature = "fips"))]
     fn camera(listener: TcpListener, seen: mpsc::Sender<String>, tls: Option<std::sync::Arc<ironsocketlayer::config::ServerConfig>>) {
         let (sdp, rtptimes, frames) = fixture();
         let (tcp, _) = listener.accept().unwrap();
@@ -742,21 +749,21 @@ mod tests {
         }
     }
 
-    #[cfg_attr(feature = "fips", ignore = "FIPS build: exercises plaintext transports or MD5 Digest, which it refuses (tests/fips.rs covers the refusals)")]
+    #[cfg(not(feature = "fips"))]
     #[test]
     fn plays_a_camera_with_digest_credentials() {
         crate::net::allow_loopback_for_tests();
         plays_a_camera("", false);
     }
 
-    #[cfg_attr(feature = "fips", ignore = "FIPS build: exercises plaintext transports or MD5 Digest, which it refuses (tests/fips.rs covers the refusals)")]
+    #[cfg(not(feature = "fips"))]
     #[test]
     fn plays_a_camera_over_udp() {
         crate::net::allow_loopback_for_tests();
         plays_a_camera("?transport=udp", false);
     }
 
-    #[cfg_attr(feature = "fips", ignore = "FIPS build: exercises plaintext transports or MD5 Digest, which it refuses (tests/fips.rs covers the refusals)")]
+    #[cfg(not(feature = "fips"))]
     #[test]
     fn plays_a_camera_over_tls() {
         crate::net::allow_loopback_for_tests();
@@ -766,6 +773,7 @@ mod tests {
         assert_eq!(RtspSource::open(&u, "rtsps://127.0.0.1:1/live".into()).err().unwrap().code, ErrorCode::InvalidArgument);
     }
 
+    #[cfg(not(feature = "fips"))]
     fn plays_a_camera(options: &str, tls: bool) {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = l.local_addr().unwrap().port();

@@ -13,6 +13,7 @@ pub mod fips;
 mod auth;
 mod hls;
 mod http;
+#[cfg(not(feature = "fips"))]
 mod md5;
 pub mod net;
 pub mod reconnect;

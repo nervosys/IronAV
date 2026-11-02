@@ -219,7 +219,7 @@ pub(crate) fn connect(sock: TcpStream, host: &str, alpn: Option<&'static [u8]>, 
 
 /// For tests: a throwaway CA, trusted through `IRONAV_CA_FILE` (so before this process's first TLS
 /// connection), and a server configuration with a certificate from it for 127.0.0.1 and localhost.
-#[cfg(test)]
+#[cfg(all(test, not(feature = "fips")))]
 pub(crate) fn test_server_config() -> Arc<ironsocketlayer::config::ServerConfig> {
     use ironsocketlayer::config::{Identity, ServerConfig};
     use ironsocketlayer::crypto::sign::{KeyKind, SigningKey};
