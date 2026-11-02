@@ -325,7 +325,7 @@ mod tests {
 
     #[test]
     fn digest_is_allowed_over_plaintext() {
-        let offered = [r#"Basic realm="cam""#.to_string(), r#"Digest realm="cam", nonce="n", qop=auth"#.to_string()];
+        let offered = [r#"Basic realm="cam""#.to_string(), r#"Digest realm="cam", nonce="n", qop=auth, algorithm=SHA-256"#.to_string()];
         assert!(matches!(choose(&offered, "u", "p", false, false), Ok(Auth::Digest(_))));
         assert!(matches!(choose(&offered[1..], "u", "p", false, false), Ok(Auth::Digest(_))));
     }
@@ -340,7 +340,7 @@ mod tests {
 
     #[test]
     fn cnonces_are_128_bits_and_differ() {
-        let mut a = Auth::answer(r#"Digest realm="r", nonce="n", qop=auth"#, "u", "p").unwrap();
+        let mut a = Auth::answer(r#"Digest realm="r", nonce="n", qop=auth, algorithm=SHA-256"#, "u", "p").unwrap();
         let (mut seen_a, mut seen_b) = (String::new(), String::new());
         for _ in 0..2 {
             let h = a.header("GET", "/x");
