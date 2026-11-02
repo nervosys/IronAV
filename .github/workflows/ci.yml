@@ -48,6 +48,10 @@ jobs:
       - run: cargo test --no-default-features -p ironav-cli -p ironav-engine --locked
       - name: FIPS mode (approved algorithms only)
         run: cargo test -p ironav-live --features fips --locked
+      - name: Opus and voice alone (ironav-codec without default features, no serde)
+        run: |
+          cargo test -p ironav-codec --no-default-features --features opus,voice --lib --locked
+          ! cargo tree -p ironav-codec --no-default-features --features opus,voice -e normal --locked | grep -q serde
 
   clippy:
     name: clippy
