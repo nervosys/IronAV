@@ -880,6 +880,7 @@ struct Log<'a> {
 
 impl Log<'_> {
     fn push(&mut self, mut o: Observation) -> Result<()> {
+        crate::untrusted::observation(&mut o);
         if let Some(pic) = o.picture.take() {
             if self.thumb_dir.is_some() || self.inline_left > 0 {
                 let (_, _, png) = png_of(&pic.0, None)?;

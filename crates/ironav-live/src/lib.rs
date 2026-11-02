@@ -8,6 +8,7 @@
 //! a deadline, so whoever reads can notice in time that it has been asked to stop.
 
 pub mod capture;
+pub mod exe;
 mod auth;
 mod hls;
 mod http;

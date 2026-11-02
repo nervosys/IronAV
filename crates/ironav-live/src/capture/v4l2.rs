@@ -385,8 +385,10 @@ fn microphone(name: Option<&str>, ok: &SyncSender<Result<()>>, tx: &Tx) -> Resul
     let list = microphones();
     let devs: Vec<Device> = list.iter().enumerate().map(|(index, (n, _))| Device { kind: "audio", index, name: n.clone() }).collect();
     let d = choose(&devs, name, "audio")?;
-    let mut child = Command::new("arecord")
-        .args(["-q", "-D", &list[d.index].1, "-t", "raw", "-f", "S16_LE", "-c", "1", "-r", &RATE.to_string()])
+    let arecord = crate::exe::locate("arecord").ok_or_else(|| Error::new(ErrorCode::HardwareUnavailable, "could not find arecord on PATH").hint("install alsa-utils"))?;
+    // the device is attached to -D, so a name that starts with '-' is not read as an option
+    let mut child = Command::new(arecord)
+        .args(["-q", &format!("-D{}", list[d.index].1), "-t", "raw", "-f", "S16_LE", "-c", "1", "-r", &RATE.to_string()])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

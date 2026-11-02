@@ -15,6 +15,7 @@ pub mod sidecar;
 pub mod tap;
 pub mod tools;
 pub mod transcode;
+pub mod untrusted;
 
 pub use job::{FilterCall, Job, Latency, OpusJob, OpusMode, OpusSignal, ProResProfile, StreamOpts};
 pub use plan::{plan, Plan};

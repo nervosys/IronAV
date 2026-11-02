@@ -71,6 +71,23 @@ pub struct SidecarConfig {
     /// The kind of stream it will ask for, if known: then it is not started for media without one.
     #[serde(default)]
     pub media: Option<SidecarMedia>,
+    /// Environment variables to set for the child, by name and value. The child gets only a minimal
+    /// environment of its own (see [`base_env`]) plus these.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// Names of variables to pass on from IronAV's own environment (a model cache directory, say).
+    #[serde(default)]
+    pub inherit_env: Vec<String>,
+}
+
+/// The variables every child gets from the parent: enough to find programs and a temporary directory,
+/// and nothing else (no cloud credentials, tokens or proxy settings).
+pub fn base_env() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &["PATH", "SystemRoot", "SYSTEMROOT", "windir", "TEMP", "TMP", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "PATHEXT", "COMSPEC"]
+    } else {
+        &["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER"]
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
@@ -312,6 +329,14 @@ struct Pipes {
 fn spawn(name: &str, cfg: &SidecarConfig, start: Option<&Value>, gen: u32, shared: &Shared, sup: &SyncSender<In>, events: &SyncSender<Event>) -> Result<(Running, Wants)> {
     let mut cmd = Command::new(&cfg.command[0]);
     cmd.args(&cfg.command[1..]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    // a minimal environment, not everything IronAV was started with
+    cmd.env_clear();
+    for k in base_env().iter().copied().chain(cfg.inherit_env.iter().map(String::as_str)) {
+        if let Some(v) = std::env::var_os(k) {
+            cmd.env(k, v);
+        }
+    }
+    cmd.envs(&cfg.env);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -358,7 +383,7 @@ fn spawn(name: &str, cfg: &SidecarConfig, start: Option<&Value>, gen: u32, share
         running.await_stderr(Duration::from_secs(2));
         let tail = running.tail();
         let e = Error::new(ErrorCode::Io, format!("sidecar '{name}' {msg}"));
-        if tail.is_empty() { e } else { e.hint(format!("its error output ended with: {tail}")) }
+        if tail.is_empty() { e } else { e.hint(crate::untrusted::quoted("its error output ended with", &tail)) }
     };
     let hello = match hello_rx.recv_timeout(Duration::from_secs_f64(cfg.start_seconds)) {
         Ok(Ok(v)) => v,
@@ -629,6 +654,7 @@ impl Stats {
         if !self.text.is_empty() {
             self.text.push(' ');
         }
+        let (s, _) = crate::untrusted::clean(s);
         for c in s.chars() {
             if self.text.len() + c.len_utf8() > MAX_TEXT {
                 break;
@@ -645,6 +671,7 @@ impl Stats {
         }
         if !self.text.is_empty() {
             m.insert("text".into(), json!(self.text));
+            m.insert("untrusted".into(), json!(true));
         }
         if self.dropped > 0 {
             m.insert("dropped_inputs".into(), json!(self.dropped));

@@ -1000,6 +1000,7 @@ impl Session {
     }
 
     fn log(&self, mut o: Observation, arrival: Option<Instant>) -> Result<()> {
+        crate::untrusted::observation(&mut o);
         let mut sh = lock(&self.shared);
         if let Some(p) = o.picture.take() {
             sh.thumbnails.push_back((o.t, p.0));
