@@ -9,6 +9,9 @@
 //! - `mute`: exits before its hello, complaining on stderr.
 //! - `slow SECONDS PIDFILE`: writes its process id to PIDFILE, then waits before its hello until the
 //!   file PIDFILE.go exists (at most SECONDS), then behaves as `echo`.
+//! - `hog PIDFILE`: writes its process id to PIDFILE, says hello, then allocates and touches memory
+//!   a megabyte at a time (up to a gigabyte) before it waits for its input. Under a memory limit it
+//!   is stopped by the allocation.
 
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
@@ -18,6 +21,10 @@ fn main() {
     let mode = args.first().map(String::as_str).unwrap_or("");
     let hello = match mode {
         "dtmf" => json!({ "audio": { "rate": 8000, "format": "s16", "chunk_seconds": 0.5 } }),
+        "hog" => {
+            let _ = std::fs::write(&args[1], std::process::id().to_string());
+            json!({ "audio": { "rate": 16000, "format": "s16", "chunk_seconds": 1.0 } })
+        }
         "slow" => {
             let _ = std::fs::write(&args[2], std::process::id().to_string());
             let go = format!("{}.go", args[2]);
@@ -36,7 +43,7 @@ fn main() {
             std::process::exit(2);
         }
         _ => {
-            eprintln!("usage: ironav-sidecar-example dtmf|echo|pictures|crash N MARKER|mute|slow SECONDS PIDFILE");
+            eprintln!("usage: ironav-sidecar-example dtmf|echo|pictures|crash N MARKER|mute|slow SECONDS PIDFILE|hog PIDFILE");
             std::process::exit(2);
         }
     };
@@ -55,6 +62,21 @@ fn main() {
         let _ = out.flush();
     };
     say(json!({ "op": "hello", "protocol": 1, "wants": hello }));
+    // what a `hog` touched is kept for the rest of the run (touched, so it is committed: a memory
+    // limit stops the process here)
+    let _held: Vec<Vec<u8>> = if mode == "hog" {
+        (0..1024)
+            .map(|_| {
+                let mut block = vec![0u8; 1 << 20];
+                for b in block.iter_mut().step_by(4096) {
+                    *b = 1;
+                }
+                block
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let mut dtmf = Dtmf::default();
     let mut chunks = 0u64;
     for line in std::io::stdin().lock().lines() {

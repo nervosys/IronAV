@@ -33,3 +33,11 @@ ironav-ontology.workspace = true
 ironav-analyze.workspace = true
 ironav-live.workspace = true
 ironav-player.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# sidecar resource limits: a job object per child (the same windows crate and version as ironav-live)
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+
+[target.'cfg(unix)'.dependencies]
+# sidecar resource limits: setrlimit before exec (the same libc as ironav-live)
+libc = "0.2"

@@ -23,6 +23,8 @@ Sidecars are defined by whoever runs IronAV, not by requests. `IRONAV_SIDECARS` 
 | `finish_seconds` | 120 | how long it may take to finish once the input has ended |
 | `hang_seconds` | 60 | a child that takes no input for this long while inputs are waiting is killed and restarted |
 | `media` | (none) | `"audio"` or `"video"`: what its hello will ask for. When given, the sidecar is not started at all for media with no stream of that kind, and a hello asking for the other kind is a failure. Without it, IronAV must start the program to learn what it wants |
+| `max_memory_mb` | (no limit) | the most memory the child may use, in whole MB (at most 1048576). See "Resource limits" below |
+| `max_cpu_seconds` | (no limit) | the most CPU time the child may use over its life, in seconds (at most a year). See "Resource limits" below |
 
 A request's sidecars start side by side, so a slow model load does not hold up the others.
 
@@ -33,6 +35,26 @@ kind it asks for (use `streams` to choose). A live session can also gain or lose
 (`stream_configure` with `add` or `remove`): it starts in the background and joins the first stream of its kind once it
 has said hello, so the media is never held up by a model loading, and a removed one gets `end` and its usual time to
 finish.
+
+### Resource limits
+
+`max_memory_mb` and `max_cpu_seconds` bound what a child can use. Neither is set by default, so an entry without them runs
+as it always has. Recommended for a CPU-only speech or detection model: `max_memory_mb` of 2048 to 8192. For a GPU runtime,
+leave `max_memory_mb` unset on Linux and macOS, because CUDA and large Python runtimes reserve far more address space than
+they use. For `max_cpu_seconds`, choose a few times the CPU a file of the expected length needs. A long-running live
+sidecar needs a value well above a day's CPU use, or none.
+
+- **Windows:** the child runs in a job object. `max_memory_mb` caps its committed memory and `max_cpu_seconds` its user-mode
+  CPU time. The job is assigned just after the child starts, so a grandchild started in that first instant is not limited.
+- **Linux and macOS:** the limits are `setrlimit` calls made before the program runs. `max_memory_mb` caps the address space
+  (`RLIMIT_AS`) and `max_cpu_seconds` the CPU time (`RLIMIT_CPU`). The memory limit therefore counts reserved address space,
+  not only memory in use.
+
+A child over a limit is stopped. IronAV treats that as a crash: it reports `analyzer_failed` and restarts the child with
+back-off, and the CPU time starts again from zero in the new child. If a limit cannot be applied (the job cannot be made, or
+`setrlimit` refuses), the child does not start and the error says why. Invalid values are refused when the list is read.
+Limits do not restrict what a child reads, writes or connects to; use the operating system's sandboxing, a cgroup or a
+container for that.
 
 ## Protocol (version 1)
 

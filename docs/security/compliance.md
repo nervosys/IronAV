@@ -156,7 +156,7 @@ update checks, crash upload, or files in the home directory. Test media in the r
   local process that swaps a path between the check and the open.
 - yt-dlp makes its own connections, outside the allow-list. It is refused in FIPS mode.
 - GPU drivers parse the bitstream for NVDEC. A driver bug can still crash the process.
-- Sidecars run as the IronAV user, with no CPU or memory limits. Use a job object, cgroup or container to limit them.
+- Sidecars run as the IronAV user. CPU and memory limits (`max_cpu_seconds`, `max_memory_mb`) are opt-in per sidecar and unset by default. They are not cgroups or containers: on Linux and macOS the memory limit caps address space, which can stop a GPU runtime. File, network and device access by sidecars is not limited.
 - The H.264 and VP9 concurrency primitives have not yet been run under Miri, loom or ThreadSanitizer.
 - The internals of IronSocketLayer, IronCrypto and IronPKI were not reviewed here.
 - The MD5 code (RFC 1321, for Digest) is in the default build, and refused only at run time when `IRONAV_FIPS=1` is set.

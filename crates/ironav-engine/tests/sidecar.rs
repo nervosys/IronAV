@@ -32,6 +32,7 @@ fn configure() -> &'static Path {
             "liar": { "command": [exe, "dtmf"], "media": "video" },
             "missing": { "command": ["ironav-no-such-sidecar-program"] },
             "slow": { "command": [exe, "slow", "20", dir.join("slow.pid").to_str().unwrap()] },
+            "hog": { "command": [exe, "hog", dir.join("hog.pid").to_str().unwrap()], "max_memory_mb": 64 },
         });
         let path = dir.join("sidecars.json");
         std::fs::write(&path, list.to_string()).unwrap();
@@ -217,6 +218,27 @@ fn a_sidecar_removed_while_starting_is_stopped_and_never_joins() {
     let failed = call_tool("stream_query", &json!({ "session": id, "kinds": ["analyzer_failed"] })).unwrap();
     assert_eq!(failed["matched"], 0, "a removal is not a failure: {failed}");
     let _ = call_tool("stream_close", &json!({ "session": id }));
+}
+
+/// A sidecar that touches a gigabyte, with a 64 MB memory limit, is stopped at the limit. (Only on
+/// Windows here: the limit is a job object's, and the test would be run there.) Without the limit
+/// the process would hold its gigabyte and still be alive when the test gives up.
+#[cfg(windows)]
+#[test]
+fn a_sidecar_over_its_memory_limit_is_stopped() {
+    let dir = configure();
+    let pidfile = dir.join("hog.pid");
+    let _ = std::fs::remove_file(&pidfile);
+    let cfg = ironav_engine::sidecar::configured().unwrap()["hog"].clone();
+    // it says hello, after writing its process id, and then allocates
+    let pending = ironav_engine::sidecar::Pending::start("hog", &cfg, false).expect("hog says hello");
+    let pid: u32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+    let t0 = std::time::Instant::now();
+    while alive(pid) {
+        assert!(t0.elapsed().as_secs() < 20, "the sidecar ran past its 64 MB limit");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    drop(pending);
 }
 
 /// Keys 1, 5 and # for 120 ms each, 120 ms apart, from 0.5 s, in 48 kHz stereo.

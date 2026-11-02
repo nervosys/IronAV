@@ -16,6 +16,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 ### Security
 
 - **Security (FIPS):** builds with the `fips` feature of `ironav-live` compile out the MD5 Digest code instead of only refusing it at run time; an MD5 challenge is still refused, and SHA-256 Digest is unchanged.
+- **Sidecar resource limits:** a sidecar entry may set `max_memory_mb` (the job object's committed memory on Windows, `RLIMIT_AS` on Linux and macOS) and `max_cpu_seconds` (the job's user-mode CPU time on Windows, `RLIMIT_CPU` on Linux and macOS). Both are unset by default, so nothing changes until an operator sets them. Invalid values are refused when the list is read, and a child whose limits cannot be applied is not started. This addresses the CWE-400 residual risk in `docs/security/compliance.md`, section 8. See "Resource limits" in `docs/sidecars.md`.
 
 ## [0.1.0] - 2026-11-02
 

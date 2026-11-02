@@ -17,6 +17,7 @@
 //! dropped while it is behind. A child that crashes, or takes nothing for `hang_seconds`, is
 //! restarted with back-off.
 
+use crate::limits;
 use ironav_analyze::{intern, kind_info, Analyzer, Input, Observation, VoiceActivity, ANALYZERS};
 use ironav_core::{AudioFrame, Error, ErrorCode, Filter, Frame, MediaType, Result, StreamInfo, StreamParams, VideoFrame};
 use serde::Deserialize;
@@ -78,6 +79,25 @@ pub struct SidecarConfig {
     /// Names of variables to pass on from IronAV's own environment (a model cache directory, say).
     #[serde(default)]
     pub inherit_env: Vec<String>,
+    /// The most memory the child may use, in whole MB (at most 1 TiB). Unset: no limit. On Windows
+    /// this is the child's committed memory (a job object); on Unix its address space (`RLIMIT_AS`),
+    /// which is larger than the memory in use, so GPU runtimes need a generous value. A child over
+    /// the limit is stopped, and restarted like any other crash. Recommended: 2048 to 8192 for a
+    /// CPU-only model. See `docs/sidecars.md`.
+    #[serde(default)]
+    pub max_memory_mb: Option<f64>,
+    /// The most CPU time the child may use over its life, in seconds (at most a year). Unset: no
+    /// limit. A child over the limit is stopped and restarted, so it starts again from zero. A
+    /// long-running live sidecar needs a value well above a day's CPU use. See `docs/sidecars.md`.
+    #[serde(default)]
+    pub max_cpu_seconds: Option<f64>,
+}
+
+impl SidecarConfig {
+    /// The resource limits the operator set for this child.
+    pub fn limits(&self) -> limits::Limits {
+        limits::Limits { memory_mb: self.max_memory_mb, cpu_seconds: self.max_cpu_seconds }
+    }
 }
 
 /// The variables every child gets from the parent: enough to find programs and a temporary directory,
@@ -136,6 +156,13 @@ pub fn load(path: &str) -> Result<BTreeMap<String, SidecarConfig>> {
             if !(v > 0.0 && v <= 86400.0) {
                 return Err(Error::invalid_arg(format!("{CONFIG_VAR}: sidecar '{name}': {field} must be above 0 and at most a day")));
             }
+        }
+        if c.max_memory_mb.is_some_and(|mb| !limits::valid_memory_mb(mb)) {
+            return Err(Error::invalid_arg(format!("{CONFIG_VAR}: sidecar '{name}': max_memory_mb must be a whole number of MB, from 1 to {}", limits::MAX_MEMORY_MB as u64))
+                .hint("for example \"max_memory_mb\": 4096"));
+        }
+        if c.max_cpu_seconds.is_some_and(|s| !limits::valid_cpu_seconds(s)) {
+            return Err(Error::invalid_arg(format!("{CONFIG_VAR}: sidecar '{name}': max_cpu_seconds must be above 0 and at most a year")));
         }
     }
     Ok(list)
@@ -298,6 +325,8 @@ struct Running {
     /// Disconnects when the child's error output has ended.
     eof: Receiver<()>,
     gen: u32,
+    /// Keeps the child's resource limits in force while it runs (see [`limits`]).
+    _limits: limits::Guard,
 }
 
 impl Running {
@@ -343,7 +372,17 @@ fn spawn(name: &str, cfg: &SidecarConfig, start: Option<&Value>, gen: u32, share
         // CREATE_NO_WINDOW: no console window for a child of a windowless process
         cmd.creation_flags(0x0800_0000);
     }
+    let lim = cfg.limits();
+    limits::before_spawn(&mut cmd, &lim);
     let mut child = cmd.spawn().map_err(|e| Error::new(ErrorCode::Io, format!("sidecar '{name}': cannot start {}: {e}", cfg.command[0])))?;
+    let guard = match limits::after_spawn(&child, &lim) {
+        Ok(g) => g,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Error::new(ErrorCode::Io, format!("sidecar '{name}': cannot apply its resource limits: {e}")));
+        }
+    };
     let stdin = child.stdin.take();
     let stdout = child.stdout.take().unwrap();
     let stderr_pipe = child.stderr.take().unwrap();
@@ -376,7 +415,7 @@ fn spawn(name: &str, cfg: &SidecarConfig, start: Option<&Value>, gen: u32, share
     let (sup, events) = (sup.clone(), events.clone());
     std::thread::spawn(move || read_child(stdout, hello_tx, events, sup, gen));
     *shared.child.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
-    let mut running = Running { stdin, stderr, eof, gen };
+    let mut running = Running { stdin, stderr, eof, gen, _limits: guard };
     let fail = |running: &Running, msg: String| {
         shared.kill();
         // its last words are waited for, not timed: they are all in once its error output ends
