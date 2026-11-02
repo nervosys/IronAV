@@ -539,6 +539,9 @@ impl<'a> Vop<'a> {
                 if !self.br.bit() {
                     // escape 1: the level is raised by the largest level the table has for the run
                     let s = rl.vlc.read(&mut self.br).ok_or_else(|| self.vlc_err())?;
+                    if s == rl.escape {
+                        return Err(bad("escape code inside an escape"));
+                    }
                     let l = (s >= rl.last_from) as usize;
                     run = rl.run[s] as i32;
                     let v = rl.level[s] as i32 + rl.max_level[l][run as usize] as i32;
@@ -547,6 +550,9 @@ impl<'a> Vop<'a> {
                 } else if !self.br.bit() {
                     // escape 2: the run is raised by the largest run the table has for the level
                     let s = rl.vlc.read(&mut self.br).ok_or_else(|| self.vlc_err())?;
+                    if s == rl.escape {
+                        return Err(bad("escape code inside an escape"));
+                    }
                     let l = (s >= rl.last_from) as usize;
                     let lv = rl.level[s] as usize;
                     run = rl.run[s] as i32 + rl.max_run[l][lv] as i32 + 1;
