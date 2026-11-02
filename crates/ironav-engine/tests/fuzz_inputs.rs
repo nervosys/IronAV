@@ -463,3 +463,11 @@ fn y4m_picture_past_the_size_limit_is_refused_at_open() {
     let err = ironav_formats::open_demuxer(&path).err().expect("refused");
     assert!(err.to_string().contains("larger than the supported size"), "{err}");
 }
+
+/// A WAV whose fmt chunk claims 4 GiB is refused without reading or allocating that much.
+#[test]
+fn wav_fmt_chunk_past_the_size_limit_is_refused_at_open() {
+    let path = regression_file("wav-huge-fmt.wav");
+    let err = ironav_formats::open_demuxer(&path).err().expect("refused");
+    assert!(err.to_string().contains("implausibly large"), "{err}");
+}
