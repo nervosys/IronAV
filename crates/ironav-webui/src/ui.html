@@ -58,7 +58,7 @@ footer{padding:8px 16px;color:var(--mute);font-size:12px;text-align:center}
   <section id="queue"><h2>Queue</h2><div class="note">Empty.</div></section>
 </main>
 <footer>IronAV runs locally; this page talks only to the process that served it.</footer>
-<script>
+<script nonce="__IRONAV_NONCE__">
 const TOKEN='__IRONAV_TOKEN__';
 const api=async(p,b)=>(await fetch(p,{method:b===undefined?'GET':'POST',headers:{'X-IronAV-Token':TOKEN,'Content-Type':'application/json'},body:b===undefined?undefined:JSON.stringify(b)})).json();
 const tool=(n,a)=>api('/api/tool/'+n,a||{});

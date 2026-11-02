@@ -44,11 +44,13 @@ struct State {
     next_job: AtomicU64,
     jobs: Arc<Mutex<HashMap<u64, Value>>>,
     running: Arc<AtomicUsize>,
+    /// The page's one allowed script, so that the page's CSP needs no 'unsafe-inline'.
+    nonce: String,
 }
 
 impl State {
     fn new(port: u16) -> Self {
-        State { token: random_token(), port, next_job: AtomicU64::new(1), jobs: Arc::new(Mutex::new(HashMap::new())), running: Arc::new(AtomicUsize::new(0)) }
+        State { token: random_token(), port, next_job: AtomicU64::new(1), jobs: Arc::new(Mutex::new(HashMap::new())), running: Arc::new(AtomicUsize::new(0)), nonce: random_hex::<16>() }
     }
 }
 
@@ -277,12 +279,20 @@ fn body_len(req: &Request) -> Option<usize> {
     (len <= MAX_BODY).then_some(len)
 }
 
+/// The Content-Security-Policy with `script_src` for scripts; nothing else may load or run.
+fn csp(script_src: &str) -> String {
+    format!("default-src 'none'; {script_src}; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'")
+}
+
 fn respond(stream: &mut TcpStream, status: &str, ctype: &str, body: &[u8]) -> std::io::Result<()> {
+    respond_csp(stream, status, ctype, body, &csp("script-src 'none'"))
+}
+
+fn respond_csp(stream: &mut TcpStream, status: &str, ctype: &str, body: &[u8], policy: &str) -> std::io::Result<()> {
     write!(
         stream,
         "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\
-         X-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\n\
-         Content-Security-Policy: default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'\r\n\r\n",
+         X-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: {policy}\r\n\r\n",
         body.len()
     )?;
     stream.write_all(body)
@@ -318,8 +328,8 @@ fn handle(mut stream: TcpStream, st: &State) -> std::io::Result<()> {
         if !req.query.get("t").is_some_and(|t| token_eq(t, &st.token)) {
             return respond(&mut stream, "403 Forbidden", "text/plain", b"missing or wrong token; use the URL printed by `ironav gui`");
         }
-        let page = INDEX_HTML.replace("__IRONAV_TOKEN__", &st.token);
-        return respond(&mut stream, "200 OK", "text/html; charset=utf-8", page.as_bytes());
+        let page = INDEX_HTML.replace("__IRONAV_TOKEN__", &st.token).replace("__IRONAV_NONCE__", &st.nonce);
+        return respond_csp(&mut stream, "200 OK", "text/html; charset=utf-8", page.as_bytes(), &csp(&format!("script-src 'nonce-{}'", st.nonce)));
     }
 
     if !req.headers.get("x-ironav-token").is_some_and(|t| token_eq(t, &st.token)) {
@@ -512,13 +522,13 @@ mod tests {
         drop(idle);
     }
 
-    fn test_server() -> (u16, String) {
+    fn test_server() -> (u16, String, String) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let state = Arc::new(State::new(port));
-        let token = state.token.clone();
+        let (token, nonce) = (state.token.clone(), state.nonce.clone());
         std::thread::spawn(move || accept_loop(listener, state));
-        (port, token)
+        (port, token, nonce)
     }
 
     /// Sends `request` and returns whatever comes back before the server closes or the read times out.
@@ -533,7 +543,7 @@ mod tests {
 
     #[test]
     fn headers_are_checked_before_the_body_is_read() {
-        let (port, token) = test_server();
+        let (port, token, _) = test_server();
         // a body of 1000 bytes is promised and never sent: a refused head must not wait for it
         let wrong_host = raw_request(port, "POST /api/jobs HTTP/1.1\r\nHost: evil.example\r\nContent-Length: 1000\r\n\r\n");
         assert!(wrong_host.starts_with("HTTP/1.1 403"), "{wrong_host}");
@@ -546,12 +556,32 @@ mod tests {
 
     #[test]
     fn a_foreign_origin_is_refused_even_with_the_token() {
-        let (port, token) = test_server();
+        let (port, token, _) = test_server();
         let with = |origin: &str| format!("GET /api/fs HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{origin}X-IronAV-Token: {token}\r\n\r\n");
         assert!(raw_request(port, &with("")).starts_with("HTTP/1.1 200"));
         assert!(raw_request(port, &with(&format!("Origin: http://127.0.0.1:{port}\r\n"))).starts_with("HTTP/1.1 200"));
         assert!(raw_request(port, &with("Origin: http://evil.example\r\n")).starts_with("HTTP/1.1 403"));
         assert!(raw_request(port, &with("Origin: null\r\n")).starts_with("HTTP/1.1 403"));
+    }
+
+    #[test]
+    fn the_page_runs_only_its_own_script() {
+        let (port, token, nonce) = test_server();
+        let answer = raw_request(port, &format!("GET /?t={token} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"));
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+        assert!(answer.contains(&format!("Content-Security-Policy: default-src 'none'; script-src 'nonce-{nonce}';")), "{answer}");
+        assert!(!answer.contains("script-src 'unsafe-inline'"), "{answer}");
+        assert!(answer.contains(&format!("<script nonce=\"{nonce}\">")), "the page's script carries the nonce");
+        assert!(!answer.contains("__IRONAV_NONCE__") && !answer.contains("__IRONAV_TOKEN__"));
+    }
+
+    #[test]
+    fn the_page_builds_its_dom_without_html_strings() {
+        // file names, stream names and error text come from media and the network: none may be parsed as HTML
+        for sink in ["innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "createContextualFragment"] {
+            assert!(!INDEX_HTML.contains(sink), "ui.html uses {sink}");
+        }
+        assert!(!INDEX_HTML.contains(" onclick=\"") && !INDEX_HTML.contains(" onload=\""), "no inline event handlers");
     }
 
     #[test]
