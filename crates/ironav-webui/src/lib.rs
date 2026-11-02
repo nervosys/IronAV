@@ -44,6 +44,14 @@ fn random_token() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Whether two tokens are equal, in a time that depends only on their lengths (which are not secret),
+/// not on where they first differ: a comparison that stops early would let a caller learn the token a
+/// byte at a time.
+fn token_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 pub fn serve(opts: Options) -> Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", opts.port))?;
     let port = listener.local_addr()?.port();
@@ -186,14 +194,14 @@ fn handle(mut stream: TcpStream, st: &State) -> std::io::Result<()> {
     }
 
     if req.method == "GET" && req.path == "/" {
-        if req.query.get("t") != Some(&st.token) {
+        if !req.query.get("t").is_some_and(|t| token_eq(t, &st.token)) {
             return respond(&mut stream, "403 Forbidden", "text/plain", b"missing or wrong token; use the URL printed by `ironav gui`");
         }
         let page = INDEX_HTML.replace("__IRONAV_TOKEN__", &st.token);
         return respond(&mut stream, "200 OK", "text/html; charset=utf-8", page.as_bytes());
     }
 
-    if req.headers.get("x-ironav-token") != Some(&st.token) {
+    if !req.headers.get("x-ironav-token").is_some_and(|t| token_eq(t, &st.token)) {
         return respond(&mut stream, "403 Forbidden", "application/json", &envelope(Err(Error::new(ErrorCode::InvalidArgument, "bad token"))));
     }
     let body: Value = if req.body.is_empty() { json!({}) } else { serde_json::from_slice(&req.body).unwrap_or(Value::Null) };
@@ -276,5 +284,22 @@ mod tests {
             assert!(t.bytes().all(|c| c.is_ascii_hexdigit()), "{t}");
         }
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn token_comparison_is_exact() {
+        let t = random_token();
+        assert!(token_eq(&t, &t.clone()));
+        assert!(token_eq("", ""));
+        // one byte wrong at the start, at the end, or a different length
+        let mut first = t.clone().into_bytes();
+        first[0] ^= 1;
+        let mut last = t.clone().into_bytes();
+        last[31] ^= 1;
+        assert!(!token_eq(&t, std::str::from_utf8(&first).unwrap()));
+        assert!(!token_eq(&t, std::str::from_utf8(&last).unwrap()));
+        assert!(!token_eq(&t, &t[..31]));
+        assert!(!token_eq(&t, &format!("{t}0")));
+        assert!(!token_eq("", &t));
     }
 }
