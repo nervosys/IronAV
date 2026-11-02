@@ -80,6 +80,7 @@ fn read_job_arg(a: &mut Args) -> Result<Value> {
         std::io::stdin().read_to_string(&mut s)?;
         s
     } else {
+        ironav_engine::policy::check_read(&src)?;
         std::fs::read_to_string(&src)?
     };
     Ok(serde_json::from_str(&text)?)

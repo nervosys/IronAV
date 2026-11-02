@@ -8,7 +8,7 @@ pub mod rational;
 pub mod traits;
 
 pub use error::{Error, ErrorCode, Result};
-pub use fsutil::replace_file;
+pub use fsutil::{create_new, replace_file};
 pub use media::*;
 pub use rational::Rational;
 pub use traits::*;

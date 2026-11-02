@@ -308,6 +308,7 @@ pub fn open(args: &OpenArgs) -> Result<Arc<Session>> {
 pub fn open_with_taps(args: &OpenArgs, taps: Vec<TapConfig>) -> Result<(Arc<Session>, Vec<Tap>)> {
     let (taps, feeders): (Vec<Tap>, Vec<_>) = taps.into_iter().map(crate::tap::tap).collect::<Result<Vec<_>>>()?.into_iter().unzip();
     let url = SourceUrl::parse(&args.source)?;
+    crate::policy::check_source(&url)?;
     if args.keyframe_jpegs > MAX_KEYFRAME_JPEGS {
         return Err(Error::invalid_arg(format!("keyframe_jpegs is at most {MAX_KEYFRAME_JPEGS}")));
     }
@@ -426,7 +427,8 @@ pub fn open_with_taps(args: &OpenArgs, taps: Vec<TapConfig>) -> Result<(Arc<Sess
         .spawn(move || {
             let mut rec = record.map(Recorder::new);
             let mut tc = transcode.map(crate::transcode::Transcoder::new);
-            let r = worker.run(source, &opts, &stream_opts, realtime, &mut rec, &mut tc);
+            // a panic ends this session with an error; it must not skip the closing steps below
+            let r = crate::tools::contain("the live session", || worker.run(source, &opts, &stream_opts, realtime, &mut rec, &mut tc));
             // the transcoder drains its encoder and finishes its output
             if let Some(tc) = tc.as_mut() {
                 tc.finish();
@@ -1159,6 +1161,7 @@ impl Session {
     /// Writes the retained packets from the keyframe at or before `from` up to `to` into `output`,
     /// without re-encoding.
     pub fn clip(&self, from: f64, to: f64, output: &str, format: Option<&str>, overwrite: bool) -> Result<Value> {
+        crate::policy::check_write(output)?;
         if to <= from {
             return Err(Error::invalid_arg("'to' must be after 'from'"));
         }

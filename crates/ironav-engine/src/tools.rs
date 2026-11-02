@@ -53,11 +53,79 @@ impl Tool {
     pub fn call(&self, args: &Value) -> Result<Value> {
         self.call_with(args, &Ctx::default())
     }
+    /// Runs the tool. A panic inside it (a decoder meeting hostile input, say) comes back as an
+    /// `internal` error naming the tool and the panic's message, so one bad file cannot take down
+    /// a server that holds other sessions. The state a panicking call leaves behind is its own:
+    /// the shared registries lock through poison-tolerant guards.
     pub fn call_with(&self, args: &Value, ctx: &Ctx) -> Result<Value> {
-        match self.handler {
+        crate::policy::current().check_call(self.name, args)?;
+        contain(self.name, || match self.handler {
             Handler::Plain(h) => h(args),
             Handler::WithCtx(h) => h(args, ctx),
+        })
+    }
+
+    /// Can it overwrite or delete what is there? (MCP `destructiveHint`.)
+    pub fn destructive(&self) -> bool {
+        matches!(self.name, "run" | "analyze" | "stream_open" | "stream_clip" | "stream_configure")
+    }
+
+    /// Does it reach out to the network or to other machines? (MCP `openWorldHint`.)
+    pub fn open_world(&self) -> bool {
+        matches!(self.name, "onvif_discover" | "onvif_profiles" | "stream_open")
+    }
+}
+
+/// Runs `f`, turning a panic into an `internal` error.
+pub fn contain<T>(what: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(r) => r,
+        Err(p) => Err(panic_error(what, p.as_ref())),
+    }
+}
+
+pub fn panic_error(what: &str, p: &(dyn std::any::Any + Send)) -> Error {
+    let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| "(no message)".into());
+    let msg: String = msg.chars().filter(|c| !c.is_control()).take(300).collect();
+    Error::new(ErrorCode::Internal, format!("{what} panicked: {msg}"))
+        .hint("this is a bug in IronAV, probably triggered by the input; the server is still running. Try another input, and report this one")
+}
+
+#[cfg(test)]
+mod containment_tests {
+    use super::*;
+
+    #[test]
+    fn a_panicking_tool_is_an_internal_error_and_the_next_call_works() {
+        let boom = Tool {
+            name: "boom",
+            description: "",
+            cli: "",
+            input_schema: json!({}),
+            read_only: true,
+            handler: Handler::Plain(|a| if a["panic"] == "str" { panic!("decoder fell over at 0x{:x}", 255) } else { std::panic::panic_any(7u8) }),
+        };
+        let e = boom.call(&json!({ "panic": "str" })).unwrap_err();
+        assert_eq!(e.code, ErrorCode::Internal);
+        assert!(e.message.contains("boom panicked: decoder fell over at 0xff"), "{}", e.message);
+        let e = boom.call(&json!({ "panic": "other" })).unwrap_err();
+        assert_eq!(e.code, ErrorCode::Internal);
+        assert!(e.message.contains("(no message)"));
+        // the process, and the registry, carry on
+        assert!(call_tool("ontology_search", &json!({ "query": "h264" })).is_ok());
+        assert_eq!(contain("x", || -> Result<()> { Err(Error::invalid_arg("plain")) }).unwrap_err().code, ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn annotations_tell_the_truth() {
+        let t = |n: &str| tools().iter().find(|t| t.name == n).unwrap();
+        for n in ["run", "stream_clip", "stream_open", "analyze", "stream_configure"] {
+            assert!(!t(n).read_only && t(n).destructive(), "{n}");
         }
+        for n in ["probe", "plan", "stream_events", "ontology_search", "capabilities"] {
+            assert!(t(n).read_only && !t(n).destructive(), "{n}");
+        }
+        assert!(t("stream_open").open_world() && t("onvif_discover").open_world() && !t("run").open_world());
     }
 }
 
@@ -203,6 +271,7 @@ fn h_capabilities(_: &Value) -> Result<Value> {
 
 fn h_probe(args: &Value) -> Result<Value> {
     let path = need_str(args, "path")?;
+    crate::policy::check_read(path)?;
     let d = open_demuxer(Path::new(path))?;
     let size = std::fs::metadata(path).map(|m| m.len()).ok();
     let duration = d.streams().iter().filter_map(|s| s.duration_secs()).fold(None, |a: Option<f64>, x| Some(a.map_or(x, |a| a.max(x))));
@@ -532,7 +601,7 @@ pub fn tools() -> &'static [Tool] {
                 description: "Start watching a live source (a socket, a pipe, a growing file, or a file played as if live). It is read, demuxed and analyzed on its own thread as it arrives; follow it with stream_events. Readable as it arrives: MPEG-TS, Matroska/WebM (as MediaRecorder or OBS send it), fragmented MP4 (CMAF), Y4M, WAV, ADTS AAC, MP3, Ogg (Opus, Vorbis, FLAC; internet radio) and raw H.264/HEVC.",
                 cli: "ironav watch <source> [--analyzers a,b] [--sidecars a,b] [--level L] [--format F] [--fps N] [--pace realtime]",
                 input_schema: stream_open_schema(),
-                read_only: true,
+                read_only: false,
                 handler: Handler::Plain(h_stream_open),
             },
             Tool {

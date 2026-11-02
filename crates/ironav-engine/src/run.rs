@@ -103,6 +103,7 @@ pub fn run(job: &Job, on_progress: &mut dyn FnMut(&Progress)) -> Result<Report> 
 /// [`run`], stopping with a `cancelled` error (and no output) once `cancel` is set.
 pub fn run_with(job: &Job, on_progress: &mut dyn FnMut(&Progress), cancel: Option<&std::sync::atomic::AtomicBool>) -> Result<Report> {
     let t0 = Instant::now();
+    crate::policy::check_write(&job.output)?;
     let plan = plan(job)?;
     let demuxes = std::iter::once(&job.input).chain(&job.extra_inputs).map(|p| open_demuxer(Path::new(p))).collect::<Result<Vec<_>>>()?;
     let partial = format!("{}.partial", job.output);
@@ -282,10 +283,11 @@ fn execute(
             let hw_dec = st.hardware.iter().find(|h| h.direction == Direction::Decode).and_then(|h| h.chosen);
             let decoder = match hw_dec {
                 Some(backend) => {
+                    crate::policy::current().check_decode(src)?;
                     hw_dec_name = Some(backend.name());
                     new_video_decoder(backend, src.codec, &src.params, &src.extradata)?
                 }
-                None => ironav_codec::new_decoder_for(src)?,
+                None => crate::policy::new_decoder_for(src)?,
             };
             (Some(decoder), Some(encoder), fs)
         } else {

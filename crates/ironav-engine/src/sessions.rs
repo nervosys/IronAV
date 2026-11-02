@@ -30,6 +30,7 @@ fn get(args: &Value) -> Result<Arc<Player>> {
 
 pub fn open(args: &Value) -> Result<Value> {
     let path = args.get("path").and_then(Value::as_str).ok_or_else(|| Error::invalid_arg("missing \"path\""))?;
+    crate::policy::check_read(path)?;
     let mut opts = OpenOptions::default();
     // Reuse the options' own serde shape so the schema and the behaviour cannot drift.
     let mut o = serde_json::Map::new();

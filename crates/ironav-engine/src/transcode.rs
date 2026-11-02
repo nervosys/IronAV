@@ -225,7 +225,7 @@ impl Work {
     fn run(mut self, rx: Receiver<(Packet, bool)>) {
         let info = &self.streams[self.video];
         // live: each picture as soon as it can be shown
-        match ironav_codec::new_decoder_with(info, &ironav_codec::DecoderOptions { low_delay: true }) {
+        match crate::policy::new_decoder_with(info, &ironav_codec::DecoderOptions { low_delay: true }) {
             Ok(d) => self.decoder = Some(d),
             Err(e) => self.error = Some(e),
         }

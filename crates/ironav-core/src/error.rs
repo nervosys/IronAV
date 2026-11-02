@@ -18,11 +18,14 @@ pub enum ErrorCode {
     Cancelled,
     /// A limit on work running at once was reached; retry after something finishes.
     Busy,
+    /// The operator's settings forbid this: a path outside IRONAV_ROOTS, read-only mode, a device or
+    /// a browser's cookies that were not enabled.
+    PermissionDenied,
     Internal,
 }
 
 impl ErrorCode {
-    pub const ALL: [ErrorCode; 12] = [
+    pub const ALL: [ErrorCode; 13] = [
         Self::Io,
         Self::InvalidInput,
         Self::InvalidArgument,
@@ -34,6 +37,7 @@ impl ErrorCode {
         Self::NotFound,
         Self::Cancelled,
         Self::Busy,
+        Self::PermissionDenied,
         Self::Internal,
     ];
 
@@ -49,6 +53,7 @@ impl ErrorCode {
             ErrorCode::HardwareUnavailable => 8,
             ErrorCode::Cancelled => 130,
             ErrorCode::Busy => 75,
+            ErrorCode::PermissionDenied => 77,
             ErrorCode::Internal => 70,
         }
     }

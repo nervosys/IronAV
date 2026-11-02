@@ -150,6 +150,10 @@ fn av1_only(name: &str, media: MediaType, to: CodecId) -> Error {
 }
 
 pub fn plan(job: &Job) -> Result<Plan> {
+    for p in std::iter::once(&job.input).chain(&job.extra_inputs) {
+        crate::policy::check_read(p)?;
+    }
+    crate::policy::check_write_scope(&job.output)?;
     let out_path = Path::new(&job.output);
     let in_paths: Vec<&Path> = std::iter::once(job.input.as_str()).chain(job.extra_inputs.iter().map(String::as_str)).map(Path::new).collect();
     let demuxes = in_paths.iter().map(|p| open_demuxer(p)).collect::<Result<Vec<_>>>()?;
@@ -455,14 +459,14 @@ pub fn plan(job: &Job) -> Result<Plan> {
             let hw_capable = provider_codecs(Direction::Decode).contains(&s.codec);
             let hw_first = soft && ironav_codec::prefers_hardware_decode(s.codec, &s.params) && !matches!(policy, HwPolicy::Off | HwPolicy::Require(_) | HwPolicy::RequireAny);
             if (soft && !hw_first) || !hw_capable {
-                ironav_codec::new_decoder_for(s)?;
+                crate::policy::new_decoder_for(s)?;
             } else if soft && !matches!(policy, HwPolicy::Require(_) | HwPolicy::RequireAny) && select(s.codec, Direction::Decode, policy, &probes).is_err() {
                 // the GPU rejects this stream outright (size, profile); the software decoder takes it
-                ironav_codec::new_decoder_for(s)?;
+                crate::policy::new_decoder_for(s)?;
             } else {
                 let sel = select(s.codec, Direction::Decode, policy, &probes)?;
                 if sel.chosen.is_none() && soft {
-                    ironav_codec::new_decoder_for(s)?;
+                    crate::policy::new_decoder_for(s)?;
                 } else if sel.chosen.is_none() {
                     let why = sel.considered.iter().map(|c| format!("{}: {}", c.backend.name(), c.reason)).collect::<Vec<_>>().join("; ");
                     let why = if why.is_empty() { String::new() } else { format!(" ({why})") };
@@ -482,7 +486,7 @@ pub fn plan(job: &Job) -> Result<Plan> {
                     if let Err(m) = ironav_hwaccel::nvdec::accepts(&s.params) {
                         // the GPU cannot take this stream; the software decoder can, unless hardware was required
                         if soft && !matches!(policy, HwPolicy::Require(_) | HwPolicy::RequireAny) {
-                            ironav_codec::new_decoder_for(s)?;
+                            crate::policy::new_decoder_for(s)?;
                             use_gpu = false;
                         } else {
                             return Err(Error::new(ErrorCode::UnsupportedCodec, m).hint("only 8-bit and 10-bit 4:2:0 video can be decoded on the GPU (10-bit H.264 also needs a GPU whose NVDEC supports it)"));

@@ -22,6 +22,21 @@ pub fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
     std::fs::rename(from, to)
 }
 
+/// Creates `path` for writing and fails if anything is there already, a file or a symbolic link
+/// (`O_EXCL`, `CREATE_NEW`), so a temporary output name cannot be turned into a way to write
+/// through a link someone else put there. A name left behind by a crashed run is refused with
+/// a hint to remove it.
+pub fn create_new(path: &Path) -> crate::Result<std::fs::File> {
+    std::fs::OpenOptions::new().write(true).create_new(true).open(path).map_err(|e| {
+        if e.kind() == io::ErrorKind::AlreadyExists {
+            crate::Error::new(crate::ErrorCode::OutputExists, format!("'{}' exists already", path.display()))
+                .hint("it is the temporary name of an output and was left by an earlier run that did not finish (or put there by someone else); remove it and try again")
+        } else {
+            e.into()
+        }
+    })
+}
+
 /// ERROR_ACCESS_DENIED (5), ERROR_SHARING_VIOLATION (32) and ERROR_LOCK_VIOLATION (33).
 fn is_sharing(e: &io::Error) -> bool {
     matches!(e.raw_os_error(), Some(5 | 32 | 33)) || e.kind() == io::ErrorKind::PermissionDenied

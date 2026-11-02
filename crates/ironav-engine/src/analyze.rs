@@ -192,7 +192,7 @@ fn start_decoder(s: &mut Stream, hwaccel: &str, live: bool) -> std::result::Resu
     let made = if s.info.params.media_type() == MediaType::Video {
         ironav_player::open_video_decoder_with(&s.info, hwaccel, &ironav_codec::DecoderOptions { low_delay: live || s.keyframes_only })
     } else {
-        ironav_codec::new_decoder_for(&s.info).map(|d| (d, "software"))
+        crate::policy::new_decoder_for(&s.info).map(|d| (d, "software"))
     };
     match made {
         Ok((dec, n)) => {
@@ -312,7 +312,7 @@ impl Analysis {
                     // in order of decoding are in order of showing
                     ironav_player::open_video_decoder_with(info, &opts.hwaccel, &ironav_codec::DecoderOptions { low_delay: live || opts.keyframes_only })
                 } else {
-                    ironav_codec::new_decoder_for(info).map(|d| (d, "software"))
+                    crate::policy::new_decoder_for(info).map(|d| (d, "software"))
                 };
                 match made {
                     Ok((dec, name)) => (decoder, decoder_name) = (Some(dec), Some(name)),
@@ -915,6 +915,10 @@ impl Log<'_> {
 /// `on_observation` as it is made, so a caller can stream them.
 pub fn analyze(job: &AnalyzeJob, ctx: &Ctx, on_observation: &mut dyn FnMut(&Observation)) -> Result<Value> {
     let t0 = Instant::now();
+    crate::policy::check_read(&job.input)?;
+    if let Some(dir) = &job.thumbnail_dir {
+        crate::policy::check_write(dir)?;
+    }
     let mut d = open_demuxer(Path::new(&job.input))?;
     let infos = d.streams().to_vec();
     let from = job.from.unwrap_or(0.0).max(0.0);

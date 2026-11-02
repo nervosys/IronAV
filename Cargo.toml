@@ -51,4 +51,5 @@ type_complexity = "allow"
 [profile.release]
 lto = "thin"
 codegen-units = 1
-panic = "abort"
+# Unwinding, not abort: the long-lived front ends (mcp, web UI, live sessions) catch a panic at the
+# tool boundary and report it as an `internal` error instead of dying with every other session.

@@ -35,6 +35,7 @@ impl RecordOptions {
 
     /// Checks what can be checked before any media arrives.
     pub fn check(&self) -> Result<()> {
+        crate::policy::check_write(&self.path)?;
         let path = Path::new(&self.path);
         if path.file_stem().is_none_or(|s| s.is_empty()) {
             return Err(Error::invalid_arg(format!("'{}' is not a file path", self.path)));
