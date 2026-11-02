@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -37,11 +37,16 @@ struct State {
     jobs: Arc<Mutex<HashMap<u64, Value>>>,
 }
 
-/// 128 random bits, hex encoded: the operating system's entropy through IronCrypto's SP 800-90A DRBG.
-/// If the operating system cannot supply entropy the process stops rather than hand out a guessable token.
-fn random_token() -> String {
-    let bytes: [u8; 16] = ic_drbg::Rng::from_os().and_then(|mut rng| rng.random_array()).expect("the operating system's entropy source failed; no launch token can be made safely");
+/// `N` random bytes, hex encoded: the operating system's entropy through IronCrypto's SP 800-90A DRBG.
+/// If the operating system cannot supply entropy the process stops rather than hand out a guessable value.
+fn random_hex<const N: usize>() -> String {
+    let bytes: [u8; N] = ic_drbg::Rng::from_os().and_then(|mut rng| rng.random_array()).expect("the operating system's entropy source failed; no random value can be made safely");
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The launch token: 128 random bits.
+fn random_token() -> String {
+    random_hex::<16>()
 }
 
 /// Whether two tokens are equal, in a time that depends only on their lengths (which are not secret),
@@ -59,7 +64,9 @@ pub fn serve(opts: Options) -> Result<()> {
     let url = format!("http://127.0.0.1:{port}/?t={}", state.token);
     println!("{}", json!({ "ok": true, "result": { "gui_url": url, "note": "serving on loopback only; press Ctrl+C to stop" } }));
     if opts.open_browser {
-        open_url(&url);
+        if let Err(e) = open_launch_page(&url) {
+            eprintln!("could not open a browser ({e}); open the gui_url printed above");
+        }
     }
     for conn in listener.incoming() {
         let Ok(stream) = conn else { continue };
@@ -71,14 +78,76 @@ pub fn serve(opts: Options) -> Result<()> {
     Ok(())
 }
 
-fn open_url(url: &str) {
-    let _ = if cfg!(target_os = "windows") {
-        std::process::Command::new("rundll32").args(["url.dll,FileProtocolHandler", url]).spawn()
-    } else if cfg!(target_os = "macos") {
-        std::process::Command::new("open").arg(url).spawn()
+/// Opens the launch URL in the browser without putting it on a command line, where other users can read
+/// it in the process list. A small page that redirects to the URL is written into a fresh directory under
+/// the OS temp dir, and the page's path is opened. The directory is removed a minute later, when the
+/// browser has read the page.
+fn open_launch_page(url: &str) -> std::io::Result<()> {
+    let dir = stage_launch_page(url)?;
+    let opened = open_path(&dir.join(LAUNCH_PAGE));
+    if opened.is_ok() {
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(60));
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     } else {
-        std::process::Command::new("xdg-open").arg(url).spawn()
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    opened
+}
+
+const LAUNCH_PAGE: &str = "open.html";
+
+/// Writes the redirect page into a new directory with a random name, readable by this user only, and
+/// returns the directory. The name is not the token: it is only a name.
+fn stage_launch_page(url: &str) -> std::io::Result<PathBuf> {
+    let dir = std::env::temp_dir().join(format!("ironav-gui-{}", random_hex::<8>()));
+    create_private_dir(&dir)?;
+    let escaped = url.replace('&', "&amp;").replace('"', "&quot;").replace('<', "&lt;").replace('>', "&gt;");
+    let page = format!("<!doctype html>\n<meta charset=\"utf-8\">\n<meta http-equiv=\"refresh\" content=\"0; url={escaped}\">\n<title>IronAV</title>\n<p>Opening IronAV: <a href=\"{escaped}\">{escaped}</a></p>\n");
+    write_private_file(&dir.join(LAUNCH_PAGE), page.as_bytes())?;
+    Ok(dir)
+}
+
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(0o700).create(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        // the temp directory on Windows is per user, so a new directory in it is private already
+        std::fs::create_dir(dir)
+    }
+}
+
+fn write_private_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(data)
+}
+
+fn open_path(path: &Path) -> std::io::Result<()> {
+    let mut command = if cfg!(target_os = "windows") {
+        let mut c = std::process::Command::new("rundll32");
+        c.arg("url.dll,FileProtocolHandler").arg(path);
+        c
+    } else if cfg!(target_os = "macos") {
+        let mut c = std::process::Command::new("open");
+        c.arg(path);
+        c
+    } else {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(path);
+        c
     };
+    command.spawn().map(drop)
 }
 
 struct Request {
@@ -275,6 +344,26 @@ fn list_dir(path: Option<&str>) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launch_page_holds_the_url_not_on_any_command_line() {
+        let url = "http://127.0.0.1:1/?t=abc&x=<y>";
+        let dir = stage_launch_page(url).unwrap();
+        let page = std::fs::read_to_string(dir.join(LAUNCH_PAGE)).unwrap();
+        assert!(page.contains("url=http://127.0.0.1:1/?t=abc&amp;x=&lt;y&gt;"), "{page}");
+        assert!(!dir.file_name().unwrap().to_string_lossy().contains("abc"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+            assert_eq!(std::fs::metadata(dir.join(LAUNCH_PAGE)).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        // a second page gets its own directory
+        let other = stage_launch_page(url).unwrap();
+        assert_ne!(dir, other);
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&other).unwrap();
+    }
 
     #[test]
     fn launch_tokens_are_128_random_bits_and_differ() {
