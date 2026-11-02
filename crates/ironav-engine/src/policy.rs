@@ -99,6 +99,7 @@ impl Policy {
     }
 
     fn denied(&self, what: &str, shown: &str) -> Error {
+        crate::audit::refused("roots", shown);
         let roots = match &self.roots {
             Some(r) if !r.is_empty() => r.iter().map(|p| p.display().to_string().trim_start_matches(r"\\?\").to_string()).collect::<Vec<_>>().join(", "),
             _ => "none".into(),
@@ -158,11 +159,14 @@ impl Policy {
     /// May a tool write `path`: inside the roots, and not in read-only mode.
     pub fn write(&self, path: &str) -> Result<()> {
         self.require_writable()?;
-        self.write_scope(path)
+        self.write_scope(path)?;
+        crate::audit::event("file_write", serde_json::json!({ "path": path }));
+        Ok(())
     }
 
     pub fn require_writable(&self) -> Result<()> {
         if self.read_only {
+            crate::audit::refused("read_only", "write");
             return Err(Error::new(ErrorCode::PermissionDenied, "this server is read-only: it does not write files")
                 .hint(format!("the operator set {READ_ONLY_VAR}; use plan, probe and analyze without thumbnail_dir, which write nothing")));
         }
@@ -173,6 +177,7 @@ impl Policy {
         if self.devices {
             return Ok(());
         }
+        crate::audit::refused("devices", what);
         Err(Error::new(ErrorCode::PermissionDenied, format!("{what}: cameras and microphones are not available to this server"))
             .hint(format!("the operator must set {DEVICES_VAR}=1 to allow device:// sources")))
     }
@@ -181,6 +186,7 @@ impl Policy {
         if self.cookies {
             return Ok(());
         }
+        crate::audit::refused("cookies", "cookies option");
         Err(Error::new(ErrorCode::PermissionDenied, "the cookies option (a browser's signed-in session) is not enabled on this server")
             .hint(format!("the operator must set {COOKIES_VAR}=1 to allow it")))
     }
@@ -199,12 +205,14 @@ impl Policy {
             StreamParams::Video { width, height, .. } => {
                 let pixels = width as u64 * height as u64;
                 if width > self.max_side || height > self.max_side || pixels > self.max_pixels {
+                    crate::audit::refused("caps", &format!("{width}x{height} video"));
                     return Err(Error::new(ErrorCode::InvalidInput, format!("stream {} is {width}x{height}, larger than this build decodes", s.index))
                         .hint(format!("the limit is {} pixels (and {} on a side); the operator can raise it with {MAX_PIXELS_VAR}", self.max_pixels, self.max_side.min(self.max_pixels.min(u32::MAX as u64) as u32))));
                 }
             }
             StreamParams::Audio { channels, .. } => {
                 if channels > MAX_CHANNELS {
+                    crate::audit::refused("caps", &format!("{channels} audio channels"));
                     return Err(Error::new(ErrorCode::InvalidInput, format!("stream {} has {channels} audio channels; at most {MAX_CHANNELS} are decoded", s.index)));
                 }
             }
@@ -256,16 +264,18 @@ pub fn new_decoder_with(s: &StreamInfo, o: &ironav_codec::DecoderOptions) -> Res
 
 /// May a live session be opened on this source URL? File and pipe paths must be inside the roots,
 /// device capture and the cookies option must be enabled.
-pub fn check_source(u: &ironav_live::SourceUrl) -> Result<()> {
+pub fn check_source(raw: &str, u: &ironav_live::SourceUrl) -> Result<()> {
     let pol = current();
     match u.scheme.as_str() {
         "file" | "pipe" if !u.target.is_empty() => pol.read(&u.target)?,
         "device" => {
             pol.require_devices(&format!("device://{}", u.target))?;
+            crate::audit::event("device_open", serde_json::json!({ "device": u.target }));
             if mcp_mode() {
                 eprintln!("ironav: opening capture device {}", u.target);
             }
         }
+        "tcp" | "udp" | "rtsp" | "rtsps" | "http" | "https" => crate::audit::event("network_open", serde_json::json!({ "url": ironav_live::redact(raw) })),
         _ => {}
     }
     if u.option("cookies").is_some() {

@@ -308,7 +308,7 @@ pub fn open(args: &OpenArgs) -> Result<Arc<Session>> {
 pub fn open_with_taps(args: &OpenArgs, taps: Vec<TapConfig>) -> Result<(Arc<Session>, Vec<Tap>)> {
     let (taps, feeders): (Vec<Tap>, Vec<_>) = taps.into_iter().map(crate::tap::tap).collect::<Result<Vec<_>>>()?.into_iter().unzip();
     let url = SourceUrl::parse(&args.source)?;
-    crate::policy::check_source(&url)?;
+    crate::policy::check_source(&args.source, &url)?;
     if args.keyframe_jpegs > MAX_KEYFRAME_JPEGS {
         return Err(Error::invalid_arg(format!("keyframe_jpegs is at most {MAX_KEYFRAME_JPEGS}")));
     }
@@ -492,7 +492,7 @@ pub fn close(id: &str) -> Result<Value> {
     Ok(v)
 }
 
-fn now_iso() -> String {
+pub(crate) fn now_iso() -> String {
     let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
     let secs = d.as_secs();
     let (days, rem) = (secs / 86_400, secs % 86_400);

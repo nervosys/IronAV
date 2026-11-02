@@ -541,6 +541,7 @@ fn main() {
             let result = (|| -> Result<()> {
                 if a.switch(&["--web"]) {
                     let port = a.flag(&["--port"])?.map(|p| p.parse::<u16>()).transpose().map_err(|_| Error::invalid_arg("--port must be 0-65535"))?;
+                    ironav_engine::audit::set_caller(ironav_engine::audit::Caller::WebUi);
                     return ironav_webui::serve(ironav_webui::Options { port: port.unwrap_or(0), open_browser: !a.switch(&["--no-open"]) });
                 }
                 let player = a.switch(&["--play", "--player"]);

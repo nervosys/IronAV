@@ -58,12 +58,23 @@ impl Tool {
     /// a server that holds other sessions. The state a panicking call leaves behind is its own:
     /// the shared registries lock through poison-tolerant guards.
     pub fn call_with(&self, args: &Value, ctx: &Ctx) -> Result<Value> {
-        crate::policy::current().check_call(self.name, args)?;
-        contain(self.name, || match self.handler {
-            Handler::Plain(h) => h(args),
-            Handler::WithCtx(h) => h(args, ctx),
-        })
-        .map_err(clean_error)
+        let t0 = std::time::Instant::now();
+        crate::audit::event("tool_start", json!({ "tool": self.name }));
+        let r = crate::policy::current()
+            .check_call(self.name, args)
+            .and_then(|_| {
+                contain(self.name, || match self.handler {
+                    Handler::Plain(h) => h(args),
+                    Handler::WithCtx(h) => h(args, ctx),
+                })
+            })
+            .map_err(clean_error);
+        let outcome = match &r {
+            Ok(_) => json!("ok"),
+            Err(e) => json!(e.code),
+        };
+        crate::audit::event("tool_end", json!({ "tool": self.name, "outcome": outcome, "duration_ms": t0.elapsed().as_millis() as u64 }));
+        r
     }
 
     /// Can it overwrite or delete what is there? (MCP `destructiveHint`.)

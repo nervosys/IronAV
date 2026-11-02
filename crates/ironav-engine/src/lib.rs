@@ -4,6 +4,7 @@
 //! from [`tools::tools`], so they cannot drift apart.
 
 pub mod analyze;
+pub mod audit;
 pub mod job;
 pub mod live;
 pub mod plan;

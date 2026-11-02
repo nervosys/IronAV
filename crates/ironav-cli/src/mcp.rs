@@ -100,6 +100,7 @@ pub fn serve() -> Result<()> {
     // From here on the server's defaults are the strict ones: files only under the working directory
     // (or IRONAV_ROOTS), no cameras or microphones, no browser cookies.
     ironav_engine::policy::set_mcp_mode();
+    ironav_engine::audit::set_caller(ironav_engine::audit::Caller::Mcp);
     serve_on(&mut std::io::stdin().lock(), Out(Arc::new(Mutex::new(Box::new(std::io::stdout())))), MAX_LINE, MAX_IN_FLIGHT)
 }
 
