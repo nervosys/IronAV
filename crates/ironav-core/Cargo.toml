@@ -16,6 +16,12 @@ categories = ["multimedia", "multimedia::encoding"]
 [lints]
 workspace = true
 
+# `serde` (the default) gives the core types their Serialize and Deserialize impls and the
+# `From<serde_json::Error>` conversion. Without it the crate has no dependencies.
+[features]
+default = ["serde"]
+serde = ["dep:serde", "dep:serde_json"]
+
 [dependencies]
-serde.workspace = true
-serde_json.workspace = true
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }

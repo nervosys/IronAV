@@ -11,7 +11,6 @@ mod celt;
 mod encoder;
 mod multistream;
 mod plc;
-pub(crate) mod mdct;
 mod rc;
 mod silk;
 mod silk_resampler;
@@ -20,7 +19,8 @@ mod tables;
 
 use ironav_core::{AudioFrame, Decoder, Error, ErrorCode, Frame, Packet, Result, StreamParams};
 use rc::RangeDecoder;
-pub use encoder::{opus_head, OpusEncoder, OpusMode, OpusSignal, SILK_PRE_SKIP};
+pub use crate::options::{OpusMode, OpusSignal};
+pub use encoder::{opus_head, OpusEncoder, SILK_PRE_SKIP};
 pub use multistream::{new_decoder, MultistreamDecoder, MultistreamEncoder};
 use silk_resampler::SilkResampler;
 use tables::CELT_WINDOW2;

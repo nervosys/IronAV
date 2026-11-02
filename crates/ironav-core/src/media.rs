@@ -1,15 +1,18 @@
 use crate::{Error, ErrorCode, Rational, Result};
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
 pub enum MediaType {
     Audio,
     Video,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
 pub enum SampleFormat {
     U8,
     S16,
@@ -42,8 +45,9 @@ impl SampleFormat {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
 pub enum PixelFormat {
     Gray8,
     Yuv420p,
@@ -51,30 +55,30 @@ pub enum PixelFormat {
     Yuv444p,
     Rgb24,
     /// 4:2:0 with 10-bit samples stored as little-endian 16-bit words (value in the low 10 bits).
-    #[serde(rename = "yuv420p10le")]
+    #[cfg_attr(feature = "serde", serde(rename = "yuv420p10le"))]
     Yuv420p10,
     /// 4:2:2 with 10-bit samples stored as little-endian 16-bit words.
-    #[serde(rename = "yuv422p10le")]
+    #[cfg_attr(feature = "serde", serde(rename = "yuv422p10le"))]
     Yuv422p10,
     /// 4:4:4 with 10-bit samples stored as little-endian 16-bit words.
-    #[serde(rename = "yuv444p10le")]
+    #[cfg_attr(feature = "serde", serde(rename = "yuv444p10le"))]
     Yuv444p10,
     /// 4:2:0 with 12-bit samples stored as little-endian 16-bit words (value in the low 12 bits).
-    #[serde(rename = "yuv420p12le")]
+    #[cfg_attr(feature = "serde", serde(rename = "yuv420p12le"))]
     Yuv420p12,
     /// 4:2:2 with 12-bit samples stored as little-endian 16-bit words.
-    #[serde(rename = "yuv422p12le")]
+    #[cfg_attr(feature = "serde", serde(rename = "yuv422p12le"))]
     Yuv422p12,
     /// 4:4:4 with 12-bit samples stored as little-endian 16-bit words.
-    #[serde(rename = "yuv444p12le")]
+    #[cfg_attr(feature = "serde", serde(rename = "yuv444p12le"))]
     Yuv444p12,
     /// 4:4:0 (chroma halved vertically only) with 8-bit samples.
     Yuv440p,
     /// 4:4:0 with 10-bit samples stored as little-endian 16-bit words.
-    #[serde(rename = "yuv440p10le")]
+    #[cfg_attr(feature = "serde", serde(rename = "yuv440p10le"))]
     Yuv440p10,
     /// 4:4:0 with 12-bit samples stored as little-endian 16-bit words.
-    #[serde(rename = "yuv440p12le")]
+    #[cfg_attr(feature = "serde", serde(rename = "yuv440p12le"))]
     Yuv440p12,
 }
 
@@ -245,11 +249,13 @@ impl CodecId {
     }
 }
 
+#[cfg(feature = "serde")]
 impl Serialize for CodecId {
     fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
         s.serialize_str(self.name())
     }
 }
+#[cfg(feature = "serde")]
 impl<'de> Deserialize<'de> for CodecId {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
         let s = String::deserialize(d)?;
@@ -257,8 +263,9 @@ impl<'de> Deserialize<'de> for CodecId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(tag = "type", rename_all = "kebab-case")]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
+#[cfg_attr(feature = "serde", serde(tag = "type", rename_all = "kebab-case"))]
 pub enum StreamParams {
     Audio { sample_rate: u32, channels: u16 },
     Video { width: u32, height: u32, pix_fmt: PixelFormat, frame_rate: Rational },
@@ -273,27 +280,28 @@ impl StreamParams {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct StreamInfo {
     pub index: usize,
     pub codec: CodecId,
     pub time_base: Rational,
     /// Duration in `time_base` units, when known.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub duration: Option<i64>,
     /// Bits per sample of the coded audio, when meaningful (PCM, FLAC).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub bits: Option<u8>,
     /// Codec configuration a container needs to describe the stream when it is copied (for AAC, the
     /// AudioSpecificConfig). Empty when the codec has none.
-    #[serde(skip)]
+    #[cfg_attr(feature = "serde", serde(skip))]
     pub extradata: Vec<u8>,
     /// Time (in `time_base` units) at the start of the stream that a container's edit list skips, such
     /// as encoder delay or the lead-in before the first shown frame. Copying the stream keeps it so
     /// audio and video stay in sync.
-    #[serde(skip)]
+    #[cfg_attr(feature = "serde", serde(skip))]
     pub lead_in: i64,
-    #[serde(flatten)]
+    #[cfg_attr(feature = "serde", serde(flatten))]
     pub params: StreamParams,
 }
 

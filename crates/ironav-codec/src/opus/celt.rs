@@ -3,7 +3,7 @@
 //!
 //! Translated from the structure of FFmpeg's native Opus decoder (`libavcodec/opus/{celt,dec_celt,pvq}.c`).
 
-use super::mdct::Dct4;
+use crate::mdct::Dct4;
 use super::rc::{ilog, Coder, RangeDecoder};
 
 pub(super) mod enc;

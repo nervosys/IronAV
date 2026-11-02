@@ -14,7 +14,8 @@ mod tables;
 
 pub use enc::{headers as encoder_headers, VorbisEncoder};
 
-use crate::opus::mdct::Dct4;
+use crate::channels::ORDER;
+use crate::mdct::Dct4;
 use ironav_core::{AudioFrame, Decoder, Error, ErrorCode, Frame, Packet, Result, StreamParams};
 use tables::FLOOR1_INVERSE_DB;
 
@@ -806,18 +807,6 @@ fn slope(len: usize) -> Vec<f32> {
         })
         .collect()
 }
-
-/// Order in which Vorbis channels fill the output layout (`out[i] = vorbis[ORDER[n - 1][i]]`).
-pub(crate) const ORDER: [&[usize]; 8] = [
-    &[0],
-    &[0, 1],
-    &[0, 2, 1],
-    &[0, 1, 2, 3],
-    &[0, 2, 1, 3, 4],
-    &[0, 2, 1, 5, 3, 4],
-    &[0, 2, 1, 6, 5, 3, 4],
-    &[0, 2, 1, 7, 5, 6, 3, 4],
-];
 
 struct Prev {
     /// Block size of the previous block.

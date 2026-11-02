@@ -183,6 +183,7 @@ impl Dpb {
     /// The counts after a picture with memory management operation 5 (8.2.1): the picture's own top
     /// count is now `top` (its lesser count rebased to 0), and the picture counts after it restart from
     /// there with frame_num 0.
+    #[cfg(feature = "order")]
     pub fn restart_after_mmco5(&mut self, top: i32) {
         self.prev_frame_num = 0;
         self.prev_frame_num_offset = 0;

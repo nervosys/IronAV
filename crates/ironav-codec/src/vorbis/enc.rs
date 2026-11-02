@@ -15,7 +15,7 @@
 //! side. There is no psychoacoustic model: the noise follows the signal's own spectral envelope.
 
 use super::{ilog, join_headers, slope, Bits, Setup};
-use crate::opus::mdct::Dct4;
+use crate::mdct::Dct4;
 use ironav_core::{Encoder, Error, ErrorCode, Frame, Packet, Result};
 
 const N: usize = 2048;

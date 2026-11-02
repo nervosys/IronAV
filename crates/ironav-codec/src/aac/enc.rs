@@ -16,7 +16,7 @@
 //! a centre and a pair, 4 adds a back centre, 5 and 6 add a back pair and LFE, and 8 (7.1, configuration
 //! 7) has side and back pairs. Seven channels have no standard configuration and are refused.
 
-use super::imdct::Imdct;
+use crate::imdct::Imdct;
 use super::tables::*;
 use super::SAMPLE_RATES;
 use ironav_core::{Encoder, Error, ErrorCode, Frame, Packet, Result};

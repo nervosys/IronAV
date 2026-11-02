@@ -14,7 +14,7 @@
 //! 255 (up to 255 unrelated channels) is output in the table's order.
 
 use super::{frames_of, lacing16, OpusDecoder, OpusEncoder, MAX_PACKET_SAMPLES};
-use crate::vorbis::ORDER;
+use crate::channels::ORDER;
 use ironav_core::{AudioFrame, Decoder, Encoder, Error, ErrorCode, Frame, Packet, Result, StreamParams};
 
 const RATE: u32 = 48_000;

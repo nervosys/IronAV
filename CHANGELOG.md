@@ -7,11 +7,17 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+
+- **Codec features:** `ironav-codec` puts each codec behind its own cargo feature, with `voice` and `resample` for the
+  voice-link DSP and the resampler. `default-features = false` with `features = ["opus", "voice"]` builds only those,
+  without serde. `ironav-core`'s serde support is an optional feature too, on by default.
+
 ### Security
 
 - **Security (FIPS):** builds with the `fips` feature of `ironav-live` compile out the MD5 Digest code instead of only refusing it at run time; an MD5 challenge is still refused, and SHA-256 Digest is unchanged.
 
-## [0.1.0] - Unreleased
+## [0.1.0] - 2026-11-02
 
 ### Added
 

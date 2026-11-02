@@ -1,9 +1,11 @@
+#[cfg(feature = "serde")]
 use serde::Serialize;
 use std::fmt;
 
 /// Stable, machine-readable error classes. Agents branch on these, not on message text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
 pub enum ErrorCode {
     Io,
     InvalidInput,
@@ -61,13 +63,14 @@ impl ErrorCode {
 
 /// An error that tells the caller how to recover: `hint` is a sentence of advice and
 /// `alternatives` lists concrete valid values the caller could retry with.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct Error {
     pub code: ErrorCode,
     pub message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub hint: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Vec::is_empty"))]
     pub alternatives: Vec<String>,
 }
 
@@ -116,6 +119,7 @@ impl From<std::io::Error> for Error {
     }
 }
 
+#[cfg(feature = "serde")]
 impl From<serde_json::Error> for Error {
     fn from(e: serde_json::Error) -> Self {
         Error::invalid_arg(format!("invalid JSON: {e}"))

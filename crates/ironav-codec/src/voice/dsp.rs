@@ -2,7 +2,7 @@
 //! trims the silence at the ends of a push-to-talk press, automatic gain control and a light
 //! noise suppressor. Mono `f32` samples in -1 to 1, at any rate.
 
-use crate::opus::mdct::Fft;
+use crate::mdct::Fft;
 use ironav_core::{Error, Result};
 
 /// The level of `x` in dB relative to full scale (a full-scale square wave is 0).

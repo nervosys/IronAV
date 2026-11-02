@@ -15,49 +15,7 @@ pub use enc::ProResEncoder;
 
 use ironav_core::{Decoder, Error, ErrorCode, Frame, Packet, PixelFormat, Result, VideoFrame};
 
-/// The ProRes profiles, by their sample entry FOURCC.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Profile {
-    Proxy,
-    Lt,
-    Standard,
-    Hq,
-    Fourfour,
-    FourfourXq,
-}
-
-impl Profile {
-    pub fn fourcc(self) -> [u8; 4] {
-        match self {
-            Self::Proxy => *b"apco",
-            Self::Lt => *b"apcs",
-            Self::Standard => *b"apcn",
-            Self::Hq => *b"apch",
-            Self::Fourfour => *b"ap4h",
-            Self::FourfourXq => *b"ap4x",
-        }
-    }
-
-    pub fn from_fourcc(t: &[u8]) -> Option<Self> {
-        [Self::Proxy, Self::Lt, Self::Standard, Self::Hq, Self::Fourfour, Self::FourfourXq].into_iter().find(|p| p.fourcc() == t)
-    }
-
-    /// Whether the profile is 4:4:4 (and 12-bit).
-    pub fn is_444(self) -> bool {
-        matches!(self, Self::Fourfour | Self::FourfourXq)
-    }
-
-    /// The quantiser the encoder uses: a step of this many 10-bit coefficient units.
-    pub(crate) fn qscale(self) -> u32 {
-        match self {
-            Self::Proxy => 24,
-            Self::Lt => 16,
-            Self::Standard => 8,
-            Self::Hq | Self::Fourfour => 4,
-            Self::FourfourXq => 2,
-        }
-    }
-}
+pub use crate::options::Profile;
 
 const FRAME_ID: &[u8; 4] = b"icpf";
 const FIRST_DC_CB: u8 = 0xB8;

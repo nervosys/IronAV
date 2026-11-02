@@ -5,14 +5,13 @@
 //! streams that need them are refused with an error rather than decoded wrongly.
 
 mod enc;
-pub(crate) mod imdct;
 mod sbr;
 mod sbr_tables;
 mod tables;
 
 pub use enc::{audio_specific_config, AacEncoder, PRIMING};
 
-use imdct::Imdct;
+use crate::imdct::Imdct;
 use ironav_core::{AudioFrame, Decoder, Error, ErrorCode, Frame, Packet, Result, StreamParams};
 use std::sync::OnceLock;
 use tables::*;

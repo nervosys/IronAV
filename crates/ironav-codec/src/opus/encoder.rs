@@ -21,7 +21,8 @@ use super::celt::prefilter::Prefilter;
 use super::celt::Celt;
 use super::rc::{Coder, RangeEncoder};
 use super::silk_enc::{self, SilkEncoder, SilkStereo};
-use crate::voice::StreamResampler;
+use crate::options::{OpusMode, OpusSignal};
+use crate::resample::StreamResampler;
 use ironav_core::{Encoder, Error, ErrorCode, Frame, Packet, Result};
 
 const RATE: u32 = 48_000;
@@ -89,36 +90,6 @@ impl Dtx {
         }
         send
     }
-}
-
-/// What an [`OpusEncoder`] codes with.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum OpusMode {
-    /// CELT, full band: music and anything else, at any bit rate.
-    #[default]
-    Celt,
-    /// SILK, wideband (audio up to 8 kHz): speech, at low bit rates (about 8 to 30 kb/s).
-    Silk,
-    /// Hybrid, full band: SILK up to 8 kHz and CELT above, at a variable rate; speech with its
-    /// high frequencies (about 16 to 40 kb/s).
-    Hybrid,
-    /// One of the three for each packet, by the bit rate and the signal, as libopus picks: SILK
-    /// below 16 kb/s (24 for stereo), hybrid above that for speech, and CELT above a threshold
-    /// that runs from 16 kb/s for music to 64 kb/s for speech (44 for stereo), with some
-    /// hysteresis. Frames of 10 ms or more.
-    Auto,
-}
-
-/// What the input is, for [`OpusMode::Auto`] ([`OpusEncoder::with_signal`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum OpusSignal {
-    /// Guessed from how the level moves (see [`OpusEncoder::with_signal`]).
-    #[default]
-    Auto,
-    /// Speech: SILK and hybrid up to a higher bit rate.
-    Voice,
-    /// Music: CELT down to a lower one.
-    Music,
 }
 
 /// A guess at whether the input is speech, from how its level moves: speech comes in syllables

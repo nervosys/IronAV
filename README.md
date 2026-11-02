@@ -1301,6 +1301,15 @@ See [SECURITY.md](SECURITY.md) to report a vulnerability, and [docs/security/com
 Build: `cargo build --release` · Test: `cargo test` · Rust 1.95 or newer for `ironav-cli` and `ironav-gui` (egui sets that floor), 1.88 for the library crates; IronAV is built and tested with the current stable release
 Lean build for servers/agents without the graphics or sound stack: `cargo build --release --no-default-features -p ironav-cli`
 
+Codec features: `ironav-codec` puts each codec behind a cargo feature: `aac`, `ac3`, `alac`, `av1`, `flac`, `h264`,
+`hevc`, `jpeg`, `mp3`, `mpeg2`, `mpeg4`, `opus`, `prores`, `vorbis`, `vp8` and `vp9`. Three more name shared parts:
+`voice` (the voice-link DSP, which needs `resample`, the windowed-sinc resampler), `filters` (the filter registry)
+and `order` (H.264 and HEVC picture order). `serde` gives the registries and core types their serialisation. All are
+on by default, so the workspace crates are unchanged. A small build turns the defaults off and names what it needs,
+for example `ironav-codec = { version = "0.1", default-features = false, features = ["opus", "voice"] }`, which
+compiles Opus, the voice-link DSP and the resampler, with no serde. The feature list, and which features each one
+pulls in, are commented in `crates/ironav-codec/Cargo.toml`.
+
 ## License
 
 Dual-licensed: **[AGPL-3.0-or-later](LICENSE)** for open use, or a **commercial license** from Nervosys if you

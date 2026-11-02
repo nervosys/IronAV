@@ -4,7 +4,7 @@
 //! coder. A frame that would not come out smaller than its samples is written uncompressed.
 
 use super::{lpc_adapt, lpc_base, rice_k, run_k, sign_extend, update_history, zigzag, CHANNEL_OFFSETS, FRAME_LENGTH, INITIAL_HISTORY, LIMIT, MULT};
-use crate::flac::bits::BitWriter;
+use crate::bitio::BitWriter;
 use ironav_core::{Encoder, Error, Frame, Packet, Result};
 
 /// The predictor: second order, with the coefficients of 2x[i-1] - x[i-2] at quantizer 2^4.

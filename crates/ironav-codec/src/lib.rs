@@ -3,40 +3,76 @@
 //! The registries ([`implemented`], [`FILTERS`]) are the single source of truth for
 //! "what can IronAV actually do"; the ontology and the planner both read them.
 
+#[cfg(feature = "aac")]
 pub mod aac;
+#[cfg(feature = "ac3")]
 pub mod ac3;
+#[cfg(feature = "av1")]
 pub mod av1;
+#[cfg(feature = "alac")]
 pub mod alac;
+#[cfg(feature = "h264")]
 pub mod change;
+#[cfg(feature = "flac")]
 pub mod flac;
+#[cfg(feature = "h264")]
 pub mod h264;
+#[cfg(feature = "hevc")]
 pub mod hevc;
+#[cfg(feature = "vp9")]
 pub mod vp9;
+#[cfg(feature = "jpeg")]
 pub mod jpeg;
+#[cfg(feature = "filters")]
 mod filters;
+#[cfg(feature = "mp3")]
 pub mod mp3;
+#[cfg(feature = "mpeg2")]
 pub mod mpeg2;
+#[cfg(feature = "mpeg4")]
 pub mod mpeg4;
+#[cfg(feature = "opus")]
 pub mod opus;
+#[cfg(feature = "order")]
 pub mod order;
+#[cfg(feature = "prores")]
 pub mod prores;
+#[cfg(feature = "vorbis")]
 pub mod vorbis;
+#[cfg(feature = "vp8")]
 pub mod vp8;
+mod options;
 mod pcm;
+#[cfg(feature = "filters")]
 mod pixconv;
 mod rawvideo;
-mod resample;
+#[cfg(feature = "resample")]
+pub mod resample;
+#[cfg(feature = "filters")]
 mod scale;
+#[cfg(feature = "voice")]
 pub mod voice;
+#[cfg(any(feature = "aac", feature = "ac3"))]
+mod imdct;
+#[cfg(any(feature = "opus", feature = "vorbis", feature = "voice"))]
+mod mdct;
+#[cfg(any(feature = "opus", feature = "vorbis"))]
+mod channels;
+#[cfg(any(feature = "flac", feature = "alac"))]
+pub mod bitio;
 
+#[cfg(feature = "filters")]
 pub use filters::{build_filter, FilterSpec, ParamSpec, FILTERS};
+#[cfg(feature = "filters")]
 pub use pixconv::{convert as convert_pixel_format, Matrix};
+#[cfg(feature = "filters")]
 pub use scale::resize_frame;
 
 use ironav_core::{CodecId, Decoder, Encoder, Error, ErrorCode, MediaType, Result, StreamParams};
-use serde::Serialize;
 
-#[derive(Debug, Clone, Serialize)]
+/// One codec this crate implements, and in which directions.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct CodecImpl {
     pub codec: CodecId,
     pub decode: bool,
@@ -54,63 +90,82 @@ pub fn implemented() -> Vec<CodecImpl> {
     CodecId::ALL
         .iter()
         .filter_map(|&c| {
+            #[cfg(feature = "aac")]
             if c == CodecId::Aac {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-aac" });
             }
+            #[cfg(feature = "mp3")]
             if c == CodecId::Mp3 {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-mp3" });
             }
+            #[cfg(feature = "mp3")]
             if c == CodecId::Mp2 {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-mp2" });
             }
+            #[cfg(feature = "ac3")]
             if c == CodecId::Ac3 {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-ac3" });
             }
+            #[cfg(feature = "alac")]
             if c == CodecId::Alac {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-alac" });
             }
+            #[cfg(feature = "mpeg4")]
             if c == CodecId::Mpeg4 {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-mpeg4" });
             }
+            #[cfg(feature = "mpeg2")]
             if c == CodecId::Mpeg2Video {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-mpeg2" });
             }
+            #[cfg(feature = "mpeg2")]
             if c == CodecId::Mpeg1Video {
                 return Some(CodecImpl { codec: c, decode: true, encode: false, implementation: "ironav-mpeg2" });
             }
+            #[cfg(feature = "prores")]
             if c == CodecId::ProRes {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-prores" });
             }
+            #[cfg(feature = "opus")]
             if c == CodecId::Opus {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-opus" });
             }
+            #[cfg(feature = "vorbis")]
             if c == CodecId::Vorbis {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-vorbis" });
             }
+            #[cfg(feature = "jpeg")]
             if c == CodecId::Mjpeg {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-jpeg" });
             }
+            #[cfg(feature = "h264")]
             if c == CodecId::H264 {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-h264" });
             }
+            #[cfg(feature = "hevc")]
             if c == CodecId::Hevc {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-hevc" });
             }
+            #[cfg(feature = "av1")]
             if c == CodecId::Av1 {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-av1" });
             }
+            #[cfg(feature = "vp8")]
             if c == CodecId::Vp8 {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-vp8" });
             }
+            #[cfg(feature = "vp9")]
             if c == CodecId::Vp9 {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-vp9" });
+            }
+            #[cfg(feature = "flac")]
+            if c == CodecId::Flac {
+                return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-flac" });
             }
             let implementation = if c.sample_format().is_some() {
                 "ironav-pcm"
             } else if c == CodecId::RawVideo {
                 "ironav-rawvideo"
-            } else if c == CodecId::Flac {
-                "ironav-flac"
             } else {
                 return None;
             };
@@ -137,13 +192,16 @@ fn unsupported(codec: CodecId, what: &str) -> Error {
 /// A decoder for a stream, including the codec configuration (AAC's AudioSpecificConfig) it carries.
 /// The displayed picture size an H.264 or HEVC sequence parameter set describes; `nal` is the
 /// whole NAL unit, header included. `None` for other NAL units or codecs, or a damaged one.
+#[cfg(any(feature = "h264", feature = "hevc"))]
 pub fn sps_picture_size(codec: CodecId, nal: &[u8]) -> Option<(u32, u32)> {
     match codec {
+        #[cfg(feature = "h264")]
         CodecId::H264 if nal.len() > 1 && nal[0] & 31 == 7 => {
             let s = h264::ps::parse_sps(&h264::bits::unescape(&nal[1..])).ok()?;
             let [l, r, t, b] = s.crop;
             Some(((s.mb_width * 16).checked_sub(l + r)? as u32, (s.mb_height * 16).checked_sub(t + b)? as u32))
         }
+        #[cfg(feature = "hevc")]
         CodecId::Hevc if nal.len() > 2 && (nal[0] >> 1) & 63 == 33 => {
             let s = hevc::ps::parse_sps(&h264::bits::unescape(&nal[2..])).ok()?;
             let [l, r, t, b] = s.crop;
@@ -153,15 +211,24 @@ pub fn sps_picture_size(codec: CodecId, nal: &[u8]) -> Option<(u32, u32)> {
     }
 }
 
+/// Without H.264 or HEVC there is no sequence parameter set to read.
+#[cfg(not(any(feature = "h264", feature = "hevc")))]
+pub fn sps_picture_size(_codec: CodecId, _nal: &[u8]) -> Option<(u32, u32)> {
+    None
+}
+
 /// The frame rate a H.264 or HEVC sequence parameter set states in its VUI timing, reduced; `nal`
 /// is the whole NAL unit, header included. `None` when the VUI says nothing about timing. H.264
 /// counts ticks per field, so a frame is two ticks; HEVC counts ticks per picture.
+#[cfg(any(feature = "h264", feature = "hevc"))]
 pub fn sps_frame_rate(codec: CodecId, nal: &[u8]) -> Option<ironav_core::Rational> {
     let (units, scale, ticks) = match codec {
+        #[cfg(feature = "h264")]
         CodecId::H264 if nal.len() > 1 && nal[0] & 31 == 7 => {
             let (units, scale) = h264::ps::parse_sps(&h264::bits::unescape(&nal[1..])).ok()?.timing?;
             (units, scale, 2)
         }
+        #[cfg(feature = "hevc")]
         CodecId::Hevc if nal.len() > 2 && (nal[0] >> 1) & 63 == 33 => {
             let (units, scale) = hevc::ps::parse_sps(&h264::bits::unescape(&nal[2..])).ok()?.timing?;
             (units, scale, 1)
@@ -176,15 +243,24 @@ pub fn sps_frame_rate(codec: CodecId, nal: &[u8]) -> Option<ironav_core::Rationa
     Some(ironav_core::Rational::new(num / g, den / g))
 }
 
+/// Without H.264 or HEVC there is no sequence parameter set to read.
+#[cfg(not(any(feature = "h264", feature = "hevc")))]
+pub fn sps_frame_rate(_codec: CodecId, _nal: &[u8]) -> Option<ironav_core::Rational> {
+    None
+}
+
 /// The pixel format an H.264 or HEVC sequence parameter set describes, from its chroma format and bit
 /// depth: monochrome 8-bit is `gray`, deeper monochrome comes out as 4:2:0 (as the decoders give it).
 /// `nal` is the whole NAL unit, header included.
+#[cfg(any(feature = "h264", feature = "hevc"))]
 pub fn sps_pixel_format(codec: CodecId, nal: &[u8]) -> Option<ironav_core::PixelFormat> {
     let (chroma, depth) = match codec {
+        #[cfg(feature = "h264")]
         CodecId::H264 if nal.len() > 1 && nal[0] & 31 == 7 => {
             let s = h264::ps::parse_sps(&h264::bits::unescape(&nal[1..])).ok()?;
             (s.chroma_format_idc, s.bit_depth_luma.max(s.bit_depth_chroma))
         }
+        #[cfg(feature = "hevc")]
         CodecId::Hevc if nal.len() > 2 && (nal[0] >> 1) & 63 == 33 => {
             let s = hevc::ps::parse_sps(&h264::bits::unescape(&nal[2..])).ok()?;
             (s.chroma_format_idc, s.bit_depth_luma.max(s.bit_depth_chroma))
@@ -207,6 +283,13 @@ pub fn sps_pixel_format(codec: CodecId, nal: &[u8]) -> Option<ironav_core::Pixel
     })
 }
 
+/// Without H.264 or HEVC there is no sequence parameter set to read.
+#[cfg(not(any(feature = "h264", feature = "hevc")))]
+pub fn sps_pixel_format(_codec: CodecId, _nal: &[u8]) -> Option<ironav_core::PixelFormat> {
+    None
+}
+
+#[cfg(any(feature = "h264", feature = "hevc"))]
 fn gcd(a: i64, b: i64) -> i64 {
     if b == 0 {
         a
@@ -225,7 +308,10 @@ pub struct DecoderOptions {
 }
 
 /// [`new_decoder_for`] with options.
+// Some arguments are read only by the codecs that take them, so a build without those codecs leaves them unused.
+#[allow(unused_variables)]
 pub fn new_decoder_with(s: &ironav_core::StreamInfo, o: &DecoderOptions) -> Result<Box<dyn Decoder>> {
+    #[cfg(feature = "h264")]
     if o.low_delay && s.codec == CodecId::H264 {
         return Ok(Box::new(h264::H264Decoder::low_delay()));
     }
@@ -234,10 +320,12 @@ pub fn new_decoder_with(s: &ironav_core::StreamInfo, o: &DecoderOptions) -> Resu
 
 pub fn new_decoder_for(s: &ironav_core::StreamInfo) -> Result<Box<dyn Decoder>> {
     match s.codec {
+        #[cfg(feature = "aac")]
         CodecId::Aac => {
             let d: Box<dyn Decoder> = Box::new(aac::AacDecoder::new(&s.extradata, &s.params)?);
             Ok(kept_span(s, d))
         }
+        #[cfg(feature = "mp3")]
         CodecId::Mp3 => {
             let d: Box<dyn Decoder> = Box::new(mp3::Mp3Decoder::new(&s.params)?);
             // extradata from the MP3 reader: where the LAME tag says the audio starts and ends
@@ -246,19 +334,33 @@ pub fn new_decoder_for(s: &ironav_core::StreamInfo) -> Result<Box<dyn Decoder>> 
                 _ => kept_span(s, d),
             })
         }
+        #[cfg(feature = "mp3")]
         CodecId::Mp2 => Ok(kept_span(s, Box::new(mp3::Mp2Decoder::new(&s.params)?))),
+        #[cfg(feature = "ac3")]
         CodecId::Ac3 => Ok(kept_span(s, Box::new(ac3::Ac3Decoder::new()))),
+        #[cfg(feature = "alac")]
         CodecId::Alac => Ok(Box::new(alac::AlacDecoder::new(&s.extradata, &s.params)?)),
+        #[cfg(feature = "opus")]
         CodecId::Opus => Ok(trimmed(s, opus::new_decoder(&s.extradata, &s.params)?)),
+        #[cfg(feature = "vorbis")]
         CodecId::Vorbis => Ok(trimmed(s, Box::new(vorbis::VorbisDecoder::new(&s.extradata, &s.params)?))),
+        #[cfg(feature = "vp8")]
         CodecId::Vp8 => Ok(Box::new(vp8::Vp8Decoder::new())),
+        #[cfg(feature = "h264")]
         CodecId::H264 => Ok(Box::new(h264::H264Decoder::new())),
+        #[cfg(feature = "hevc")]
         CodecId::Hevc => Ok(Box::new(hevc::HevcDecoder::new())),
+        #[cfg(feature = "vp9")]
         CodecId::Vp9 => Ok(Box::new(vp9::Vp9Decoder::new())),
+        #[cfg(feature = "jpeg")]
         CodecId::Mjpeg => Ok(Box::new(jpeg::JpegDecoder::new())),
+        #[cfg(feature = "prores")]
         CodecId::ProRes => Ok(Box::new(prores::ProResDecoder::new())),
+        #[cfg(feature = "mpeg4")]
         CodecId::Mpeg4 => Ok(Box::new(mpeg4::Mpeg4Decoder::new(&s.extradata))),
+        #[cfg(feature = "mpeg2")]
         CodecId::Mpeg2Video | CodecId::Mpeg1Video => Ok(Box::new(mpeg2::Mpeg2Decoder::new(&s.extradata))),
+        #[cfg(feature = "av1")]
         CodecId::Av1 => Ok(Box::new(av1::Av1Decoder::new(&s.extradata))),
         _ => new_decoder(s.codec, &s.params, s.bits),
     }
@@ -268,6 +370,7 @@ pub fn new_decoder_for(s: &ironav_core::StreamInfo) -> Result<Box<dyn Decoder>> 
 /// priming, in samples of the stream's rate) to `lead_in` plus its duration, which the container
 /// set (an MP4 edit's segment, or a Matroska codec delay less its discard padding). A stream with no
 /// lead-in, or whose time base is not its sample rate, is left whole.
+#[cfg(any(feature = "aac", feature = "mp3", feature = "ac3"))]
 fn kept_span(s: &ironav_core::StreamInfo, d: Box<dyn Decoder>) -> Box<dyn Decoder> {
     let in_samples = matches!(s.params, StreamParams::Audio { sample_rate, .. } if s.time_base.num == 1 && s.time_base.den == sample_rate as i64);
     if s.lead_in <= 0 || !in_samples {
@@ -285,8 +388,10 @@ fn kept_span(s: &ironav_core::StreamInfo, d: Box<dyn Decoder>) -> Box<dyn Decode
 /// The second field is the stream's rate: frames at another rate (a chained Ogg link's, whose
 /// packets are timed in the stream's rate) are not cut, since a duration in the stream's rate cannot
 /// say their length exactly; the padding being cut is a file's last packet's.
+#[cfg(any(feature = "opus", feature = "vorbis"))]
 struct EndTrim(Box<dyn Decoder>, i64);
 
+#[cfg(any(feature = "opus", feature = "vorbis"))]
 impl EndTrim {
     fn cut(frames: &mut [ironav_core::Frame], duration: i64, rate: i64) {
         for f in frames {
@@ -303,6 +408,7 @@ impl EndTrim {
     }
 }
 
+#[cfg(any(feature = "opus", feature = "vorbis"))]
 impl Decoder for EndTrim {
     fn decode(&mut self, packet: &ironav_core::Packet) -> Result<Vec<ironav_core::Frame>> {
         let mut frames = self.0.decode(packet)?;
@@ -319,6 +425,7 @@ impl Decoder for EndTrim {
 
 /// Drops decoded samples before `start` and from `end` on (positions in the decoder's own output),
 /// and renumbers the frames' pts from the first kept sample.
+#[cfg(any(feature = "aac", feature = "mp3", feature = "ac3"))]
 struct Gapless {
     inner: Box<dyn Decoder>,
     start: u64,
@@ -326,6 +433,7 @@ struct Gapless {
     pos: u64,
 }
 
+#[cfg(any(feature = "aac", feature = "mp3", feature = "ac3"))]
 impl Gapless {
     fn keep(&mut self, frames: Vec<ironav_core::Frame>) -> Vec<ironav_core::Frame> {
         let mut out = Vec::with_capacity(frames.len());
@@ -349,6 +457,7 @@ impl Gapless {
     }
 }
 
+#[cfg(any(feature = "aac", feature = "mp3", feature = "ac3"))]
 impl Decoder for Gapless {
     fn decode(&mut self, packet: &ironav_core::Packet) -> Result<Vec<ironav_core::Frame>> {
         let frames = self.inner.decode(packet)?;
@@ -362,6 +471,7 @@ impl Decoder for Gapless {
 
 /// Wrap a decoder in [`EndTrim`] when the stream's packet durations are in samples (time base
 /// 1/rate), which is how the Ogg reader gives them; Matroska's millisecond durations are left alone.
+#[cfg(any(feature = "opus", feature = "vorbis"))]
 fn trimmed(s: &ironav_core::StreamInfo, d: Box<dyn Decoder>) -> Box<dyn Decoder> {
     let rate = match s.params {
         StreamParams::Audio { sample_rate, .. } => sample_rate as i64,
@@ -375,11 +485,14 @@ fn trimmed(s: &ironav_core::StreamInfo, d: Box<dyn Decoder>) -> Box<dyn Decoder>
 }
 
 /// `bits` is the stream's bits per sample where that is meaningful (PCM, FLAC).
+// Some arguments are read only by the codecs that take them, so a build without those codecs leaves them unused.
+#[allow(unused_variables)]
 pub fn new_decoder(codec: CodecId, params: &StreamParams, bits: Option<u8>) -> Result<Box<dyn Decoder>> {
     match (codec, params) {
         (c, StreamParams::Audio { sample_rate, channels }) if c.sample_format().is_some() => {
             Ok(Box::new(pcm::PcmDecoder::new(c.sample_format().unwrap(), *sample_rate, *channels)))
         }
+        #[cfg(feature = "flac")]
         (CodecId::Flac, StreamParams::Audio { sample_rate, channels }) => Ok(Box::new(flac::FlacDecoder::new(*sample_rate, *channels, bits))),
         (CodecId::RawVideo, StreamParams::Video { width, height, pix_fmt, .. }) => {
             Ok(Box::new(rawvideo::RawVideoDecoder::new(*width, *height, *pix_fmt)))
@@ -415,9 +528,9 @@ pub fn new_encoder_with(codec: CodecId, params: &StreamParams, bits: Option<u8>,
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct OpusOptions {
     /// CELT, SILK, hybrid or automatic.
-    pub mode: opus::OpusMode,
+    pub mode: options::OpusMode,
     /// What the input is, for automatic mode.
-    pub signal: opus::OpusSignal,
+    pub signal: options::OpusSignal,
     /// Packet length in milliseconds: 2.5, 5, 10, 20, 40 or 60.
     pub frame_ms: Option<f64>,
     /// Expected packet loss in percent, for in-band FEC; 0 is off.
@@ -426,6 +539,7 @@ pub struct OpusOptions {
     pub dtx: bool,
 }
 
+#[cfg(feature = "opus")]
 impl OpusOptions {
     fn apply(&self, enc: opus::OpusEncoder) -> Result<opus::OpusEncoder> {
         // the frame length first: the SILK and hybrid modes check it
@@ -454,6 +568,7 @@ pub struct VideoOptions {
 
 impl VideoOptions {
     /// The settings for a HEVC encoder.
+    #[cfg(feature = "hevc")]
     pub fn apply_hevc(&self, enc: hevc::HevcEncoder) -> hevc::HevcEncoder {
         match self.bframes {
             Some(n) => enc.with_bframes(n),
@@ -462,6 +577,7 @@ impl VideoOptions {
     }
 
     /// The settings for an MPEG-4 encoder.
+    #[cfg(feature = "mpeg4")]
     pub fn apply_mpeg4(&self, enc: mpeg4::enc::Mpeg4Encoder) -> mpeg4::enc::Mpeg4Encoder {
         match self.bframes {
             Some(n) => enc.with_bframes(n),
@@ -470,6 +586,7 @@ impl VideoOptions {
     }
 
     /// The settings for an MPEG-2 encoder.
+    #[cfg(feature = "mpeg2")]
     pub fn apply_mpeg2(&self, enc: mpeg2::enc::Mpeg2Encoder) -> mpeg2::enc::Mpeg2Encoder {
         match self.bframes {
             Some(n) => enc.with_bframes(n),
@@ -478,6 +595,7 @@ impl VideoOptions {
     }
 
     /// The settings for an AV1 encoder.
+    #[cfg(feature = "av1")]
     pub fn apply_av1(&self, mut enc: av1::enc::Av1Encoder) -> av1::enc::Av1Encoder {
         if let Some((cols_log2, rows_log2)) = self.tiles {
             enc = enc.with_tiles(cols_log2, rows_log2);
@@ -494,11 +612,16 @@ impl VideoOptions {
 
 /// Like `new_encoder_with`, with Opus encoder settings for the Opus codec (other codecs ignore them), and
 /// with `video` settings for the HEVC, MPEG-4 and AV1 encoders (other codecs ignore them).
-pub fn new_encoder_with_opts(codec: CodecId, params: &StreamParams, bits: Option<u8>, bitrate_kbps: Option<u32>, opus_opts: Option<&OpusOptions>, prores_profile: Option<prores::Profile>, video: Option<&VideoOptions>) -> Result<Box<dyn Encoder>> {
+// Some arguments are read only by the codecs that take them, so a build without those codecs leaves them unused.
+#[allow(unused_variables)]
+pub fn new_encoder_with_opts(codec: CodecId, params: &StreamParams, bits: Option<u8>, bitrate_kbps: Option<u32>, opus_opts: Option<&OpusOptions>, prores_profile: Option<options::Profile>, video: Option<&VideoOptions>) -> Result<Box<dyn Encoder>> {
     match (codec, params) {
         (c, StreamParams::Audio { .. }) if c.sample_format().is_some() => Ok(Box::new(pcm::PcmEncoder::new(c.sample_format().unwrap()))),
+        #[cfg(feature = "flac")]
         (CodecId::Flac, StreamParams::Audio { sample_rate, channels }) => Ok(Box::new(flac::FlacEncoder::new(*sample_rate, *channels, bits)?)),
+        #[cfg(feature = "alac")]
         (CodecId::Alac, StreamParams::Audio { sample_rate, channels }) => Ok(Box::new(alac::AlacEncoder::new(*sample_rate, *channels, bits)?)),
+        #[cfg(feature = "opus")]
         (CodecId::Opus, StreamParams::Audio { sample_rate, channels }) => {
             let bitrate = bitrate_kbps.map_or(opus::OpusEncoder::default_bitrate(*channels as usize), |k| k * 1000);
             if *channels > 2 {
@@ -514,30 +637,39 @@ pub fn new_encoder_with_opts(codec: CodecId, params: &StreamParams, bits: Option
                 None => enc,
             }))
         }
+        #[cfg(feature = "vorbis")]
         (CodecId::Vorbis, StreamParams::Audio { sample_rate, channels }) => {
             let bitrate = bitrate_kbps.map_or(vorbis::VorbisEncoder::default_bitrate(*channels as usize), |k| k * 1000);
             Ok(Box::new(vorbis::VorbisEncoder::new(*sample_rate, *channels as usize, bitrate)?))
         }
+        #[cfg(feature = "aac")]
         (CodecId::Aac, StreamParams::Audio { sample_rate, channels }) => {
             let bitrate = bitrate_kbps.map_or(aac::AacEncoder::default_bitrate(*channels as usize), |k| k * 1000);
             Ok(Box::new(aac::AacEncoder::new(*sample_rate, *channels as usize, bitrate)?))
         }
+        #[cfg(feature = "mp3")]
         (CodecId::Mp3, StreamParams::Audio { sample_rate, channels }) => {
             let bitrate = bitrate_kbps.map_or(mp3::Mp3Encoder::default_bitrate(*channels as usize), |k| k * 1000);
             Ok(Box::new(mp3::Mp3Encoder::new(*sample_rate, *channels as usize, bitrate)?))
         }
+        #[cfg(feature = "mp3")]
         (CodecId::Mp2, StreamParams::Audio { sample_rate, channels }) => {
             let bitrate = bitrate_kbps.map_or(mp3::Mp2Encoder::default_bitrate(*channels as usize), |k| k * 1000);
             Ok(Box::new(mp3::Mp2Encoder::new(*sample_rate, *channels as usize, bitrate)?))
         }
+        #[cfg(feature = "ac3")]
         (CodecId::Ac3, StreamParams::Audio { sample_rate, channels }) => {
             // 0 asks the encoder for FFmpeg's default for the channel count
             Ok(Box::new(ac3::Ac3Encoder::new(*sample_rate, *channels as usize, bitrate_kbps.map_or(0, |k| k * 1000))?))
         }
         (CodecId::RawVideo, StreamParams::Video { .. }) => Ok(Box::new(rawvideo::RawVideoEncoder)),
+        #[cfg(feature = "jpeg")]
         (CodecId::Mjpeg, StreamParams::Video { .. }) => Ok(Box::new(jpeg::JpegEncoder::new(jpeg::JpegEncoder::default_quality()))),
-        (CodecId::ProRes, StreamParams::Video { .. }) => Ok(Box::new(prores::ProResEncoder::new(params, prores_profile.unwrap_or(prores::Profile::Hq))?)),
+        #[cfg(feature = "prores")]
+        (CodecId::ProRes, StreamParams::Video { .. }) => Ok(Box::new(prores::ProResEncoder::new(params, prores_profile.unwrap_or(options::Profile::Hq))?)),
+        #[cfg(feature = "h264")]
         (CodecId::H264, StreamParams::Video { .. }) => Ok(Box::new(h264::H264Encoder::new(params, None, bitrate_kbps.map(|k| k.saturating_mul(1000)))?)),
+        #[cfg(feature = "hevc")]
         (CodecId::Hevc, StreamParams::Video { .. }) => {
             let enc = hevc::HevcEncoder::new(params, None, bitrate_kbps.map(|k| k.saturating_mul(1000)))?;
             Ok(Box::new(match video {
@@ -545,8 +677,11 @@ pub fn new_encoder_with_opts(codec: CodecId, params: &StreamParams, bits: Option
                 None => enc,
             }))
         }
+        #[cfg(feature = "vp8")]
         (CodecId::Vp8, StreamParams::Video { .. }) => Ok(Box::new(vp8::Vp8Encoder::new(params, None, bitrate_kbps.map(|k| k.saturating_mul(1000)))?)),
+        #[cfg(feature = "vp9")]
         (CodecId::Vp9, StreamParams::Video { .. }) => Ok(Box::new(vp9::Vp9Encoder::new(params, None)?)),
+        #[cfg(feature = "mpeg4")]
         (CodecId::Mpeg4, StreamParams::Video { .. }) => {
             let enc = mpeg4::enc::Mpeg4Encoder::new(params, None, bitrate_kbps.map(|k| k.saturating_mul(1000)))?;
             Ok(Box::new(match video {
@@ -554,6 +689,7 @@ pub fn new_encoder_with_opts(codec: CodecId, params: &StreamParams, bits: Option
                 None => enc,
             }))
         }
+        #[cfg(feature = "mpeg2")]
         (CodecId::Mpeg2Video, StreamParams::Video { .. }) => {
             let enc = mpeg2::enc::Mpeg2Encoder::new(params, None, bitrate_kbps.map(|k| k.saturating_mul(1000)))?;
             Ok(Box::new(match video {
@@ -561,6 +697,7 @@ pub fn new_encoder_with_opts(codec: CodecId, params: &StreamParams, bits: Option
                 None => enc,
             }))
         }
+        #[cfg(feature = "av1")]
         (CodecId::Av1, StreamParams::Video { .. }) => {
             let enc = av1::enc::Av1Encoder::new(params, None, bitrate_kbps.map(|k| k.saturating_mul(1000)))?;
             Ok(Box::new(match video {
@@ -580,20 +717,25 @@ pub fn new_encoder_with_opts(codec: CodecId, params: &StreamParams, bits: Option
 
 /// The codec configuration for a stream from `new_encoder_with_opts` with the same arguments: as
 /// `encoder_extradata`, but an Opus head carries the pre-skip of the mode asked for.
-pub fn encoder_extradata_with_opts(codec: CodecId, params: &StreamParams, bitrate_kbps: Option<u32>, opus_opts: Option<&OpusOptions>, prores_profile: Option<prores::Profile>, video: Option<&VideoOptions>) -> Result<Vec<u8>> {
+// Some arguments are read only by the codecs that take them, so a build without those codecs leaves them unused.
+#[allow(unused_variables)]
+pub fn encoder_extradata_with_opts(codec: CodecId, params: &StreamParams, bitrate_kbps: Option<u32>, opus_opts: Option<&OpusOptions>, prores_profile: Option<options::Profile>, video: Option<&VideoOptions>) -> Result<Vec<u8>> {
     match (codec, params, opus_opts) {
+        #[cfg(feature = "opus")]
         (CodecId::Opus, StreamParams::Audio { sample_rate, channels }, Some(o)) if *channels > 2 => {
             let bitrate = bitrate_kbps.map_or(opus::OpusEncoder::default_bitrate(*channels as usize), |k| k * 1000);
             Ok(opus::MultistreamEncoder::new(*sample_rate, *channels as usize, bitrate)?.map_streams(|e| o.apply(e))?.head())
         }
+        #[cfg(feature = "opus")]
         (CodecId::Opus, StreamParams::Audio { sample_rate, channels }, Some(o)) => {
             let bitrate = bitrate_kbps.map_or(opus::OpusEncoder::default_bitrate(*channels as usize), |k| k * 1000);
             Ok(o.apply(opus::OpusEncoder::new(*sample_rate, *channels as usize, bitrate)?)?.head())
         }
+        #[cfg(feature = "mpeg4")]
         (CodecId::Mpeg4, StreamParams::Video { width, height, frame_rate, .. }, _) if video.and_then(|v| v.bframes).is_some_and(|n| n > 0) => {
             Ok(mpeg4::enc::config_with_bframes(*width, *height, if frame_rate.num > 0 { frame_rate.num } else { 25 }))
         }
-        (CodecId::ProRes, StreamParams::Video { .. }, _) => Ok(prores_profile.unwrap_or(prores::Profile::Hq).fourcc().to_vec()),
+        (CodecId::ProRes, StreamParams::Video { .. }, _) => Ok(prores_profile.unwrap_or(options::Profile::Hq).fourcc().to_vec()),
         _ => Ok(encoder_extradata(codec, params)),
     }
 }
@@ -602,12 +744,18 @@ pub fn encoder_extradata_with_opts(codec: CodecId, params: &StreamParams, bitrat
 /// (empty when the codec needs none).
 pub fn encoder_extradata(codec: CodecId, params: &StreamParams) -> Vec<u8> {
     match (codec, params) {
+        #[cfg(feature = "opus")]
         (CodecId::Opus, StreamParams::Audio { channels, .. }) => opus::opus_head(*channels as usize),
+        #[cfg(feature = "vorbis")]
         (CodecId::Vorbis, StreamParams::Audio { sample_rate, channels }) => vorbis::encoder_headers(*sample_rate, *channels as usize),
+        #[cfg(feature = "aac")]
         (CodecId::Aac, StreamParams::Audio { sample_rate, channels }) => aac::audio_specific_config(*sample_rate, *channels as usize),
-        (CodecId::ProRes, _) => prores::Profile::Hq.fourcc().to_vec(),
+        (CodecId::ProRes, _) => options::Profile::Hq.fourcc().to_vec(),
+        #[cfg(feature = "av1")]
         (CodecId::Av1, StreamParams::Video { width, height, .. }) => av1::enc::config_record(*width, *height),
+        #[cfg(feature = "mpeg4")]
         (CodecId::Mpeg4, StreamParams::Video { width, height, frame_rate, .. }) => mpeg4::enc::config(*width, *height, if frame_rate.num > 0 { frame_rate.num } else { 25 }),
+        #[cfg(feature = "mpeg2")]
         (CodecId::Mpeg2Video, StreamParams::Video { width, height, frame_rate, .. }) => {
             let (num, den) = if frame_rate.num > 0 && frame_rate.den > 0 { (frame_rate.num, frame_rate.den) } else { (25, 1) };
             mpeg2::enc::config(*width, *height, num, den)
@@ -620,9 +768,13 @@ pub fn encoder_extradata(codec: CodecId, params: &StreamParams) -> Vec<u8> {
 /// (containers record it so players can skip it).
 pub fn encoder_lead_in(codec: CodecId) -> i64 {
     match codec {
+        #[cfg(feature = "aac")]
         CodecId::Aac => aac::PRIMING,
+        #[cfg(feature = "mp3")]
         CodecId::Mp3 => mp3::LEAD_IN,
+        #[cfg(feature = "mp3")]
         CodecId::Mp2 => mp3::MP2_LEAD_IN,
+        #[cfg(feature = "ac3")]
         CodecId::Ac3 => ac3::LEAD_IN,
         _ => 0,
     }

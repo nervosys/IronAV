@@ -4,7 +4,7 @@
 //! (`vector_fmul_window`); the transforms are IronAV's own inverse MDCT.
 
 use super::tables::{BESSEL_P1, BESSEL_P2, BESSEL_Q1, BESSEL_Q2};
-use crate::aac::imdct::Imdct;
+use crate::imdct::Imdct;
 use std::f64::consts::PI;
 
 pub(super) const BLOCK: usize = 256;

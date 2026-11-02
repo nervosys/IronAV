@@ -11,8 +11,7 @@
 
 mod dsp;
 mod playout;
-mod resample;
 
 pub use dsp::{Agc, Denoiser, Gate, Spectrum, SpectrumMeter, Vad};
 pub use playout::{Playout, PlayoutStats, Pop};
-pub use resample::StreamResampler;
+pub use crate::resample::StreamResampler;

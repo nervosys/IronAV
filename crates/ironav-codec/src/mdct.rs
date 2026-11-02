@@ -88,6 +88,7 @@ impl Fft {
     }
 }
 
+#[cfg_attr(not(any(feature = "opus", feature = "vorbis")), allow(dead_code))]
 pub struct Dct4 {
     n: usize,
     pre: Vec<C>,
@@ -97,6 +98,7 @@ pub struct Dct4 {
     b: Vec<C>,
 }
 
+#[cfg_attr(not(any(feature = "opus", feature = "vorbis")), allow(dead_code))]
 impl Dct4 {
     pub fn new(n: usize) -> Self {
         let m = n / 2;

@@ -6,7 +6,7 @@
 //!
 //! Each packet is exactly one FLAC frame.
 
-pub mod bits;
+pub use crate::bitio as bits;
 pub mod crc;
 pub mod decoder;
 pub mod encoder;

@@ -16,7 +16,92 @@ categories = ["multimedia::encoding", "multimedia::video", "multimedia::audio"]
 [lints]
 workspace = true
 
+# Features. `default` turns on every codec, the shared filters and the voice link, so the workspace
+# crates build unchanged. For a smaller build, turn the defaults off and name what you need, e.g.
+#
+#   ironav-codec = { version = "0.1", default-features = false, features = ["opus", "voice"] }
+#
+# which compiles Opus, the voice-link DSP and the resampler, and no serde. A codec feature lists the
+# other features its module reads from (`hevc` needs `h264`'s bit reader and CABAC tables, for
+# example); those are enabled with it.
+[features]
+default = [
+    "aac", "ac3", "alac", "av1", "flac", "h264", "hevc", "jpeg", "mp3", "mpeg2", "mpeg4", "opus", "prores",
+    "vorbis", "vp8", "vp9", "voice", "resample", "filters", "order", "serde",
+]
+# One feature per codec module (the decoder and, where there is one, the encoder).
+aac = []
+ac3 = []
+alac = []
+av1 = []
+flac = []
+h264 = []
+# Needs H.264's bit reader, CABAC and tables.
+hevc = ["h264"]
+jpeg = []
+mp3 = []
+# Needs MPEG-4's bit reader, IDCT and units.
+mpeg2 = ["mpeg4"]
+mpeg4 = []
+# Opus needs the resampler: its encoder runs SILK on 16 kHz input.
+opus = ["resample"]
+prores = []
+vorbis = []
+vp8 = []
+# Needs VP8's boolean encoder.
+vp9 = ["vp8"]
+# The voice-link DSP (`voice::Vad`, `Gate`, `Agc`, `Denoiser`, `Playout`) and `voice::StreamResampler`.
+# It needs the resampler and the shared FFT, but not the Opus codec: an encoder is the caller's choice.
+voice = ["resample"]
+# The windowed-sinc resampler (`resample` filter, `voice::StreamResampler`).
+resample = []
+# Picture order of H.264 and HEVC streams, from slice headers (`order::PictureOrder`).
+order = ["h264", "hevc"]
+# The filter registry (`FILTERS`, `build_filter`), with the pixel format conversion and scaling
+# behind it. Needs serde, to describe the filters.
+filters = ["serde", "resample"]
+# Serialises the registries (`CodecImpl`), the `ironav-core` types and the filter descriptions.
+# Without it the crate needs neither serde nor serde_json.
+serde = ["dep:serde", "dep:serde_json", "ironav-core/serde"]
+
 [dependencies]
-serde.workspace = true
-serde_json.workspace = true
-ironav-core.workspace = true
+ironav-core = { path = "../ironav-core", version = "0.1.0", default-features = false }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+# Integration tests that exercise only some codecs are built only with those features.
+[[test]]
+name = "ac3_ffmpeg"
+required-features = ["ac3"]
+
+[[test]]
+name = "av1_perf"
+required-features = ["av1"]
+
+[[test]]
+name = "flac_perf"
+required-features = ["flac"]
+
+[[test]]
+name = "h264_enc_refs"
+required-features = ["h264"]
+
+[[test]]
+name = "h264_mbaff"
+required-features = ["h264"]
+
+[[test]]
+name = "h264_perf"
+required-features = ["h264"]
+
+[[test]]
+name = "mp2_ffmpeg"
+required-features = ["mp3"]
+
+[[test]]
+name = "opus_low_delay"
+required-features = ["opus", "voice"]
+
+[[test]]
+name = "voice_dsp"
+required-features = ["voice"]

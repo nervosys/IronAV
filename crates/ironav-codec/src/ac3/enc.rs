@@ -7,7 +7,7 @@
 //! encoder helpers of `ac3dsp.c` and `ac3tab.c` (LGPL-2.1 or later; Copyright (c) 2000 Fabrice
 //! Bellard, 2006-2011 Justin Ruggles, 2006-2010 Prakash Punnoor). The float encoder is the one
 //! ported: the input is float samples and the transform is float. The bit allocation (`alloc.rs`),
-//! the KBD window (`synth.rs`), the DCT-IV (`aac/imdct.rs`) and every table are shared with the
+//! the KBD window (`synth.rs`), the DCT-IV (`imdct.rs`) and every table are shared with the
 //! decoder. The forward MDCT is the decoder's DCT-IV behind the TDAC fold, scaled as FFmpeg's
 //! `av_tx` MDCT is (-2 / 512); FFmpeg's own transform is an FFT with its own rounding, so the
 //! coefficients, and so the frames, are close to FFmpeg's but not guaranteed to match its bits.
@@ -15,7 +15,7 @@
 use super::alloc::{self, AllocParams, Dba};
 use super::synth::kbd_window;
 use super::tables::{BAP_TAB, DB_PER_BIT, FAST_DECAY, FAST_GAIN, FLOOR, FRAME_SIZE, REMATRIX_BAND, SLOW_DECAY, SLOW_GAIN};
-use crate::aac::imdct::Imdct;
+use crate::imdct::Imdct;
 use ironav_core::{Encoder, Error, ErrorCode, Frame, Packet, Result};
 use std::collections::VecDeque;
 

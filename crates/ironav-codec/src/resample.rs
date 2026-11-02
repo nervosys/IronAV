@@ -5,6 +5,11 @@
 //! keeps anything above it from aliasing when the rate goes down. One set of filter taps is
 //! precomputed per fractional position (`L` of them for a ratio `L / M`).
 
+mod stream;
+
+pub use stream::StreamResampler;
+
+#[cfg(feature = "filters")]
 use ironav_core::{AudioFrame, Error, Filter, Frame, Result, StreamParams};
 use std::f64::consts::PI;
 
@@ -29,6 +34,8 @@ fn gcd(a: u64, b: u64) -> u64 {
     if b == 0 { a } else { gcd(b, a % b) }
 }
 
+// The `Resample` filter: the sample-rate conversion behind the registry's `resample` entry.
+#[cfg(feature = "filters")]
 struct State {
     channels: usize,
     /// Output samples per `m` input samples.
@@ -81,6 +88,7 @@ pub(crate) fn design(in_rate: u32, out_rate: u32) -> (usize, usize, usize, Vec<f
     }
 }
 
+#[cfg(feature = "filters")]
 impl State {
     fn new(in_rate: u32, out_rate: u32, channels: usize) -> Self {
         let (l, m, half, table) = design(in_rate, out_rate);
@@ -141,17 +149,20 @@ impl State {
 }
 
 /// The `resample` filter.
+#[cfg(feature = "filters")]
 pub struct Resample {
     pub rate: u32,
     state: Option<State>,
 }
 
+#[cfg(feature = "filters")]
 impl Resample {
     pub fn new(rate: u32) -> Self {
         Self { rate, state: None }
     }
 }
 
+#[cfg(feature = "filters")]
 impl Filter for Resample {
     fn output_params(&self, input: &StreamParams) -> StreamParams {
         match input {
@@ -194,7 +205,7 @@ impl Filter for Resample {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "filters"))]
 mod tests {
     use super::*;
 

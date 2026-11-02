@@ -1,5 +1,5 @@
 use super::{bad, frame_mult, lpc_adapt, lpc_base, parse_config, rice_k, run_k, sign_extend, unzigzag, update_history, Config, CHANNEL_OFFSETS, INITIAL_HISTORY, LIMIT};
-use crate::flac::bits::BitReader;
+use crate::bitio::BitReader;
 use ironav_core::{AudioFrame, Decoder, Error, Frame, Packet, Result, StreamParams};
 
 const END: u32 = 7;
