@@ -52,7 +52,8 @@ pub(crate) fn parse_header(line: &[u8]) -> Result<(u32, u32, Rational, PixelForm
     }
     let (mut w, mut h, mut fps, mut pix) = (0u32, 0u32, Rational::new(25, 1), PixelFormat::Yuv420p);
     for tok in header.trim_end().split(' ').skip(1) {
-        let (k, v) = tok.split_at(tok.len().min(1));
+        // split after the first character: a lossy conversion can leave a multi-byte one first
+        let (k, v) = tok.split_at(tok.char_indices().nth(1).map_or(tok.len(), |(i, _)| i));
         match k {
             "W" => w = v.parse().map_err(|_| Error::invalid_input("bad Y4M width"))?,
             "H" => h = v.parse().map_err(|_| Error::invalid_input("bad Y4M height"))?,
@@ -90,6 +91,12 @@ pub(crate) fn parse_header(line: &[u8]) -> Result<(u32, u32, Rational, PixelForm
     }
     if w == 0 || h == 0 || fps.num <= 0 || fps.den <= 0 {
         return Err(Error::invalid_input("Y4M header must give positive W, H and frame rate"));
+    }
+    // a frame is allocated from these, so the header bounds it
+    const MAX_SIDE: u32 = 16384;
+    const MAX_FRAME_BYTES: usize = 1 << 30;
+    if w > MAX_SIDE || h > MAX_SIDE || pix.frame_bytes(w as usize, h as usize) > MAX_FRAME_BYTES {
+        return Err(Error::invalid_input(format!("Y4M picture {w}x{h} is larger than the supported size (sides up to {MAX_SIDE}, frames up to 1 GiB)")));
     }
     Ok((w, h, fps, pix))
 }
