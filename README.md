@@ -1264,8 +1264,11 @@ Other protections:
 
 ## Security notes (browser GUI)
 
-The native GUI runs in-process and opens no sockets. The `--web` variant is loopback only; every request needs a per-launch random token and a loopback `Host` header. The file browser can list
-any directory the process can read, so treat the launch URL like a credential.
+The native GUI runs in-process and opens no sockets. The `--web` variant is loopback only; every request needs a per-launch random token (compared in constant time), a loopback `Host` header and,
+when the browser sends one, a loopback `Origin`. At most 32 connections and 4 running jobs are served. The file browser lists only the directories `IRONAV_ROOTS` allows (any readable directory when it is
+unset), so treat the launch URL like a credential. The page carries a Content Security Policy with a per-response script nonce.
+
+See [SECURITY.md](SECURITY.md) to report a vulnerability, and [docs/security/compliance.md](docs/security/compliance.md) for the security review and its CWE, MITRE ATT&CK, FIPS 140-3 and CMMC 2.0 mapping.
 
 ## Layout
 
