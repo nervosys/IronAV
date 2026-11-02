@@ -1269,7 +1269,11 @@ behaviour unless a variable is set.
 | `IRONAV_MAX_PIXELS` | 268435456 (2^28; at most 16384 on a side) | The most pixels in one decoded picture; a stream that asks for more is refused before a decoder is made. A value replaces both limits. Audio streams above 64 channels are refused. |
 | `IRONAV_YTDLP` | unset: `yt-dlp` from `PATH` | Absolute path of yt-dlp (a relative one is refused). `capabilities` reports which program is used. |
 | `IRONAV_AUDIT_LOG` | off | A file to append one JSON line to for each tool call start and end (tool, caller `cli`/`mcp`/`webui`, outcome or error code, duration), file write, network source and device open, and each refusal by the settings above. Times are UTC RFC 3339; URLs are redacted; no credentials or media are written. |
-| `IRONAV_SIDECARS`, `IRONAV_NET_ALLOW`, `IRONAV_CA_FILE` | unset | See the sections on sidecars and live sources. |
+| `IRONAV_NET_ALLOW` | unset: no outbound connections | Which addresses sources may reach: `private`, `loopback`, `public`, `any`, addresses and CIDR ranges, comma-separated, checked after the name resolves and at each redirect. See "Watching live sources". |
+| `IRONAV_NET_ALLOW_METADATA` | off | `1` lets the cloud metadata endpoints (169.254.169.254 and the like) be reached when `IRONAV_NET_ALLOW` covers them. |
+| `IRONAV_ALLOW_PLAINTEXT_BASIC` | off | `1` lets a Basic password be sent over plain `http://` or `rtsp://`. |
+| `IRONAV_FIPS` | off (on in a `fips` build) | `1` restricts TLS to FIPS-approved algorithms and refuses plaintext transports, YouTube sources and MD5 Digest. The cryptography is not CMVP-validated. |
+| `IRONAV_SIDECARS`, `IRONAV_CA_FILE` | unset | See the sections on sidecars and live sources. |
 
 Other protections:
 
