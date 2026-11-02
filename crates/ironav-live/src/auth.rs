@@ -51,7 +51,8 @@ impl Hash {
 
 pub(crate) struct Digest {
     user: String,
-    pass: String,
+    /// HA1 = H(user:realm:password), the value RFC 7616 has a server keep. The password itself is not kept.
+    ha1: String,
     realm: String,
     nonce: String,
     opaque: Option<String>,
@@ -93,7 +94,9 @@ impl Auth {
             return Err(format!("{name} without qop auth"));
         }
         let need = |k: &str| get(k).ok_or_else(|| format!("a challenge without a {k}"));
-        Ok(Auth::Digest(Digest { user: user.into(), pass: pass.into(), realm: need("realm")?, nonce: need("nonce")?, opaque: get("opaque"), algorithm, hash, sess, qop, nc: 0 }))
+        let realm = need("realm")?;
+        let ha1 = hash.hex(format!("{user}:{realm}:{pass}").as_bytes());
+        Ok(Auth::Digest(Digest { user: user.into(), ha1, realm, nonce: need("nonce")?, opaque: get("opaque"), algorithm, hash, sess, qop, nc: 0 }))
     }
 
     fn is_sha256(&self) -> bool {
@@ -133,8 +136,7 @@ impl Digest {
     /// The request digest: `H(HA1:nonce:nc:cnonce:qop:HA2)`, or `H(HA1:nonce:HA2)` without qop, for
     /// the hash `H` the challenge named.
     fn response(&self, method: &str, uri: &str, nc: u32, cnonce: &str) -> String {
-        let ha1 = self.hash.hex(format!("{}:{}:{}", self.user, self.realm, self.pass).as_bytes());
-        let ha1 = if self.sess { self.hash.hex(format!("{ha1}:{}:{cnonce}", self.nonce).as_bytes()) } else { ha1 };
+        let ha1 = if self.sess { self.hash.hex(format!("{}:{}:{cnonce}", self.ha1, self.nonce).as_bytes()) } else { self.ha1.clone() };
         let ha2 = self.hash.hex(format!("{method}:{uri}").as_bytes());
         if self.qop {
             self.hash.hex(format!("{ha1}:{}:{nc:08x}:{cnonce}:auth:{ha2}", self.nonce).as_bytes())

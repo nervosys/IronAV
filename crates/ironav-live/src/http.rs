@@ -246,6 +246,11 @@ type Key = (bool, String, u16, String, String);
 
 /// The answers to challenges, kept for the rest of the process so that each request after the first
 /// to a host is sent with them, and needs no round trip (a Digest nonce's count goes up each time).
+///
+/// The cache is process-wide on purpose: HLS segment fetches, ONVIF calls and the HTTP sources all share
+/// it. Scoping it to one connection would change every caller, so it is not scoped. What it holds: the
+/// key still has the password, and a Basic answer has it base64 encoded, for the process lifetime. A
+/// Digest answer holds only HA1 (see `auth::Digest`). RTSP keeps its answer in the session, which ends with it.
 static ANSWERS: Mutex<BTreeMap<Key, Auth>> = Mutex::new(BTreeMap::new());
 
 fn key(u: &HttpUrl) -> Option<Key> {
