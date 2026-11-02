@@ -17,12 +17,20 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const INDEX_HTML: &str = include_str!("ui.html");
 const MAX_BODY: usize = 4 << 20;
+/// Connections served at once; one more is closed without an answer.
+const MAX_CONNECTIONS: usize = 32;
+/// Jobs running at once; one more is refused as busy.
+const MAX_RUNNING_JOBS: usize = 4;
+/// Finished jobs kept for the page to read; the oldest are dropped.
+const MAX_FINISHED_JOBS: usize = 64;
+/// How long a connection may stall on a read or a write.
+const IO_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub struct Options {
     /// 0 picks a free port.
@@ -35,6 +43,13 @@ struct State {
     port: u16,
     next_job: AtomicU64,
     jobs: Arc<Mutex<HashMap<u64, Value>>>,
+    running: Arc<AtomicUsize>,
+}
+
+impl State {
+    fn new(port: u16) -> Self {
+        State { token: random_token(), port, next_job: AtomicU64::new(1), jobs: Arc::new(Mutex::new(HashMap::new())), running: Arc::new(AtomicUsize::new(0)) }
+    }
 }
 
 /// `N` random bytes, hex encoded: the operating system's entropy through IronCrypto's SP 800-90A DRBG.
@@ -60,7 +75,7 @@ fn token_eq(a: &str, b: &str) -> bool {
 pub fn serve(opts: Options) -> Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", opts.port))?;
     let port = listener.local_addr()?.port();
-    let state = Arc::new(State { token: random_token(), port, next_job: AtomicU64::new(1), jobs: Arc::new(Mutex::new(HashMap::new())) });
+    let state = Arc::new(State::new(port));
     let url = format!("http://127.0.0.1:{port}/?t={}", state.token);
     println!("{}", json!({ "ok": true, "result": { "gui_url": url, "note": "serving on loopback only; press Ctrl+C to stop" } }));
     if opts.open_browser {
@@ -68,14 +83,37 @@ pub fn serve(opts: Options) -> Result<()> {
             eprintln!("could not open a browser ({e}); open the gui_url printed above");
         }
     }
+    accept_loop(listener, state);
+    Ok(())
+}
+
+/// Serves connections until the listener fails. A connection beyond `MAX_CONNECTIONS` is closed at once.
+fn accept_loop(listener: TcpListener, state: Arc<State>) {
+    let active = Arc::new(AtomicUsize::new(0));
     for conn in listener.incoming() {
         let Ok(stream) = conn else { continue };
+        // only this loop adds to the count, so checking and then adding cannot overshoot the cap
+        if active.load(Ordering::SeqCst) >= MAX_CONNECTIONS {
+            drop(stream);
+            continue;
+        }
+        active.fetch_add(1, Ordering::SeqCst);
+        let slot = ConnectionSlot(Arc::clone(&active));
         let st = Arc::clone(&state);
         std::thread::spawn(move || {
+            let _slot = slot;
             let _ = handle(stream, &st);
         });
     }
-    Ok(())
+}
+
+/// A connection's place under the cap, given back when its thread ends.
+struct ConnectionSlot(Arc<AtomicUsize>);
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Opens the launch URL in the browser without putting it on a command line, where other users can read
@@ -250,7 +288,8 @@ fn envelope(r: Result<Value>) -> Vec<u8> {
 }
 
 fn handle(mut stream: TcpStream, st: &State) -> std::io::Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(15)))?;
+    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))?;
     let Some(req) = read_request(&mut stream)? else {
         return respond(&mut stream, "400 Bad Request", "text/plain", b"bad request");
     };
@@ -292,15 +331,21 @@ fn start_job(st: &State, body: Value) -> Result<Value> {
     let job: Job = serde_json::from_value(body).map_err(|e| Error::invalid_arg(format!("invalid job: {e}")))?;
     // Surface validation errors synchronously so the UI can show them next to the form.
     ironav_engine::plan(&job)?;
+    let slot = reserve_job(&st.running)?;
     let id = st.next_job.fetch_add(1, Ordering::Relaxed);
     let jobs = Arc::clone(&st.jobs);
     let put = move |v: Value| {
         if let Ok(mut j) = jobs.lock() {
+            let finished = v["state"] != "running";
             j.insert(id, v);
+            if finished {
+                evict_finished(&mut j, MAX_FINISHED_JOBS);
+            }
         }
     };
     put(json!({ "state": "running", "progress": null }));
     std::thread::spawn(move || {
+        let _slot = slot;
         let result = ironav_engine::run(&job, &mut |p| put(json!({ "state": "running", "progress": p })));
         put(match result {
             Ok(report) => json!({ "state": "done", "report": report }),
@@ -308,6 +353,39 @@ fn start_job(st: &State, body: Value) -> Result<Value> {
         });
     });
     Ok(json!({ "id": id }))
+}
+
+/// A running-job slot, given back when the job's thread ends.
+struct JobSlot(Arc<AtomicUsize>);
+
+impl Drop for JobSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn reserve_job(running: &Arc<AtomicUsize>) -> Result<JobSlot> {
+    let mut current = running.load(Ordering::SeqCst);
+    loop {
+        if current >= MAX_RUNNING_JOBS {
+            return Err(Error::new(ErrorCode::Busy, format!("{MAX_RUNNING_JOBS} jobs are already running")).hint("wait for one to finish, then start this one"));
+        }
+        match running.compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return Ok(JobSlot(Arc::clone(running))),
+            Err(now) => current = now,
+        }
+    }
+}
+
+/// Drops the oldest finished jobs so that at most `keep` remain. Running jobs are never dropped.
+fn evict_finished(jobs: &mut HashMap<u64, Value>, keep: usize) {
+    let mut finished: Vec<u64> = jobs.iter().filter(|(_, v)| v["state"] != "running").map(|(id, _)| *id).collect();
+    if finished.len() > keep {
+        finished.sort_unstable();
+        for id in &finished[..finished.len() - keep] {
+            jobs.remove(id);
+        }
+    }
 }
 
 fn list_dir(path: Option<&str>) -> Result<Value> {
@@ -373,6 +451,45 @@ mod tests {
             assert!(t.bytes().all(|c| c.is_ascii_hexdigit()), "{t}");
         }
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn jobs_beyond_the_running_limit_are_refused_until_one_ends() {
+        let running = Arc::new(AtomicUsize::new(0));
+        let slots: Vec<JobSlot> = (0..MAX_RUNNING_JOBS).map(|_| reserve_job(&running).unwrap()).collect();
+        assert_eq!(reserve_job(&running).err().unwrap().code, ErrorCode::Busy);
+        drop(slots);
+        assert_eq!(running.load(Ordering::SeqCst), 0);
+        assert!(reserve_job(&running).is_ok());
+    }
+
+    #[test]
+    fn only_the_newest_finished_jobs_are_kept() {
+        let mut jobs: HashMap<u64, Value> = HashMap::new();
+        jobs.insert(1, json!({ "state": "running", "progress": null }));
+        for id in 2..=(MAX_FINISHED_JOBS as u64 + 10) {
+            jobs.insert(id, json!({ "state": "done" }));
+        }
+        evict_finished(&mut jobs, MAX_FINISHED_JOBS);
+        assert!(jobs.contains_key(&1), "a running job is never dropped");
+        assert_eq!(jobs.len(), MAX_FINISHED_JOBS + 1);
+        assert!(!jobs.contains_key(&2) && !jobs.contains_key(&10) && jobs.contains_key(&11));
+    }
+
+    #[test]
+    fn connections_beyond_the_cap_are_closed_at_once() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let state = Arc::new(State::new(port));
+        std::thread::spawn(move || accept_loop(listener, state));
+        // silent connections hold their slots until the read timeout
+        let idle: Vec<TcpStream> = (0..MAX_CONNECTIONS).map(|_| TcpStream::connect(("127.0.0.1", port)).unwrap()).collect();
+        std::thread::sleep(Duration::from_millis(300));
+        let mut extra = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        extra.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut buf = [0u8; 16];
+        assert!(matches!(extra.read(&mut buf), Ok(0)), "the connection beyond the cap gets no answer and is closed");
+        drop(idle);
     }
 
     #[test]
