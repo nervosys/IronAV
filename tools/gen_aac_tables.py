@@ -1,5 +1,6 @@
-import re, os
-src = open(r'ffmpeg/libavcodec/aactab.c', encoding='utf-8').read()
+# usage: python tools/gen_aac_tables.py <ffmpeg source dir> <output tables.rs>
+import re, os, sys
+src = open(os.path.join(sys.argv[1], 'libavcodec', 'aactab.c'), encoding='utf-8').read()
 
 def arr(name):
     m = re.search(r'\b' + re.escape(name) + r'\s*\[[^\]]*\]\s*=\s*\{(.*?)\};', src, re.S)
@@ -56,7 +57,7 @@ for n in ('tns_tmp2_map_0_3', 'tns_tmp2_map_0_4', 'tns_tmp2_map_1_3', 'tns_tmp2_
     emit(n.upper(), 'f32', floats(n), 4)
 m = mapping('ff_tns_tmp2_map')
 out.append('/// Indexed by `2 * coef_compress + coef_res`.\npub const TNS_MAP: [&[f32]; 4] = [' + ', '.join('&' + t.upper() for t in m) + '];\n')
-dst = r'crates/ironav-codec/src/aac/tables.rs'
+dst = sys.argv[2]
 os.makedirs(os.path.dirname(dst), exist_ok=True)
 open(dst, 'w', encoding='utf-8', newline='\n').write('\n'.join(out))
 print(len('\n'.join(out)), 'bytes')
