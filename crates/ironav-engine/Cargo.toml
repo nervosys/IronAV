@@ -9,6 +9,8 @@ homepage.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 readme = "../../README.md"
+# the reference media is for the tests in the repository, not for users of the crate
+exclude = ["tests/data"]
 keywords = ["video", "audio", "transcode", "streaming", "multimedia"]
 categories = ["multimedia::encoding", "multimedia::video", "multimedia::audio"]
 
