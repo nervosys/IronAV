@@ -220,10 +220,10 @@ fn a_sidecar_removed_while_starting_is_stopped_and_never_joins() {
     let _ = call_tool("stream_close", &json!({ "session": id }));
 }
 
-/// A sidecar that touches a gigabyte, with a 64 MB memory limit, is stopped at the limit. (Only on
-/// Windows here: the limit is a job object's, and the test would be run there.) Without the limit
-/// the process would hold its gigabyte and still be alive when the test gives up.
-#[cfg(windows)]
+/// A sidecar that touches a gigabyte, with a 64 MB memory limit, is stopped at the limit: a job
+/// object on Windows, `RLIMIT_AS` on Linux (where the allocation fails and the program aborts). Without
+/// the limit the process would hold its gigabyte and still be alive when the test gives up.
+#[cfg(any(windows, target_os = "linux"))]
 #[test]
 fn a_sidecar_over_its_memory_limit_is_stopped() {
     let dir = configure();
