@@ -250,13 +250,13 @@ impl Client<'_> {
     fn call(&self, url: &str, ns: &str, action: &str, body: &str, auth: bool) -> Result<String> {
         let header = match (&self.cred, auth) {
             (Some((user, pass)), true) => {
-                let nonce = &sha1(format!("{}{}{:?}", uuid(), std::process::id(), SystemTime::now()).as_bytes())[..16];
+                let nonce = nonce();
                 let created = iso(now_secs() + self.skew);
                 format!(
                     r#"<s:Header><Security s:mustUnderstand="1" xmlns="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"><UsernameToken><Username>{}</Username><Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">{}</Password><Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary">{}</Nonce><Created xmlns="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">{created}</Created></UsernameToken></Security></s:Header>"#,
                     xml_escape(user),
-                    password_digest(nonce, &created, pass),
-                    base64(nonce)
+                    password_digest(&nonce, &created, pass),
+                    base64(&nonce)
                 )
             }
             _ => String::new(),
@@ -291,6 +291,11 @@ pub fn password_digest(nonce: &[u8], created: &str, password: &str) -> String {
     d.extend_from_slice(created.as_bytes());
     d.extend_from_slice(password.as_bytes());
     base64(&sha1(&d))
+}
+
+/// A WS-Security nonce: 128 random bits, so that a captured digest cannot be replayed to guess the password.
+fn nonce() -> [u8; 16] {
+    crate::auth::random_bytes()
 }
 
 /// A random-enough UUID (version 4 form) for message IDs: unique, not secret.
@@ -477,5 +482,16 @@ fn next_tag(xml: &str, from: usize) -> Option<Tag<'_>> {
         let name_end = inner.find(|c: char| c.is_whitespace()).unwrap_or(inner.len());
         let qname = &inner[..name_end];
         return Some(Tag { start, end: gt + 1, local: qname.rsplit(':').next().unwrap_or(qname), attrs: &inner[name_end..], close, empty });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn nonces_are_128_random_bits_and_differ() {
+        let (a, b) = (super::nonce(), super::nonce());
+        assert_eq!(a.len(), 16);
+        assert_ne!(a, b);
+        assert_ne!(a, [0u8; 16]);
     }
 }

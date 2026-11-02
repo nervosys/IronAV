@@ -6,8 +6,13 @@ use crate::http::base64;
 use crate::md5::md5_hex;
 use crate::sha256::sha256_hex;
 use ironav_core::{Error, ErrorCode};
-use std::collections::hash_map::RandomState;
-use std::hash::{BuildHasher, Hasher};
+
+/// `N` random bytes for a nonce or a cnonce: from the operating system's entropy through IronCrypto's
+/// SP 800-90A DRBG, the generator IronSocketLayer uses for TLS. If the operating system cannot supply
+/// entropy this stops the process rather than answer with a guessable value.
+pub(crate) fn random_bytes<const N: usize>() -> [u8; N] {
+    ic_drbg::Rng::from_os().and_then(|mut rng| rng.random_array()).expect("the operating system's entropy source failed; no random value can be made safely")
+}
 
 /// The environment variable that lets Basic credentials go over plaintext (`http://`, `rtsp://`).
 pub const ALLOW_PLAINTEXT_BASIC_VAR: &str = "IRONAV_ALLOW_PLAINTEXT_BASIC";
@@ -108,7 +113,7 @@ impl Digest {
     fn header(&mut self, method: &str, uri: &str) -> String {
         let (nc, cnonce) = if self.qop {
             self.nc += 1;
-            (self.nc, format!("{:016x}", RandomState::new().build_hasher().finish()))
+            (self.nc, random_bytes::<16>().iter().map(|b| format!("{b:02x}")).collect::<String>())
         } else {
             (0, String::new())
         };
@@ -325,6 +330,28 @@ mod tests {
         for v in [None, Some(""), Some("0"), Some("true"), Some("yes"), Some(" 1")] {
             assert!(!opt_in(v), "{v:?}");
         }
+    }
+
+    #[test]
+    fn cnonces_are_128_bits_and_differ() {
+        let mut a = Auth::answer(r#"Digest realm="r", nonce="n", qop=auth"#, "u", "p").unwrap();
+        let (mut seen_a, mut seen_b) = (String::new(), String::new());
+        for _ in 0..2 {
+            let h = a.header("GET", "/x");
+            let cnonce = h.split("cnonce=\"").nth(1).and_then(|r| r.split('"').next()).unwrap().to_string();
+            assert_eq!(cnonce.len(), 32, "{cnonce}");
+            assert!(cnonce.bytes().all(|b| b.is_ascii_hexdigit()), "{cnonce}");
+            if seen_a.is_empty() { seen_a = cnonce } else { seen_b = cnonce }
+        }
+        assert_ne!(seen_a, seen_b);
+    }
+
+    #[test]
+    fn random_bytes_differ_between_calls() {
+        let a = random_bytes::<16>();
+        let b = random_bytes::<16>();
+        assert_ne!(a, b);
+        assert_ne!(a, [0u8; 16]);
     }
 
     #[test]

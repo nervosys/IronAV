@@ -23,6 +23,8 @@ ironav-core.workspace = true
 ironav-formats.workspace = true
 # TLS 1.3 for https:// and rtsps://, with IronPKI validating certificates
 ironsocketlayer = "0.7.2"
+# the operating system's entropy through a DRBG, for Digest cnonces and WS-Security nonces
+ic-drbg = { version = "0.3.2", features = ["std"] }
 
 [target.'cfg(windows)'.dependencies]
 # cameras and microphones through Media Foundation
@@ -33,5 +35,4 @@ windows = { version = "0.62", features = ["Win32_Media_MediaFoundation", "Win32_
 libc = "0.2"
 
 [dev-dependencies]
-# the TLS test issues its own certificates
-ic-drbg = { version = "0.3.2", features = ["std"] }
+# the TLS test issues its own certificates (ic-drbg is a dependency already)

@@ -13,9 +13,7 @@
 use ironav_core::{Error, ErrorCode, Result};
 use ironav_engine::{call_tool, Job};
 use serde_json::{json, Value};
-use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
-use std::hash::{BuildHasher, Hasher};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -39,15 +37,11 @@ struct State {
     jobs: Arc<Mutex<HashMap<u64, Value>>>,
 }
 
+/// 128 random bits, hex encoded: the operating system's entropy through IronCrypto's SP 800-90A DRBG.
+/// If the operating system cannot supply entropy the process stops rather than hand out a guessable token.
 fn random_token() -> String {
-    // RandomState is seeded from the OS RNG per process; two independent hashes give 128 bits.
-    let part = |salt: u64| {
-        let mut h = RandomState::new().build_hasher();
-        h.write_u64(salt);
-        h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
-        h.finish()
-    };
-    format!("{:016x}{:016x}", part(1), part(2))
+    let bytes: [u8; 16] = ic_drbg::Rng::from_os().and_then(|mut rng| rng.random_array()).expect("the operating system's entropy source failed; no launch token can be made safely");
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 pub fn serve(opts: Options) -> Result<()> {
@@ -268,4 +262,19 @@ fn list_dir(path: Option<&str>) -> Result<Value> {
         "roots": roots,
         "entries": entries,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn launch_tokens_are_128_random_bits_and_differ() {
+        let (a, b) = (random_token(), random_token());
+        for t in [&a, &b] {
+            assert_eq!(t.len(), 32, "{t}");
+            assert!(t.bytes().all(|c| c.is_ascii_hexdigit()), "{t}");
+        }
+        assert_ne!(a, b);
+    }
 }

@@ -2342,6 +2342,7 @@ dependencies = [
 name = "ironav-webui"
 version = "0.1.0"
 dependencies = [
+ "ic-drbg",
  "ironav-core",
  "ironav-engine",
  "serde_json",

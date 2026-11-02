@@ -20,3 +20,5 @@ workspace = true
 serde_json.workspace = true
 ironav-core.workspace = true
 ironav-engine.workspace = true
+# the launch token: the operating system's entropy through a DRBG
+ic-drbg = { version = "0.3.2", features = ["std"] }
