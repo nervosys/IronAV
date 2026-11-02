@@ -439,7 +439,7 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps> {
         return Err(bad("block size limits are out of range"));
     }
     // the coding blocks tile the picture, so it is a whole number of minimum coding blocks
-    if width % (1 << log2_min_cb) != 0 || height % (1 << log2_min_cb) != 0 {
+    if !width.is_multiple_of(1 << log2_min_cb) || !height.is_multiple_of(1 << log2_min_cb) {
         return Err(bad("picture size is not a multiple of the minimum coding block size"));
     }
     let max_th_depth_inter = r.ue()?;
