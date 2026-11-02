@@ -438,6 +438,10 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps> {
     if !(4..=6).contains(&log2_ctb) || log2_max_tb > 5 || log2_min_tb >= log2_min_cb {
         return Err(bad("block size limits are out of range"));
     }
+    // the coding blocks tile the picture, so it is a whole number of minimum coding blocks
+    if width % (1 << log2_min_cb) != 0 || height % (1 << log2_min_cb) != 0 {
+        return Err(bad("picture size is not a multiple of the minimum coding block size"));
+    }
     let max_th_depth_inter = r.ue()?;
     let max_th_depth_intra = r.ue()?;
     let scaling_list_enabled = r.flag()?;
