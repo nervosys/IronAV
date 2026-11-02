@@ -29,6 +29,10 @@ impl<R: Read + Seek + Send> WavDemuxer<R> {
             let size = u32::from_le_bytes([h[4], h[5], h[6], h[7]]) as u64;
             match &h[..4] {
                 b"fmt " => {
+                    // the format fields are a few dozen bytes; a longer chunk is not a format header
+                    if size > 1 << 16 {
+                        return Err(Error::invalid_input("WAV fmt chunk is implausibly large"));
+                    }
                     let mut b = vec![0u8; size as usize];
                     r.read_exact(&mut b)?;
                     fmt = Some(fmt_fields(&b)?);
