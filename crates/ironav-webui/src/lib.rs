@@ -419,11 +419,17 @@ fn evict_finished(jobs: &mut HashMap<u64, Value>, keep: usize) {
 }
 
 fn list_dir(path: Option<&str>) -> Result<Value> {
-    let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).ok().map(PathBuf::from);
+    // the browser lists only what the tools may read: under IRONAV_ROOTS it starts in the first root
+    let policy = ironav_engine::policy::current();
+    let home = match policy.roots() {
+        Some(r) => r.first().cloned(),
+        None => std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).ok().map(PathBuf::from),
+    };
     let mut p = path.filter(|p| !p.is_empty()).map(PathBuf::from).or(home).unwrap_or_else(|| PathBuf::from("."));
     if p.is_file() {
         p.pop();
     }
+    policy.read(&p.to_string_lossy())?;
     let mut entries: Vec<Value> = std::fs::read_dir(&p)?
         .flatten()
         .filter_map(|e| {
@@ -436,7 +442,9 @@ fn list_dir(path: Option<&str>) -> Result<Value> {
         })
         .collect();
     entries.sort_by_key(|e| (!e["dir"].as_bool().unwrap_or(false), e["name"].as_str().unwrap_or("").to_lowercase()));
-    let roots: Vec<String> = if cfg!(windows) {
+    let roots: Vec<String> = if let Some(r) = policy.roots() {
+        r.iter().map(|p| p.display().to_string()).collect()
+    } else if cfg!(windows) {
         ('A'..='Z').map(|c| format!("{c}:\\")).filter(|d| std::path::Path::new(d).exists()).collect()
     } else {
         vec!["/".into()]
@@ -452,6 +460,20 @@ fn list_dir(path: Option<&str>) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_file_browser_stays_inside_the_roots() {
+        let root = std::env::temp_dir().join(format!("ironav-webui-roots-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("inside")).unwrap();
+        let outside = std::env::temp_dir();
+        let policy = ironav_engine::policy::Policy::open().with_roots(&[root.as_path()]);
+        ironav_engine::policy::with_policy(policy, || {
+            let listed = list_dir(None).unwrap();
+            assert!(listed["entries"].as_array().unwrap().iter().any(|e| e["name"] == "inside"), "starts in the root: {listed}");
+            assert!(list_dir(Some(&outside.to_string_lossy())).is_err(), "a directory outside the roots is refused");
+        });
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn launch_page_holds_the_url_not_on_any_command_line() {
