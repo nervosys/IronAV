@@ -15,6 +15,8 @@
 pub mod nvdec;
 #[cfg(any(windows, target_os = "linux"))]
 pub mod nvenc;
+#[cfg(any(windows, target_os = "linux"))]
+mod driver;
 
 use ironav_core::{CodecId, Error, ErrorCode, Result};
 use serde::Serialize;

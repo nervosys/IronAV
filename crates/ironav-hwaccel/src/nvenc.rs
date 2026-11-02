@@ -12,6 +12,7 @@
 //! and no look-ahead, so output order equals input order and every frame yields a packet
 //! without added latency.
 
+use crate::driver::load;
 use crate::RateControl;
 use ironav_core::{CodecId, Encoder, Error, ErrorCode, Frame, Packet, PixelFormat, Rational, Result, StreamParams};
 use libloading::Library;
@@ -165,18 +166,6 @@ pub const ENCODE_CODECS: &[CodecId] = &[CodecId::H264, CodecId::Hevc];
 fn unavailable(msg: impl Into<String>) -> Error {
     Error::new(ErrorCode::HardwareUnavailable, msg)
         .hint("run `ironav hw probe` to see what is detected, or set hwaccel to \"off\" to use software where it exists")
-}
-
-fn load(names: &[&str]) -> std::result::Result<Library, String> {
-    let mut last = String::new();
-    for n in names {
-        // SAFETY: loading the NVIDIA driver libraries; their initialisers are the vendor's.
-        match unsafe { Library::new(n) } {
-            Ok(l) => return Ok(l),
-            Err(e) => last = format!("{n}: {e}"),
-        }
-    }
-    Err(last)
 }
 
 struct Slot {

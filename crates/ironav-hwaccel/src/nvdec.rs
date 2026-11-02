@@ -15,6 +15,7 @@
 #![allow(clippy::useless_conversion)]
 
 use ironav_core::{CodecId, Decoder, Error, ErrorCode, Frame, Packet, PixelFormat, Result, StreamParams, VideoFrame};
+use crate::driver::load;
 use libloading::Library;
 use std::collections::VecDeque;
 use std::ffi::{c_ulong, c_void};
@@ -218,24 +219,28 @@ fn unavailable(msg: impl Into<String>) -> Error {
         .hint("run `ironav hw probe` to see what is detected; NVDEC needs an NVIDIA GPU and driver")
 }
 
-fn load(names: &[&str]) -> std::result::Result<Library, String> {
-    let mut last = String::new();
-    for n in names {
-        // SAFETY: loading the NVIDIA driver libraries; their initialisers are the vendor's.
-        match unsafe { Library::new(n) } {
-            Ok(l) => return Ok(l),
-            Err(e) => last = format!("{n}: {e}"),
-        }
-    }
-    Err(last)
-}
-
 fn cu(r: CuResult, what: &str) -> Result<()> {
     if r == 0 {
         Ok(())
     } else {
         Err(Error::new(ErrorCode::Internal, format!("NVDEC: {what} failed with CUDA error {r}")))
     }
+}
+
+/// Size of the display rectangle `[left, top, right, bottom]` if it lies inside the coded picture
+/// (`0 <= left < right <= coded_width` and likewise for height), else `None`. The subtraction is
+/// checked and the bounds are compared in `i64`, so hostile values from the parser cannot overflow.
+fn display_rect_size(area: [i32; 4], coded_width: u32, coded_height: u32) -> Option<(u32, u32)> {
+    let [l, t, r, b] = area;
+    let w = r.checked_sub(l)?;
+    let h = b.checked_sub(t)?;
+    let inside = l >= 0
+        && t >= 0
+        && w > 0
+        && h > 0
+        && i64::from(r) <= i64::from(coded_width)
+        && i64::from(b) <= i64::from(coded_height);
+    inside.then_some((w as u32, h as u32))
 }
 
 /// Everything the parser callbacks touch. It lives on the heap so its address, handed to the
@@ -249,6 +254,8 @@ struct State {
     /// Bits per sample the caller expects (8 or 10); the stream must have the same depth.
     bits: u8,
     decoder: *mut c_void,
+    /// Coded size of the current decoder; the display rectangle must lie inside it.
+    coded_width: u32,
     /// Coded height of the current decoder, for locating the chroma plane in a mapped frame.
     coded_height: u32,
     display: [i32; 4],
@@ -289,8 +296,13 @@ impl State {
                 format!("the stream is {stream_bits}-bit but was declared {}-bit", self.bits),
             ));
         }
-        let (l, t, r, b) = (f.display_area[0], f.display_area[1], f.display_area[2], f.display_area[3]);
-        let (dw, dh) = ((r - l).max(0) as u32, (b - t).max(0) as u32);
+        // Copies are offset and sized from this rectangle, so it must lie inside the coded picture first.
+        let Some((dw, dh)) = display_rect_size(f.display_area, f.coded_width, f.coded_height) else {
+            return self.fail(Error::invalid_input(format!(
+                "the stream's display area {:?} does not lie inside its {}x{} coded picture",
+                f.display_area, f.coded_width, f.coded_height
+            )));
+        };
         if (dw, dh) != (self.width, self.height) {
             return self.fail(
                 Error::new(ErrorCode::UnsupportedFormat, format!("the stream is {dw}x{dh} but was declared {}x{}; changing resolution mid-stream is not supported", self.width, self.height)),
@@ -375,6 +387,7 @@ impl State {
             self.decoder = ptr::null_mut();
             return self.fail(Error::new(ErrorCode::HardwareUnavailable, format!("NVDEC could not create a decoder (CUDA error {r})")));
         }
+        self.coded_width = f.coded_width;
         self.coded_height = f.coded_height;
         self.display = f.display_area;
         surfaces as i32
@@ -464,6 +477,13 @@ impl State {
     /// The chroma goes into `uv`, which is reused between pictures so it is not reallocated
     /// (and page-faulted in) for every one.
     fn copy_planes(&self, dptr: u64, pitch: u32, uv: &mut Vec<u8>) -> Result<Vec<u8>> {
+        // Refuse rather than copy from outside the mapped picture (the sequence callback checks this too).
+        if display_rect_size(self.display, self.coded_width, self.coded_height).is_none() {
+            return Err(Error::invalid_input(format!(
+                "the stream's display area {:?} does not lie inside its {}x{} coded picture",
+                self.display, self.coded_width, self.coded_height
+            )));
+        }
         let (w, h) = (self.width as usize, self.height as usize);
         let bps = if self.bits == 10 { 2 } else { 1 };
         let (left, top) = ((self.display[0].max(0) as u64 & !1) * bps as u64, self.display[1].max(0) as u64 & !1);
@@ -609,6 +629,7 @@ impl NvdecDecoder {
                 height,
                 bits,
                 decoder: ptr::null_mut(),
+                coded_width: 0,
                 coded_height: 0,
                 display: [0; 4],
                 out: VecDeque::new(),
@@ -711,6 +732,30 @@ pub fn accepts(params: &StreamParams) -> std::result::Result<(), String> {
 mod tests {
     use super::*;
     use std::mem::size_of;
+
+    #[test]
+    fn display_rect_must_lie_inside_the_coded_picture() {
+        // Cropped 1080p in a 1088-line coded picture, and an uncropped one.
+        assert_eq!(display_rect_size([0, 0, 1920, 1080], 1920, 1088), Some((1920, 1080)));
+        assert_eq!(display_rect_size([0, 0, 1920, 1088], 1920, 1088), Some((1920, 1088)));
+        assert_eq!(display_rect_size([2, 4, 1918, 1084], 1920, 1088), Some((1916, 1080)));
+        // Right or bottom edge past the coded picture.
+        assert_eq!(display_rect_size([0, 0, 1921, 1080], 1920, 1088), None);
+        assert_eq!(display_rect_size([0, 0, 1920, 1089], 1920, 1088), None);
+        assert_eq!(display_rect_size([0, 0, i32::MAX, 16], 1920, 1088), None);
+        // Negative origin.
+        assert_eq!(display_rect_size([-2, 0, 1918, 1080], 1920, 1088), None);
+        assert_eq!(display_rect_size([0, -1, 1920, 1080], 1920, 1088), None);
+        // Empty or inverted rectangles.
+        assert_eq!(display_rect_size([8, 0, 8, 16], 1920, 1088), None);
+        assert_eq!(display_rect_size([16, 0, 8, 16], 1920, 1088), None);
+        assert_eq!(display_rect_size([0, 16, 16, 8], 1920, 1088), None);
+        // Subtractions that overflow i32 must be refused, not wrapped.
+        assert_eq!(display_rect_size([i32::MIN, 0, i32::MAX, 16], 1920, 1088), None);
+        assert_eq!(display_rect_size([0, i32::MIN, 16, i32::MAX], 1920, 1088), None);
+        // No coded picture (state not yet set) accepts nothing.
+        assert_eq!(display_rect_size([0, 0, 16, 16], 0, 0), None);
+    }
 
     /// Struct sizes as computed by clang from the NVIDIA headers.
     #[test]
