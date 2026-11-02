@@ -4,16 +4,12 @@
 all-features = true
 
 [advisories]
-# unmaintained and unsound crates are reported; the ones below are reached only through the GUI and
-# terminal UI front ends, never on a path that reads media or the network
+# unmaintained and unsound crates are reported; the ones below are reached only through the GUI front end, never on a path that reads media or the network
 ignore = [
-    { id = "RUSTSEC-2024-0436", reason = "paste (unmaintained), a proc macro used by ratatui at build time" },
     { id = "RUSTSEC-2026-0192", reason = "ttf-parser (unmaintained), used by winit's Wayland decorations for bundled fonts" },
     { id = "RUSTSEC-2026-0370", reason = "zvariant (unmaintained), accessibility over D-Bus in eframe on Linux" },
     { id = "RUSTSEC-2026-0371", reason = "zbus_names (unmaintained), accessibility over D-Bus in eframe on Linux" },
     { id = "RUSTSEC-2026-0372", reason = "zvariant_derive (unmaintained), accessibility over D-Bus in eframe on Linux" },
-    { id = "RUSTSEC-2026-0002", reason = "lru IterMut (unsound), ratatui 0.29's layout cache; the terminal UI never iterates it mutably" },
-    { id = "RUSTSEC-2026-0253", reason = "lru pop panic safety (unsound), ratatui 0.29's layout cache; release builds abort on panic" },
 ]
 
 [licenses]

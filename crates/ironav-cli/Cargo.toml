@@ -27,7 +27,8 @@ ironav-webui.workspace = true
 ironav-gui = { workspace = true, optional = true }
 ironav-ontology.workspace = true
 ironav-player.workspace = true
-ratatui = "0.29"
+# no layout-cache: its lru dependency is flagged unsound (RUSTSEC-2026-0002, RUSTSEC-2026-0253)
+ratatui = { version = "0.30", default-features = false, features = ["std", "crossterm", "all-widgets", "underline-color"] }
 
 [features]
 default = ["native-gui", "audio"]
