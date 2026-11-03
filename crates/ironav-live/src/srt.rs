@@ -1300,6 +1300,9 @@ pub(crate) fn open(u: &SourceUrl, shown: String) -> Result<SrtSource> {
         let rx = Receiver::new(RxConfig { my_id: c.my_id, peer_id: c.hs.sock, isn: c.hs.isn, latency_ms: latency, crypto: c.crypto, hs_reply: None }, Instant::now());
         (sock, Some((rx, peer)))
     };
+    // a burst, or this thread held up for a moment, must not overflow the default buffer (about
+    // 50 packets): each packet lost there is a retransmission, and possibly a too-late drop
+    crate::webrtc::grow_receive_buffer(&sock);
     let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = sync_channel(256);
     let flag = stop.clone();
@@ -1929,7 +1932,7 @@ mod tests {
     }
 
     fn free_port() -> u16 {
-        UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+        crate::net::free_udp_port_for_tests()
     }
 
     fn config(n: usize) -> SenderConfig {

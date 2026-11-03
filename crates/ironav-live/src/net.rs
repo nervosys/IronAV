@@ -266,6 +266,21 @@ pub(crate) fn recv_from_within(sock: &UdpSocket, buf: &mut [u8], wait: Duration)
     }
 }
 
+/// A UDP port nothing is using, for a test to listen on. It is outside the ephemeral range, so
+/// that a socket bound to port 0 meanwhile, in this test or another, cannot be given it.
+#[cfg(test)]
+pub(crate) fn free_udp_port_for_tests() -> u16 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let start = std::process::id() % 20_000;
+    loop {
+        let port = 20_000 + (start + NEXT.fetch_add(1, Ordering::Relaxed)) % 20_000;
+        if UdpSocket::bind(("127.0.0.1", port as u16)).is_ok() {
+            return port as u16;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

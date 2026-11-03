@@ -833,7 +833,7 @@ impl Endpoint {
 /// Asks for a larger receive buffer on the media socket than the system's default (64 KiB on
 /// Windows), so a keyframe's burst of packets is not dropped while the endpoint is busy. Best
 /// effort: the system may grant less, and elsewhere its default stays.
-fn grow_receive_buffer(sock: &UdpSocket) {
+pub(crate) fn grow_receive_buffer(sock: &UdpSocket) {
     const SIZE: i32 = 4 << 20;
     #[cfg(windows)]
     {

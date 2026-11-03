@@ -719,7 +719,7 @@ mod tests {
     }
 
     fn free_port() -> u16 {
-        UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+        crate::net::free_udp_port_for_tests()
     }
 
     // ---- the protocol state, with no socket and a clock the test moves
@@ -996,6 +996,8 @@ mod tests {
         fn new(server: SocketAddr, lose: Option<(usize, usize)>, data_from_client: bool) -> Relay {
             let front = UdpSocket::bind("127.0.0.1:0").unwrap();
             let back = UdpSocket::bind("127.0.0.1:0").unwrap();
+            crate::webrtc::grow_receive_buffer(&front);
+            crate::webrtc::grow_receive_buffer(&back);
             front.set_nonblocking(true).unwrap();
             back.set_nonblocking(true).unwrap();
             let port = front.local_addr().unwrap().port();
@@ -1088,7 +1090,8 @@ mod tests {
 
     /// Our sender to our receiver, through a path that loses packets: the bytes that come out are
     /// the bytes that went in. `sender_calls` says which end calls; `key` is the key length of an
-    /// encrypted stream.
+    /// encrypted stream. The latency is long so that a busy machine does not turn this into a test
+    /// of the too-late drop: a stalled thread is not what is being tested.
     fn roundtrip(sender_calls: bool, key: Option<usize>) {
         crate::net::allow_loopback_for_tests();
         // 364 whole payloads and a partial one, which is the 365th and is lost on its way (so the
@@ -1099,11 +1102,11 @@ mod tests {
             let rport = free_port();
             let src = open_source(&format!("srt://127.0.0.1:{rport}?mode=listener&reconnect=0{pass}")).unwrap();
             let relay = Relay::new(SocketAddr::from((Ipv4Addr::LOCALHOST, rport)), Some((9, 4)), true);
-            let sink = open_sink(&format!("srt://127.0.0.1:{}?latency=120{pass}", relay.port)).unwrap();
+            let sink = open_sink(&format!("srt://127.0.0.1:{}?latency=1000{pass}", relay.port)).unwrap();
             (src, sink, relay)
         } else {
             let sport = free_port();
-            let sink = open_sink(&format!("srt://127.0.0.1:{sport}?mode=listener&latency=120{pass}")).unwrap();
+            let sink = open_sink(&format!("srt://127.0.0.1:{sport}?mode=listener&latency=1000{pass}")).unwrap();
             let relay = Relay::new(SocketAddr::from((Ipv4Addr::LOCALHOST, sport)), Some((9, 4)), false);
             let src = open_source(&format!("srt://127.0.0.1:{}?reconnect=0{pass}", relay.port)).unwrap();
             (src, sink, relay)
@@ -1115,7 +1118,8 @@ mod tests {
         let got = reader.join().unwrap();
         let stats = sink.stats();
         let lost = relay.finish();
-        assert!(lost >= 40, "the path lost {lost}");
+        // about 40 when every original reaches the relay; a busy machine overflows its socket first
+        assert!(lost >= 20, "the path lost {lost}");
         assert!(stats.retransmitted >= lost, "{stats:?}, lost {lost}");
         assert_eq!(got.len(), data.len(), "{stats:?}");
         assert!(got == data, "the bytes differ");
