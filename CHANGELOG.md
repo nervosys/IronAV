@@ -16,6 +16,14 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   keep-alive and shutdown, and `?streamid=`. `?passphrase=` reads an AES-CTR encrypted stream (key material, PBKDF2-HMAC-SHA1
   and the RFC 3394 key wrap; the passphrase is redacted from everything shown). A caller reconnects with back-off like RTSP,
   addresses go through `IRONAV_NET_ALLOW`, and without a passphrase it is a plaintext transport that FIPS mode refuses.
+- **WebRTC ingest (WHIP, RFC 9725):** a `whip://[host]:port[/path]` live source that OBS, FFmpeg, GStreamer or a browser
+  publishes H.264 and Opus to. It is written in-tree with no async runtime: an HTTP/1.1 endpoint for the offer, answer and
+  DELETE; ICE-lite (STUN with MESSAGE-INTEGRITY and FINGERPRINT); a DTLS 1.2 server (ECDHE-ECDSA P-256 with AES-128-GCM,
+  `use_srtp`, cookies, retransmission and reassembly, and the publisher's certificate checked against its offer);
+  SRTP and SRTCP (AES-128-GCM and AES-128-CM-HMAC-SHA1-80) with replay protection; receiver reports, NACK and PLI. The
+  packets reach the session as an RTSP camera's do. It listens on loopback unless a host is given, takes other publishers
+  only from addresses `IRONAV_NET_ALLOW` admits, and `?token=` requires a bearer token, compared in constant time. FIPS
+  mode keeps it, with the AES-GCM SRTP profile only. Works with `ironav watch`, `stream_open` and the MCP server.
 
 ## [0.1.1] - 2026-11-02
 

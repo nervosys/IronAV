@@ -1,6 +1,6 @@
 # Design: agentic-first real-time streaming, parsing and understanding
 
-Status: M1 to M5 are implemented and M6 is in part (TLS, HTTPS and RTSPS, capture devices); the rest is a proposal
+Status: M1 to M5 are implemented and M6 is in part (TLS, HTTPS and RTSPS, capture devices, WebRTC ingest); the rest is a proposal
 (2026-10-29). Nothing beyond that is implemented yet unless it says so. §8 lists what is still open. TLS (`https://`, `rtsps://`) uses IronSocketLayer, with
 IronPKI validating certificates.
 
@@ -360,7 +360,7 @@ Each milestone is usable on its own and passes the test gate.
 | **M3: broadcast** (done) | the MPEG-TS demuxer and muxer; live fMP4 and MKV reading; a progressive fMP4/TS recorder; `stream_clip`; segmenting; the `latency: low` encode profile | none |
 | **M4: cameras and the web** (done) | RTSP and RTP depacketizers with a jitter buffer and RTCP; HLS over plain HTTP | none |
 | **M5: models** (done) | the sidecar protocol, voice-activity gating and two reference sidecars kept out of tree (speech-to-text, detection) | none in the core; each sidecar chooses its own |
-| **M6: optional transports** (in part) | HTTPS and HLS over TLS, RTSPS, SRT (caller and listener, with encryption), and capture devices (Media Foundation, V4L2, and AVFoundation, which has not been run on a Mac) are done; WebRTC ingest is not | each one by decision (§10) |
+| **M6: optional transports** (done) | HTTPS and HLS over TLS, RTSPS, SRT (caller and listener, with encryption), WebRTC ingest (WHIP), and capture devices (Media Foundation, V4L2, and AVFoundation, which has not been run on a Mac) | each one by decision (§10); SRT and WHIP add no crate (`ic-cipher` and `ic-core` were already locked), AVFoundation adds the macOS-only `objc2` framework crates |
 
 M2 as built: the `Source` trait and every source above; `StreamDemuxer` for Annex B H.264/HEVC, ADTS, Y4M and WAV;
 live sessions with the ring buffer and log; `stream_open`, `stream_events`, `stream_status`, `stream_snapshot`,
@@ -461,3 +461,13 @@ files at once, and it fixes the event model, analyzer trait and MCP plumbing bef
    `ic-cipher`, which IronSocketLayer already pulls in, and a small PBKDF2-HMAC-SHA1 (IronCrypto has no SHA-1). Not done:
    rendezvous mode, the message API, AES-GCM, packet filters (FEC), groups, and handshake version 4. Interop with libsrt has
    not been run in CI (the `#[ignore]` test needs `srt-live-transmit` on the `PATH`).
+7. **WebRTC ingest**: decided and done. WHIP (RFC 9725) only, receive-only, written in `ironav-live/src/webrtc` on threads
+   and blocking sockets like the other sources, not webrtc-rs or an async runtime. The endpoint is the ICE-lite, DTLS-server
+   side with one host candidate, BUNDLE and `rtcp-mux` on one UDP port beside its HTTP port; H.264 (`packetization-mode=1`)
+   and Opus are taken and other codecs declined. DTLS 1.2 is one suite (ECDHE-ECDSA P-256, AES-128-GCM) built from
+   IronCrypto's primitives through IronSocketLayer (key exchange, ECDSA, X.509) and `ic-cipher` (AES, AES-GCM, AES-CTR);
+   SRTP takes AES-128-GCM or AES-128-CM-HMAC-SHA1-80 (AES-GCM only in FIPS mode). The decrypted packets go through the
+   RTP framing RTSP uses, so depacketizing, the jitter buffer and sender-report timing are shared. Binding is loopback by
+   default, other publishers must be in `IRONAV_NET_ALLOW`, and `?token=` adds a bearer token. Not done: the DTLS client
+   role (a publisher that insists on `setup:passive`), TURN, trickle ICE and ICE restarts (PATCH is answered 405), RTX,
+   simulcast, more than one publisher per endpoint, and TLS on the HTTP side (use a reverse proxy).

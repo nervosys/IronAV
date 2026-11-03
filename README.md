@@ -123,6 +123,32 @@ comes back with different tracks ends the session. `stream_status` has `source_h
 `reconnecting` or `failed`, since when, how many reconnects and failed attempts, and the last error), and the log has
 `source_stalled`, `source_lost`, `source_restored` and `source_failed` as they happen.
 
+`whip://:port[/path]` is a WebRTC ingest endpoint ([WHIP](https://www.rfc-editor.org/rfc/rfc9725)): OBS, FFmpeg,
+GStreamer or a browser publishes to `http://host:port/path` and the session reads what it sends, H.264
+(`packetization-mode=1`) and Opus, the same way it reads an RTSP camera (other codecs are declined in the answer). It
+listens for HTTP on that port over TCP and for the media on the same port over UDP, on loopback unless a host is given
+(`whip://0.0.0.0:8080/live`). One publisher at a time: it POSTs its SDP offer and gets the answer and a `Location`, and the
+source ends when it DELETEs that, closes DTLS, or sends nothing for 10 s. The endpoint is ICE-lite with one host
+candidate, and the media is DTLS 1.2 and SRTP (AES-128-GCM, or AES-128-CM with HMAC-SHA1-80; only AES-GCM in FIPS mode),
+with the publisher's certificate checked against the fingerprint in its offer. It sends receiver reports, NACKs for
+small gaps and picture loss indications until a keyframe comes. `?token=SECRET` makes every POST and DELETE carry
+`Authorization: Bearer SECRET` (checked in constant time); without a token anyone who can reach the port can publish, so
+set one whenever the endpoint listens beyond loopback. Publishers other than loopback ones are taken only from addresses
+`IRONAV_NET_ALLOW` admits (the same list that limits outbound connections; a LAN encoder needs `private`). The HTTP
+exchange itself is not encrypted (the media is), so the token and the offer cross the network in the clear: beyond a
+trusted network, put a TLS reverse proxy in front of the HTTP port.
+
+```sh
+ironav watch "whip://0.0.0.0:8080/live?token=s3cret" --analyzers scene,loudness
+# OBS 30+: Settings > Stream > Service "WHIP", Server http://HOST:8080/live, Bearer Token s3cret
+ffmpeg -re -i in.mp4 -c:v libx264 -profile:v baseline -pix_fmt yuv420p -bf 0 -g 50 -c:a libopus -ar 48000 -ac 2 \
+  -whip_flags dtls_active -authorization s3cret -f whip http://HOST:8080/live
+```
+
+FFmpeg's WHIP muxer (FFmpeg 8 and later) offers `a=setup:passive` unless given `-whip_flags dtls_active`; this endpoint is
+always the DTLS server, so FFmpeg needs that flag. FFmpeg may log "Failed to dispose resource" when it stops, even though
+its DELETE was received and ended the source.
+
 An ONVIF camera need not be known in advance. `onvif_discover` (`ironav onvif`) sends a WS-Discovery probe for video
 transmitters and lists those that answer, with their device service URLs and their scopes (name, hardware, location).
 `onvif_profiles` (`ironav onvif URL --user U --password P`) asks one camera for its maker, model and firmware and for
@@ -162,7 +188,7 @@ installs; the Windows certificate store is not read) and `IRONAV_CA_FILE`, a PEM
 camera maker's or your own CA. Checking cannot be turned off. A redirect from TLS to plain HTTP or RTSP is refused, and so
 is `rtsps://` with `?transport=udp`, which would send the media outside TLS. Servers that only speak TLS 1.2, as some
 older cameras do, cannot be reached.
-Outbound connections are refused unless whoever runs IronAV allows them with `IRONAV_NET_ALLOW`, checked after the name
+Outbound connections (and WHIP publishers from other machines) are refused unless whoever runs IronAV allows them with `IRONAV_NET_ALLOW`, checked after the name
 resolves (and again at each redirect). The value is a comma-separated list of:
 - `private` for cameras, encoders and servers on the local network (10/8, 172.16/12, 192.168/16, 100.64/10, 169.254/16,
   fc00::/7, fe80::/10). A LAN camera needs `IRONAV_NET_ALLOW=private`.
@@ -179,7 +205,8 @@ widen the list. A YouTube source is fetched by yt-dlp, which makes its own conne
 IronSocketLayer's FIPS 140-3 profile, narrowed to AES-GCM suites, P-256 and P-384 key exchange, and ECDSA and RSA-PSS
 signatures (RSA PKCS#1 v1.5 stays only for certificate chains). ChaCha20-Poly1305, X25519 and the hybrid groups are not
 offered. Plaintext `http://`, `rtsp://`, `tcp://`, `udp://` and unencrypted `srt://` sources are refused, as are YouTube sources and MD5 Digest
-authentication (SHA-256 Digest is still used). `ironav capabilities` reports `"fips": true` and the TLS profile in force.
+authentication (SHA-256 Digest is still used). `whip://` stays allowed, since its media is DTLS-SRTP, but takes only
+the AES-GCM SRTP profile. `ironav capabilities` reports `"fips": true` and the TLS profile in force.
 This restricts the algorithms and transports to FIPS-approved ones. IronCrypto, IronSocketLayer and IronPKI are not
 CMVP-validated, so an IronAV build in FIPS mode is not a FIPS 140-3 validated module, and it should not be described as one.
 Credentials: Basic (a password sent in base64, which any eavesdropper can read) is refused over plain `http://` and `rtsp://`, with a hint to use `https://` or `rtsps://`, or a camera that offers Digest, which does not send the password. Digest over plain HTTP or RTSP is allowed. Only when a camera or proxy on a network you trust needs Basic over plaintext, whoever runs IronAV can set `IRONAV_ALLOW_PLAINTEXT_BASIC=1`; a request cannot.
@@ -1293,7 +1320,7 @@ behaviour unless a variable is set.
 | `IRONAV_MAX_PIXELS` | 268435456 (2^28; at most 16384 on a side) | The most pixels in one decoded picture; a stream that asks for more is refused before a decoder is made. A value replaces both limits. Audio streams above 64 channels are refused. |
 | `IRONAV_YTDLP` | unset: `yt-dlp` from `PATH` | Absolute path of yt-dlp (a relative one is refused). `capabilities` reports which program is used. |
 | `IRONAV_AUDIT_LOG` | off | A file to append one JSON line to for each tool call start and end (tool, caller `cli`/`mcp`/`webui`, outcome or error code, duration), file write, network source and device open, and each refusal by the settings above. Times are UTC RFC 3339; URLs are redacted; no credentials or media are written. |
-| `IRONAV_NET_ALLOW` | unset: no outbound connections | Which addresses sources may reach: `private`, `loopback`, `public`, `any`, addresses and CIDR ranges, comma-separated, checked after the name resolves and at each redirect. See "Watching live sources". |
+| `IRONAV_NET_ALLOW` | unset: no outbound connections | Which addresses sources may reach: `private`, `loopback`, `public`, `any`, addresses and CIDR ranges, comma-separated, checked after the name resolves and at each redirect. A `whip://` endpoint takes publishers only from loopback and these addresses. See "Watching live sources". |
 | `IRONAV_NET_ALLOW_METADATA` | off | `1` lets the cloud metadata endpoints (169.254.169.254 and the like) be reached when `IRONAV_NET_ALLOW` covers them. |
 | `IRONAV_ALLOW_PLAINTEXT_BASIC` | off | `1` lets a Basic password be sent over plain `http://` or `rtsp://`. |
 | `IRONAV_FIPS` | off (on in a `fips` build) | `1` restricts TLS to FIPS-approved algorithms and refuses plaintext transports, YouTube sources and MD5 Digest. The cryptography is not CMVP-validated. |
