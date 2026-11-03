@@ -82,7 +82,7 @@ unsafe fn name(a: &IMFActivate) -> String {
 unsafe fn listed(kind: &'static str) -> Result<(Vec<IMFActivate>, Vec<Device>)> {
     let guid = if kind == "video" { MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID } else { MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_AUDCAP_GUID };
     let acts = enumerate(guid)?;
-    let devs = acts.iter().enumerate().map(|(index, a)| Device { kind, index, name: name(a) }).collect();
+    let devs = acts.iter().enumerate().map(|(index, a)| Device::new(kind, index, name(a))).collect();
     Ok((acts, devs))
 }
 

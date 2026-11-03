@@ -9,7 +9,7 @@ A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so 
 > Video: **software decoders for H.264, HEVC (including 4:2:2 and 4:4:4), VP8 and VP9; a software H.264 encoder (High profile: CABAC and the 8x8 transform), a software HEVC encoder (Main profile, 8-bit 4:2:0, merge and skip, SAO), a software VP8 encoder, and a software VP9 encoder (key and inter frames), and a software AV1 encoder (key and inter frames, profile 0, 8-bit 4:2:0); JPEG/Motion-JPEG and Apple ProRes decoded and encoded in software; MPEG-4 Part 2 (Simple and Advanced Simple profiles) decoded in software, and Simple profile I and P pictures encoded in software, with Advanced Simple B pictures as an option (MP4 and Matroska); MPEG-1 and MPEG-2 video (frame and field pictures, 4:2:0 and 4:2:2) decoded in software, and MPEG-2 video (Main profile, 4:2:0, progressive frames, optional B pictures) encoded in software.**
 > NVIDIA GPUs encode H.264 and HEVC (NVENC, preferred when usable) and decode H.264, HEVC and AV1 (NVDEC).
 > AV1 is decoded on NVIDIA GPUs (NVDEC) or in software (key, intra-only and inter frames, superres included). VP9 and AV1 copy between WebM, Matroska and MP4.
-> Live sources: **files as they grow, pipes, TCP, UDP, SRT (with encryption), RTSP/RTSPS, HLS over HTTP(S), WebRTC ingest (WHIP, over TLS with `whips://`), YouTube, and cameras and microphones (Media Foundation, Video4Linux2, AVFoundation).**
+> Live sources: **files as they grow, pipes, TCP, UDP, SRT (with encryption), RTSP/RTSPS, HLS over HTTP(S), WebRTC ingest (WHIP, over TLS with `whips://`), YouTube, cameras and microphones (Media Foundation, Video4Linux2, AVFoundation), and screens (DXGI Desktop Duplication, X11, CoreGraphics).**
 > IronAV is not yet a drop-in replacement for FFmpeg or HandBrake.
 
 ## Install
@@ -246,6 +246,20 @@ the NV12 or YUY2 it gives to 4:2:0) and are timed at the mode's frame rate, or, 
 live Matroska timed by the driver's clock and decoded by the JPEG decoder (which supplies the standard Huffman tables
 such cameras leave out); a microphone arrives as 16-bit PCM. A device that sends nothing for 5 s once open (as when a video call
 holds it) fails with `hardware-unavailable` rather than waiting forever.
+A screen is a source too: `device://screen` is the primary display and `device://screen/N` display N as `ironav devices`
+lists it, with its native size. It arrives as Y4M 4:2:0 (BT.709, limited range) at a constant rate: `fps=` (30 by
+default, 60 at most), `size=WxH` (scaled down to fit, the aspect kept, both sides even; by default the display's own size,
+but no wider than 1920 so that software encoding stays feasible) and `cursor=0` to leave the mouse cursor out. When the
+screen has not changed, the last picture is sent again, so a still desktop does not look like a stalled stream. On Windows
+it uses DXGI Desktop Duplication (run on a laptop's other GPU or in a remote-desktop session it may be unavailable, and
+the error says so; the duplication is made again after a mode change or a UAC prompt, and the last picture is repeated
+meanwhile). On Linux it reads the X server with `XGetImage`, loading libX11 (and libXinerama and libXfixes, for the
+monitors and the cursor) when it is opened, so nothing is needed to build; a Wayland-only session is refused with an error
+that says it needs the PipeWire portal, which is not supported yet. On macOS it uses CoreGraphics, which asks for the Screen
+Recording permission in System Settings > Privacy & Security (a refusal says so) and never draws the cursor. The
+Windows capture has been run on a real desktop; the Linux and macOS ones are compile-checked only. A screen shows
+everything on the display, passwords and other people's messages included, so the agent tools treat it as a device
+(`IRONAV_ALLOW_DEVICES`), and nothing opens it unless a source asks.
 For testing without either, `test://video` and `test://audio` are made up at the pace they play: a grey ramp with a
 white square crossing it each second and a new colour every 5 s, its frame number in its top row as 32 black or white
 blocks of 8 pixels (`ironav_live::synthetic::frame_number` reads it back, so a test can tell which frame it has and how
@@ -1337,7 +1351,7 @@ behaviour unless a variable is set.
 |---|---|---|
 | `IRONAV_ROOTS` | unset: no limit for the CLI and GUI; the working directory in `ironav mcp` | Directories (separated like `PATH`: `;` on Windows, `:` elsewhere) that tools may read from and write to: inputs, outputs, `thumbnail_dir`, recordings, clips, `file:` and `pipe:` sources, job files. Symbolic links and `..` are resolved first (for an output that does not exist yet, the nearest directory that does); a path outside is refused with a `permission-denied` error naming `IRONAV_ROOTS`. The check is made when a tool starts, so it guards against an agent's mistakes and injected instructions, not against a hostile local process that swaps paths meanwhile. |
 | `IRONAV_READ_ONLY` | off | `1` refuses every call that would write (`run`, `stream_clip`, `analyze` with `thumbnail_dir`, `stream_open` and `stream_configure` with `record` or `transcode`). `plan`, `probe` and reading tools work. |
-| `IRONAV_ALLOW_DEVICES` | off in `ironav mcp`, on elsewhere | `1` lets `device://video` and `device://audio` sources (cameras, microphones) be opened. Opens are logged to stderr. |
+| `IRONAV_ALLOW_DEVICES` | off in `ironav mcp`, on elsewhere | `1` lets `device://video`, `device://audio` and `device://screen` sources (cameras, microphones, the screen) be opened. Opens are logged to stderr. |
 | `IRONAV_ALLOW_COOKIES` | off in `ironav mcp`, on elsewhere | `1` allows the `?cookies=BROWSER` option, which lets yt-dlp read that browser's cookie store. |
 | `IRONAV_MAX_PIXELS` | 268435456 (2^28; at most 16384 on a side) | The most pixels in one decoded picture; a stream that asks for more is refused before a decoder is made. A value replaces both limits. Audio streams above 64 channels are refused. |
 | `IRONAV_YTDLP` | unset: `yt-dlp` from `PATH` | Absolute path of yt-dlp (a relative one is refused). `capabilities` reports which program is used. |

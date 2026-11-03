@@ -233,7 +233,7 @@ fn handles(video: bool) -> Vec<Retained<AVCaptureDevice>> {
 
 fn named(video: bool, list: &[Retained<AVCaptureDevice>]) -> Vec<Device> {
     // SAFETY: a getter
-    list.iter().enumerate().map(|(index, d)| Device { kind: if video { "video" } else { "audio" }, index, name: unsafe { d.localizedName() }.to_string() }).collect()
+    list.iter().enumerate().map(|(index, d)| Device::new(if video { "video" } else { "audio" }, index, unsafe { d.localizedName() }.to_string())).collect()
 }
 
 pub(super) fn devices() -> Result<Vec<Device>> {

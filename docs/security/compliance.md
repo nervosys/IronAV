@@ -31,7 +31,7 @@ RUSTSEC-2026-0002 and RUSTSEC-2026-0253; `lru` 0.18.5 is now used) and `paste` (
 | 1 | Medium | CWE-427 | NVIDIA driver DLLs (nvcuda, nvcuvid, nvEncodeAPI) were loaded by bare name, so the Windows search order could load a planted DLL | Loaded with `LOAD_LIBRARY_SEARCH_SYSTEM32` only |
 | 2 | Medium | CWE-248, CWE-400 | `panic = "abort"` in release builds: one decoder bug on a hostile file ended the whole MCP server or web UI | Release builds unwind; each tool call and live session worker catches a panic and reports an `internal` error |
 | 3 | Medium | CWE-22, CWE-73, CWE-862 | Agent tools accepted any read or write path | `IRONAV_ROOTS` (default in `ironav mcp`: the working directory), `IRONAV_READ_ONLY`; links and `..` are resolved before the check; the web UI file browser lists only the roots |
-| 4 | Medium | CWE-359 | An agent could open the camera and microphone without consent | `IRONAV_ALLOW_DEVICES`, off in `ironav mcp`; device opens are logged |
+| 4 | Medium | CWE-359 | An agent could open the camera, the microphone or the screen without consent (a `device://screen` source reads everything on the display: passwords, messages and other people's windows; it is opened only when a source asks, and nothing is saved or logged but the open) | `IRONAV_ALLOW_DEVICES`, off in `ironav mcp`; device opens are logged |
 | 5 | Medium | CWE-918 | The default network allow-list included loopback, private and link-local ranges (SSRF, internal scanning) | Nothing is allowed by default; `IRONAV_NET_ALLOW` names classes (`private`, `loopback`, `public`, `any`) or ranges; cloud metadata endpoints need `IRONAV_NET_ALLOW_METADATA=1` even under `any` |
 | 6 | Medium | CWE-1426 (OWASP LLM01) | Text from media (captions, device and rendition names, sidecar output) reached the model unlabelled | Control characters stripped, cut to 512 characters, marked `"untrusted": true`; the tool descriptions say not to follow it |
 | 7 | Low-Medium | CWE-214 | The web UI's launch URL, with its token, was passed on a browser command line visible to other local users | The browser opens a temporary redirect file instead |
@@ -69,7 +69,7 @@ stops them. IronAV produces no detections.
 | T1499 Endpoint Denial of Service | Hostile file or stream crashes or exhausts a server | Unwind and containment, caps, fuzzing (2, 13, 16, 21) |
 | T1083 File and Directory Discovery, T1005 Data from Local System | An agent, or instructions injected into one, reads files outside its task | `IRONAV_ROOTS` (3) |
 | T1565.001 Stored Data Manipulation, T1485 Data Destruction | Outputs overwrite or replace files | Roots, `IRONAV_READ_ONLY`, overwrite refused by default, exclusive temporary files (3, 10) |
-| T1125 Video Capture, T1123 Audio Capture | An agent turns on the camera or microphone | `IRONAV_ALLOW_DEVICES`, logged (4) |
+| T1125 Video Capture, T1123 Audio Capture, T1113 Screen Capture | An agent turns on the camera or microphone, or records the screen | `IRONAV_ALLOW_DEVICES`, logged (4) |
 | T1046 Network Service Discovery, T1090 Proxy | Source URLs used to probe or reach internal hosts (SSRF) | Default-deny allow-list checked after resolution and at each redirect; metadata endpoints refused (5) |
 | T1552.005 Cloud Instance Metadata API | Credentials read from 169.254.169.254 | Refused unless `IRONAV_NET_ALLOW_METADATA=1` (5) |
 | T1040 Network Sniffing, T1557 Adversary-in-the-Middle | Credentials or media read on the wire | TLS 1.3 with verification that cannot be turned off; no TLS-to-plaintext redirects; Basic refused over plaintext (8) |

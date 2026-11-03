@@ -2,7 +2,7 @@
 //! `rtsp://[user:password@]host[:port]/path`,
 //! `http://host[:port]/path` (HLS or a download; a YouTube video or live stream by its watch URL,
 //! through yt-dlp), `device://video[/NAME]` or
-//! `device://audio[/NAME]` (a camera or microphone), `whip://[host]:port[/path]` (a WHIP endpoint
+//! `device://audio[/NAME]` (a camera or microphone), `device://screen[/N]` (a display),`whip://[host]:port[/path]` (a WHIP endpoint
 //! a WebRTC publisher sends to), `pipe:`, `-`, `file:path` or a bare path, each
 //! optionally followed by `?key=value&...` options.
 
@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 /// Options a source URL can carry:
 /// - `format`: the stream's format when it cannot be told from its first bytes;
 /// - `fps`: the frame rate of a raw H.264/HEVC stream (`30` or `30000/1001`), or to ask a camera for;
-/// - `size`: the picture size to ask a camera for (`1280x720`);
+/// - `size`: the picture size to ask a camera for (`1280x720`), or the box a screen is scaled down to fit;
 /// - `pace=realtime`: read a file no faster than it plays, as if it were live;
 /// - `follow`: keep reading a file as it grows;
 /// - `idle`: with `follow`, end after this many seconds without new bytes;
@@ -28,8 +28,9 @@ use std::collections::BTreeMap;
 /// - `streamid`: for SRT, the stream ID to give the sender;
 /// - `passphrase`: for SRT, the passphrase of an encrypted stream (redacted from what is shown);
 /// - `token`: the bearer token a WHIP publisher must send (redacted wherever the URL is shown);
-/// - `cert`, `key`: for `whips://`, the PEM files of the endpoint's TLS certificate chain and private key.
-pub const OPTIONS: [&str; 25] = ["format", "fps", "pace", "follow", "idle", "listen", "transport", "audio", "size", "reconnect", "stall", "retries", "rate", "duration", "height", "cookies", "captions", "mode", "latency", "streamid", "passphrase", "token", "cert", "key", "cors"];
+/// - `cert`, `key`: for `whips://`, the PEM files of the endpoint's TLS certificate chain and private key;
+/// - `cursor`: for `device://screen`, `0` leaves the mouse cursor out of the picture (it is drawn by default).
+pub const OPTIONS: [&str; 26] = ["format", "fps", "pace", "follow", "idle", "listen", "transport", "audio", "size", "reconnect", "stall", "retries", "rate", "duration", "height", "cookies", "captions", "mode", "latency", "streamid", "passphrase", "token", "cert", "key", "cors", "cursor"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SourceUrl {

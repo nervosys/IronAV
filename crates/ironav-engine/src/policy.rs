@@ -178,7 +178,7 @@ impl Policy {
             return Ok(());
         }
         crate::audit::refused("devices", what);
-        Err(Error::new(ErrorCode::PermissionDenied, format!("{what}: cameras and microphones are not available to this server"))
+        Err(Error::new(ErrorCode::PermissionDenied, format!("{what}: cameras, microphones and screens are not available to this server"))
             .hint(format!("the operator must set {DEVICES_VAR}=1 to allow device:// sources")))
     }
 

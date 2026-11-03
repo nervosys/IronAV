@@ -36,8 +36,9 @@ ic-cipher = "0.3.2"
 ic-core = "0.3.2"
 
 [target.'cfg(windows)'.dependencies]
-# cameras and microphones through Media Foundation, and a WHIP endpoint's UDP receive buffer
-windows = { version = "0.62", features = ["Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_Networking_WinSock"] }
+# cameras and microphones through Media Foundation, screens through DXGI Desktop Duplication (on
+# Direct3D 11), and a WHIP endpoint's UDP receive buffer
+windows = { version = "0.62", features = ["Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_Networking_WinSock", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # cameras through Video4Linux2's ioctls, and a WHIP endpoint's UDP receive buffer

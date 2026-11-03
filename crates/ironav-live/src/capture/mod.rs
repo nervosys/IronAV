@@ -9,6 +9,9 @@
 //! from [`devices`] or a part of its name (any case); without it, the first device is used.
 //! `size=WxH` and `fps` ask the camera for a mode, the nearest it has being taken.
 //!
+//! `device://screen[/N]` is a display, as Y4M too (see [`screen`]): DXGI Desktop Duplication on
+//! Windows, CoreGraphics on macOS, X11 on Linux.
+//!
 //! Y4M carries no timestamps, so pictures are timed at the mode's frame rate: a camera that
 //! drops frames (in low light, say) runs behind the clock by as many.
 
@@ -17,10 +20,17 @@
 
 #[cfg(target_os = "macos")]
 mod avf;
+#[cfg(target_os = "macos")]
+mod cg;
+#[cfg(windows)]
+mod dxgi;
 #[cfg(windows)]
 mod mf;
+mod screen;
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 mod v4l2;
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+mod x11;
 
 use crate::source::{SourceInfo, ThreadSource};
 use crate::url::SourceUrl;
@@ -31,11 +41,22 @@ use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 /// A capture device.
 #[derive(Debug, Clone, Serialize)]
 pub struct Device {
-    /// `video` or `audio`.
+    /// `video`, `audio` or `screen`.
     pub kind: &'static str,
     /// Its place among the devices of its kind, as `device://video/0` names it.
     pub index: usize,
     pub name: String,
+    /// A screen's native size in pixels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+}
+
+impl Device {
+    pub(crate) fn new(kind: &'static str, index: usize, name: String) -> Device {
+        Device { kind, index, name, width: None, height: None }
+    }
 }
 
 /// What a source asks of a camera.
@@ -45,24 +66,19 @@ pub(crate) struct VideoWants {
     pub fps: Option<f64>,
 }
 
-/// The capture devices present, cameras first.
+/// The capture devices present: cameras and microphones, then screens (a screen that cannot be
+/// listed, with no X server to ask, say, is left out rather than failing the list).
 pub fn devices() -> Result<Vec<Device>> {
     #[cfg(windows)]
-    {
-        mf::devices()
-    }
+    let mut all = mf::devices()?;
     #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
-    {
-        v4l2::devices()
-    }
+    let mut all = v4l2::devices()?;
     #[cfg(target_os = "macos")]
-    {
-        avf::devices()
-    }
+    let mut all = avf::devices()?;
     #[cfg(not(any(windows, target_os = "macos", all(target_os = "linux", target_pointer_width = "64"))))]
-    {
-        Ok(Vec::new())
-    }
+    let mut all = Vec::new();
+    all.extend(screen::list().into_iter().enumerate().map(|(index, s)| Device { width: Some(s.width), height: Some(s.height), ..Device::new("screen", index, s.name) }));
+    Ok(all)
 }
 
 /// How long an open device may send nothing before reads fail: a driver can block forever when
@@ -75,8 +91,11 @@ pub(crate) fn open(u: &SourceUrl, shown: String) -> Result<ThreadSource> {
         Some((k, n)) => (k.to_ascii_lowercase(), Some(n).filter(|n| !n.is_empty())),
         None => (u.target.to_ascii_lowercase(), None),
     };
+    if kind == "screen" {
+        return screen::open(u, shown);
+    }
     if kind != "video" && kind != "audio" {
-        return Err(Error::invalid_arg(format!("device sources are device://video[/NAME] or device://audio[/NAME], got device://{}", u.target)).alternatives(["device://video", "device://audio"]));
+        return Err(Error::invalid_arg(format!("device sources are device://video[/NAME], device://audio[/NAME] or device://screen[/N], got device://{}", u.target)).alternatives(["device://video", "device://audio", "device://screen"]));
     }
     let wants = VideoWants {
         size: u.option("size").map(parse_size).transpose()?,
@@ -488,7 +507,7 @@ mod tests {
 
     #[test]
     fn a_device_is_chosen_by_index_or_name() {
-        let list = [Device { kind: "video", index: 0, name: "Integrated Camera".into() }, Device { kind: "video", index: 1, name: "USB Capture HDMI".into() }];
+        let list = [Device::new("video", 0, "Integrated Camera".into()), Device::new("video", 1, "USB Capture HDMI".into())];
         assert_eq!(choose(&list, None, "video").unwrap().index, 0);
         assert_eq!(choose(&list, Some("1"), "video").unwrap().index, 1);
         assert_eq!(choose(&list, Some("hdmi"), "video").unwrap().index, 1);

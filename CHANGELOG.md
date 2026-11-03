@@ -9,6 +9,14 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Added
 
+- **Screen capture:** `device://screen` (the primary display) and `device://screen/N` as a live source, listed by
+  `ironav devices` and the `devices` tool with each display's name, index and native size. Y4M 4:2:0 (BT.709, limited
+  range) at a constant rate: `fps=` (30, at most 60), `size=WxH` (scaled down to fit with the aspect kept; by default the
+  native size, capped at 1920 wide) and `cursor=0`. A still screen repeats its last picture. Windows uses DXGI Desktop
+  Duplication (recreated after `DXGI_ERROR_ACCESS_LOST`; run on a desktop), Linux X11 through `XGetImage` with libX11,
+  libXinerama and libXfixes loaded at run time (Wayland is refused with an error that names the PipeWire portal), and macOS
+  CoreGraphics (the error for a missing Screen Recording permission names the System Settings pane). The Linux and macOS
+  backends are compile-checked only. It is a device under `IRONAV_ALLOW_DEVICES`.
 - **`whips://`, WHIP signalling over TLS:** `whips://[host]:port[/path]?cert=CHAIN.pem&key=KEY.pem[&token=...]` is the WHIP
   endpoint with each accepted connection wrapped in a TLS 1.3 server session (IronSocketLayer) before the HTTP/1.1
   parsing, so the offer, the answer and the bearer token no longer cross the network in the clear. `cert` is a PEM

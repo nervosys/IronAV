@@ -222,8 +222,8 @@ fn microphones() -> Vec<(String, String)> {
 }
 
 pub(super) fn devices() -> Result<Vec<Device>> {
-    let mut out: Vec<Device> = cameras().into_iter().enumerate().map(|(index, (name, _))| Device { kind: "video", index, name }).collect();
-    out.extend(microphones().into_iter().enumerate().map(|(index, (name, _))| Device { kind: "audio", index, name }));
+    let mut out: Vec<Device> = cameras().into_iter().enumerate().map(|(index, (name, _))| Device::new("video", index, name)).collect();
+    out.extend(microphones().into_iter().enumerate().map(|(index, (name, _))| Device::new("audio", index, name)));
     Ok(out)
 }
 
@@ -253,7 +253,7 @@ impl Drop for Mapped {
 
 fn camera(name: Option<&str>, wants: VideoWants, ok: &SyncSender<Result<()>>, tx: &Tx) -> Result<()> {
     let list = cameras();
-    let devs: Vec<Device> = list.iter().enumerate().map(|(index, (n, _))| Device { kind: "video", index, name: n.clone() }).collect();
+    let devs: Vec<Device> = list.iter().enumerate().map(|(index, (n, _))| Device::new("video", index, n.clone())).collect();
     let d = choose(&devs, name, "video")?;
     let path = &list[d.index].1;
     let fd = Fd::open(path).map_err(io(&format!("could not open {}", d.name)))?;
@@ -383,7 +383,7 @@ fn camera(name: Option<&str>, wants: VideoWants, ok: &SyncSender<Result<()>>, tx
 fn microphone(name: Option<&str>, ok: &SyncSender<Result<()>>, tx: &Tx) -> Result<()> {
     const RATE: u32 = 48_000;
     let list = microphones();
-    let devs: Vec<Device> = list.iter().enumerate().map(|(index, (n, _))| Device { kind: "audio", index, name: n.clone() }).collect();
+    let devs: Vec<Device> = list.iter().enumerate().map(|(index, (n, _))| Device::new("audio", index, n.clone())).collect();
     let d = choose(&devs, name, "audio")?;
     let arecord = crate::exe::locate("arecord").ok_or_else(|| Error::new(ErrorCode::HardwareUnavailable, "could not find arecord on PATH").hint("install alsa-utils"))?;
     // the device is attached to -D, so a name that starts with '-' is not read as an option
