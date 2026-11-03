@@ -9,6 +9,10 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Added
 
+- **`voice::Vad` learns steady noise:** a level that holds still for 400 ms (a standard deviation of at most 3 dB) becomes the
+  noise floor, so a fan louder than the -50 dBFS starting floor stops reading as speech within half a second instead of rising
+  out of it at 1 dB a second; speech over it is still found. `Vad::with_floor` starts from a known floor, such as the one
+  `levels()` gave at the end of the last push-to-talk press.
 - **macOS capture devices:** `device://video` and `device://audio` on macOS, through AVFoundation (an `AVCaptureSession` with video and audio data outputs, written with the `objc2` crates): `ironav devices` and the `devices` tool list the cameras and microphones, `size=` and `fps=` pick the nearest camera mode, pictures arrive as Y4M converted from NV12 and sound as 16-bit WAV, and a refused Camera or Microphone permission is an error that names System Settings > Privacy & Security. It is compile-checked for `aarch64-apple-darwin` and `x86_64-apple-darwin` and its conversions are unit-tested, but it has not been run against a real camera or microphone.
 - **SRT live source:** `srt://host:port` calls an SRT sender and `srt://:port?mode=listener` waits for one (live mode, receiver
   only, MPEG-TS payload read as `udp://` is). Written in tree with no new dependency: handshake v5, ACK and ACKACK, NAK loss

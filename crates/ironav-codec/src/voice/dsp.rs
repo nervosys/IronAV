@@ -14,10 +14,22 @@ fn level_db(x: &[f32]) -> f32 {
 /// A cheap speech detector: a frame is active when it stands well above an adaptive noise floor
 /// and is not hiss (too many zero crossings). Speech starts after two active frames in a row,
 /// and lasts until `hangover_ms` without one, so the ends of words are kept.
+///
+/// Noise that is louder than the floor but steady, such as a fan when a stream starts, is
+/// learned within [`STEADY_MS`](Self::STEADY_MS): once the frames' levels over that long have
+/// spread by no more than [`STEADY_DB`](Self::STEADY_DB) (a standard deviation), the floor jumps
+/// to their mean. Speech does not hold that
+/// still, since syllables come and go a few times a second (a sung or long-held vowel can). A
+/// caller that already knows the floor, say from the last press, can start there with
+/// [`with_floor`](Self::with_floor).
 pub struct Vad {
     floor: f32,
     /// Floor rise per frame (1 dB a second).
     rise: f32,
+    /// The last frames' levels, for the steadiness test, and how many have been filled.
+    recent: Vec<f32>,
+    next: usize,
+    seen: usize,
     run: u32,
     quiet: u32,
     hangover: u32,
@@ -26,9 +38,34 @@ pub struct Vad {
 }
 
 impl Vad {
-    /// A detector for frames of `frame_ms`.
+    /// How long the level must hold still to be taken as noise.
+    pub const STEADY_MS: f64 = 400.0;
+    /// How far a steady level may spread, as a standard deviation in dB. A fan after the
+    /// [`Denoiser`] spreads by about 2 dB in 10 ms frames; speech, rising and falling
+    /// with its syllables, by far more.
+    pub const STEADY_DB: f32 = 3.0;
+
+    /// A detector for frames of `frame_ms`, starting from a floor of -50 dBFS.
     pub fn new(frame_ms: f64, hangover_ms: f64) -> Self {
-        Self { floor: -50.0, rise: (frame_ms / 1000.0) as f32, run: 0, quiet: 0, hangover: (hangover_ms / frame_ms).ceil() as u32, speaking: false, level: -120.0 }
+        Self::with_floor(frame_ms, hangover_ms, -50.0)
+    }
+
+    /// A detector that starts from a noise floor of `floor_dbfs` (held to -75 to 0), such as the
+    /// floor [`levels`](Self::levels) gave at the end of the last press.
+    pub fn with_floor(frame_ms: f64, hangover_ms: f64, floor_dbfs: f32) -> Self {
+        let steady = (Self::STEADY_MS / frame_ms).ceil().max(2.0) as usize;
+        Self {
+            floor: floor_dbfs.clamp(-75.0, 0.0),
+            rise: (frame_ms / 1000.0) as f32,
+            recent: vec![0.0; steady],
+            next: 0,
+            seen: 0,
+            run: 0,
+            quiet: 0,
+            hangover: (hangover_ms / frame_ms).ceil() as u32,
+            speaking: false,
+            level: -120.0,
+        }
     }
 
     /// Whether speech is under way after this frame.
@@ -38,6 +75,18 @@ impl Vad {
         let zcr = frame.windows(2).filter(|w| (w[0] >= 0.0) != (w[1] >= 0.0)).count() as f32 / frame.len().max(1) as f32;
         // the floor follows the quietest frames down at once and creeps up
         self.floor = if e < self.floor { e.max(-75.0) } else { self.floor + self.rise };
+        // a level that has held still is noise, however far above the floor it is
+        let n = self.recent.len();
+        self.recent[self.next] = e;
+        self.next = (self.next + 1) % n;
+        self.seen = (self.seen + 1).min(n);
+        if self.seen == n {
+            let mean = self.recent.iter().sum::<f32>() / n as f32;
+            let var = self.recent.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / n as f32;
+            if var <= Self::STEADY_DB * Self::STEADY_DB && mean > self.floor {
+                self.floor = mean.min(0.0);
+            }
+        }
         let active = e > self.floor + 10.0 && e > -55.0 && zcr < 0.35;
         if active {
             self.run += 1;

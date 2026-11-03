@@ -233,3 +233,58 @@ fn the_spectrum_tells_a_tone_from_hiss() {
     let s = m.measure(&[0.0; 100], 16_000);
     assert!(s.rms_dbfs < -100.0 && s.centroid_hz == 0.0, "{s:?}");
 }
+
+/// A fan: low-passed noise (so it is not hiss by its zero crossings) at `dbfs`.
+fn fan(n: usize, dbfs: f64) -> Vec<f32> {
+    let mut y = 0f32;
+    let x: Vec<f32> = noise(n, 1.0, 13)
+        .into_iter()
+        .map(|v| {
+            y = 0.9 * y + 0.1 * v;
+            y
+        })
+        .collect();
+    let k = 10f64.powf((dbfs - level_db(&x)) / 20.0) as f32;
+    x.into_iter().map(|v| v * k).collect()
+}
+
+#[test]
+fn vad_learns_steady_noise_at_the_start() {
+    // three seconds of a fan at -31.5 dBFS, then two of speech over it, from a fresh detector
+    let mut x = fan(16_000 * 5, -31.5);
+    let zcr = x.windows(2).filter(|w| (w[0] >= 0.0) != (w[1] >= 0.0)).count() as f64 / x.len() as f64;
+    assert!(zcr < 0.35, "{zcr}");
+    for (o, s) in x[16_000 * 3..].iter_mut().zip(voice(16_000 * 2, 1.0)) {
+        *o += s;
+    }
+    let mut vad = Vad::new(20.0, 200.0);
+    let flags: Vec<bool> = x.chunks(FRAME).map(|f| vad.process(f)).collect();
+    // at most the steadiness window and the hangover read as speech
+    let early = flags[..150].iter().filter(|f| **f).count();
+    assert!(early <= 32, "{early} frames of the fan read as speech: {flags:?}");
+    assert!(flags[35..150].iter().all(|f| !f), "the fan read as speech: {flags:?}");
+    let (_, floor) = vad.levels();
+    assert!(flags[155..250].iter().filter(|f| **f).count() >= 80, "speech over the fan lost: {flags:?}");
+    assert!(floor > -40.0, "floor {floor}");
+
+    // starting from the floor the last press ended with, the fan never reads as speech
+    let mut vad = Vad::with_floor(20.0, 200.0, floor);
+    assert!(x[..16_000 * 3].chunks(FRAME).all(|f| !vad.process(f)));
+}
+
+#[test]
+fn vad_learns_a_fan_through_the_denoiser_at_48k() {
+    // a voice link's chain: 48 kHz, 10 ms frames, the suppressor before the detector
+    let mut x = fan(48_000 * 3, -31.5);
+    let mut dn = Denoiser::new(48_000, 240, -12.0).unwrap();
+    let mut vad = Vad::new(10.0, 200.0);
+    let mut active = 0;
+    for (i, f) in x.chunks_mut(480).enumerate() {
+        dn.process(f).unwrap();
+        if vad.process(f) {
+            active += 1;
+            assert!(i < 70, "the fan reads as speech at frame {i}");
+        }
+    }
+    assert!(active <= 70, "{active}");
+}
