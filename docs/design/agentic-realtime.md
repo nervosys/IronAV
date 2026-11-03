@@ -475,3 +475,13 @@ files at once, and it fixes the event model, analyzer trait and MCP plumbing bef
    simulcast, and more than one publisher per endpoint. The HTTP side has TLS as `whips://` (decided: plain HTTP signalling is not
    acceptable under FIPS, so FIPS mode refuses `whip://`): each accepted connection is wrapped in an IronSocketLayer TLS 1.3
    server session, on a thread of its own with a 3 s handshake deadline, from a PEM chain and key given as `cert=` and `key=`.
+
+   The other direction exists as a library: `WhipPublisher` (`ironav-live/src/webrtc/publisher.rs`, not yet wired into the engine, CLI or
+   tools) pushes H.264 and Opus to a WHIP endpoint. It POSTs an offer (send-only, BUNDLE, `rtcp-mux`, `setup:actpass`) over `http://` or
+   `https://` (the TLS stack `https://` sources use; FIPS mode refuses `http://`), sends ICE checks with USE-CANDIDATE to the answer's host
+   candidates (consent every 5 s, 30 s without an answer ends it), runs the DTLS 1.2 client (the server's certificate must have the
+   answer's SHA-256 fingerprint; GCM only in FIPS mode), and sends SRTP: H.264 as single NAL units and FU-A (RFC 6184, 1200-byte
+   payloads), Opus as is (RFC 7587), sender reports each second. Picture loss and full intra requests surface through
+   `keyframe_requested()`, NACKs are answered from the last 512 packets of each stream, and `close()` says goodbye and DELETEs the
+   session. It adds no crate, and shares the DTLS, SRTP, STUN and SDP code with the endpoint. Not done: redirects, RTX, STAP-A,
+   trickle ICE, TURN, and a server that insists on being the DTLS client.

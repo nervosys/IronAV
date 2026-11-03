@@ -38,3 +38,4 @@ pub use sink::{open_sink, plan_sink, Sink, SinkInfo, SinkPlan, SinkStats};
 pub use source::{open_source, Caption, Chunk, Source, SourceInfo};
 pub use tls::CA_FILE_VAR;
 pub use url::{redact, SourceUrl};
+pub use webrtc::{WhipOptions, WhipPublisher};

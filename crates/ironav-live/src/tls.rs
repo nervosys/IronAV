@@ -196,7 +196,11 @@ fn config(alpn: Option<&'static [u8]>) -> Result<Arc<ClientConfig>> {
 /// at most `HANDSHAKE_TIMEOUT`. `shown` is the redacted URL, for errors. The socket comes back with
 /// no timeouts: the caller sets its own.
 pub(crate) fn connect(sock: TcpStream, host: &str, alpn: Option<&'static [u8]>, shown: &str) -> Result<Conn> {
-    let config = config(alpn)?;
+    connect_with(sock, host, config(alpn)?, shown)
+}
+
+/// [`connect`] under a client configuration of the caller's own (a WHIP publisher given one by its tests).
+pub(crate) fn connect_with(sock: TcpStream, host: &str, config: Arc<ClientConfig>, shown: &str) -> Result<Conn> {
     let sock = Sock { sock, deadline: Cell::new(Some(Instant::now() + HANDSHAKE_TIMEOUT)), broken: Cell::new(false) };
     let t = TlsStream::connect(sock, config, host).map_err(|e| {
         let msg = e.to_string();

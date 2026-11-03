@@ -27,6 +27,18 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   with back-off. Destinations are checked by `IRONAV_NET_ALLOW`, and FIPS mode refuses a plaintext one. Tested against
   FFmpeg 9.0.1 (libsrt) receiving, in both roles, in the clear and with 16, 24 and 32 byte keys. The receiver's shutdown
   packet now carries the 4-byte body libsrt requires.
+- **WHIP publisher (library):** `ironav_live::WhipPublisher::connect(url, token, WhipOptions)` pushes H.264 and Opus to a WHIP
+  endpoint: `send_h264_access_unit` (Annex B, 90 kHz), `send_opus` (48 kHz), `keyframe_requested` (a picture loss indication or
+  full intra request from the server, polled), and `close` (RTCP BYE, DTLS close_notify, DELETE of the session). It POSTs an offer
+  (send-only, BUNDLE, rtcp-mux, a=setup:actpass, H.264 packetization-mode=1 and Opus) over `http://` or `https://` with an
+  optional bearer token (sent only to the endpoint's own host and port); `https://` uses the TLS stack of `https://` sources,
+  and FIPS mode refuses `http://` as it does `whip://`. ICE connectivity checks with USE-CANDIDATE go to the answer's host
+  candidates that `IRONAV_NET_ALLOW` permits, with consent checks every 5 s and a 30 s timeout. The DTLS 1.2 client (the former
+  test client, now with retransmission, fragment reassembly, a handshake timeout and bounds checks) takes only a server whose
+  certificate has the answer's SHA-256 fingerprint, and offers AES-GCM SRTP only in FIPS mode. H.264 goes out as single NAL
+  units and FU-A fragments of at most 1200 bytes (a keyframe without parameter sets gets the last ones seen), RTCP sender
+  reports go out every second, and NACKs are answered from the last 512 packets of each stream. Tested against the in-process
+  WHIP endpoint over `http://` and `https://`. Not wired into the engine, CLI or tools yet.
 - **`whips://`, WHIP signalling over TLS:** `whips://[host]:port[/path]?cert=CHAIN.pem&key=KEY.pem[&token=...]` is the WHIP
   endpoint with each accepted connection wrapped in a TLS 1.3 server session (IronSocketLayer) before the HTTP/1.1
   parsing, so the offer, the answer and the bearer token no longer cross the network in the clear. `cert` is a PEM

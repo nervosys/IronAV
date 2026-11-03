@@ -29,12 +29,18 @@
 //! second, NACKs for small gaps in the video, and picture loss indications at the start (until a
 //! keyframe comes) and after a large gap. The source ends when the publisher DELETEs its session or
 //! closes DTLS, or when its media stops for [`MEDIA_TIMEOUT`].
+//!
+//! The other direction is [`WhipPublisher`], a WHIP client over the same STUN, DTLS, SRTP and SDP code.
 
 mod dtls;
 mod http;
+mod packetize;
+mod publisher;
 mod sdp;
 mod srtp;
 mod stun;
+
+pub use publisher::{WhipOptions, WhipPublisher};
 #[cfg(test)]
 mod tests;
 

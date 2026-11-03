@@ -12,11 +12,9 @@ const BINDING_SUCCESS: u16 = 0x0101;
 const USERNAME: u16 = 0x0006;
 const MESSAGE_INTEGRITY: u16 = 0x0008;
 const XOR_MAPPED_ADDRESS: u16 = 0x0020;
-#[cfg(test)]
 const PRIORITY: u16 = 0x0024;
 const USE_CANDIDATE: u16 = 0x0025;
 const FINGERPRINT: u16 = 0x8028;
-#[cfg(test)]
 const ICE_CONTROLLING: u16 = 0x802A;
 const FINGERPRINT_XOR: u32 = 0x5354_554e;
 /// The largest message looked at: a binding request is a hundred bytes or so.
@@ -169,13 +167,14 @@ pub(crate) fn success(txid: &[u8; 12], from: SocketAddr, local_pwd: &str) -> Vec
     seal(out, local_pwd.as_bytes())
 }
 
-/// A binding request as a controlling full agent sends it, for tests.
-#[cfg(test)]
-pub(crate) fn request(txid: &[u8; 12], username: &str, password: &str, use_candidate: bool) -> Vec<u8> {
+/// A binding request as a controlling agent sends it (RFC 8445 §7.2.4, with `tiebreaker` in ICE-CONTROLLING),
+/// signed with the peer's password. `username` is `remote:local`. A WHIP publisher sends these as its
+/// connectivity checks and its consent checks (RFC 7675).
+pub(crate) fn request(txid: &[u8; 12], username: &str, password: &str, use_candidate: bool, tiebreaker: [u8; 8]) -> Vec<u8> {
     let mut out = header(BINDING_REQUEST, txid);
     push_attr(&mut out, USERNAME, username.as_bytes());
     push_attr(&mut out, PRIORITY, &0x6e00_01ffu32.to_be_bytes());
-    push_attr(&mut out, ICE_CONTROLLING, &[1, 2, 3, 4, 5, 6, 7, 8]);
+    push_attr(&mut out, ICE_CONTROLLING, &tiebreaker);
     if use_candidate {
         push_attr(&mut out, USE_CANDIDATE, &[]);
     }
@@ -184,17 +183,36 @@ pub(crate) fn request(txid: &[u8; 12], username: &str, password: &str, use_candi
     seal(out, password.as_bytes())
 }
 
-/// Whether a response answers `txid` and checks out under `password`; for tests.
+/// Whether `msg` is the success response to the request `txid` and checks out under `password`
+/// (MESSAGE-INTEGRITY and FINGERPRINT), whatever address it carries.
+pub(crate) fn is_success(msg: &[u8], txid: &[u8; 12], password: &str) -> bool {
+    msg.len() <= MAX_MESSAGE && is_stun(msg) && u16::from_be_bytes([msg[0], msg[1]]) == BINDING_SUCCESS && msg[8..20] == txid[..] && verify(msg, password.as_bytes()).is_some()
+}
+
+/// [`is_success`], with the address the response says the request came from (XOR-MAPPED-ADDRESS); for tests.
 #[cfg(test)]
 pub(crate) fn check_success(msg: &[u8], txid: &[u8; 12], password: &str) -> Option<SocketAddr> {
-    if !is_stun(msg) || u16::from_be_bytes([msg[0], msg[1]]) != BINDING_SUCCESS || &msg[8..20] != txid {
+    if !is_success(msg, txid, password) {
         return None;
     }
-    let attrs = verify(msg, password.as_bytes())?;
+    let attrs = attributes(msg)?;
     let v = attrs.iter().find(|a| a.0 == XOR_MAPPED_ADDRESS)?.1;
-    let port = u16::from_be_bytes([v[2], v[3]]) ^ (MAGIC >> 16) as u16;
-    let ip: [u8; 4] = std::array::from_fn(|i| v[4 + i] ^ MAGIC.to_be_bytes()[i]);
-    (v[1] == 1).then(|| SocketAddr::from((ip, port)))
+    let port = u16::from_be_bytes([*v.get(2)?, *v.get(3)?]) ^ (MAGIC >> 16) as u16;
+    match *v.get(1)? {
+        1 => {
+            let a = v.get(4..8)?;
+            let ip: [u8; 4] = std::array::from_fn(|i| a[i] ^ MAGIC.to_be_bytes()[i]);
+            Some(SocketAddr::from((ip, port)))
+        }
+        2 => {
+            let a = v.get(4..20)?;
+            let mut mask = MAGIC.to_be_bytes().to_vec();
+            mask.extend_from_slice(txid);
+            let ip: [u8; 16] = std::array::from_fn(|i| a[i] ^ mask[i]);
+            Some(SocketAddr::from((ip, port)))
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -252,7 +270,7 @@ mod tests {
     #[test]
     fn requests_round_trip_and_ipv6_maps() {
         let txid = [7u8; 12];
-        let req = request(&txid, "local:remote", "pw-of-the-local-agent!!", true);
+        let req = request(&txid, "local:remote", "pw-of-the-local-agent!!", true, [9; 8]);
         let b = check_request(&req, "local", "remote", "pw-of-the-local-agent!!").unwrap();
         assert!(b.use_candidate);
         let v6 = xor_address("[2001:db8::1]:5000".parse().unwrap(), &txid);

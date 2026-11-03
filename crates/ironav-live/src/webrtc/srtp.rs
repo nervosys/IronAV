@@ -33,7 +33,6 @@ impl Profile {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn from_id(id: u16) -> Option<Profile> {
         match id {
             0x0007 => Some(Profile::AeadAes128Gcm),
@@ -212,8 +211,7 @@ pub(crate) struct Context {
     /// Per SSRC: the RTP replay window, and the SRTCP one.
     rtp_in: HashMap<u32, Window>,
     rtcp_in: HashMap<u32, Window>,
-    /// Per SSRC sent: the highest index sent (only a test publisher sends RTP).
-    #[cfg(test)]
+    /// Per SSRC sent: the highest index sent (a publisher sends RTP).
     rtp_out: HashMap<u32, Window>,
     rtcp_index: u32,
 }
@@ -229,7 +227,6 @@ impl Context {
             rtcp: Keys::new(profile, master_key, master_salt, 3)?,
             rtp_in: HashMap::new(),
             rtcp_in: HashMap::new(),
-            #[cfg(test)]
             rtp_out: HashMap::new(),
             rtcp_index: 0,
         })
@@ -331,8 +328,7 @@ impl Context {
     }
 
     /// An RTP packet protected as SRTP (the sender keeps the rollover counter by watching its own
-    /// sequence numbers wrap), as a publisher sends it; for tests.
-    #[cfg(test)]
+    /// sequence numbers wrap), as a publisher sends it.
     pub(crate) fn protect_rtp(&mut self, p: &[u8]) -> Result<Vec<u8>, Reject> {
         let h = rtp_header_len(p).ok_or(Reject::Malformed)?;
         let seq = u16::from_be_bytes([p[2], p[3]]);

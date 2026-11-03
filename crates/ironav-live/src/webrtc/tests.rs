@@ -3,7 +3,7 @@
 //! over SRTCP; and against garbage on the same port. Over `whips://` the signalling goes through a
 //! TLS client, to a certificate this module issues; the FIPS build runs the flow that way only.
 
-use super::dtls::client::Client;
+use super::dtls::Client;
 use super::*;
 use ironav_formats::stream::{stream_demuxer, StreamDemuxer, StreamOptions};
 use ironsocketlayer::config::{ClientConfig, Profile};
@@ -177,7 +177,7 @@ struct Publisher {
 }
 
 fn publish(port: u16, path: &str, token: Option<&str>, profiles: &[u16]) -> Publisher {
-    let mut client = Client::new([0; 32], profiles, true);
+    let mut client = Client::with_options(Arc::new(dtls::Identity::generate("WHIP test client").unwrap()), [0; 32], profiles.to_vec(), true).unwrap();
     let (status, headers, answer) = request(port, "POST", path, token, &offer(&client.id.fingerprint));
     assert_eq!(status, 201, "{answer}");
     let location = headers.iter().find(|(k, _)| k == "location").unwrap().1.clone();
@@ -194,12 +194,12 @@ fn publish(port: u16, path: &str, token: Option<&str>, profiles: &[u16]) -> Publ
     let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
     sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let txid = [3u8; 12];
-    sock.send_to(&stun::request(&txid, &format!("{ufrag}:pubU"), &pwd, true), to).unwrap();
+    sock.send_to(&stun::request(&txid, &format!("{ufrag}:pubU"), &pwd, true, [1, 2, 3, 4, 5, 6, 7, 8]), to).unwrap();
     let mut buf = vec![0u8; 4096];
     let (n, _) = sock.recv_from(&mut buf).unwrap();
     assert_eq!(stun::check_success(&buf[..n], &txid, &pwd), Some(sock.local_addr().unwrap()));
 
-    let mut pending = client.start();
+    let mut pending = client.start(Instant::now()).unwrap();
     let started = Instant::now();
     while client.keys.is_none() {
         assert!(started.elapsed() < Duration::from_secs(10), "the handshake did not finish");
@@ -207,7 +207,7 @@ fn publish(port: u16, path: &str, token: Option<&str>, profiles: &[u16]) -> Publ
             sock.send_to(&d, to).unwrap();
         }
         let (n, _) = sock.recv_from(&mut buf).unwrap();
-        pending = client.handle(&buf[..n]).unwrap();
+        pending = client.handle(&buf[..n], Instant::now()).unwrap();
     }
     let k = client.keys.clone().unwrap();
     let want = if profiles.contains(&0x0007) { srtp::Profile::AeadAes128Gcm } else { srtp::Profile::Aes128CmHmacSha1_80 };
@@ -668,4 +668,259 @@ fn ffmpeg_publishes() {
     let codecs: Vec<_> = r.streams().iter().map(|s| s.codec).collect();
     assert_eq!(codecs, [ironav_core::CodecId::Opus, ironav_core::CodecId::H264].iter().copied().filter(|c| codecs.contains(c)).collect::<Vec<_>>());
     assert!(codecs.len() == 2 && n[0] > 50 && n[1] > 50, "{codecs:?} {n:?}");
+}
+
+// ---- the publisher, against this module's own endpoint ----
+
+/// The URL of the endpoint on `port` as a publisher is given it, and the options that trust its
+/// certificate (the endpoint serves `whips://` as `https://` to a publisher).
+fn publisher_target(port: u16, path: &str, tls: bool) -> (String, WhipOptions) {
+    let mut opts = WhipOptions::default();
+    if tls {
+        opts.tls = TLS_PORTS.lock().unwrap().iter().find(|(p, _)| *p == port).map(|(_, c)| c.clone());
+        assert!(opts.tls.is_some());
+    }
+    (format!("{}://127.0.0.1:{port}{path}", if tls { "https" } else { "http" }), opts)
+}
+
+/// The H.264 access units of the RTP fixture in Annex B form, with their 90 kHz times from the first:
+/// single NAL unit packets, STAP-A and FU-A put back together.
+fn access_units() -> Vec<(Vec<u8>, u64)> {
+    let (video, _) = media();
+    let mut out = Vec::new();
+    let (mut au, mut first) = (Vec::new(), None);
+    let start = [0u8, 0, 0, 1];
+    for p in &video {
+        let h = srtp::rtp_header_len(p).unwrap();
+        let ts = u32::from_be_bytes([p[4], p[5], p[6], p[7]]);
+        let pl = &p[h..];
+        match pl[0] & 31 {
+            24 => {
+                let mut r = &pl[1..];
+                while r.len() >= 2 {
+                    let n = u16::from_be_bytes([r[0], r[1]]) as usize;
+                    au.extend_from_slice(&start);
+                    au.extend_from_slice(&r[2..2 + n]);
+                    r = &r[2 + n..];
+                }
+            }
+            28 => {
+                if pl[1] & 0x80 != 0 {
+                    au.extend_from_slice(&start);
+                    au.push((pl[0] & 0xE0) | (pl[1] & 31));
+                }
+                au.extend_from_slice(&pl[2..]);
+            }
+            _ => {
+                au.extend_from_slice(&start);
+                au.extend_from_slice(pl);
+            }
+        }
+        if p[1] & 0x80 != 0 {
+            let f = *first.get_or_insert(ts);
+            out.push((std::mem::take(&mut au), ts.wrapping_sub(f) as u64));
+        }
+    }
+    out
+}
+
+/// The NAL units of an Annex B access unit that a publisher sends (no delimiters or filler).
+fn sent_nals(au: &[u8]) -> Vec<Vec<u8>> {
+    packetize::split_annexb(au).into_iter().filter(|n| !matches!(n[0] & 31, 9 | 12)).map(<[u8]>::to_vec).collect()
+}
+
+fn publisher_publishes(tls: bool, token: Option<&str>) {
+    crate::net::allow_loopback_for_tests();
+    let port = free_port();
+    let query = token.map(|t| format!("?token={t}")).unwrap_or_default();
+    let mut s = open_whip(port, &format!("/live{query}"), tls);
+    let (url, opts) = publisher_target(port, "/live", tls);
+    let (aus, (_, audio)) = (access_units(), media());
+    assert!(aus.len() > 50 && aus.iter().any(|(a, _)| a.len() > 1200), "the fixture has access units that need FU-A");
+    let publisher = std::thread::spawn({
+        let (aus, audio, token) = (aus.clone(), audio.clone(), token.map(str::to_string));
+        move || {
+            if token.is_some() {
+                // the wrong token, and none, are refused by the endpoint and leave nothing behind
+                for t in [None, Some("wrong")] {
+                    let e = WhipPublisher::connect(&url, t, opts.clone()).err().expect("refused");
+                    assert!(e.message.contains("401") && e.hint.as_deref().is_some_and(|h| h.contains("token")), "{e:?}");
+                }
+            }
+            let mut p = WhipPublisher::connect(&url, token.as_deref(), opts).unwrap();
+            // a second publisher is turned away while this one is connected
+            // (the endpoint takes one at a time)
+            // P frames alone get a request for a keyframe, from the endpoint's PLI
+            let p_frame = [0u8, 0, 0, 1, 0x41, 0x9A, 1, 2, 3, 4];
+            let started = Instant::now();
+            let mut asked = false;
+            while !asked && started.elapsed() < Duration::from_secs(8) {
+                p.send_h264_access_unit(&p_frame, 0).unwrap();
+                std::thread::sleep(Duration::from_millis(100));
+                asked = p.keyframe_requested();
+            }
+            assert!(asked, "the endpoint asks for a keyframe");
+            assert!(!p.keyframe_requested(), "and it is told once");
+            for (i, (au, pts)) in aus.iter().enumerate() {
+                p.send_h264_access_unit(au, *pts).unwrap();
+                if i % 2 == 0 && i / 2 < audio.len() {
+                    p.send_opus(&audio[i / 2], 960 * (i / 2) as u64).unwrap();
+                }
+                std::thread::sleep(Duration::from_millis(4));
+            }
+            // a sender report goes out each second
+            std::thread::sleep(Duration::from_millis(1300));
+            assert_eq!(p.failure(), None);
+            p.close().unwrap();
+        }
+    });
+    let mut got = Vec::new();
+    assert!(drain(s.as_mut(), &mut got, Instant::now() + Duration::from_secs(60)), "the source ends after the publisher's DELETE");
+    publisher.join().unwrap();
+
+    let f = frames(&got);
+    assert_eq!(f[0].0, ironav_formats::rtp::DESCRIPTION_CHANNEL);
+    let desc: Description = serde_json::from_slice(&f[0].1).unwrap();
+    assert!(desc.sdp.contains("m=video 0 RTP/AVP 102") && desc.sdp.contains("m=audio 0 RTP/AVP 111"), "{}", desc.sdp);
+    // the publisher's sender reports reached the endpoint
+    assert!(f[1..].iter().any(|(c, _)| c % 2 == 1 && c / 2 == 0 && f.iter().any(|_| true) && !f.is_empty()), "an RTCP packet on the video's channel");
+    let mut r = ironav_formats::rtp::RtpStream::default();
+    r.feed(&got).unwrap();
+    r.end();
+    let mut out = Vec::new();
+    while let Some(p) = r.next_packet().unwrap() {
+        out.push(p);
+    }
+    let codecs: Vec<_> = r.streams().iter().map(|s| s.codec).collect();
+    assert_eq!(codecs, [ironav_core::CodecId::H264, ironav_core::CodecId::Opus]);
+    // every Opus packet, as sent
+    let opus: Vec<&Vec<u8>> = out.iter().filter(|p| p.packet.stream == 1).map(|p| &p.packet.data).collect();
+    let sent_opus = (0..aus.len()).filter(|i| i % 2 == 0 && i / 2 < audio.len()).count();
+    assert_eq!(opus, audio[..sent_opus].iter().collect::<Vec<_>>());
+    // and every access unit: its NAL units, in order, after the P frames that were sent to be asked for a keyframe
+    let video: Vec<Vec<Vec<u8>>> = out.iter().filter(|p| p.packet.stream == 0).map(|p| sent_nals(&p.packet.data)).collect();
+    let want: Vec<Vec<Vec<u8>>> = aus.iter().map(|(a, _)| sent_nals(a)).collect();
+    assert!(video.len() >= want.len(), "{} access units of {}", video.len(), want.len());
+    assert_eq!(video[video.len() - want.len()..], want[..]);
+    assert!(out.iter().filter(|p| p.packet.stream == 0 && p.key).count() >= 3, "the fixture's IDR pictures arrive as keyframes");
+}
+
+#[test]
+fn a_publisher_publishes_to_our_whip_endpoint() {
+    // FIPS mode refuses plaintext signalling, so that build publishes through TLS
+    publisher_publishes(cfg!(feature = "fips"), Some("s3cret"));
+}
+
+#[test]
+fn a_publisher_publishes_to_our_whips_endpoint() {
+    publisher_publishes(true, None);
+}
+
+/// A server of one scripted answer after another on a port of its own: each reply is sent to the
+/// next connection, and the request heads (and bodies) it saw are returned when it has served them all.
+fn scripted_server(replies: Vec<String>) -> (u16, std::thread::JoinHandle<Vec<String>>) {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let h = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        for reply in replies {
+            let (mut c, _) = l.accept().unwrap();
+            c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let mut got = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = c.read(&mut buf).unwrap();
+                got.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&got).to_string();
+                if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                    let len = head.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap())).unwrap_or(0);
+                    if body.len() >= len {
+                        break;
+                    }
+                }
+                assert!(n > 0, "the client closed early");
+            }
+            seen.push(String::from_utf8_lossy(&got).to_string());
+            c.write_all(reply.as_bytes()).unwrap();
+        }
+        seen
+    });
+    (port, h)
+}
+
+#[test]
+#[cfg_attr(feature = "fips", ignore = "FIPS build: the scripted server speaks plain http, which FIPS mode refuses (fips_publishers_refuse_http covers it)")]
+fn a_session_that_cannot_start_is_deleted_and_the_tokens_stay_home() {
+    crate::net::allow_loopback_for_tests();
+    // 201, a Location on the same server, and an answer that is no SDP: the publisher must DELETE the Location
+    let created = "HTTP/1.1 201 Created\r\nLocation: /whip/session/1\r\nContent-Type: application/sdp\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnope".to_string();
+    let deleted = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string();
+    let (port, server) = scripted_server(vec![created, deleted]);
+    let (url, opts) = publisher_target(port, "/whip", false);
+    let e = WhipPublisher::connect(&url, Some("tok3n"), opts).err().expect("a bad answer");
+    assert!(e.message.contains("answer"), "{e:?}");
+    let seen = server.join().unwrap();
+    assert!(seen[0].starts_with("POST /whip HTTP/1.1\r\n") && seen[0].contains("Authorization: Bearer tok3n\r\n") && seen[0].contains("Content-Type: application/sdp\r\n"), "{}", seen[0]);
+    assert!(seen[0].contains("a=setup:actpass") && seen[0].contains("a=sendonly") && seen[0].contains("a=rtcp-mux"), "{}", seen[0]);
+    assert!(seen[1].starts_with("DELETE /whip/session/1 HTTP/1.1\r\n") && seen[1].contains("Authorization: Bearer tok3n\r\n"), "{}", seen[1]);
+
+    // a Location on another host gets the DELETE but not the token
+    let created = "HTTP/1.1 201 Created\r\nLocation: http://localhost:PORT/elsewhere\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnope";
+    let deleted = "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".to_string();
+    let other = TcpListener::bind("127.0.0.1:0").unwrap();
+    let other_port = other.local_addr().unwrap().port();
+    let (port, server) = scripted_server(vec![created.replace("PORT", &other_port.to_string())]);
+    let other = std::thread::spawn(move || {
+        let (mut c, _) = other.accept().unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut buf = [0u8; 2048];
+        let n = c.read(&mut buf).unwrap();
+        c.write_all(deleted.as_bytes()).unwrap();
+        String::from_utf8_lossy(&buf[..n]).to_string()
+    });
+    let (url, opts) = publisher_target(port, "/whip", false);
+    assert!(WhipPublisher::connect(&url, Some("tok3n"), opts).is_err());
+    server.join().unwrap();
+    let delete = other.join().unwrap();
+    assert!(delete.starts_with("DELETE /elsewhere HTTP/1.1\r\n") && !delete.contains("tok3n") && !delete.contains("Authorization"), "{delete}");
+
+    // anything but 201 is an error that says what the server said, and deletes nothing
+    for (reply, wants) in [
+        ("HTTP/1.1 403 Forbidden\r\nContent-Length: 6\r\nConnection: close\r\n\r\nnot you", "403"),
+        ("HTTP/1.1 307 Temporary Redirect\r\nLocation: https://elsewhere.example/whip\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", "elsewhere.example"),
+        ("HTTP/1.1 201 Created\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnope", "Location"),
+    ] {
+        let (port, server) = scripted_server(vec![reply.to_string()]);
+        let (url, opts) = publisher_target(port, "/whip", false);
+        let e = WhipPublisher::connect(&url, None, opts).err().expect("refused");
+        assert!(e.message.contains(wants) || e.hint.as_deref().is_some_and(|h| h.contains(wants)), "{e:?}");
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+}
+
+#[test]
+#[cfg_attr(feature = "fips", ignore = "FIPS build: the scripted server speaks plain http, which FIPS mode refuses (fips_publishers_refuse_http covers it)")]
+fn a_publisher_goes_only_where_the_allow_list_permits() {
+    // (the list this process runs with is loopback only)
+    crate::net::allow_loopback_for_tests();
+    let e = WhipPublisher::connect("http://192.0.2.1:9/whip", None, WhipOptions::default()).err().unwrap();
+    assert!(e.message.contains("IRONAV_NET_ALLOW") || e.hint.as_deref().is_some_and(|h| h.contains("IRONAV_NET_ALLOW")), "{e:?}");
+    // an answer that names an address outside it is refused before anything is sent there
+    let answer = "v=0\r\no=- 1 2 IN IP4 192.0.2.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0\r\na=ice-ufrag:abcd\r\na=ice-pwd:abcdefghijklmnopqrstuv\r\na=fingerprint:sha-256 00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF\r\na=setup:passive\r\nm=video 5000 UDP/TLS/RTP/SAVPF 102\r\nc=IN IP4 192.0.2.1\r\na=mid:0\r\na=recvonly\r\na=rtcp-mux\r\na=rtpmap:102 H264/90000\r\na=candidate:1 1 udp 2130706431 192.0.2.1 5000 typ host\r\n";
+    let created = format!("HTTP/1.1 201 Created\r\nLocation: /s\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}", answer.len());
+    let deleted = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string();
+    let (port, server) = scripted_server(vec![created, deleted]);
+    let (url, opts) = publisher_target(port, "/whip", false);
+    let e = WhipPublisher::connect(&url, None, WhipOptions { audio: false, ..opts }).err().expect("an address the list does not permit");
+    assert!(e.message.contains("does not permit") && e.message.contains("192.0.2.1"), "{e:?}");
+    assert_eq!(server.join().unwrap().len(), 2, "the session was deleted");
+}
+
+/// FIPS mode refuses a plaintext endpoint, before anything is sent.
+#[cfg(feature = "fips")]
+#[test]
+fn fips_publishers_refuse_http() {
+    let e = WhipPublisher::connect("http://127.0.0.1:9/whip", None, WhipOptions::default()).err().expect("http opened in FIPS mode");
+    assert!(e.message.contains("plaintext") && e.message.contains("FIPS"), "{e:?}");
+    assert!(e.hint.as_deref().is_some_and(|h| h.contains("https")), "{e:?}");
 }
