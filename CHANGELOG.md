@@ -25,6 +25,12 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   only from addresses `IRONAV_NET_ALLOW` admits, and `?token=` requires a bearer token, compared in constant time. FIPS
   mode keeps it, with the AES-GCM SRTP profile only. Works with `ironav watch`, `stream_open` and the MCP server.
 
+### Fixed
+
+- **Lost UDP datagrams on Windows:** `udp://`, ONVIF discovery and the new SRT and WHIP sources waited for
+  datagrams with a short socket receive timeout, and on Windows a datagram that arrives just as such a timeout runs out
+  can be lost (a few in a thousand with sparse traffic). They now wait with `WSAPoll` and then read.
+
 ## [0.1.1] - 2026-11-02
 
 ### Added

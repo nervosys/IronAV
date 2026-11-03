@@ -20,7 +20,7 @@
 
 use crate::fips::env_flag;
 use ironav_core::{Error, ErrorCode, Result};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::time::Duration;
 
 /// The environment variable that opens addresses to sources.
@@ -237,6 +237,33 @@ pub fn resolve_udp(host: &str, port: u16, allow: &Allow, shown: &str) -> Result<
         return Err(Error::new(ErrorCode::Io, format!("{shown} resolves to no address")));
     }
     addrs.iter().copied().find(|a| allow.permits(a.ip())).ok_or_else(|| allow.refused(&addrs.iter().map(|a| a.ip()).collect::<Vec<_>>(), shown))
+}
+
+/// Receives one datagram, waiting at most `wait` (at least a millisecond) for it; a wait that
+/// ends with nothing is `ErrorKind::TimedOut`. On Windows it waits with `WSAPoll` and then reads,
+/// rather than through a receive timeout: there a datagram that arrives just as `SO_RCVTIMEO`
+/// runs out can be lost (a few in a thousand on loopback with 5 ms timeouts and sparse traffic).
+/// The socket must not have a read timeout of its own, and only one thread may read it.
+pub(crate) fn recv_from_within(sock: &UdpSocket, buf: &mut [u8], wait: Duration) -> std::io::Result<(usize, SocketAddr)> {
+    let wait = wait.max(Duration::from_millis(1));
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        use windows::Win32::Networking::WinSock::{WSAPoll, POLLRDNORM, SOCKET, WSAPOLLFD};
+        let mut fd = WSAPOLLFD { fd: SOCKET(sock.as_raw_socket() as usize), events: POLLRDNORM, ..Default::default() };
+        // SAFETY: one descriptor, valid for the call
+        match unsafe { WSAPoll(&mut fd, 1, wait.as_millis().min(i32::MAX as u128) as i32) } {
+            0 => Err(std::io::ErrorKind::TimedOut.into()),
+            n if n < 0 => Err(std::io::Error::last_os_error()),
+            // readable, or an error to report (a reset from an earlier send): neither blocks
+            _ => sock.recv_from(buf),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        sock.set_read_timeout(Some(wait))?;
+        sock.recv_from(buf)
+    }
 }
 
 #[cfg(test)]

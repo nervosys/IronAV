@@ -341,8 +341,7 @@ impl Source for UdpSource {
         &self.info
     }
     fn read(&mut self, buf: &mut [u8], wait: Duration) -> Result<Chunk> {
-        self.sock.set_read_timeout(Some(wait.max(Duration::from_millis(1))))?;
-        match self.sock.recv_from(buf) {
+        match crate::net::recv_from_within(&self.sock, buf, wait) {
             Ok((n, _from)) => Ok(Chunk::Data(n)),
             Err(e) if timed_out(&e) || e.kind() == ErrorKind::Interrupted => Ok(Chunk::Idle),
             // Windows reports an ICMP "port unreachable" from an earlier send as a reset; a

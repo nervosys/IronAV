@@ -1012,7 +1012,6 @@ fn handshake_caller(sock: &UdpSocket, peer: SocketAddr, o: &Options, shown: &str
     }
     let base = Handshake { version: 5, isn, mtu: MTU, mfw: WINDOW as u32, sock: my_id, ..Handshake::default() };
     let induction = hs_packet(&Handshake { version: 4, ext: 2, kind: HS_INDUCTION, ..base.clone() }, 0, 0);
-    sock.set_read_timeout(Some(Duration::from_millis(20)))?;
     let mut buf = vec![0u8; MAX_DATAGRAM];
     // None until the induction response has come
     let mut conclusion: Option<(Vec<u8>, u32)> = None;
@@ -1022,7 +1021,7 @@ fn handshake_caller(sock: &UdpSocket, peer: SocketAddr, o: &Options, shown: &str
             sock.send_to(conclusion.as_ref().map_or(&induction, |c| &c.0), peer)?;
             last_sent = Some(Instant::now());
         }
-        let n = match sock.recv_from(&mut buf) {
+        let n = match crate::net::recv_from_within(sock, &mut buf, Duration::from_millis(20)) {
             Ok((n, from)) if from == peer => n,
             Ok(_) => continue,
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted) => continue,
@@ -1105,10 +1104,9 @@ impl Cookies {
 fn accept(sock: &UdpSocket, o: &Options, stop: &AtomicBool) -> std::io::Result<Option<(Receiver, SocketAddr)>> {
     let my_id = (u32::from_be_bytes(random_bytes::<4>()) & SEQ_MASK).max(1);
     let cookies = Cookies { secret: random_bytes::<16>(), t0: Instant::now() };
-    sock.set_read_timeout(Some(Duration::from_millis(20)))?;
     let mut buf = vec![0u8; MAX_DATAGRAM];
     while !stop.load(Ordering::Relaxed) {
-        let (n, from) = match sock.recv_from(&mut buf) {
+        let (n, from) = match crate::net::recv_from_within(sock, &mut buf, Duration::from_millis(20)) {
             Ok(x) => x,
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted | ErrorKind::ConnectionReset) => continue,
             Err(e) => return Err(e),
@@ -1166,14 +1164,13 @@ fn accept(sock: &UdpSocket, o: &Options, stop: &AtomicBool) -> std::io::Result<O
 
 /// Runs a connection until it ends: datagrams in, protocol, payloads on to `tx`.
 fn pump(sock: &UdpSocket, peer: SocketAddr, mut rx: Receiver, tx: &SyncSender<std::io::Result<Vec<u8>>>, stop: &AtomicBool) {
-    let _ = sock.set_read_timeout(Some(POLL));
     let mut buf = vec![0u8; MAX_DATAGRAM];
     loop {
         if stop.load(Ordering::Relaxed) {
             let _ = sock.send_to(&rx.shutdown_packet(Instant::now()), peer);
             return;
         }
-        match sock.recv_from(&mut buf) {
+        match crate::net::recv_from_within(sock, &mut buf, POLL) {
             Ok((n, from)) if from == peer => rx.on_datagram(&buf[..n], Instant::now()),
             Ok(_) => {}
             // Windows reports an ICMP "port unreachable" from an earlier send as a reset

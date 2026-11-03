@@ -342,8 +342,8 @@ fn publishes(profiles: &[u16], token: Option<&str>) {
     assert!(desc.tracks.iter().all(|t| t.rtptime.is_some()));
     assert!(desc.sdp.contains("m=video 0 RTP/AVP 102") && desc.sdp.contains("m=audio 0 RTP/AVP 111"), "{}", desc.sdp);
     let rtp_frames: Vec<(u8, Vec<u8>)> = f[1..].iter().filter(|(c, _)| c % 2 == 0).cloned().collect();
-    // loopback UDP may still drop a datagram when the machine is busy (other tests, builds), so a
-    // few packets may be missing; what does come must be unchanged, once each, in order
+    // every packet sent must come, unchanged, once each, in order (loopback with the endpoint's
+    // receive buffer loses none; on Windows that needs net::recv_from_within)
     let mut missing = Vec::new();
     let mut next = rtp_frames.iter().peekable();
     for (i, p) in sent.iter().enumerate() {
@@ -354,7 +354,7 @@ fn publishes(profiles: &[u16], token: Option<&str>) {
         }
     }
     assert!(next.next().is_none(), "every packet received was sent, once, unchanged, in order");
-    assert!(missing.len() <= sent.len() / 50, "missing {missing:?}");
+    assert!(missing.is_empty(), "missing {missing:?}");
     let reports: Vec<&(u8, Vec<u8>)> = f[1..].iter().filter(|(c, _)| c % 2 == 1).collect();
     assert_eq!(reports.len(), 1);
     assert_eq!((reports[0].0, &reports[0].1), (1, &sender_report()));
@@ -371,13 +371,9 @@ fn publishes(profiles: &[u16], token: Option<&str>) {
     assert_eq!(codecs, [ironav_core::CodecId::H264, ironav_core::CodecId::Opus]);
     let (_, audio) = media();
     let opus: Vec<&Vec<u8>> = out.iter().filter(|p| p.packet.stream == 1).map(|p| &p.packet.data).collect();
-    if missing.is_empty() {
-        assert_eq!(opus, audio.iter().collect::<Vec<_>>());
-    } else {
-        assert!(opus.len() + missing.len() >= audio.len() && opus.iter().all(|o| audio.contains(o)));
-    }
+    assert_eq!(opus, audio.iter().collect::<Vec<_>>());
     let video: Vec<_> = out.iter().filter(|p| p.packet.stream == 0).collect();
-    assert!(video.len() > 10 && (video[0].key || !missing.is_empty()));
+    assert!(video.len() > 10 && video[0].key);
     assert!(r.wall_clock(0).is_some(), "the sender report reached the video track");
 }
 

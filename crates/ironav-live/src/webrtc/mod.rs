@@ -153,7 +153,6 @@ pub(crate) fn open(u: &SourceUrl, shown: String) -> Result<WhipSource> {
     let listener = TcpListener::bind((host.as_str(), port)).map_err(unreachable)?;
     let local = listener.local_addr()?;
     let udp = UdpSocket::bind(local).map_err(unreachable)?;
-    udp.set_read_timeout(Some(POLL))?;
     grow_receive_buffer(&udp);
     let id = dtls::Identity::generate("IronAV WHIP").map_err(|e| Error::new(ErrorCode::Internal, format!("could not make the WHIP endpoint's DTLS certificate: {e}")))?;
     let http = http::Server::new(listener, allow.clone(), sdp::MAX_OFFER)?;
@@ -338,7 +337,7 @@ impl Endpoint {
             }
             // a burst of datagrams, then the timers
             for _ in 0..256 {
-                match self.udp.recv_from(&mut buf) {
+                match crate::net::recv_from_within(&self.udp, &mut buf, POLL) {
                     Ok((n, from)) => {
                         if let Flow::End(e) = self.datagram(&buf[..n], from, Instant::now()) {
                             return self.finish(e);

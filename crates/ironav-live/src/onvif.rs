@@ -106,8 +106,7 @@ pub fn discover(target: &str, wait: Duration) -> Result<Vec<Discovered>> {
             resent = true;
             let _ = sock.send_to(probe.as_bytes(), target);
         }
-        sock.set_read_timeout(Some((deadline - now).min(wait / 2).max(Duration::from_millis(1))))?;
-        let (n, from) = match sock.recv_from(&mut buf) {
+        let (n, from) = match crate::net::recv_from_within(&sock, &mut buf, (deadline - now).min(wait / 2)) {
             Ok(r) => r,
             Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut | std::io::ErrorKind::ConnectionReset) => continue,
             Err(e) => return Err(e.into()),
