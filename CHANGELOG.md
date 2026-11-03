@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-11-03
+
 ### Added
 
 - **`voice::Vad` learns steady noise:** a level that holds still for 400 ms (a standard deviation of at most 3 dB) becomes the
