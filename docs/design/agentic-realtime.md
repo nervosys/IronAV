@@ -459,8 +459,9 @@ files at once, and it fixes the event model, analyzer trait and MCP plumbing bef
 6. **SRT**: decided and done, in tree, with no new dependency. The receiver (live mode, caller and listener) is written in
    `ironav-live/src/srt.rs` over `std::net::UdpSocket`; encryption (`?passphrase=`) uses AES and the RFC 3394 key wrap from
    `ic-cipher`, which IronSocketLayer already pulls in, and a small PBKDF2-HMAC-SHA1 (IronCrypto has no SHA-1). Not done:
-   rendezvous mode, the message API, AES-GCM, packet filters (FEC), groups, and handshake version 4. Interop with libsrt has
-   not been run in CI (the `#[ignore]` test needs `srt-live-transmit` on the `PATH`).
+   rendezvous mode, the message API, AES-GCM, packet filters (FEC), groups, and handshake version 4. Interop with libsrt
+   (through FFmpeg 9.0.1) passes in both roles, in the clear and with each key length, and with packets lost; it is not
+   run in CI (the `#[ignore]` tests need FFmpeg with libsrt, or `srt-live-transmit`, on the `PATH`).
 7. **WebRTC ingest**: decided and done. WHIP (RFC 9725) only, receive-only, written in `ironav-live/src/webrtc` on threads
    and blocking sockets like the other sources, not webrtc-rs or an async runtime. The endpoint is the ICE-lite, DTLS-server
    side with one host candidate, BUNDLE and `rtcp-mux` on one UDP port beside its HTTP port; H.264 (`packetization-mode=1`)

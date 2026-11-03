@@ -110,7 +110,10 @@ key material wrapped as RFC 3394, PBKDF2-HMAC-SHA1 key derivation); a sender tha
 passphrase, is refused, and the passphrase is hidden from every status and message. A caller is reconnected with back-off
 like RTSP (`?reconnect=0` turns it off), and its address goes through `IRONAV_NET_ALLOW` like any other outbound
 connection. Not supported: rendezvous mode, the message API, AES-GCM, forward error correction, groups and handshake
-version 4 (libsrt before 1.3). Without a passphrase SRT is a plaintext transport, which FIPS mode refuses.
+version 4 (libsrt before 1.3). Without a passphrase SRT is a plaintext transport, which FIPS mode refuses. It has been
+tested against libsrt through FFmpeg 9.0.1, calling and listening, in the clear and with 16, 24 and 32 byte keys, and
+with 3% of the sender's packets lost on the way (`cargo test -p ironav-live --lib interop_with_ffmpeg_libsrt -- --ignored`
+with an FFmpeg built with libsrt on the `PATH`).
 `rtsp://[user:password@]host[:port]/path` plays a camera or RTSP server: RTP interleaved on the RTSP connection
 (or over UDP with `?transport=udp`, taken only from the server's address),
 Basic or Digest credentials, keepalives and TEARDOWN, with H.264, HEVC, AAC, Opus, G.711 and L16 tracks (others are

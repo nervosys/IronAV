@@ -1051,10 +1051,11 @@ fn handshake_caller(sock: &UdpSocket, peer: SocketAddr, o: &Options, shown: &str
                 let ext = 1 | if km.is_some() { 2 } else { 0 } | if o.streamid.is_some() { 4 } else { 0 };
                 let enc = if km.is_some() { 2 } else { 0 };
                 let c = Handshake { enc, ext, kind: HS_CONCLUSION, cookie: h.cookie, exts, ..base.clone() };
-                conclusion = Some((hs_packet(&c, started.elapsed().as_micros() as u32, h.sock), h.sock));
+                // a caller's requests go to socket 0 (the listener's): libsrt drops one sent elsewhere
+                conclusion = Some((hs_packet(&c, started.elapsed().as_micros() as u32, 0), 0));
                 last_sent = None;
             }
-            Some((_, peer_id)) if h.kind == HS_CONCLUSION => {
+            Some(_) if h.kind == HS_CONCLUSION => {
                 if h.version < 5 {
                     return Err(failed("the sender speaks SRT handshake version 4, which is not supported".into()));
                 }
@@ -1067,7 +1068,8 @@ fn handshake_caller(sock: &UdpSocket, peer: SocketAddr, o: &Options, shown: &str
                     }
                 }
                 let latency = o.latency.max(h.peer_delay().unwrap_or(0));
-                let rx = Receiver::new(RxConfig { my_id, peer_id: *peer_id, isn: h.isn, latency_ms: latency, crypto, hs_reply: None }, Instant::now());
+                // the sender's socket is named in its conclusion, not in the induction response
+                let rx = Receiver::new(RxConfig { my_id, peer_id: h.sock, isn: h.isn, latency_ms: latency, crypto, hs_reply: None }, Instant::now());
                 return Ok(rx);
             }
             _ => {}
@@ -1117,7 +1119,7 @@ fn accept(sock: &UdpSocket, o: &Options, stop: &AtomicBool) -> std::io::Result<O
         if h.kind == HS_INDUCTION && dst == 0 && h.version >= 4 {
             let r = Handshake { ext: MAGIC, kind: HS_INDUCTION, ..reply };
             sock.send_to(&hs_packet(&r, 0, h.sock), from)?;
-        } else if h.kind == HS_CONCLUSION && dst == my_id && h.version >= 5 && cookies.valid(&from, h.cookie) {
+        } else if h.kind == HS_CONCLUSION && (dst == 0 || dst == my_id) && h.version >= 5 && cookies.valid(&from, h.cookie) {
             let reject = |code: u32| hs_packet(&Handshake { kind: code, cookie: h.cookie, ..reply.clone() }, 0, h.sock);
             let mut crypto = None;
             let mut exts = vec![(E_HSRSP, hs_ext(o.latency, o.passphrase.is_some()))];
@@ -1699,7 +1701,7 @@ mod tests {
                             (peer_id, cookie) = (h.sock, 0xc00c1e);
                             let r = Handshake { version: 5, ext: MAGIC, isn: h.isn, mtu: 1500, mfw: 8192, kind: HS_INDUCTION, sock: my_id, cookie, ..Handshake::default() };
                             sock.send_to(&hs_packet(&r, 0, peer_id), from).unwrap();
-                        } else if h.kind == HS_CONCLUSION && dst == my_id {
+                        } else if h.kind == HS_CONCLUSION && dst == 0 {
                             assert_eq!(h.cookie, cookie);
                             saw.streamid = h.ext(E_SID).map(|b| {
                                 let mut v = b.to_vec();
@@ -1751,7 +1753,7 @@ mod tests {
                                     if let Some(s) = &cfg.streamid {
                                         exts.push((E_SID, sid_encode(s)));
                                     }
-                                    hs_packet(&Handshake { version: 5, enc: 2, ext: 7, kind: HS_CONCLUSION, cookie: c, exts, ..ind.clone() }, 0, peer_id)
+                                    hs_packet(&Handshake { version: 5, enc: 2, ext: 7, kind: HS_CONCLUSION, cookie: c, exts, ..ind.clone() }, 0, 0)
                                 }
                             };
                             sock.send_to(&pkt, target).unwrap();
@@ -1978,7 +1980,7 @@ mod tests {
         // a caller says it again if it hears nothing
         let n = (0..10)
             .find_map(|_| {
-                sock.send_to(&hs_packet(&c, 0, h.sock), target).unwrap();
+                sock.send_to(&hs_packet(&c, 0, 0), target).unwrap();
                 sock.recv_from(&mut buf).ok().map(|(n, _)| n)
             })
             .expect("the rejection");
@@ -2090,6 +2092,52 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
         assert!(!got.is_empty() && got[0] == 0x47);
+    }
+
+    /// With FFmpeg built with libsrt on the PATH: libsrt as the sender, calling and listening, in the clear and encrypted
+    /// with each key length.
+    #[ignore = "needs ffmpeg with libsrt on the PATH"]
+    #[test]
+    fn interop_with_ffmpeg_libsrt() {
+        crate::net::allow_loopback_for_tests();
+        let src = concat!(env!("CARGO_MANIFEST_DIR"), "/../ironav-formats/tests/data/h264_aac.ts");
+        let size = std::fs::metadata(src).unwrap().len() as usize;
+        let pass = "correcthorsebattery";
+        for listen in [true, false] {
+            for key in [0, 16, 24, 32] {
+                let port = free_port();
+                let crypt = if key > 0 { format!("&passphrase={pass}&pbkeylen={key}") } else { String::new() };
+                let (mine, theirs) = if listen {
+                    (format!("srt://:{port}?mode=listener"), format!("srt://127.0.0.1:{port}?mode=caller{crypt}"))
+                } else {
+                    (format!("srt://127.0.0.1:{port}?reconnect=0"), format!("srt://127.0.0.1:{port}?mode=listener{crypt}"))
+                };
+                let mine = if key > 0 { format!("{mine}&passphrase={pass}") } else { mine };
+                let spawn = || {
+                    std::process::Command::new("ffmpeg")
+                        .args(["-hide_banner", "-loglevel", "error", "-re", "-i", src, "-c", "copy", "-f", "mpegts", &theirs])
+                        .stdin(std::process::Stdio::null())
+                        .spawn()
+                        .unwrap()
+                };
+                // a listener first: ours opens at once, FFmpeg's needs a moment
+                let (mut s, mut child) = if listen {
+                    let s = open_source(&mine).unwrap();
+                    (s, spawn())
+                } else {
+                    let child = spawn();
+                    std::thread::sleep(Duration::from_millis(800));
+                    (open_source(&mine).unwrap(), child)
+                };
+                let (got, _) = drain_all(s.as_mut(), Duration::from_secs(if listen { 8 } else { 20 }));
+                let _ = child.kill();
+                let _ = child.wait();
+                let case = format!("{} key {key}", if listen { "listening" } else { "calling" });
+                assert!(got.len() % 188 == 0 && got.first() == Some(&0x47), "{case}: {} bytes", got.len());
+                // FFmpeg rewrites the multiplex, so compare sizes loosely
+                assert!(got.len() > size / 2, "{case}: {} of about {size} bytes", got.len());
+            }
+        }
     }
 
     #[cfg_attr(feature = "fips", ignore = "FIPS build: an unencrypted SRT source is refused (tests/fips.rs covers the refusal)")]

@@ -7,6 +7,14 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Fixed
+
+- **SRT with libsrt:** a caller sent its handshake conclusion to its own socket ID instead of 0, which libsrt drops, so
+  `srt://host:port` could not connect to a libsrt listener, and the listener took a conclusion only if it was addressed to
+  its own ID, which a libsrt caller does not do. Both now follow libsrt, and the sender's socket ID is taken from its
+  conclusion. Tested against FFmpeg 9.0.1's libsrt in both roles, with and without encryption at each key length, and
+  with packet loss; `interop_with_ffmpeg_libsrt` is an ignored test that needs FFmpeg with libsrt.
+
 ## [0.1.2] - 2026-11-03
 
 ### Added
