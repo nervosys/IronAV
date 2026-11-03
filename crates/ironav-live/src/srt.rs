@@ -5,8 +5,9 @@
 //! `srt://host:port` calls a sender that listens; `srt://:port?mode=listener` (or `?mode=listener`
 //! with a host to bind to) waits for one sender to call. Both speak handshake version 5 (an
 //! induction, then a conclusion carrying the HSREQ extension with the latency and the flags, the
-//! stream ID, and the key material when there is a passphrase). IronAV only receives, so the
-//! sender's role is the other side's whatever side calls.
+//! stream ID, and the key material when there is a passphrase). This file is the receiver; the
+//! sender (`send`) speaks the same handshake from the other end, and shares its packets, key
+//! material and cipher.
 //!
 //! What the receiver does once connected:
 //! - data packets are put in sequence; a gap is reported at once in a NAK (loss report), and
@@ -50,6 +51,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+mod send;
+pub(crate) use send::{check_sender, open_sender};
 
 const HEADER: usize = 16;
 const MAX_DATAGRAM: usize = 65536;
@@ -233,6 +237,11 @@ impl Handshake {
     fn peer_delay(&self) -> Option<u16> {
         self.ext(E_HSREQ).or_else(|| self.ext(E_HSRSP)).filter(|b| b.len() >= 12).map(|b| half(b, 10))
     }
+
+    /// The receiver delay (milliseconds) the peer's HSREQ or HSRSP says it holds packets for.
+    fn peer_rcv_delay(&self) -> Option<u16> {
+        self.ext(E_HSREQ).or_else(|| self.ext(E_HSRSP)).filter(|b| b.len() >= 12).map(|b| half(b, 8))
+    }
 }
 
 fn hs_packet(h: &Handshake, ts: u32, dst: u32) -> Vec<u8> {
@@ -266,16 +275,16 @@ fn rejection(code: u32) -> &'static str {
     match code {
         1000 => "unknown reason",
         1001 => "system error",
-        1002 => "the sender rejected the connection",
-        1003 => "the sender is out of resources",
-        1004 => "the sender took this for a rogue connection",
-        1005 => "the sender's backlog is full",
-        1006 => "internal error at the sender",
-        1007 => "the sender is closing",
+        1002 => "the other end rejected the connection",
+        1003 => "the other end is out of resources",
+        1004 => "the other end took this for a rogue connection",
+        1005 => "the other end's backlog is full",
+        1006 => "internal error at the other end",
+        1007 => "the other end is closing",
         1008 => "the SRT versions do not match",
         1009 => "bad rendezvous cookie",
         1010 => "bad passphrase (or one was needed)",
-        1011 => "the sender requires encryption and no passphrase matched, or encryption is not wanted",
+        1011 => "the other end requires encryption and no passphrase matched, or encryption is not wanted",
         1012 => "the message API does not match",
         1013 => "the congestion controllers do not match",
         1014 => "the packet filters do not match",
@@ -401,12 +410,22 @@ fn build_km(pass: &[u8], salt: &[u8; 16], sek: &[u8]) -> Option<Vec<u8>> {
     ok.then_some(km)
 }
 
+/// New keys for a connection this end starts: the key material to send (a `klen`-byte key, 16, 24
+/// or 32, wrapped under the passphrase) and the keys as the cipher holds them.
+fn new_keys(pass: &str, klen: usize) -> Option<(Decryptor, Vec<u8>)> {
+    let (salt, sek) = (random_bytes::<16>(), random_bytes::<32>());
+    let msg = build_km(pass.as_bytes(), &salt, sek.get(..klen)?)?;
+    let mut d = Decryptor::new(pass);
+    parse_km(&msg).is_some_and(|k| d.install(&k)).then_some((d, msg))
+}
+
 struct Sek {
     cipher: Cipher,
     salt: [u8; 16],
 }
 
-/// The stream encrypting keys of a connection, as the passphrase unwraps them.
+/// The stream encrypting keys of a connection, as the passphrase unwraps them (the sender's, which
+/// it made itself, go through the same unwrap, and `apply` encrypts as it decrypts).
 struct Decryptor {
     pass: Vec<u8>,
     /// Even and odd.
@@ -598,7 +617,8 @@ impl Receiver {
     }
 
     fn shutdown_packet(&self, now: Instant) -> Vec<u8> {
-        control(C_SHUTDOWN, 0, 0, self.us(now) as u32, self.peer_id, &[])
+        // libsrt drops one without its four (empty) bytes of control information
+        control(C_SHUTDOWN, 0, 0, self.us(now) as u32, self.peer_id, &[0; 4])
     }
 
     fn on_datagram(&mut self, d: &[u8], now: Instant) {
@@ -608,7 +628,8 @@ impl Receiver {
                 self.last_recv = n;
                 self.on_data(seq, kk, ts, payload, n);
             }
-            Some(Packet::Control { kind, sub, info, dst, cif }) if dst == self.my_id => {
+            // a caller that asks again sends its conclusion to socket 0, as it did the first time
+            Some(Packet::Control { kind, sub, info, dst, cif }) if dst == self.my_id || (kind == C_HANDSHAKE && dst == 0) => {
                 self.last_recv = n;
                 self.on_control(kind, sub, info, cif, n);
             }
@@ -957,6 +978,8 @@ struct Options {
     latency: u16,
     streamid: Option<String>,
     passphrase: Option<String>,
+    /// The key length a sender makes, in bytes (`pbkeylen`: 16, 24 or 32).
+    pbkeylen: usize,
 }
 
 /// Whether a URL waits for the sender (`mode=listener`, or no host) rather than calling it.
@@ -986,28 +1009,39 @@ fn options(u: &SourceUrl) -> Result<Options> {
     if passphrase.as_ref().is_some_and(|p| !(10..=79).contains(&p.len())) {
         return Err(Error::invalid_arg("an srt passphrase is 10 to 79 characters"));
     }
-    Ok(Options { listener, host: host.to_string(), port, latency, streamid, passphrase })
+    let pbkeylen = match u.option("pbkeylen") {
+        None => 16,
+        Some(s) => s.parse::<usize>().ok().filter(|k| matches!(k, 16 | 24 | 32)).ok_or_else(|| Error::invalid_arg(format!("pbkeylen must be 16, 24 or 32 (bytes), got '{s}'")))?,
+    };
+    Ok(Options { listener, host: host.to_string(), port, latency, streamid, passphrase, pbkeylen })
 }
 
 fn io_err(kind: ErrorKind, msg: impl Into<String>) -> std::io::Error {
     std::io::Error::new(kind, msg.into())
 }
 
-/// The caller's side of the handshake, ending with the receiver for the connection.
-fn handshake_caller(sock: &UdpSocket, peer: SocketAddr, o: &Options, shown: &str) -> Result<Receiver> {
-    let failed = |what: String| Error::new(ErrorCode::Io, format!("{shown}: {what}")).hint("check the address, that the sender is running in listener mode, and the passphrase and latency");
+/// A connection a caller has made: what either end needs to go on.
+struct Connected {
+    my_id: u32,
+    /// The sequence number the caller chose, which starts both directions.
+    isn: u32,
+    /// The listener's conclusion, which names its socket and its latency.
+    hs: Handshake,
+    /// The keys, when the stream is encrypted (the caller makes them).
+    crypto: Option<Decryptor>,
+}
+
+/// The caller's side of the handshake. `other` names the listener (the `sender` or the `receiver`)
+/// in what is reported.
+fn handshake_caller(sock: &UdpSocket, peer: SocketAddr, o: &Options, shown: &str, other: &str) -> Result<Connected> {
+    let failed = |what: String| Error::new(ErrorCode::Io, format!("{shown}: {what}")).hint(format!("check the address, that the {other} is running in listener mode, and the passphrase and latency"));
     let started = Instant::now();
     let my_id = (u32::from_be_bytes(random_bytes::<4>()) & SEQ_MASK).max(1);
     let isn = u32::from_be_bytes(random_bytes::<4>()) & SEQ_MASK;
     let mut crypto = None;
     let mut km = None;
     if let Some(p) = &o.passphrase {
-        let (salt, sek) = (random_bytes::<16>(), random_bytes::<16>());
-        let msg = build_km(p.as_bytes(), &salt, &sek).ok_or_else(|| failed("could not make the key material".into()))?;
-        let mut d = Decryptor::new(p);
-        if !parse_km(&msg).is_some_and(|k| d.install(&k)) {
-            return Err(failed("could not make the key material".into()));
-        }
+        let (d, msg) = new_keys(p, o.pbkeylen).ok_or_else(|| failed("could not make the key material".into()))?;
         (crypto, km) = (Some(d), Some(msg));
     }
     let base = Handshake { version: 5, isn, mtu: MTU, mfw: WINDOW as u32, sock: my_id, ..Handshake::default() };
@@ -1034,12 +1068,12 @@ fn handshake_caller(sock: &UdpSocket, peer: SocketAddr, o: &Options, shown: &str
             continue;
         }
         if h.kind >= 1000 && h.kind != HS_CONCLUSION {
-            return Err(failed(format!("the sender refused the connection: {}", rejection(h.kind))));
+            return Err(failed(format!("the {other} refused the connection: {}", rejection(h.kind))));
         }
         match &conclusion {
             None if h.kind == HS_INDUCTION => {
                 if h.version < 5 || h.ext != MAGIC {
-                    return Err(failed("the sender speaks SRT handshake version 4, which is not supported (SRT 1.3 or later is needed)".into()));
+                    return Err(failed(format!("the {other} speaks SRT handshake version 4, which is not supported (SRT 1.3 or later is needed)")));
                 }
                 let mut exts = vec![(E_HSREQ, hs_ext(o.latency, o.passphrase.is_some()))];
                 if let Some(k) = &km {
@@ -1049,7 +1083,7 @@ fn handshake_caller(sock: &UdpSocket, peer: SocketAddr, o: &Options, shown: &str
                     exts.push((E_SID, sid_encode(s)));
                 }
                 let ext = 1 | if km.is_some() { 2 } else { 0 } | if o.streamid.is_some() { 4 } else { 0 };
-                let enc = if km.is_some() { 2 } else { 0 };
+                let enc = if km.is_some() { (o.pbkeylen / 8) as u16 } else { 0 };
                 let c = Handshake { enc, ext, kind: HS_CONCLUSION, cookie: h.cookie, exts, ..base.clone() };
                 // a caller's requests go to socket 0 (the listener's): libsrt drops one sent elsewhere
                 conclusion = Some((hs_packet(&c, started.elapsed().as_micros() as u32, 0), 0));
@@ -1057,25 +1091,23 @@ fn handshake_caller(sock: &UdpSocket, peer: SocketAddr, o: &Options, shown: &str
             }
             Some(_) if h.kind == HS_CONCLUSION => {
                 if h.version < 5 {
-                    return Err(failed("the sender speaks SRT handshake version 4, which is not supported".into()));
+                    return Err(failed(format!("the {other} speaks SRT handshake version 4, which is not supported")));
                 }
                 if o.passphrase.is_some() {
                     match h.ext(E_KMRSP) {
-                        // a status word: the sender could not use our key
-                        Some(b) if b.len() == 4 => return Err(failed("the sender could not use the passphrase (is it the same one?)".into())),
+                        // a status word: the other end could not use our key
+                        Some(b) if b.len() == 4 => return Err(failed(format!("the {other} could not use the passphrase (is it the same one?)"))),
                         Some(b) if b.len() >= 16 => {}
-                        _ => return Err(failed("the sender does not encrypt, though a passphrase was given".into())),
+                        _ => return Err(failed(format!("the {other} does not encrypt, though a passphrase was given"))),
                     }
                 }
-                let latency = o.latency.max(h.peer_delay().unwrap_or(0));
-                // the sender's socket is named in its conclusion, not in the induction response
-                let rx = Receiver::new(RxConfig { my_id, peer_id: h.sock, isn: h.isn, latency_ms: latency, crypto, hs_reply: None }, Instant::now());
-                return Ok(rx);
+                // the listener's socket is named in its conclusion, not in the induction response
+                return Ok(Connected { my_id, isn, hs: h, crypto });
             }
             _ => {}
         }
     }
-    Err(failed("the sender did not answer the handshake".into()))
+    Err(failed(format!("the {other} did not answer the handshake")))
 }
 
 /// The state a listener keeps to tell a caller that has been through an induction.
@@ -1102,8 +1134,20 @@ impl Cookies {
     }
 }
 
+/// A caller whose handshake a listener has answered.
+struct Accepted {
+    my_id: u32,
+    from: SocketAddr,
+    /// The caller's conclusion: its socket, sequence number, extensions.
+    hs: Handshake,
+    /// The keys, when the stream is encrypted (the caller's, which both directions use).
+    crypto: Option<Decryptor>,
+    /// Our conclusion response, sent again if the caller asks again.
+    reply: Vec<u8>,
+}
+
 /// Waits for a caller and answers its handshake; `None` when asked to stop first.
-fn accept(sock: &UdpSocket, o: &Options, stop: &AtomicBool) -> std::io::Result<Option<(Receiver, SocketAddr)>> {
+fn accept(sock: &UdpSocket, o: &Options, stop: &AtomicBool) -> std::io::Result<Option<Accepted>> {
     let my_id = (u32::from_be_bytes(random_bytes::<4>()) & SEQ_MASK).max(1);
     let cookies = Cookies { secret: random_bytes::<16>(), t0: Instant::now() };
     let mut buf = vec![0u8; MAX_DATAGRAM];
@@ -1153,9 +1197,7 @@ fn accept(sock: &UdpSocket, o: &Options, stop: &AtomicBool) -> std::io::Result<O
             let r = Handshake { enc, ext, kind: HS_CONCLUSION, exts, ..reply };
             let pkt = hs_packet(&r, 0, h.sock);
             sock.send_to(&pkt, from)?;
-            let latency = o.latency.max(h.peer_delay().unwrap_or(0));
-            let rx = Receiver::new(RxConfig { my_id, peer_id: h.sock, isn: h.isn, latency_ms: latency, crypto, hs_reply: Some(pkt) }, Instant::now());
-            return Ok(Some((rx, from)));
+            return Ok(Some(Accepted { my_id, from, hs: h, crypto, reply: pkt }));
         }
     }
     Ok(None)
@@ -1253,7 +1295,9 @@ pub(crate) fn open(u: &SourceUrl, shown: String) -> Result<SrtSource> {
     } else {
         let peer = net::resolve_udp(&o.host, o.port, &Allow::from_env()?, &shown)?;
         let sock = UdpSocket::bind(if peer.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }).map_err(|e| unreachable(e, "could not open a socket for"))?;
-        let rx = handshake_caller(&sock, peer, &o, &shown)?;
+        let c = handshake_caller(&sock, peer, &o, &shown, "sender")?;
+        let latency = o.latency.max(c.hs.peer_delay().unwrap_or(0));
+        let rx = Receiver::new(RxConfig { my_id: c.my_id, peer_id: c.hs.sock, isn: c.hs.isn, latency_ms: latency, crypto: c.crypto, hs_reply: None }, Instant::now());
         (sock, Some((rx, peer)))
     };
     let stop = Arc::new(AtomicBool::new(false));
@@ -1265,7 +1309,11 @@ pub(crate) fn open(u: &SourceUrl, shown: String) -> Result<SrtSource> {
             let (receiver, peer) = match first {
                 Some(x) => x,
                 None => match accept(&sock, &o, &flag) {
-                    Ok(Some(x)) => x,
+                    Ok(Some(a)) => {
+                        let latency = o.latency.max(a.hs.peer_delay().unwrap_or(0));
+                        let rx = Receiver::new(RxConfig { my_id: a.my_id, peer_id: a.hs.sock, isn: a.hs.isn, latency_ms: latency, crypto: a.crypto, hs_reply: Some(a.reply) }, Instant::now());
+                        (rx, a.from)
+                    }
                     Ok(None) => return,
                     Err(e) => {
                         let _ = tx.send(Err(e));

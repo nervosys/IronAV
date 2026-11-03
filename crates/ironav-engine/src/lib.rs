@@ -10,6 +10,7 @@ mod limits;
 pub mod live;
 pub mod plan;
 pub mod policy;
+pub mod publish;
 pub mod record;
 pub mod run;
 mod sessions;

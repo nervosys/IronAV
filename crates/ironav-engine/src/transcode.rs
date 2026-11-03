@@ -83,12 +83,20 @@ pub struct Transcoder {
     dropping: bool,
     late: bool,
     dropped: u64,
+    /// Where the output is also sent, as MPEG-TS, when the session publishes.
+    publisher: Option<crate::publish::Publisher>,
 }
 
 impl Transcoder {
     pub fn new(opts: TranscodeOptions) -> Self {
         let status = Arc::new(Mutex::new(json!({ "output": opts.output, "state": "waiting" })));
-        Transcoder { opts, tx: None, thread: None, status, video: None, dropping: false, late: false, dropped: 0 }
+        Transcoder { opts, tx: None, thread: None, status, video: None, dropping: false, late: false, dropped: 0, publisher: None }
+    }
+
+    /// Sends what the transcoder writes to `p` as well: the session's publisher. It is told the
+    /// output's streams when the first picture has been encoded, and finished with the output.
+    pub fn publish_to(&mut self, p: crate::publish::Publisher) {
+        self.publisher = Some(p);
     }
 
     /// [`start`](Self::start) on a session already running: decoding begins at the next video
@@ -111,6 +119,7 @@ impl Transcoder {
         let (tx, rx) = sync_channel(QUEUE);
         let mut work = Work::new(self.opts.clone(), streams, v, self.status.clone());
         work.late = self.late;
+        work.publisher = self.publisher.take();
         self.tx = Some(tx);
         let status = self.status.clone();
         let output = self.opts.output.clone();
@@ -202,6 +211,7 @@ struct Work {
     size: Option<(u32, u32)>,
     late: bool,
     error: Option<Error>,
+    publisher: Option<crate::publish::Publisher>,
 }
 
 impl Work {
@@ -219,7 +229,7 @@ impl Work {
             }
         }
         let rec = Recorder::new(opts.record());
-        Work { opts, streams: streams.to_vec(), video, map, decoder: None, convert: None, scale: None, encoder: None, rec, started: false, status, pictures_in: 0, pictures_out: 0, size: None, late: false, error: None }
+        Work { opts, streams: streams.to_vec(), video, map, decoder: None, convert: None, scale: None, encoder: None, rec, started: false, status, pictures_in: 0, pictures_out: 0, size: None, late: false, error: None, publisher: None }
     }
 
     fn run(mut self, rx: Receiver<(Packet, bool)>) {
@@ -258,6 +268,9 @@ impl Work {
             }
         }
         self.rec.finish(0.0);
+        if let Some(pb) = self.publisher.as_mut() {
+            pb.finish();
+        }
         self.publish("finished");
     }
 
@@ -269,6 +282,9 @@ impl Work {
                 let t = q.pts as f64 * self.streams[q.stream].time_base.as_f64();
                 q.stream = self.map[q.stream].unwrap();
                 self.rec.packet(&q, t, key);
+                if let Some(pb) = self.publisher.as_mut() {
+                    pb.packet(&q, key);
+                }
             }
             return Ok(());
         }
@@ -347,6 +363,9 @@ impl Work {
         } else {
             self.rec.start(&out);
         }
+        if let Some(pb) = self.publisher.as_mut() {
+            pb.start(&out);
+        }
         Ok(())
     }
 
@@ -367,6 +386,9 @@ impl Work {
             let t = p.pts as f64 * tb;
             p.stream = out;
             self.rec.packet(&p, t, key);
+            if let Some(pb) = self.publisher.as_mut() {
+                pb.packet(&p, key);
+            }
         }
     }
 

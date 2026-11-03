@@ -119,12 +119,20 @@ passphrase is redacted from statuses, errors and the audit log. A sender that do
 is refused, so the stream cannot be downgraded. Without a passphrase SRT is a plaintext transport. AES and the key wrap come
 from `ic-cipher` (not CMVP-validated); the SHA-1 is in-tree.
 
+The SRT sender (`ironav-live/src/srt/send.rs`, used by `--publish` and the `publish` field of `stream_open`) is an outbound
+path. A caller sends only to an address `IRONAV_NET_ALLOW` permits, checked when the URL is opened and for every attempt;
+the engine's audit log records the destination (`network_publish`) with the passphrase redacted. A listener sender binds a
+UDP port (loopback unless an address is given) and serves one receiver at a time. The send buffer, the retransmission
+queue and the output queue are bounded, a slow or absent receiver drops packets instead of blocking the session, and
+control packets from the receiver are length-checked as on the receiving side. The sender generates its own key and salt
+(AES-CTR, as above, with no authentication of the data). Without a passphrase it sends plaintext, which FIPS mode refuses.
+
 **FIPS mode.** Turned on by `IRONAV_FIPS=1` or by building with the `fips` feature. In FIPS mode:
 
 - TLS offers only AES-GCM suites, P-256 and P-384 ECDHE, and ECDSA and RSA-PSS signatures. RSA PKCS#1 v1.5 is accepted
   only on certificates.
 - ChaCha20-Poly1305, X25519 and the hybrid groups are not offered.
-- Plaintext `http://`, `rtsp://`, `tcp://`, `udp://`, `whip://` and unencrypted `srt://` (no `passphrase`) sources are refused, and so are YouTube sources, which yt-dlp
+- Plaintext `http://`, `rtsp://`, `tcp://`, `udp://`, `whip://` and unencrypted `srt://` (no `passphrase`) sources and `publish` destinations are refused, and so are YouTube sources, which yt-dlp
   fetches outside IronAV's control.
 - MD5 Digest is refused, and in builds with the `fips` feature the MD5 code is not compiled in at all. SHA-256 Digest is
   still used. A default build with `IRONAV_FIPS=1` keeps the MD5 code and refuses it at run time.

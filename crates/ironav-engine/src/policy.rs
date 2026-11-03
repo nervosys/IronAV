@@ -290,6 +290,15 @@ pub fn check_source(raw: &str, u: &ironav_live::SourceUrl) -> Result<()> {
     Ok(())
 }
 
+/// May a live session send its media to this destination? The scheme and options are checked, FIPS
+/// mode refuses a plaintext transport, and the destination is audited like a network source (the
+/// address allow-list `IRONAV_NET_ALLOW` applies when it connects, to where a caller sends).
+pub fn check_publish(raw: &str) -> Result<ironav_live::SinkPlan> {
+    let plan = ironav_live::plan_sink(raw)?;
+    crate::audit::event("network_publish", serde_json::json!({ "url": plan.shown }));
+    Ok(plan)
+}
+
 /// Whether this call to `tool` would write files (or open a way to), judged from its arguments.
 pub fn writes_files(tool: &str, args: &serde_json::Value) -> bool {
     let given = |k: &str| args.get(k).is_some_and(|v| !v.is_null());
@@ -394,6 +403,11 @@ mod tests {
         assert!(!writes_files("analyze", &serde_json::json!({ "input": "x" })));
         assert!(writes_files("stream_open", &serde_json::json!({ "record": "r.m3u8" })));
         assert!(!writes_files("stream_open", &serde_json::json!({ "source": "test://video" })));
+        // sending media out writes no file: it is the destination that is checked
+        assert!(!writes_files("stream_open", &serde_json::json!({ "publish": "srt://127.0.0.1:9" })));
+        assert!(check_publish("srt://127.0.0.1:9?passphrase=0123456789").is_ok());
+        assert_eq!(check_publish("udp://127.0.0.1:9").unwrap_err().code, ErrorCode::InvalidArgument);
+        assert!(check_publish("srt://127.0.0.1:9?latency=x").is_err());
         let _ = std::fs::remove_dir_all(&d);
     }
 

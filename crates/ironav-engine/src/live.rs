@@ -81,6 +81,10 @@ pub struct OpenArgs {
     /// Also encode the video again, as low-latency H.264, to a file or HLS.
     #[serde(default)]
     pub transcode: Option<crate::transcode::TranscodeOptions>,
+    /// Also send the media, as MPEG-TS, to a destination (`srt://`): the transcode's output when
+    /// there is one, else the source remuxed as a `.ts` recording would be.
+    #[serde(default)]
+    pub publish: Option<String>,
 }
 
 fn default_idle() -> f64 {
@@ -144,6 +148,8 @@ struct Shared {
     record: Option<Value>,
     /// The transcode sink's status, as last published by the session thread.
     transcode: Option<Value>,
+    /// Where the publisher reports; its status is read when asked for.
+    publish: Option<Arc<crate::publish::PublishCell>>,
     /// The recording asked for (at open or by `configure`) and not yet asked to stop, so a second
     /// start is refused even before the session thread has taken the first.
     recording: Option<String>,
@@ -355,6 +361,7 @@ pub fn open_with_taps(args: &OpenArgs, taps: Vec<TapConfig>) -> Result<(Arc<Sess
             return Err(Error::invalid_arg("record and transcode cannot write the same path"));
         }
     }
+    let publisher = args.publish.as_ref().map(|u| crate::publish::check(u).map(|plan| crate::publish::Publisher::new(u, plan))).transpose()?;
     if !(args.retain_seconds >= 0.0) {
         return Err(Error::invalid_arg("retain_seconds must be 0 or more"));
     }
@@ -403,6 +410,7 @@ pub fn open_with_taps(args: &OpenArgs, taps: Vec<TapConfig>) -> Result<(Arc<Sess
             thumbnails: VecDeque::new(),
             record: None,
             transcode: None,
+            publish: publisher.as_ref().map(crate::publish::Publisher::cell),
             recording: args.record.clone(),
             transcoding: args.transcode.as_ref().map(|t| t.output.clone()),
             reconfigure: VecDeque::new(),
@@ -427,13 +435,23 @@ pub fn open_with_taps(args: &OpenArgs, taps: Vec<TapConfig>) -> Result<(Arc<Sess
         .spawn(move || {
             let mut rec = record.map(Recorder::new);
             let mut tc = transcode.map(crate::transcode::Transcoder::new);
+            let mut publisher = publisher;
+            // with a transcode, what is published is what it writes
+            if let (Some(t), true) = (tc.as_mut(), publisher.is_some()) {
+                t.publish_to(publisher.take().expect("a publisher"));
+            }
             // a panic ends this session with an error; it must not skip the closing steps below
-            let r = crate::tools::contain("the live session", || worker.run(source, &opts, &stream_opts, realtime, &mut rec, &mut tc));
+            let r = crate::tools::contain("the live session", || worker.run(source, &opts, &stream_opts, realtime, &mut rec, &mut tc, &mut publisher));
             // the transcoder drains its encoder and finishes its output
             if let Some(tc) = tc.as_mut() {
                 tc.finish();
                 lock(&worker.shared).transcode = Some(tc.status());
             }
+            // the publisher sends what is queued and says goodbye
+            if let Some(p) = publisher.as_mut() {
+                p.finish();
+            }
+            worker.publish_events();
             // a recording is closed however the session ended
             if let Some(rec) = rec.as_mut() {
                 let end = lock(&worker.shared).media_seconds;
@@ -691,8 +709,19 @@ impl Session {
         })
     }
 
-    fn run(&self, mut source: Box<dyn Source>, opts: &AnalyzeOptions, sopts: &StreamOptions, realtime: bool, rec: &mut Option<Recorder>, tc: &mut Option<crate::transcode::Transcoder>) -> Result<()> {
+    /// Logs what the publisher has to say about its destination (it never fails the session).
+    fn publish_events(&self) {
+        let Some(cell) = lock(&self.shared).publish.clone() else { return };
+        for ev in cell.take_events() {
+            let t = lock(&self.shared).media_seconds;
+            let _ = self.log(Observation::new(ev.kind, "publish", t, ev.data), None);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run(&self, mut source: Box<dyn Source>, opts: &AnalyzeOptions, sopts: &StreamOptions, realtime: bool, rec: &mut Option<Recorder>, tc: &mut Option<crate::transcode::Transcoder>, publisher: &mut Option<crate::publish::Publisher>) -> Result<()> {
         let mut deferred = Vec::new();
+        let has_publish = lock(&self.shared).publish.is_some();
         let mut published = Instant::now();
         let mut buf = vec![0u8; 64 << 10];
         let mut head = Vec::new();
@@ -821,6 +850,9 @@ impl Session {
                         tc.start(&streams);
                         sh.transcode = Some(tc.status());
                     }
+                    if let Some(p) = publisher.as_mut() {
+                        p.start(&streams);
+                    }
                     sh.streams = streams;
                     drop(sh);
                     analysis = Some(a);
@@ -865,14 +897,19 @@ impl Session {
                     // queued for the transcoder's thread, never waited for
                     tc.packet(&sp.packet, sp.key);
                 }
-                if published.elapsed() >= Duration::from_millis(250) && (rec.is_some() || tc.is_some()) {
+                if published.elapsed() >= Duration::from_millis(250) && (rec.is_some() || tc.is_some() || has_publish) {
                     published = Instant::now();
+                    self.publish_events();
                     let (r, c) = (rec.as_ref().map(Recorder::status), tc.as_ref().map(|t| t.status()));
                     let mut sh = lock(&self.shared);
                     (sh.record, sh.transcode) = (r.or(sh.record.take()), c.or(sh.transcode.take()));
                 }
                 if let Some(rec) = rec.as_mut() {
                     rec.packet(&sp.packet, t, sp.key);
+                }
+                if let Some(p) = publisher.as_mut() {
+                    // queued for the publisher's thread, never waited for
+                    p.packet(&sp.packet, sp.key);
                 }
                 let queued = arrived.elapsed();
                 a.packet_keyed(&sp.packet, sp.key, &mut |o| self.log(o, Some(arrived)))?;
@@ -1060,6 +1097,7 @@ impl Session {
             "retained": { "from": sh.ring.front().map(|k| k.t), "to": sh.ring.back().map(|k| k.t), "bytes": sh.ring_bytes },
             "record": sh.record,
             "transcode": sh.transcode,
+            "publish": sh.publish.as_ref().map(|c| c.status()),
             "source_health": sh.health,
             "sender_clock": sh.clocks.iter().map(|(s, c)| json!({ "stream": s, "unix_at_zero": (c * 1000.0).round() / 1000.0 })).collect::<Vec<_>>(),
         })

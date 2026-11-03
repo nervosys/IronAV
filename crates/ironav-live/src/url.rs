@@ -4,7 +4,8 @@
 //! through yt-dlp), `device://video[/NAME]` or
 //! `device://audio[/NAME]` (a camera or microphone), `device://screen[/N]` (a display),`whip://[host]:port[/path]` (a WHIP endpoint
 //! a WebRTC publisher sends to), `pipe:`, `-`, `file:path` or a bare path, each
-//! optionally followed by `?key=value&...` options.
+//! optionally followed by `?key=value&...` options. The same forms name an output (`sink`), of
+//! which `srt://` is the one there is.
 
 use ironav_core::{Error, Result};
 use std::collections::BTreeMap;
@@ -27,10 +28,11 @@ use std::collections::BTreeMap;
 /// - `latency`: for SRT, the milliseconds a packet is held for retransmissions (120);
 /// - `streamid`: for SRT, the stream ID to give the sender;
 /// - `passphrase`: for SRT, the passphrase of an encrypted stream (redacted from what is shown);
+/// - `pbkeylen`: for an SRT output, the length of the key it makes for a `passphrase`, in bytes (16, 24 or 32);
 /// - `token`: the bearer token a WHIP publisher must send (redacted wherever the URL is shown);
 /// - `cert`, `key`: for `whips://`, the PEM files of the endpoint's TLS certificate chain and private key;
 /// - `cursor`: for `device://screen`, `0` leaves the mouse cursor out of the picture (it is drawn by default).
-pub const OPTIONS: [&str; 26] = ["format", "fps", "pace", "follow", "idle", "listen", "transport", "audio", "size", "reconnect", "stall", "retries", "rate", "duration", "height", "cookies", "captions", "mode", "latency", "streamid", "passphrase", "token", "cert", "key", "cors", "cursor"];
+pub const OPTIONS: [&str; 27] = ["format", "fps", "pace", "follow", "idle", "listen", "transport", "audio", "size", "reconnect", "stall", "retries", "rate", "duration", "height", "cookies", "captions", "mode", "latency", "streamid", "passphrase", "token", "cert", "key", "cors", "cursor", "pbkeylen"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SourceUrl {

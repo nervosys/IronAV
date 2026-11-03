@@ -4,7 +4,7 @@
 //! which the `fips` feature runs with the FIPS profile.
 
 use ironav_core::ErrorCode;
-use ironav_live::{fips, net, onvif, open_source, Allow};
+use ironav_live::{fips, net, onvif, open_sink, open_source, plan_sink, Allow};
 use std::time::Duration;
 
 fn fips_on() {
@@ -70,6 +70,29 @@ fn an_encrypted_srt_source_is_not_refused_by_the_policy() {
     }
     // and it is listening, not refused
     assert!(open_source("srt://127.0.0.1:0?mode=listener&passphrase=0123456789").is_ok());
+}
+
+#[test]
+fn plaintext_srt_outputs_are_refused_and_an_encrypted_one_is_not() {
+    fips_on();
+    for url in ["srt://127.0.0.1:9", "srt://:9?mode=listener&latency=50"] {
+        for e in [open_sink(url).err().unwrap_or_else(|| panic!("{url} was opened in FIPS mode")), plan_sink(url).unwrap_err()] {
+            assert_eq!(e.code, ErrorCode::InvalidArgument, "{url}");
+            assert!(e.message.contains("plaintext") && e.message.contains("FIPS"), "{url}: {e:?}");
+            assert!(e.hint.is_some(), "{url}");
+        }
+    }
+    // with a passphrase it is past the policy: the failure is the connection, not the policy
+    net::allow_loopback_for_tests();
+    assert!(plan_sink("srt://127.0.0.1:9?passphrase=0123456789").is_ok());
+    match open_sink("srt://127.0.0.1:9?passphrase=0123456789") {
+        Ok(_) => panic!("connected to nothing"),
+        Err(e) => assert_eq!(e.code, ErrorCode::Io, "{e:?}"),
+    }
+    // and a listener is bound, not refused
+    assert!(open_sink("srt://127.0.0.1:0?mode=listener&passphrase=0123456789").is_ok());
+    // other schemes are not outputs at all
+    assert_eq!(plan_sink("udp://127.0.0.1:9").unwrap_err().code, ErrorCode::InvalidArgument);
 }
 
 #[test]

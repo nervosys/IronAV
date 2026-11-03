@@ -17,6 +17,16 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   libXinerama and libXfixes loaded at run time (Wayland is refused with an error that names the PipeWire portal), and macOS
   CoreGraphics (the error for a missing Screen Recording permission names the System Settings pane). The Linux and macOS
   backends are compile-checked only. It is a device under `IRONAV_ALLOW_DEVICES`.
+- **SRT sender, and `publish`:** `ironav_live::open_sink(url)` returns a `Sink` (`write` MPEG-TS bytes, `finish`, `stats`) for
+  `srt://host:port` (caller) and `srt://:port?mode=listener`, sharing the handshake, key-material and crypto code with
+  the receiver. Live mode with 1316-byte payloads, a send buffer of the latency, NAK retransmission, ACK/ACKACK with an
+  RTT estimate, keep-alive, shutdown, too-late drop, `latency`, `streamid`, `passphrase` with `pbkeylen` (16, 24, 32)
+  and `reconnect`. `ironav watch --publish URL` and the `stream_open` tool's `publish` field send a session's MPEG-TS
+  (the transcode's, else the source remuxed as a `.ts` recording) on a thread with a bounded queue; a failure is a
+  `publish_lost`, `publish_restored` or `publish_failed` event and never stops the session, and a caller is retried
+  with back-off. Destinations are checked by `IRONAV_NET_ALLOW`, and FIPS mode refuses a plaintext one. Tested against
+  FFmpeg 9.0.1 (libsrt) receiving, in both roles, in the clear and with 16, 24 and 32 byte keys. The receiver's shutdown
+  packet now carries the 4-byte body libsrt requires.
 - **`whips://`, WHIP signalling over TLS:** `whips://[host]:port[/path]?cert=CHAIN.pem&key=KEY.pem[&token=...]` is the WHIP
   endpoint with each accepted connection wrapped in a TLS 1.3 server session (IronSocketLayer) before the HTTP/1.1
   parsing, so the offer, the answer and the bearer token no longer cross the network in the clear. `cert` is a PEM

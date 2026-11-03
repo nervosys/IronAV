@@ -102,7 +102,7 @@ The same analyzers run on media as it arrives. A source is a path, `path?follow`
 `tcp://:port` (listen, on loopback unless an address is given), or `udp://:port` / `udp://group:port` (multicast).
 `srt://host:port` calls an SRT sender (an encoder, `srt-live-transmit`, ffmpeg in listener mode) and
 `srt://:port?mode=listener` waits for one to call (on loopback unless an address is given); the MPEG-TS it carries is read
-as `udp://` is. This is SRT's live mode, receiving only, written here with no extra dependency: handshake version 5,
+as `udp://` is. This is SRT's live mode, written here with no extra dependency: handshake version 5,
 ACKs, NAK loss reports and retransmission, and delivery by the sender's timestamps plus a latency (`?latency=MS`, 120 by
 default; a packet that has not come when a later one is due is dropped), `?streamid=ID`, keep-alives and shutdown.
 `?passphrase=SECRET` (10 to 79 characters) reads an AES-CTR encrypted stream (AES-128, 192 or 256 by the sender's choice,
@@ -113,7 +113,7 @@ connection. Not supported: rendezvous mode, the message API, AES-GCM, forward er
 version 4 (libsrt before 1.3). Without a passphrase SRT is a plaintext transport, which FIPS mode refuses. It has been
 tested against libsrt through FFmpeg 9.0.1, calling and listening, in the clear and with 16, 24 and 32 byte keys, and
 with 3% of the sender's packets lost on the way (`cargo test -p ironav-live --lib interop_with_ffmpeg_libsrt -- --ignored`
-with an FFmpeg built with libsrt on the `PATH`).
+with an FFmpeg built with libsrt on the `PATH`). It also sends, see "Sending streams out" below.
 `rtsp://[user:password@]host[:port]/path` plays a camera or RTSP server: RTP interleaved on the RTSP connection
 (or over UDP with `?transport=udp`, taken only from the server's address),
 Basic or Digest credentials, keepalives and TEARDOWN, with H.264, HEVC, AAC, Opus, G.711 and L16 tracks (others are
@@ -223,7 +223,7 @@ widen the list. A YouTube source is fetched by yt-dlp, which makes its own conne
 `IRONAV_FIPS=1`, or a build with the `fips` cargo feature (`cargo build -p ironav-cli --features fips`), turns on FIPS mode. TLS then runs
 IronSocketLayer's FIPS 140-3 profile, narrowed to AES-GCM suites, P-256 and P-384 key exchange, and ECDSA and RSA-PSS
 signatures (RSA PKCS#1 v1.5 stays only for certificate chains). ChaCha20-Poly1305, X25519 and the hybrid groups are not
-offered. Plaintext `http://`, `rtsp://`, `tcp://`, `udp://`, `whip://` and unencrypted `srt://` sources are refused, as are YouTube sources and MD5 Digest
+offered. Plaintext `http://`, `rtsp://`, `tcp://`, `udp://`, `whip://` and unencrypted `srt://` sources and outputs are refused, as are YouTube sources and MD5 Digest
 authentication (SHA-256 Digest is still used). `whip://` is refused too, since its signalling is plaintext HTTP: use
 `whips://` with `cert=` and `key=`, which serves it over the FIPS TLS profile and takes only the AES-GCM SRTP profile
 (its media is DTLS-SRTP). `ironav capabilities` reports `"fips": true` and the TLS profile in force.
@@ -325,6 +325,28 @@ video keyframe with its timestamps from zero, finishes the one running (`stop_tr
 
 ```sh
 ironav watch udp://:5000 --record live/stream.m3u8 --segment-seconds 4 --keep-segments 10
+```
+
+### Sending streams out
+
+A session can send what it makes to another machine as MPEG-TS over SRT (`publish`, or `--publish srt://...` for `watch`):
+the transcode's output when there is a `--transcode`, otherwise the source remuxed as `--record OUT.ts` would write it.
+`srt://host:port` calls a receiver (ffmpeg, `srt-live-transmit`, a media server) and `srt://:port?mode=listener` waits for
+one, on loopback unless an address is given. The options are `?latency=MS` (120 by default; also the size of the send
+buffer, and a packet later than that is dropped, as libsrt does), `?streamid=ID`, `?passphrase=SECRET` with
+`?pbkeylen=16|24|32` (AES-CTR, the sender makes the key and sends it wrapped as RFC 3394) and `?reconnect=0`. Payloads are 1316
+bytes, lost packets are sent again on the receiver's reports, and the round trip time comes from ACK and ACKACK. The
+destination of a caller goes through `IRONAV_NET_ALLOW` like any outbound connection, and FIPS mode refuses a destination
+with no passphrase. A destination that cannot be reached, or that goes away, never stops the session: it is reported
+(`publish_lost`, `publish_restored`, `publish_failed` events, and `publish` in the status) and a caller tries again with
+back-off from 0.5 s to 30 s, resuming at a video keyframe. The session hands packets to a thread through a bounded queue,
+so a slow receiver costs dropped packets (`publish.dropped_packets`), not a slow session. A listener has no one to send to
+until a receiver comes, and what is made meanwhile is not kept. `publish` is set when the session opens; `stream_configure`
+does not change it. From Rust, `ironav_live::open_sink(url)` gives a `Sink` (`write` MPEG-TS bytes, `finish`) for the same URLs.
+
+```sh
+ironav watch rtsp://cam/stream --publish "srt://relay.example:9000?streamid=cam1&passphrase=0123456789abcdef"
+ffmpeg -i "srt://:9000?mode=listener&passphrase=0123456789abcdef" -c copy out.mkv   # the receiving end
 ```
 
 Code in the same process (a detector, a speech model) can take decoded pictures or sound from a session with a tap,
