@@ -179,10 +179,10 @@ songs (the timeline carries on; a Vorbis song set up differently, even at anothe
 headers passed to the decoder, which starts over with them), and damaged pages stepped over. Matroska is read the way a browser's MediaRecorder, OBS or `ffmpeg -f matroska -`
 sends it: Segment and Clusters of unknown size, no Cues. The packets are the ones the file reader gives, whatever pieces the
 bytes arrive in. So `ironav watch tcp://:9000` can follow a webcam that a web page streams as WebM.
-A camera or microphone on this machine is a source too, on Windows (Media Foundation) and 64-bit Linux (Video4Linux2
+A camera or microphone on this machine is a source too, on Windows (Media Foundation), macOS (AVFoundation) and 64-bit Linux (Video4Linux2
 cameras in YUYV, NV12 or I420 modes, or Motion JPEG when a camera offers nothing uncompressed, streamed through
 memory-mapped buffers; ALSA microphones through `arecord` from alsa-utils, at 48 kHz mono; built and tested on Linux (Debian
-under WSL 2) but not yet run with a real camera or microphone there): `ironav devices` lists them, and `device://video` (the first camera), `device://video/1` or `device://audio/usb` (by a part of the name) open
+under WSL 2) but not yet run with a real camera or microphone there; the macOS capture, an `AVCaptureSession` with NV12 pictures and PCM sound, is compile-checked for both Mac targets and has tests in the macOS CI job, but has not been run against a real camera or microphone, and asks for the Camera or Microphone permission in System Settings > Privacy & Security): `ironav devices` lists them, and `device://video` (the first camera), `device://video/1` or `device://audio/usb` (by a part of the name) open
 one. `size=1280x720` and `fps=30` ask a camera for its nearest mode. A camera's pictures arrive as Y4M (converted from
 the NV12 or YUY2 it gives to 4:2:0) and are timed at the mode's frame rate, or, from a Motion JPEG camera on Linux, as
 live Matroska timed by the driver's clock and decoded by the JPEG decoder (which supplies the standard Huffman tables

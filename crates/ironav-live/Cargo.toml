@@ -39,5 +39,16 @@ windows = { version = "0.62", features = ["Win32_Media_MediaFoundation", "Win32_
 # cameras through Video4Linux2's ioctls
 libc = "0.2"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# cameras and microphones through AVFoundation
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSDictionary", "NSError", "NSObject", "NSString", "NSValue"] }
+objc2-av-foundation = { version = "0.3", default-features = false, features = ["std", "AVCaptureAudioDataOutput", "AVCaptureDevice", "AVCaptureInput", "AVCaptureOutput", "AVCaptureOutputBase", "AVCaptureSession", "AVCaptureVideoDataOutput", "AVMediaFormat", "block2", "dispatch2", "objc2-core-media"] }
+objc2-core-media = { version = "0.3", default-features = false, features = ["std", "CMBlockBuffer", "CMFormatDescription", "CMSampleBuffer", "CMTime", "objc2-core-audio-types", "objc2-core-video"] }
+objc2-core-video = { version = "0.3", default-features = false, features = ["std", "CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn"] }
+objc2-core-audio-types = { version = "0.3", default-features = false, features = ["std", "CoreAudioBaseTypes"] }
+dispatch2 = { version = "0.3", default-features = false, features = ["std", "objc2"] }
+block2 = "0.6"
+
 [dev-dependencies]
 # the TLS test issues its own certificates (ic-drbg is a dependency already)

@@ -1,6 +1,6 @@
 //! Capture devices: cameras and microphones, as `device://video[/NAME]` and
-//! `device://audio[/NAME]` sources: Media Foundation on Windows, Video4Linux2 and ALSA (through
-//! `arecord`) on 64-bit Linux.
+//! `device://audio[/NAME]` sources: Media Foundation on Windows, AVFoundation on macOS,
+//! Video4Linux2 and ALSA (through `arecord`) on 64-bit Linux.
 //!
 //! A device only gives pictures or samples, so the source writes them as the byte streams the
 //! stream demuxers already read: a camera as Y4M (8-bit 4:2:0, converted from the NV12 or YUY2 the
@@ -12,9 +12,11 @@
 //! Y4M carries no timestamps, so pictures are timed at the mode's frame rate: a camera that
 //! drops frames (in low light, say) runs behind the clock by as many.
 
-// the converters wait for the other platforms' backends
+// the converters wait for the other platforms' backends (macOS reads NV12 only)
 #![cfg_attr(not(any(windows, all(target_os = "linux", target_pointer_width = "64"))), allow(dead_code))]
 
+#[cfg(target_os = "macos")]
+mod avf;
 #[cfg(windows)]
 mod mf;
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
@@ -53,7 +55,11 @@ pub fn devices() -> Result<Vec<Device>> {
     {
         v4l2::devices()
     }
-    #[cfg(not(any(windows, all(target_os = "linux", target_pointer_width = "64"))))]
+    #[cfg(target_os = "macos")]
+    {
+        avf::devices()
+    }
+    #[cfg(not(any(windows, target_os = "macos", all(target_os = "linux", target_pointer_width = "64"))))]
     {
         Ok(Vec::new())
     }
@@ -84,11 +90,13 @@ pub(crate) fn open(u: &SourceUrl, shown: String) -> Result<ThreadSource> {
 
 /// Starts the device's thread, and waits for it to say whether the device opened.
 fn start(kind: &str, name: Option<String>, wants: VideoWants, tx: SyncSender<std::io::Result<Vec<u8>>>, rx: &Receiver<std::io::Result<Vec<u8>>>) -> Result<()> {
-    #[cfg(any(windows, all(target_os = "linux", target_pointer_width = "64")))]
+    #[cfg(any(windows, target_os = "macos", all(target_os = "linux", target_pointer_width = "64")))]
     {
         #[cfg(windows)]
         use mf::run;
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
+        use avf::run;
+        #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
         use v4l2::run;
         let (ok_tx, ok_rx) = sync_channel(1);
         let kind = kind.to_string();
@@ -99,10 +107,10 @@ fn start(kind: &str, name: Option<String>, wants: VideoWants, tx: SyncSender<std
         let _ = rx;
         ok_rx.recv().unwrap_or_else(|_| Err(Error::new(ErrorCode::Internal, "the capture thread stopped before the device opened")))
     }
-    #[cfg(not(any(windows, all(target_os = "linux", target_pointer_width = "64"))))]
+    #[cfg(not(any(windows, target_os = "macos", all(target_os = "linux", target_pointer_width = "64"))))]
     {
         let _ = (kind, name, wants, tx, rx);
-        Err(Error::new(ErrorCode::HardwareUnavailable, "capture devices are not supported on this platform yet").hint("Windows and 64-bit Linux are supported; macOS is planned"))
+        Err(Error::new(ErrorCode::HardwareUnavailable, "capture devices are not supported on this platform yet").hint("Windows, macOS and 64-bit Linux are supported"))
     }
 }
 
@@ -275,6 +283,68 @@ pub(crate) fn y4m_frame(src: &[u8], layout: Layout, w: usize, h: usize, stride: 
     Some(out)
 }
 
+/// One Y4M frame of the top-left `w` by `h` (both even) of an NV12 picture held as two separate
+/// planes: luma rows `ys` bytes apart, and interleaved chroma rows `uvs` bytes apart (AVFoundation
+/// gives the planes apart, each with its own stride). `None` when a plane is too short or a stride
+/// too narrow.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn y4m_frame_nv12_planes(y: &[u8], ys: usize, uv: &[u8], uvs: usize, w: usize, h: usize) -> Option<Vec<u8>> {
+    let ch = h / 2;
+    if w < 2 || h < 2 || ys < w || uvs < w || y.len() < ys * (h - 1) + w || uv.len() < uvs * (ch - 1) + w {
+        return None;
+    }
+    let mut out = Vec::with_capacity(6 + w * h + w * ch);
+    out.extend_from_slice(b"FRAME\n");
+    for r in 0..h {
+        out.extend_from_slice(&y[r * ys..r * ys + w]);
+    }
+    for p in 0..2 {
+        for r in 0..ch {
+            out.extend(uv[r * uvs..r * uvs + w].iter().skip(p).step_by(2));
+        }
+    }
+    Some(out)
+}
+
+/// The camera mode nearest what is asked, of `modes` (width, height, lowest and highest frame
+/// rate): its index, and the rate to set when one was asked for (that rate, or the nearest the mode
+/// has). Size counts before rate.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn pick_mode(modes: &[(u32, u32, f64, f64)], wants: VideoWants) -> Option<(usize, Option<f64>)> {
+    let mut best: Option<(f64, f64, usize, Option<f64>)> = None;
+    for (i, &(w, h, lo, hi)) in modes.iter().enumerate() {
+        if !lo.is_finite() || !hi.is_finite() {
+            continue;
+        }
+        let ds = wants.size.map_or(0.0, |(ww, wh)| (w as f64 - ww as f64).abs() + (h as f64 - wh as f64).abs());
+        let rate = wants.fps.map(|f| f.clamp(lo.min(hi), hi.max(lo)));
+        let df = wants.fps.zip(rate).map_or(0.0, |(f, r)| (f - r).abs());
+        if best.is_none_or(|b| (ds, df) < (b.0, b.1)) {
+            best = Some((ds, df, i, rate));
+        }
+    }
+    best.map(|b| (b.2, b.3))
+}
+
+/// The sample types a microphone's buffers may hold (little-endian, interleaved).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) enum Samples {
+    S16,
+    S32,
+    F32,
+}
+
+/// Appends `src` as 16-bit little-endian samples to `out`; a trailing partial sample is left out.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn pcm_to_s16le(src: &[u8], kind: Samples, out: &mut Vec<u8>) {
+    match kind {
+        Samples::S16 => out.extend_from_slice(&src[..src.len() & !1]),
+        Samples::S32 => out.extend(src.as_chunks::<4>().0.iter().flat_map(|c| ((i32::from_le_bytes(*c) >> 16) as i16).to_le_bytes())),
+        Samples::F32 => out.extend(src.as_chunks::<4>().0.iter().flat_map(|c| ((f32::from_le_bytes(*c).clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes())),
+    }
+}
+
 /// Sends a piece of the byte stream; false once the source has been closed.
 pub(crate) fn send(tx: &SyncSender<std::io::Result<Vec<u8>>>, b: Vec<u8>) -> bool {
     tx.send(Ok(b)).is_ok()
@@ -326,6 +396,52 @@ mod tests {
 
         assert!(y4m_frame(&yuy2[..10], Layout::Yuy2, w, h, 8, h).is_none());
         assert!(y4m_frame(&nv12[..10], Layout::Nv12, w, h, stride, h).is_none());
+    }
+
+    #[test]
+    fn nv12_planes_with_their_own_strides_become_planar_420() {
+        // 4x2: luma rows 6 bytes apart, one chroma row 8 bytes apart
+        let y = [0, 1, 2, 3, 9, 9, 10, 11, 12, 13, 9, 9];
+        let uv = [100, 200, 101, 201, 9, 9, 9, 9];
+        let f = y4m_frame_nv12_planes(&y, 6, &uv, 8, 4, 2).unwrap();
+        assert_eq!(planes(&f), &[0, 1, 2, 3, 10, 11, 12, 13, 100, 101, 200, 201]);
+        // the last row's padding may be left out, but nothing the picture needs
+        assert!(y4m_frame_nv12_planes(&y[..10], 6, &uv, 8, 4, 2).is_some());
+        assert!(y4m_frame_nv12_planes(&y[..9], 6, &uv, 8, 4, 2).is_none());
+        assert!(y4m_frame_nv12_planes(&y, 6, &uv[..3], 8, 4, 2).is_none());
+        assert!(y4m_frame_nv12_planes(&y, 3, &uv, 8, 4, 2).is_none(), "a stride narrower than the picture");
+        assert!(y4m_frame_nv12_planes(&y, 6, &uv, 8, 0, 2).is_none());
+    }
+
+    #[test]
+    fn the_nearest_camera_mode_is_picked() {
+        let modes = [(640, 480, 1.0, 30.0), (1280, 720, 1.0, 30.0), (1920, 1080, 1.0, 60.0), (1920, 1080, 1.0, 15.0)];
+        let w = |size, fps| VideoWants { size, fps };
+        assert_eq!(pick_mode(&modes, w(Some((1280, 720)), None)), Some((1, None)));
+        assert_eq!(pick_mode(&modes, w(Some((1280, 700)), Some(24.0))), Some((1, Some(24.0))));
+        // the size first, then the rate: 1080p at 60 is the mode that has it
+        assert_eq!(pick_mode(&modes, w(Some((1920, 1080)), Some(60.0))), Some((2, Some(60.0))));
+        assert_eq!(pick_mode(&modes, w(Some((1920, 1080)), Some(10.0))), Some((2, Some(10.0))));
+        // no mode has 120 fps: the fastest the best size has
+        assert_eq!(pick_mode(&modes, w(Some((1920, 1080)), Some(120.0))), Some((2, Some(60.0))));
+        assert_eq!(pick_mode(&modes, w(None, Some(45.0))), Some((2, Some(45.0))));
+        assert_eq!(pick_mode(&[], VideoWants::default()), None);
+        assert_eq!(pick_mode(&[(1, 1, f64::NAN, 1.0)], VideoWants::default()), None);
+    }
+
+    #[test]
+    fn microphone_samples_become_16_bit() {
+        let mut o = Vec::new();
+        pcm_to_s16le(&[1, 0, 0xFF, 0x7F, 5], Samples::S16, &mut o);
+        assert_eq!(o, [1, 0, 0xFF, 0x7F]);
+        o.clear();
+        pcm_to_s16le(&[0, 0, 0x34, 0x12, 0, 0, 0, 0x80, 7], Samples::S32, &mut o);
+        assert_eq!(o, [0x34, 0x12, 0x00, 0x80]);
+        o.clear();
+        let f: Vec<u8> = [0.0f32, 1.0, -1.0, 0.5, 2.0, -3.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        pcm_to_s16le(&f, Samples::F32, &mut o);
+        let s: Vec<i16> = o.chunks(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
+        assert_eq!(s, [0, 32767, -32767, 16384, 32767, -32767]);
     }
 
     #[test]

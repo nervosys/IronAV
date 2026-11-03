@@ -5,6 +5,12 @@ All notable changes to IronAV are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **macOS capture devices:** `device://video` and `device://audio` on macOS, through AVFoundation (an `AVCaptureSession` with video and audio data outputs, written with the `objc2` crates): `ironav devices` and the `devices` tool list the cameras and microphones, `size=` and `fps=` pick the nearest camera mode, pictures arrive as Y4M converted from NV12 and sound as 16-bit WAV, and a refused Camera or Microphone permission is an error that names System Settings > Privacy & Security. It is compile-checked for `aarch64-apple-darwin` and `x86_64-apple-darwin` and its conversions are unit-tested, but it has not been run against a real camera or microphone.
+
 ## [0.1.1] - 2026-11-02
 
 ### Added
