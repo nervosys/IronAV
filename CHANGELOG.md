@@ -7,6 +7,23 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+
+- **`whips://`, WHIP signalling over TLS:** `whips://[host]:port[/path]?cert=CHAIN.pem&key=KEY.pem[&token=...]` is the WHIP
+  endpoint with each accepted connection wrapped in a TLS 1.3 server session (IronSocketLayer) before the HTTP/1.1
+  parsing, so the offer, the answer and the bearer token no longer cross the network in the clear. `cert` is a PEM
+  certificate chain (server certificate first) and `key` a PEM private key (PKCS#8, or SEC1 `EC PRIVATE KEY`), both
+  required and read once at open. Each connection's handshake runs on its own thread with a 3 s deadline, so a stalled or
+  failed handshake drops that connection only; the request size, deadline and connection limits are unchanged. In FIPS
+  mode it uses IronSocketLayer's FIPS 140-3 profile, narrowed as the client's is. `cert` and `key` are options of the
+  source URL (the paths are not secret; `token` stays redacted), and the engine's file policy applies to them.
+
+### Changed
+
+- **FIPS mode refuses `whip://` (security):** its HTTP signalling is plaintext, which the SDP fingerprints and the bearer
+  token should not cross. The error says to use `whips://` with `cert=` and `key=`. `whips://` is allowed, with AES-GCM SRTP
+  only as before.
+
 ### Fixed
 
 - **SRT with libsrt:** a caller sent its handshake conclusion to its own socket ID instead of 0, which libsrt drops, so

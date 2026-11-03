@@ -2,7 +2,10 @@
 //! sends H.264 and Opus to, read as the RTP stream framing an RTSP source gives.
 //!
 //! `whip://[host]:port[/path][?token=SECRET]` listens for HTTP on `host:port` (loopback unless a
-//! host is given) and for the media on UDP at the same port. One publisher at a time: it POSTs its
+//! host is given) and for the media on UDP at the same port. `whips://` is the same endpoint with
+//! its HTTP served over TLS 1.3 (IronSocketLayer's server, the FIPS 140-3 profile in FIPS mode),
+//! the certificate chain and private key named by `cert=` and `key=` (PEM files, read once at
+//! open); FIPS mode refuses `whip://`, whose signalling is plaintext. One publisher at a time: it POSTs its
 //! SDP offer to the path, gets a `201 Created` with the answer and a `Location`, and DELETEs that
 //! location to stop. Receive-only and ICE-lite with one host candidate, BUNDLE and `rtcp-mux`, so
 //! everything arrives on that one port: STUN checks first (`stun`), then a DTLS 1.2 handshake in
@@ -123,8 +126,8 @@ impl Source for WhipSource {
 }
 
 /// `host:port/path`, the host optional (loopback) and in brackets for IPv6.
-fn parse_target(target: &str) -> Result<(String, u16, String)> {
-    let bad = || Error::invalid_arg(format!("a WHIP source needs whip://[host]:port[/path], got 'whip://{target}'"));
+fn parse_target(target: &str, scheme: &str) -> Result<(String, u16, String)> {
+    let bad = || Error::invalid_arg(format!("a WHIP source needs {scheme}://[host]:port[/path], got '{scheme}://{target}'"));
     let (hostport, path) = match target.find('/') {
         Some(i) => (&target[..i], &target[i..]),
         None => (target, "/"),
@@ -143,7 +146,18 @@ fn parse_target(target: &str) -> Result<(String, u16, String)> {
 /// Opens the endpoint `u` names and starts listening.
 pub(crate) fn open(u: &SourceUrl, shown: String) -> Result<WhipSource> {
     crate::fips::activate()?;
-    let (host, port, path) = parse_target(&u.target)?;
+    let tls = u.scheme == "whips";
+    let (host, port, path) = parse_target(&u.target, &u.scheme)?;
+    let tls = if tls {
+        let (Some(cert), Some(key)) = (u.option("cert"), u.option("key")) else {
+            return Err(Error::invalid_arg("whips:// needs cert= and key=, PEM files of the TLS certificate chain and the private key").hint("whips://:8443/live?cert=chain.pem&key=key.pem, or use whip:// for plain HTTP signalling (refused in FIPS mode)"));
+        };
+        Some(crate::tls::server_config(cert, key)?)
+    } else if u.option("cert").is_some() || u.option("key").is_some() {
+        return Err(Error::invalid_arg("cert= and key= belong to whips://; whip:// serves plain HTTP").hint("use whips://"));
+    } else {
+        None
+    };
     let token = u.option("token").map(crate::url::percent_decode);
     if token.as_ref().is_some_and(|t| t.is_empty() || t.len() > 512 || !t.bytes().all(|b| b.is_ascii_graphic())) {
         return Err(Error::invalid_arg("the WHIP token must be 1 to 512 printable characters, without spaces"));
@@ -155,7 +169,7 @@ pub(crate) fn open(u: &SourceUrl, shown: String) -> Result<WhipSource> {
     let udp = UdpSocket::bind(local).map_err(unreachable)?;
     grow_receive_buffer(&udp);
     let id = dtls::Identity::generate("IronAV WHIP").map_err(|e| Error::new(ErrorCode::Internal, format!("could not make the WHIP endpoint's DTLS certificate: {e}")))?;
-    let http = http::Server::new(listener, allow.clone(), sdp::MAX_OFFER)?;
+    let http = http::Server::new(listener, allow.clone(), sdp::MAX_OFFER, tls)?;
     let (tx, rx) = sync_channel(1024);
     let stop = Arc::new(AtomicBool::new(false));
     let mut endpoint = Endpoint { shown: shown.clone(), path, token, http, udp, id: Arc::new(id), allow, session: None, tx, stop: stop.clone(), start: Instant::now() };

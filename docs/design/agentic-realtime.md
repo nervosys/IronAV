@@ -471,4 +471,6 @@ files at once, and it fixes the event model, analyzer trait and MCP plumbing bef
    RTP framing RTSP uses, so depacketizing, the jitter buffer and sender-report timing are shared. Binding is loopback by
    default, other publishers must be in `IRONAV_NET_ALLOW`, and `?token=` adds a bearer token. Not done: the DTLS client
    role (a publisher that insists on `setup:passive`), TURN, trickle ICE and ICE restarts (PATCH is answered 405), RTX,
-   simulcast, more than one publisher per endpoint, and TLS on the HTTP side (use a reverse proxy).
+   simulcast, and more than one publisher per endpoint. The HTTP side has TLS as `whips://` (decided: plain HTTP signalling is not
+   acceptable under FIPS, so FIPS mode refuses `whip://`): each accepted connection is wrapped in an IronSocketLayer TLS 1.3
+   server session, on a thread of its own with a 3 s handshake deadline, from a PEM chain and key given as `cert=` and `key=`.

@@ -2,10 +2,21 @@
 //! until a whole request has come (headers and a body by Content-Length, both bounded) or its time
 //! is up, answered once, and closed. Connections from an address the allow-list does not admit
 //! (loopback always is) are closed unread.
+//!
+//! Under TLS (`whips://`) each accepted connection gets a thread of its own for the handshake
+//! (at most [`HANDSHAKE_TIMEOUT`], a deadline for the whole of it) and the request, so a slow or
+//! hostile client never holds up the endpoint's loop; the thread hands the whole request over and
+//! ends. A failed handshake drops that connection only. There are never more than
+//! `MAX_CONNECTIONS` such threads.
 
 use crate::net::Allow;
+use ironsocketlayer::config::ServerConfig;
+use ironsocketlayer::stream::{Timeouts, TlsStream};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const MAX_CONNECTIONS: usize = 8;
@@ -13,6 +24,10 @@ const MAX_HEADER: usize = 16 << 10;
 /// How long a client has to send its request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a TLS client has to finish its handshake.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long a read from a TLS connection waits before the request's deadline is looked at again.
+const READ_SLICE: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Request {
@@ -159,17 +174,41 @@ struct Conn {
     deadline: Instant,
 }
 
+/// What serves connections under TLS: the configuration, the connections in progress, and where
+/// their threads hand the requests that are whole.
+struct Tls {
+    config: Arc<ServerConfig>,
+    active: Arc<AtomicUsize>,
+    tx: Sender<(Request, SocketAddr, Responder)>,
+    rx: Receiver<(Request, SocketAddr, Responder)>,
+}
+
+/// One connection's place among those in progress, given back when its thread ends.
+struct Slot(Arc<AtomicUsize>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 pub(crate) struct Server {
     listener: TcpListener,
     conns: Vec<Conn>,
     allow: Allow,
     max_body: usize,
+    tls: Option<Tls>,
 }
 
 impl Server {
-    pub(crate) fn new(listener: TcpListener, allow: Allow, max_body: usize) -> std::io::Result<Server> {
+    /// A server on `listener`: plain HTTP, or HTTPS when `tls` is given.
+    pub(crate) fn new(listener: TcpListener, allow: Allow, max_body: usize, tls: Option<Arc<ServerConfig>>) -> std::io::Result<Server> {
         listener.set_nonblocking(true)?;
-        Ok(Server { listener, conns: Vec::new(), allow, max_body })
+        let tls = tls.map(|config| {
+            let (tx, rx) = channel();
+            Tls { config, active: Arc::new(AtomicUsize::new(0)), tx, rx }
+        });
+        Ok(Server { listener, conns: Vec::new(), allow, max_body, tls })
     }
 
     pub(crate) fn local_addr(&self) -> std::io::Result<SocketAddr> {
@@ -179,6 +218,23 @@ impl Server {
     /// Accepts and reads what has come, answering malformed requests itself, and returns the whole
     /// requests with a handle to answer each by.
     pub(crate) fn poll(&mut self, now: Instant) -> Vec<(Request, SocketAddr, Responder)> {
+        if let Some(tls) = &self.tls {
+            while tls.active.load(Ordering::Relaxed) < MAX_CONNECTIONS {
+                let Ok((s, peer)) = self.listener.accept() else { break };
+                if !(peer.ip().is_loopback() || self.allow.permits(peer.ip())) {
+                    continue; // dropped unread
+                }
+                tls.active.fetch_add(1, Ordering::Relaxed);
+                let slot = Slot(tls.active.clone());
+                let (config, tx, max_body) = (tls.config.clone(), tls.tx.clone(), self.max_body);
+                // if no thread can be had the closure, and with it the connection, is dropped
+                let _ = std::thread::Builder::new().name("ironav-whips-conn".into()).spawn(move || {
+                    let _slot = slot;
+                    serve_tls(s, peer, config, max_body, &tx);
+                });
+            }
+            return tls.rx.try_iter().collect();
+        }
         while self.conns.len() < MAX_CONNECTIONS {
             match self.listener.accept() {
                 Ok((s, peer)) => {
@@ -223,8 +279,8 @@ impl Server {
                     continue;
                 }
                 Parsed::Partial => {}
-                Parsed::Bad(status, why) => Responder(c.stream.try_clone().ok()).send(&response(status, &[("Content-Type", "text/plain")], why.as_bytes())),
-                Parsed::Request(r) => out.push((r, c.peer, Responder(c.stream.try_clone().ok()))),
+                Parsed::Bad(status, why) => Responder::Plain(c.stream.try_clone().ok()).send(&response(status, &[("Content-Type", "text/plain")], why.as_bytes())),
+                Parsed::Request(r) => out.push((r, c.peer, Responder::Plain(c.stream.try_clone().ok()))),
             }
             self.conns.swap_remove(k);
         }
@@ -232,16 +288,56 @@ impl Server {
     }
 }
 
+/// A TLS connection's thread: the handshake, then the request, read until it is whole or its time
+/// is up, then handed to the endpoint (or answered here, if malformed).
+fn serve_tls(sock: TcpStream, peer: SocketAddr, config: Arc<ServerConfig>, max_body: usize, tx: &Sender<(Request, SocketAddr, Responder)>) {
+    let _ = sock.set_nonblocking(false);
+    let Ok(mut t) = TlsStream::accept_with(sock, config, Timeouts::new(HANDSHAKE_TIMEOUT, READ_SLICE)) else { return };
+    let deadline = Instant::now() + REQUEST_TIMEOUT;
+    let (mut buf, mut tmp) = (Vec::new(), [0u8; 4096]);
+    loop {
+        match parse(&buf, max_body) {
+            Parsed::Request(r) => {
+                let _ = tx.send((r, peer, Responder::Tls(Box::new(t))));
+                return;
+            }
+            Parsed::Bad(status, why) => return Responder::Tls(Box::new(t)).send(&response(status, &[("Content-Type", "text/plain")], why.as_bytes())),
+            Parsed::Partial => {}
+        }
+        if Instant::now() >= deadline || buf.len() > MAX_HEADER + max_body + 4 {
+            return;
+        }
+        match t.read(&mut tmp) {
+            Ok(0) => return,
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            Err(e) if matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock | ErrorKind::Interrupted) => {}
+            Err(_) => return,
+        }
+    }
+}
+
 /// Where a request's response goes.
-pub(crate) struct Responder(Option<TcpStream>);
+pub(crate) enum Responder {
+    Plain(Option<TcpStream>),
+    Tls(Box<TlsStream<TcpStream>>),
+}
 
 impl Responder {
     pub(crate) fn send(self, bytes: &[u8]) {
-        if let Some(mut s) = self.0 {
-            let _ = s.set_nonblocking(false);
-            let _ = s.set_write_timeout(Some(WRITE_TIMEOUT));
-            let _ = s.write_all(bytes);
-            let _ = s.shutdown(std::net::Shutdown::Write);
+        match self {
+            Responder::Plain(Some(mut s)) => {
+                let _ = s.set_nonblocking(false);
+                let _ = s.set_write_timeout(Some(WRITE_TIMEOUT));
+                let _ = s.write_all(bytes);
+                let _ = s.shutdown(std::net::Shutdown::Write);
+            }
+            Responder::Plain(None) => {}
+            Responder::Tls(mut t) => {
+                t.set_timeouts(Timeouts::new(HANDSHAKE_TIMEOUT, WRITE_TIMEOUT));
+                let _ = t.write_all(bytes).and_then(|()| t.flush());
+                let _ = t.close();
+                let _ = t.get_ref().shutdown(std::net::Shutdown::Write);
+            }
         }
     }
 }

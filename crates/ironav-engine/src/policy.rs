@@ -263,9 +263,15 @@ pub fn new_decoder_with(s: &StreamInfo, o: &ironav_codec::DecoderOptions) -> Res
 }
 
 /// May a live session be opened on this source URL? File and pipe paths must be inside the roots,
-/// device capture and the cookies option must be enabled.
+/// device capture and the cookies option must be enabled. A `whips://` endpoint's certificate and key
+/// files are read, so they must be inside the roots too.
 pub fn check_source(raw: &str, u: &ironav_live::SourceUrl) -> Result<()> {
     let pol = current();
+    if u.scheme == "whips" {
+        for file in ["cert", "key"].iter().filter_map(|k| u.option(k)) {
+            pol.read(file)?;
+        }
+    }
     match u.scheme.as_str() {
         "file" | "pipe" if !u.target.is_empty() => pol.read(&u.target)?,
         "device" => {
@@ -275,7 +281,7 @@ pub fn check_source(raw: &str, u: &ironav_live::SourceUrl) -> Result<()> {
                 eprintln!("ironav: opening capture device {}", u.target);
             }
         }
-        "tcp" | "udp" | "srt" | "rtsp" | "rtsps" | "http" | "https" | "whip" => crate::audit::event("network_open", serde_json::json!({ "url": ironav_live::redact(raw) })),
+        "tcp" | "udp" | "srt" | "rtsp" | "rtsps" | "http" | "https" | "whip" | "whips" => crate::audit::event("network_open", serde_json::json!({ "url": ironav_live::redact(raw) })),
         _ => {}
     }
     if u.option("cookies").is_some() {

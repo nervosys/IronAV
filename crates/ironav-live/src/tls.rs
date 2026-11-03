@@ -5,7 +5,8 @@
 //! IronAV (a camera's own CA, say). Verification cannot be turned off.
 
 use ironav_core::{Error, ErrorCode, Result};
-use ironsocketlayer::config::{ClientConfig, Profile};
+use ironsocketlayer::config::{ClientConfig, Identity, Profile, ServerConfig};
+use ironsocketlayer::crypto::sign::SigningKey;
 use ironsocketlayer::stream::TlsStream;
 use ironsocketlayer::x509::RootStore;
 use std::cell::Cell;
@@ -215,6 +216,118 @@ pub(crate) fn connect(sock: TcpStream, host: &str, alpn: Option<&'static [u8]>, 
     t.get_ref().sock.set_read_timeout(None)?;
     t.get_ref().sock.set_write_timeout(None)?;
     Ok(Conn::Tls(Box::new(t)))
+}
+
+/// The server configuration for `whips://`: the certificate chain (leaf first) in the PEM file
+/// `cert_path` and the private key in `key_path`, with IronSocketLayer's default profile, or FIPS
+/// mode's when it is on. Read once, when the endpoint opens.
+pub(crate) fn server_config(cert_path: &str, key_path: &str) -> Result<Arc<ServerConfig>> {
+    let bad = |what: &str, path: &str, why: String| Error::invalid_arg(format!("whips://: {what} {path}: {why}"));
+    let text = std::fs::read_to_string(cert_path).map_err(|e| bad("cannot read cert", cert_path, e.to_string()))?;
+    let chain: Vec<Vec<u8>> = pem_blocks(&text).map_err(|e| bad("cert", cert_path, e))?.into_iter().filter(|(l, _)| l == "CERTIFICATE").map(|(_, d)| d).collect();
+    if chain.is_empty() {
+        return Err(bad("cert", cert_path, "no CERTIFICATE block (a PEM chain, the server's certificate first, is expected)".into()));
+    }
+    let text = std::fs::read_to_string(key_path).map_err(|e| bad("cannot read key", key_path, e.to_string()))?;
+    let key = private_key(&text).map_err(|e| bad("key", key_path, e))?;
+    let identity = Identity::new(chain, key).map_err(|e| bad("cert and key", cert_path, format!("{e} (does the key belong to the first certificate?)")))?;
+    let config = if crate::fips::enabled() {
+        crate::fips::server_config(identity)?
+    } else {
+        ServerConfig::new(Profile::Default, identity).map_err(|e| Error::new(ErrorCode::Io, format!("TLS configuration: {e}")))?
+    };
+    Ok(Arc::new(config))
+}
+
+/// The blocks of a PEM text, each as its label and decoded bytes.
+fn pem_blocks(text: &str) -> std::result::Result<Vec<(String, Vec<u8>)>, String> {
+    let mut out = Vec::new();
+    let mut open: Option<(String, String)> = None;
+    for line in text.lines().map(str::trim) {
+        if let Some(label) = line.strip_prefix("-----BEGIN ").and_then(|l| l.strip_suffix("-----")) {
+            open = Some((label.to_string(), String::new()));
+        } else if let Some(label) = line.strip_prefix("-----END ").and_then(|l| l.strip_suffix("-----")) {
+            match open.take() {
+                Some((l, b64)) if l == label => out.push((l, unbase64(&b64).ok_or_else(|| format!("the {label} block is not base64"))?)),
+                _ => return Err(format!("an END {label} line with no matching BEGIN")),
+            }
+        } else if let Some((_, b64)) = open.as_mut() {
+            b64.push_str(line);
+        }
+    }
+    match open {
+        Some((l, _)) => Err(format!("the {l} block is not closed")),
+        None => Ok(out),
+    }
+}
+
+/// Standard base64, padded or not; `None` for anything else.
+pub(crate) fn unbase64(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    let (mut acc, mut bits) = (0u32, 0);
+    for c in s.bytes().take_while(|&c| c != b'=') {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        acc = acc << 6 | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
+/// The first private key in a PEM text: PKCS#8 (`PRIVATE KEY`, any key type IronSocketLayer takes)
+/// or SEC1 (`EC PRIVATE KEY`, P-256, P-384 or P-521).
+fn private_key(text: &str) -> std::result::Result<SigningKey, String> {
+    for (label, der) in pem_blocks(text)? {
+        match label.as_str() {
+            "PRIVATE KEY" => return SigningKey::from_pkcs8_der(&der).map_err(|e| e.to_string()),
+            "EC PRIVATE KEY" => {
+                let scalar = sec1_scalar(&der).ok_or("a malformed EC PRIVATE KEY")?;
+                return match scalar.len() {
+                    32 => SigningKey::ecdsa_p256(scalar),
+                    48 => SigningKey::ecdsa_p384(scalar),
+                    66 => SigningKey::ecdsa_p521(scalar),
+                    n => return Err(format!("an EC private key of {n} bytes is not P-256, P-384 or P-521")),
+                }
+                .map_err(|e| e.to_string());
+            }
+            "ENCRYPTED PRIVATE KEY" => return Err("the key is encrypted; decrypt it first (openssl pkcs8 -nocrypt)".into()),
+            "RSA PRIVATE KEY" => return Err("a PKCS#1 RSA key; convert it to PKCS#8 (openssl pkcs8 -topk8 -nocrypt)".into()),
+            _ => {}
+        }
+    }
+    Err("no PRIVATE KEY block (PKCS#8 or SEC1 EC) in the file".into())
+}
+
+/// One DER element: its tag, its content and what follows it.
+fn der(b: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let (&tag, b) = b.split_first()?;
+    let (&first, b) = b.split_first()?;
+    let (len, b) = match first {
+        0..=0x7f => (first as usize, b),
+        0x81 => (*b.first()? as usize, &b[1..]),
+        0x82 => (u16::from_be_bytes([*b.first()?, *b.get(1)?]) as usize, &b[2..]),
+        _ => return None,
+    };
+    Some((tag, b.get(..len)?, &b[len..]))
+}
+
+/// The private scalar of a SEC1 `ECPrivateKey`: SEQUENCE { INTEGER 1, OCTET STRING scalar, ... }.
+fn sec1_scalar(b: &[u8]) -> Option<&[u8]> {
+    let (0x30, body, _) = der(b)? else { return None };
+    let (0x02, version, rest) = der(body)? else { return None };
+    let (0x04, scalar, _) = der(rest)? else { return None };
+    (version == [1]).then_some(scalar)
 }
 
 /// For tests: a throwaway CA, trusted through `IRONAV_CA_FILE` (so before this process's first TLS

@@ -1,12 +1,18 @@
 //! The endpoint end to end on loopback, against a test publisher that does what a WebRTC one does:
 //! POST an offer, STUN, a DTLS client handshake, then H.264 and Opus over SRTP and a sender report
-//! over SRTCP; and against garbage on the same port.
+//! over SRTCP; and against garbage on the same port. Over `whips://` the signalling goes through a
+//! TLS client, to a certificate this module issues; the FIPS build runs the flow that way only.
 
 use super::dtls::client::Client;
 use super::*;
 use ironav_formats::stream::{stream_demuxer, StreamDemuxer, StreamOptions};
+use ironsocketlayer::config::{ClientConfig, Profile};
+use ironsocketlayer::crypto::sign::SigningKey;
+use ironsocketlayer::stream::TlsStream;
+use ironsocketlayer::x509::{self, CertificateParams, Purpose, RootStore};
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::sync::Mutex;
 
 /// A port free for both TCP and UDP on loopback.
 fn free_port() -> u16 {
@@ -19,14 +25,98 @@ fn free_port() -> u16 {
     }
 }
 
-/// One HTTP request to the endpoint: the status, the headers and the body.
+/// A certificate chain and private key in PEM files, issued by a CA of their own, and the TLS client
+/// configuration that trusts that CA.
+struct Tls {
+    cert: String,
+    key: String,
+    client: Arc<ClientConfig>,
+}
+
+/// The TLS configuration of each port a test serves `whips://` on, for [`request`] to find.
+static TLS_PORTS: Mutex<Vec<(u16, Arc<ClientConfig>)>> = Mutex::new(Vec::new());
+
+fn pem(label: &str, der: &[u8]) -> String {
+    let b64 = crate::http::base64(der);
+    let lines: Vec<&str> = b64.as_bytes().chunks(64).map(|l| std::str::from_utf8(l).unwrap()).collect();
+    format!("-----BEGIN {label}-----\n{}\n-----END {label}-----\n", lines.join("\n"))
+}
+
+/// Issues a CA and a P-256 certificate for localhost and 127.0.0.1, and writes the chain (leaf, then
+/// CA) and the key (PKCS#8, or SEC1 as `EC PRIVATE KEY`) to files of their own.
+fn tls_fixture(sec1: bool) -> Tls {
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let rng = || ic_drbg::Rng::from_os().unwrap();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let ca_key = SigningKey::generate(ironsocketlayer::crypto::sign::KeyKind::EcdsaP256, &mut rng()).unwrap();
+    let mut p = CertificateParams::new("IronAV WHIP Test Root", now - 3600, now + 86_400, rng().random_array().unwrap());
+    p.is_ca = true;
+    p.path_len = Some(0);
+    let ca = x509::self_signed(&p, &ca_key, &mut rng()).unwrap();
+    let scalar: [u8; 32] = rng().random_array().unwrap();
+    let key = SigningKey::ecdsa_p256(&scalar).unwrap();
+    let (dns, ips) = (["localhost"], [x509::IpAddr::V4([127, 0, 0, 1])]);
+    let mut p = CertificateParams::new("localhost", now - 3600, now + 86_400, rng().random_array().unwrap());
+    p.dns_names = &dns;
+    p.ip_addresses = &ips;
+    p.usage = &[Purpose::TlsServer];
+    let leaf = x509::issue(&p, key.spki(), &ca, &ca_key, &mut rng()).unwrap();
+    let sec1_der: Vec<u8> = [&[0x30, 0x25, 0x02, 0x01, 0x01, 0x04, 0x20][..], &scalar].concat();
+    let key_pem = if sec1 {
+        pem("EC PRIVATE KEY", &sec1_der)
+    } else {
+        // PKCS#8: version 0, id-ecPublicKey with prime256v1, and the SEC1 key in an OCTET STRING
+        let head = [0x30, 0x41, 0x02, 0x01, 0x00, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x04, 0x27];
+        pem("PRIVATE KEY", &[&head[..], &sec1_der].concat())
+    };
+    let dir = std::env::temp_dir().join(format!("ironav-whips-{}-{}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (cert, key) = (dir.join("chain.pem"), dir.join("key.pem"));
+    std::fs::write(&cert, pem("CERTIFICATE", &leaf) + &pem("CERTIFICATE", &ca)).unwrap();
+    std::fs::write(&key, key_pem).unwrap();
+    let mut roots = RootStore::new();
+    roots.add_pem_bundle(&pem("CERTIFICATE", &ca)).unwrap();
+    let client = if crate::fips::enabled() { crate::fips::client_config(roots).unwrap() } else { ClientConfig::new(Profile::Default, roots).unwrap() };
+    let slashed = |p: std::path::PathBuf| p.to_str().unwrap().replace('\\', "/");
+    Tls { cert: slashed(cert), key: slashed(key), client: Arc::new(client) }
+}
+
+/// Opens the endpoint on `port`: `whip://`, or `whips://` with a certificate issued for it, which
+/// `request` then talks to over TLS. `rest` is the path and query, `/live?token=T`.
+fn open_whip(port: u16, rest: &str, tls: bool) -> Box<dyn Source> {
+    if !tls {
+        return crate::open_source(&format!("whip://127.0.0.1:{port}{rest}")).unwrap();
+    }
+    let t = tls_fixture(false);
+    TLS_PORTS.lock().unwrap().push((port, t.client.clone()));
+    let sep = if rest.contains('?') { '&' } else { '?' };
+    crate::open_source(&format!("whips://127.0.0.1:{port}{rest}{sep}cert={}&key={}", t.cert, t.key)).unwrap()
+}
+
+/// One HTTP request to the endpoint, over TLS if the port serves `whips://`: the status, the
+/// headers and the body.
 fn request(port: u16, method: &str, path: &str, token: Option<&str>, body: &str) -> (u16, Vec<(String, String)>, String) {
     let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
     c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     let auth = token.map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default();
-    write!(c, "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth}Content-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+    let req = format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth}Content-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+    let tls = TLS_PORTS.lock().unwrap().iter().find(|(p, _)| *p == port).map(|(_, c)| c.clone());
     let mut got = Vec::new();
-    c.read_to_end(&mut got).unwrap();
+    match tls {
+        None => {
+            c.write_all(req.as_bytes()).unwrap();
+            c.read_to_end(&mut got).unwrap();
+        }
+        Some(config) => {
+            let mut t = TlsStream::connect(c, config, "localhost").unwrap();
+            t.write_all(req.as_bytes()).unwrap();
+            match t.read_to_end(&mut got) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
+                Err(e) => panic!("{e}"),
+            }
+        }
+    }
     let text = String::from_utf8(got).unwrap();
     let (head, body) = text.split_once("\r\n\r\n").unwrap();
     let mut lines = head.split("\r\n");
@@ -226,14 +316,14 @@ fn frames(mut b: &[u8]) -> Vec<(u8, Vec<u8>)> {
     out
 }
 
-fn publishes(profiles: &[u16], token: Option<&str>) {
+fn publishes(profiles: &[u16], token: Option<&str>, tls: bool) {
     crate::net::allow_loopback_for_tests();
     let port = free_port();
     let query = token.map(|t| format!("?token={t}")).unwrap_or_default();
-    let url = format!("whip://127.0.0.1:{port}/live{query}");
-    let mut s = crate::open_source(&url).unwrap();
+    let mut s = open_whip(port, &format!("/live{query}"), tls);
     assert_eq!(s.info().kind, "whip");
     assert!(!s.info().url.contains("s3cret"), "{}", s.info().url);
+    assert_eq!(s.info().url.contains("whips://"), tls, "{}", s.info().url);
     let sent = plan();
     let publisher = std::thread::spawn({
         let token = token.map(str::to_string);
@@ -379,20 +469,26 @@ fn publishes(profiles: &[u16], token: Option<&str>) {
 
 #[test]
 fn publishes_over_srtp_aes_gcm_with_a_token() {
-    publishes(&[0x0001, 0x0007], Some("s3cret"));
+    // FIPS mode refuses plaintext signalling, so that build publishes through TLS
+    publishes(&[0x0001, 0x0007], Some("s3cret"), cfg!(feature = "fips"));
+}
+
+#[test]
+fn publishes_through_whips_signalling_over_tls() {
+    publishes(&[0x0001, 0x0007], Some("s3cret"), true);
 }
 
 #[test]
 #[cfg_attr(feature = "fips", ignore = "FIPS build: AES128_CM_HMAC_SHA1_80 is not offered (dtls tests cover the refusal)")]
 fn publishes_over_srtp_aes_cm_hmac_sha1() {
-    publishes(&[0x0001], None);
+    publishes(&[0x0001], None, false);
 }
 
 #[test]
 fn a_publisher_that_never_connects_frees_the_endpoint() {
     crate::net::allow_loopback_for_tests();
     let port = free_port();
-    let mut s = crate::open_source(&format!("whip://127.0.0.1:{port}")).unwrap();
+    let mut s = open_whip(port, "", cfg!(feature = "fips"));
     // a session still setting up gives way to the next offer
     let (status, _, _) = request(port, "POST", "/", None, &offer(&[1; 32]));
     assert_eq!(status, 201);
@@ -410,13 +506,84 @@ fn a_publisher_that_never_connects_frees_the_endpoint() {
 }
 
 #[test]
+fn whips_needs_a_certificate_and_a_key_and_whip_takes_neither() {
+    crate::net::allow_loopback_for_tests();
+    let t = tls_fixture(false);
+    let (cert, key) = (&t.cert, &t.key);
+    for url in ["whips://127.0.0.1:0".to_string(), format!("whips://127.0.0.1:0?cert={cert}"), format!("whips://127.0.0.1:0?key={key}"), format!("whips://127.0.0.1:0?key={key}&token=t")] {
+        let e = crate::open_source(&url).err().unwrap_or_else(|| panic!("{url} opened"));
+        assert_eq!(e.code, ErrorCode::InvalidArgument, "{url}");
+        assert!(e.message.contains("cert=") && e.message.contains("key="), "{e:?}");
+    }
+    // (FIPS mode refuses whip:// before it looks at the options)
+    let e = crate::open_source(&format!("whip://127.0.0.1:0?cert={cert}&key={key}")).err().expect("whip:// with cert=");
+    assert!(e.message.contains("whips://") || crate::fips::enabled(), "{e:?}");
+    // files that are missing, or not what they should be, say which and why
+    let e = crate::open_source(&format!("whips://127.0.0.1:0?cert={cert}.nope&key={key}")).err().unwrap();
+    assert!(e.message.contains("cannot read cert") && e.message.contains("nope"), "{e:?}");
+    let e = crate::open_source(&format!("whips://127.0.0.1:0?cert={key}&key={key}")).err().unwrap();
+    assert!(e.message.contains("no CERTIFICATE"), "{e:?}");
+    let e = crate::open_source(&format!("whips://127.0.0.1:0?cert={cert}&key={cert}")).err().unwrap();
+    assert!(e.message.contains("no PRIVATE KEY"), "{e:?}");
+    // a key that is not the certificate's
+    let other = tls_fixture(false);
+    let e = crate::open_source(&format!("whips://127.0.0.1:0?cert={cert}&key={}", other.key)).err().unwrap();
+    assert!(e.message.contains("key"), "{e:?}");
+}
+
+#[test]
+fn keys_load_in_both_pem_forms() {
+    for sec1 in [false, true] {
+        let t = tls_fixture(sec1);
+        crate::tls::server_config(&t.cert, &t.key).unwrap_or_else(|e| panic!("sec1={sec1}: {e:?}"));
+    }
+    assert!(crate::tls::unbase64("AQID").unwrap() == [1, 2, 3] && crate::tls::unbase64("AQI=").unwrap() == [1, 2] && crate::tls::unbase64("A*").is_none());
+}
+
+#[test]
+fn a_failed_tls_handshake_drops_only_that_connection() {
+    crate::net::allow_loopback_for_tests();
+    let port = free_port();
+    let _s = open_whip(port, "/live", true);
+    // plain HTTP to the TLS port, and a client that says nothing, then a good request
+    let mut plain = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    plain.write_all(b"OPTIONS /live HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    plain.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut silent = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    silent.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let started = Instant::now();
+    assert_eq!(request(port, "OPTIONS", "/live", None, "").0, 204);
+    assert!(started.elapsed() < Duration::from_secs(2), "the endpoint did not wait on the others");
+    let mut got = Vec::new();
+    let _ = plain.read_to_end(&mut got);
+    assert!(!got.starts_with(b"HTTP/"), "no HTTP answer in the clear");
+    // the silent one is let go once the handshake time is up
+    let _ = silent.read_to_end(&mut Vec::new());
+    assert!(started.elapsed() < Duration::from_secs(8), "{:?}", started.elapsed());
+    assert_eq!(request(port, "OPTIONS", "/live", None, "").0, 204);
+}
+
+/// FIPS mode refuses plaintext signalling and takes TLS.
+#[cfg(feature = "fips")]
+#[test]
+fn fips_refuses_whip_and_accepts_whips() {
+    crate::net::allow_loopback_for_tests();
+    let e = crate::open_source("whip://127.0.0.1:0/live").err().expect("whip:// opened in FIPS mode");
+    assert!(e.message.contains("plaintext") && e.message.contains("FIPS"), "{e:?}");
+    assert!(e.hint.as_deref().is_some_and(|h| h.contains("whips://") && h.contains("cert=") && h.contains("key=")), "{e:?}");
+    let t = tls_fixture(false);
+    let s = crate::open_source(&format!("whips://127.0.0.1:0/live?cert={}&key={}", t.cert, t.key)).expect("whips:// is accepted");
+    assert_eq!(s.info().kind, "whip");
+}
+
+#[test]
 fn targets_parse() {
-    assert_eq!(parse_target(":8080/live").unwrap(), ("127.0.0.1".into(), 8080, "/live".into()));
-    assert_eq!(parse_target("0.0.0.0:8080").unwrap(), ("0.0.0.0".into(), 8080, "/".into()));
-    assert_eq!(parse_target("[::1]:9/a/b/").unwrap(), ("::1".into(), 9, "/a/b".into()));
-    assert!(parse_target("host").is_err());
-    assert!(parse_target(":99999").is_err());
-    assert!(parse_target(":80/a b").is_err());
+    assert_eq!(parse_target(":8080/live", "whip").unwrap(), ("127.0.0.1".into(), 8080, "/live".into()));
+    assert_eq!(parse_target("0.0.0.0:8080", "whip").unwrap(), ("0.0.0.0".into(), 8080, "/".into()));
+    assert_eq!(parse_target("[::1]:9/a/b/", "whip").unwrap(), ("::1".into(), 9, "/a/b".into()));
+    assert!(parse_target("host", "whip").is_err());
+    assert!(parse_target(":99999", "whip").is_err());
+    assert!(parse_target(":80/a b", "whip").is_err());
     assert!(h264_key(&[0x65]) && h264_key(&[0x7C, 0x85]) && h264_key(&[0x78, 0, 4, 0x67]) && !h264_key(&[0x41]) && !h264_key(&[0x7C, 0x05]) && !h264_key(&[]));
 }
 

@@ -9,7 +9,7 @@ A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so 
 > Video: **software decoders for H.264, HEVC (including 4:2:2 and 4:4:4), VP8 and VP9; a software H.264 encoder (High profile: CABAC and the 8x8 transform), a software HEVC encoder (Main profile, 8-bit 4:2:0, merge and skip, SAO), a software VP8 encoder, and a software VP9 encoder (key and inter frames), and a software AV1 encoder (key and inter frames, profile 0, 8-bit 4:2:0); JPEG/Motion-JPEG and Apple ProRes decoded and encoded in software; MPEG-4 Part 2 (Simple and Advanced Simple profiles) decoded in software, and Simple profile I and P pictures encoded in software, with Advanced Simple B pictures as an option (MP4 and Matroska); MPEG-1 and MPEG-2 video (frame and field pictures, 4:2:0 and 4:2:2) decoded in software, and MPEG-2 video (Main profile, 4:2:0, progressive frames, optional B pictures) encoded in software.**
 > NVIDIA GPUs encode H.264 and HEVC (NVENC, preferred when usable) and decode H.264, HEVC and AV1 (NVDEC).
 > AV1 is decoded on NVIDIA GPUs (NVDEC) or in software (key, intra-only and inter frames, superres included). VP9 and AV1 copy between WebM, Matroska and MP4.
-> Live sources: **files as they grow, pipes, TCP, UDP, SRT (with encryption), RTSP/RTSPS, HLS over HTTP(S), WebRTC ingest (WHIP), YouTube, and cameras and microphones (Media Foundation, Video4Linux2, AVFoundation).**
+> Live sources: **files as they grow, pipes, TCP, UDP, SRT (with encryption), RTSP/RTSPS, HLS over HTTP(S), WebRTC ingest (WHIP, over TLS with `whips://`), YouTube, and cameras and microphones (Media Foundation, Video4Linux2, AVFoundation).**
 > IronAV is not yet a drop-in replacement for FFmpeg or HandBrake.
 
 ## Install
@@ -139,12 +139,19 @@ small gaps and picture loss indications until a keyframe comes. `?token=SECRET` 
 `Authorization: Bearer SECRET` (checked in constant time); without a token anyone who can reach the port can publish, so
 set one whenever the endpoint listens beyond loopback. Publishers other than loopback ones are taken only from addresses
 `IRONAV_NET_ALLOW` admits (the same list that limits outbound connections; a LAN encoder needs `private`). The HTTP
-exchange itself is not encrypted (the media is), so the token and the offer cross the network in the clear: beyond a
-trusted network, put a TLS reverse proxy in front of the HTTP port.
+exchange of `whip://` is not encrypted (the media is), so the token and the offer cross the network in the clear.
+`whips://:port[/path]?cert=CHAIN.pem&key=KEY.pem` is the same endpoint with its HTTP signalling served over TLS 1.3
+(IronSocketLayer's server): `cert` is a PEM certificate chain, the server's certificate first, and `key` the private key
+(PKCS#8 `PRIVATE KEY`, or SEC1 `EC PRIVATE KEY`; ECDSA P-256 or P-384, or RSA as PKCS#8), both read once when it opens.
+Publishers then use `https://HOST:port/path`, and need to trust the certificate. Each connection gets its own handshake,
+limited to 3 s, and one that fails or stalls is dropped without holding up the others; the request limits and the
+connection limit are the same as for `whip://`. Use `whips://` beyond a trusted network.
 
 ```sh
 ironav watch "whip://0.0.0.0:8080/live?token=s3cret" --analyzers scene,loudness
 # OBS 30+: Settings > Stream > Service "WHIP", Server http://HOST:8080/live, Bearer Token s3cret
+ironav watch "whips://0.0.0.0:8443/live?cert=chain.pem&key=key.pem&token=s3cret" --analyzers scene,loudness
+# the same over TLS: Server https://HOST:8443/live
 ffmpeg -re -i in.mp4 -c:v libx264 -profile:v baseline -pix_fmt yuv420p -bf 0 -g 50 -c:a libopus -ar 48000 -ac 2 \
   -whip_flags dtls_active -authorization s3cret -f whip http://HOST:8080/live
 ```
@@ -208,9 +215,10 @@ widen the list. A YouTube source is fetched by yt-dlp, which makes its own conne
 `IRONAV_FIPS=1`, or a build with the `fips` cargo feature (`cargo build -p ironav-cli --features fips`), turns on FIPS mode. TLS then runs
 IronSocketLayer's FIPS 140-3 profile, narrowed to AES-GCM suites, P-256 and P-384 key exchange, and ECDSA and RSA-PSS
 signatures (RSA PKCS#1 v1.5 stays only for certificate chains). ChaCha20-Poly1305, X25519 and the hybrid groups are not
-offered. Plaintext `http://`, `rtsp://`, `tcp://`, `udp://` and unencrypted `srt://` sources are refused, as are YouTube sources and MD5 Digest
-authentication (SHA-256 Digest is still used). `whip://` stays allowed, since its media is DTLS-SRTP, but takes only
-the AES-GCM SRTP profile. `ironav capabilities` reports `"fips": true` and the TLS profile in force.
+offered. Plaintext `http://`, `rtsp://`, `tcp://`, `udp://`, `whip://` and unencrypted `srt://` sources are refused, as are YouTube sources and MD5 Digest
+authentication (SHA-256 Digest is still used). `whip://` is refused too, since its signalling is plaintext HTTP: use
+`whips://` with `cert=` and `key=`, which serves it over the FIPS TLS profile and takes only the AES-GCM SRTP profile
+(its media is DTLS-SRTP). `ironav capabilities` reports `"fips": true` and the TLS profile in force.
 This restricts the algorithms and transports to FIPS-approved ones. IronCrypto, IronSocketLayer and IronPKI are not
 CMVP-validated, so an IronAV build in FIPS mode is not a FIPS 140-3 validated module, and it should not be described as one.
 Credentials: Basic (a password sent in base64, which any eavesdropper can read) is refused over plain `http://` and `rtsp://`, with a hint to use `https://` or `rtsps://`, or a camera that offers Digest, which does not send the password. Digest over plain HTTP or RTSP is allowed. Only when a camera or proxy on a network you trust needs Basic over plaintext, whoever runs IronAV can set `IRONAV_ALLOW_PLAINTEXT_BASIC=1`; a request cannot.

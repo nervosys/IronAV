@@ -27,8 +27,9 @@ use std::collections::BTreeMap;
 /// - `latency`: for SRT, the milliseconds a packet is held for retransmissions (120);
 /// - `streamid`: for SRT, the stream ID to give the sender;
 /// - `passphrase`: for SRT, the passphrase of an encrypted stream (redacted from what is shown);
-/// - `token`: the bearer token a WHIP publisher must send (redacted wherever the URL is shown).
-pub const OPTIONS: [&str; 22] = ["format", "fps", "pace", "follow", "idle", "listen", "transport", "audio", "size", "reconnect", "stall", "retries", "rate", "duration", "height", "cookies", "captions", "mode", "latency", "streamid", "passphrase", "token"];
+/// - `token`: the bearer token a WHIP publisher must send (redacted wherever the URL is shown);
+/// - `cert`, `key`: for `whips://`, the PEM files of the endpoint's TLS certificate chain and private key.
+pub const OPTIONS: [&str; 24] = ["format", "fps", "pace", "follow", "idle", "listen", "transport", "audio", "size", "reconnect", "stall", "retries", "rate", "duration", "height", "cookies", "captions", "mode", "latency", "streamid", "passphrase", "token", "cert", "key"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SourceUrl {
@@ -64,12 +65,12 @@ impl SourceUrl {
             ("file".to_string(), base.to_string())
         };
         match scheme.as_str() {
-            "file" | "pipe" | "tcp" | "udp" | "srt" | "rtsp" | "rtsps" | "http" | "https" | "device" | "test" | "whip" => {}
+            "file" | "pipe" | "tcp" | "udp" | "srt" | "rtsp" | "rtsps" | "http" | "https" | "device" | "test" | "whip" | "whips" => {}
             other => {
-                return Err(Error::invalid_arg(format!("'{other}' sources are not supported")).alternatives(["file", "pipe", "tcp", "udp", "srt", "rtsp", "rtsps", "http", "https", "device", "test", "whip"]));
+                return Err(Error::invalid_arg(format!("'{other}' sources are not supported")).alternatives(["file", "pipe", "tcp", "udp", "srt", "rtsp", "rtsps", "http", "https", "device", "test", "whip", "whips"]));
             }
         }
-        if matches!(scheme.as_str(), "tcp" | "udp" | "srt" | "whip") && !target.contains(':') {
+        if matches!(scheme.as_str(), "tcp" | "udp" | "srt" | "whip" | "whips") && !target.contains(':') {
             return Err(Error::invalid_arg(format!("{scheme} sources need host:port (or :port), got '{target}'")));
         }
         Ok(SourceUrl { scheme, target, options: opts })
@@ -194,5 +195,8 @@ mod tests {
         let u = SourceUrl::parse("whip://:8080/live?token=abc").unwrap();
         assert_eq!((u.scheme.as_str(), u.target.as_str(), u.option("token")), ("whip", ":8080/live", Some("abc")));
         assert!(SourceUrl::parse("whip://live").is_err());
+        let u = SourceUrl::parse("whips://:8443/live?cert=C:/tls/chain.pem&key=C:/tls/key.pem&token=abc").unwrap();
+        assert_eq!((u.scheme.as_str(), u.option("cert"), u.option("key")), ("whips", Some("C:/tls/chain.pem"), Some("C:/tls/key.pem")));
+        assert_eq!(redact("whips://:8443/live?cert=a.pem&key=k.pem&token=s3cret"), "whips://:8443/live?cert=a.pem&key=k.pem&token=***");
     }
 }

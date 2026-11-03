@@ -47,6 +47,19 @@ fn plaintext_sources_are_refused_before_any_connection() {
 }
 
 #[test]
+fn plaintext_whip_signalling_is_refused_and_whips_is_not() {
+    for url in ["whip://127.0.0.1:9", "whip://:9/live?token=t"] {
+        let e = open_error(url);
+        assert_eq!(e.code, ErrorCode::InvalidArgument, "{url}");
+        assert!(e.message.contains("plaintext") && e.message.contains("FIPS"), "{url}: {e:?}");
+        assert!(e.hint.as_deref().is_some_and(|h| h.contains("whips://") && h.contains("cert=") && h.contains("key=")), "{url}: {e:?}");
+    }
+    // whips:// is past the policy: what it lacks is the certificate and key, not permission
+    let e = open_error("whips://127.0.0.1:9/live");
+    assert!(e.message.contains("cert=") && !e.message.contains("plaintext"), "{e:?}");
+}
+
+#[test]
 fn an_encrypted_srt_source_is_not_refused_by_the_policy() {
     // allowed, so the failure is the connection (nothing answers on port 9), not the policy
     net::allow_loopback_for_tests();

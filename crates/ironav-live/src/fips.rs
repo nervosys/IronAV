@@ -8,8 +8,10 @@
 //!   signatures. There is no ChaCha20-Poly1305, no X25519 or hybrid group, and no ECH GREASE (its
 //!   HPKE uses X25519). RSA PKCS#1 v1.5 stays in the signature list only because certificate chains
 //!   are commonly signed with it.
-//! - Plaintext transports are refused: `http://`, `rtsp://`, `tcp://` and `udp://`, and `srt://`
-//!   without a `passphrase` (with one, the stream is AES-CTR encrypted). That includes plaintext redirects and ONVIF's device service and
+//! - Plaintext transports are refused: `http://`, `rtsp://`, `tcp://`, `udp://` and `whip://` (a
+//!   WHIP endpoint must be `whips://`, which serves its signalling over the same TLS profile as a
+//!   server, and takes SRTP with AES-GCM only), and `srt://` without a `passphrase` (with one, the
+//!   stream is AES-CTR encrypted). That includes plaintext redirects and ONVIF's device service and
 //!   discovery.
 //! - Digest authentication with MD5 is refused. SHA-256 Digest and Basic over TLS still work.
 //! - YouTube sources are refused: yt-dlp fetches them with its own TLS stack, outside this policy.
@@ -19,7 +21,7 @@
 //! FIPS 140-3 validated module, and nothing here should be described as one.
 
 use ironav_core::{Error, ErrorCode, Result};
-use ironsocketlayer::config::{ClientConfig, Profile};
+use ironsocketlayer::config::{ClientConfig, Identity, Profile, ServerConfig};
 use ironsocketlayer::enums::{CipherSuite, NamedGroup, SignatureScheme};
 use ironsocketlayer::x509::RootStore;
 use serde_json::{json, Value};
@@ -45,7 +47,7 @@ const SCHEMES: [SignatureScheme; 8] = [
 ];
 
 /// The transports that carry no TLS in IronAV.
-const PLAINTEXT: [&str; 5] = ["http", "rtsp", "tcp", "udp", "srt"];
+const PLAINTEXT: [&str; 6] = ["http", "rtsp", "tcp", "udp", "srt", "whip"];
 
 /// Whether `IRONAV_FIPS` is set to a true value.
 pub(crate) fn env_flag(name: &str) -> bool {
@@ -86,11 +88,22 @@ pub(crate) fn client_config(roots: RootStore) -> Result<ClientConfig> {
     Ok(c)
 }
 
+/// The TLS server configuration for FIPS mode (`whips://`): the same profile, narrowed the same way.
+pub(crate) fn server_config(identity: Identity) -> Result<ServerConfig> {
+    activate()?;
+    let mut c = ServerConfig::new(Profile::Fips140_3, identity).map_err(|e| Error::new(ErrorCode::Io, format!("TLS configuration: {e}")))?;
+    c.common.suites = SUITES.to_vec();
+    c.common.groups = GROUPS.to_vec();
+    c.common.schemes = SCHEMES.to_vec();
+    Ok(c)
+}
+
 fn refuse_plaintext(on: bool, scheme: &str) -> Result<()> {
     if on && PLAINTEXT.iter().any(|p| p.eq_ignore_ascii_case(scheme)) {
         let instead = match scheme.to_ascii_lowercase().as_str() {
             "http" => "https://",
             "rtsp" => "rtsps://",
+            "whip" => "whips:// with cert= and key= (a TLS certificate chain and private key, both PEM)",
             _ => "a TLS source (https:// or rtsps://); this transport has no TLS form in IronAV",
         };
         return Err(Error::invalid_arg(format!("{scheme}:// is a plaintext transport, which FIPS mode refuses")).hint(format!("use {instead}")));
@@ -98,7 +111,7 @@ fn refuse_plaintext(on: bool, scheme: &str) -> Result<()> {
     Ok(())
 }
 
-/// Fails for a plaintext transport (`http`, `rtsp`, `tcp`, `udp`, `srt`) while FIPS mode is on.
+/// Fails for a plaintext transport (`http`, `rtsp`, `tcp`, `udp`, `srt`, `whip`) while FIPS mode is on.
 pub fn check_transport(scheme: &str) -> Result<()> {
     refuse_plaintext(enabled(), scheme)
 }
@@ -155,17 +168,19 @@ mod tests {
 
     #[test]
     fn plaintext_transports_are_refused_only_in_fips_mode() {
-        for scheme in ["http", "rtsp", "tcp", "udp", "srt", "HTTP"] {
+        for scheme in ["http", "rtsp", "tcp", "udp", "srt", "whip", "HTTP", "WHIP"] {
             assert!(refuse_plaintext(true, scheme).is_err(), "{scheme}");
             assert!(refuse_plaintext(false, scheme).is_ok(), "{scheme} off");
         }
-        for scheme in ["https", "rtsps", "file", "pipe", "device", "test"] {
+        for scheme in ["https", "rtsps", "whips", "file", "pipe", "device", "test"] {
             assert!(refuse_plaintext(true, scheme).is_ok(), "{scheme}");
         }
         let e = refuse_plaintext(true, "http").unwrap_err();
         assert!(e.hint.as_deref().is_some_and(|h| h.contains("https://")), "{e:?}");
         let e = refuse_plaintext(true, "rtsp").unwrap_err();
         assert!(e.hint.as_deref().is_some_and(|h| h.contains("rtsps://")), "{e:?}");
+        let e = refuse_plaintext(true, "whip").unwrap_err();
+        assert!(e.hint.as_deref().is_some_and(|h| h.contains("whips://") && h.contains("cert=") && h.contains("key=")), "{e:?}");
     }
 
     #[test]
