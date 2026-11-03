@@ -8,8 +8,8 @@
 //!   signatures. There is no ChaCha20-Poly1305, no X25519 or hybrid group, and no ECH GREASE (its
 //!   HPKE uses X25519). RSA PKCS#1 v1.5 stays in the signature list only because certificate chains
 //!   are commonly signed with it.
-//! - Plaintext transports are refused: `http://`, `rtsp://`, `tcp://` and `udp://` (and `srt://`,
-//!   which is not implemented). That includes plaintext redirects and ONVIF's device service and
+//! - Plaintext transports are refused: `http://`, `rtsp://`, `tcp://` and `udp://`, and `srt://`
+//!   without a `passphrase` (with one, the stream is AES-CTR encrypted). That includes plaintext redirects and ONVIF's device service and
 //!   discovery.
 //! - Digest authentication with MD5 is refused. SHA-256 Digest and Basic over TLS still work.
 //! - YouTube sources are refused: yt-dlp fetches them with its own TLS stack, outside this policy.

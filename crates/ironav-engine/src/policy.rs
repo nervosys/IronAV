@@ -275,7 +275,7 @@ pub fn check_source(raw: &str, u: &ironav_live::SourceUrl) -> Result<()> {
                 eprintln!("ironav: opening capture device {}", u.target);
             }
         }
-        "tcp" | "udp" | "rtsp" | "rtsps" | "http" | "https" => crate::audit::event("network_open", serde_json::json!({ "url": ironav_live::redact(raw) })),
+        "tcp" | "udp" | "srt" | "rtsp" | "rtsps" | "http" | "https" => crate::audit::event("network_open", serde_json::json!({ "url": ironav_live::redact(raw) })),
         _ => {}
     }
     if u.option("cookies").is_some() {

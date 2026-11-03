@@ -1,4 +1,5 @@
-//! Source URLs: `tcp://host:port`, `udp://:port`, `rtsp://[user:password@]host[:port]/path`,
+//! Source URLs: `tcp://host:port`, `udp://:port`, `srt://host:port` or `srt://:port?mode=listener`,
+//! `rtsp://[user:password@]host[:port]/path`,
 //! `http://host[:port]/path` (HLS or a download; a YouTube video or live stream by its watch URL,
 //! through yt-dlp), `device://video[/NAME]` or
 //! `device://audio[/NAME]` (a camera or microphone), `pipe:`,
@@ -21,8 +22,12 @@ use std::collections::BTreeMap;
 /// - `height`: the tallest HLS (or YouTube) variant to play, in lines;
 /// - `cookies`: for a YouTube URL, the browser whose signed-in session yt-dlp reads (`firefox`,
 ///   `chrome`, ...), as its `--cookies-from-browser` does;
-/// - `captions`: the HLS (or YouTube) subtitles to follow, by language or name, or `off`.
-pub const OPTIONS: [&str; 17] = ["format", "fps", "pace", "follow", "idle", "listen", "transport", "audio", "size", "reconnect", "stall", "retries", "rate", "duration", "height", "cookies", "captions"];
+/// - `captions`: the HLS (or YouTube) subtitles to follow, by language or name, or `off`;
+/// - `mode`: for SRT, `caller` (the default with a host) or `listener` (the default with none);
+/// - `latency`: for SRT, the milliseconds a packet is held for retransmissions (120);
+/// - `streamid`: for SRT, the stream ID to give the sender;
+/// - `passphrase`: for SRT, the passphrase of an encrypted stream (redacted from what is shown).
+pub const OPTIONS: [&str; 21] = ["format", "fps", "pace", "follow", "idle", "listen", "transport", "audio", "size", "reconnect", "stall", "retries", "rate", "duration", "height", "cookies", "captions", "mode", "latency", "streamid", "passphrase"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SourceUrl {
@@ -58,12 +63,12 @@ impl SourceUrl {
             ("file".to_string(), base.to_string())
         };
         match scheme.as_str() {
-            "file" | "pipe" | "tcp" | "udp" | "rtsp" | "rtsps" | "http" | "https" | "device" | "test" => {}
+            "file" | "pipe" | "tcp" | "udp" | "srt" | "rtsp" | "rtsps" | "http" | "https" | "device" | "test" => {}
             other => {
-                return Err(Error::invalid_arg(format!("'{other}' sources are not supported")).alternatives(["file", "pipe", "tcp", "udp", "rtsp", "rtsps", "http", "https", "device", "test"]));
+                return Err(Error::invalid_arg(format!("'{other}' sources are not supported")).alternatives(["file", "pipe", "tcp", "udp", "srt", "rtsp", "rtsps", "http", "https", "device", "test"]));
             }
         }
-        if matches!(scheme.as_str(), "tcp" | "udp") && !target.contains(':') {
+        if matches!(scheme.as_str(), "tcp" | "udp" | "srt") && !target.contains(':') {
             return Err(Error::invalid_arg(format!("{scheme} sources need host:port (or :port), got '{target}'")));
         }
         Ok(SourceUrl { scheme, target, options: opts })
@@ -111,9 +116,22 @@ pub(crate) fn split_authority(rest: &str) -> (Option<&str>, &str, &str) {
     (cred, &after[..end], &after[end..])
 }
 
+/// `url` with the value of an SRT `passphrase` option replaced by `***`.
+fn redact_passphrase(url: &str) -> String {
+    let secret = |kv: &str| kv.split_once('=').is_some_and(|(k, _)| k.eq_ignore_ascii_case("passphrase"));
+    match url.rsplit_once('?') {
+        Some((base, q)) if q.split('&').any(secret) => {
+            let q: Vec<String> = q.split('&').map(|kv| if secret(kv) { format!("{}=***", kv.split_once('=').map_or(kv, |(k, _)| k)) } else { kv.to_string() }).collect();
+            format!("{base}?{}", q.join("&"))
+        }
+        _ => url.to_string(),
+    }
+}
+
 /// `url` with any password replaced by `***`, so it can be echoed in observations, statuses and
 /// errors. User information with no `:` may itself be a token, so all of it is replaced.
 pub fn redact(url: &str) -> String {
+    let url = &redact_passphrase(url);
     let Some((scheme, rest)) = url.split_once("://") else { return url.to_string() };
     match split_authority(rest) {
         (Some(cred), host, tail) => match cred.split_once(':') {
@@ -139,7 +157,10 @@ mod tests {
         assert_eq!(SourceUrl::parse("-").unwrap().scheme, "pipe");
         assert_eq!(SourceUrl::parse("C:/media/a?b.wav").unwrap().target, "C:/media/a?b.wav");
         assert_eq!(SourceUrl::parse("rtsp://cam/stream").unwrap().scheme, "rtsp");
-        assert!(SourceUrl::parse("srt://cam:9000").is_err());
+        let u = SourceUrl::parse("srt://cam:9000?latency=200&streamid=a&mode=caller").unwrap();
+        assert_eq!((u.scheme.as_str(), u.target.as_str(), u.option("latency"), u.option("streamid")), ("srt", "cam:9000", Some("200"), Some("a")));
+        assert!(SourceUrl::parse("srt://cam").is_err());
+        assert!(SourceUrl::parse("srtp://cam:9000").is_err());
         assert_eq!(percent_decode("p%40ss%3a%zz"), "p@ss:%zz");
         assert!(SourceUrl::parse("tcp://localhost").is_err());
     }
@@ -149,6 +170,8 @@ mod tests {
         assert_eq!(redact("tcp://bob:hunter2@cam.local:554/live?x=1"), "tcp://bob:***@cam.local:554/live?x=1");
         assert_eq!(redact("udp://:5000"), "udp://:5000");
         assert_eq!(redact("clip.y4m"), "clip.y4m");
+        assert_eq!(redact("srt://cam:9000?latency=200&passphrase=hunter2hunter2&streamid=a"), "srt://cam:9000?latency=200&passphrase=***&streamid=a");
+        assert_eq!(redact("srt://:9000?PassPhrase=x"), "srt://:9000?PassPhrase=***");
         assert_eq!(redact("rtsp://3f9aTOKEN@cam/live"), "rtsp://***@cam/live");
         // an unescaped '/' in the password must not end the user information early
         assert_eq!(redact("rtsp://bob:pa/ss@cam:554/live?x=a@b"), "rtsp://bob:***@cam:554/live?x=a@b");

@@ -2306,6 +2306,8 @@ version = "0.1.1"
 dependencies = [
  "block2 0.6.2",
  "dispatch2",
+ "ic-cipher",
+ "ic-core",
  "ic-drbg",
  "ironav-core",
  "ironav-formats",

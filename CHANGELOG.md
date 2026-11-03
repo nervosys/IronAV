@@ -10,6 +10,12 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 ### Added
 
 - **macOS capture devices:** `device://video` and `device://audio` on macOS, through AVFoundation (an `AVCaptureSession` with video and audio data outputs, written with the `objc2` crates): `ironav devices` and the `devices` tool list the cameras and microphones, `size=` and `fps=` pick the nearest camera mode, pictures arrive as Y4M converted from NV12 and sound as 16-bit WAV, and a refused Camera or Microphone permission is an error that names System Settings > Privacy & Security. It is compile-checked for `aarch64-apple-darwin` and `x86_64-apple-darwin` and its conversions are unit-tested, but it has not been run against a real camera or microphone.
+- **SRT live source:** `srt://host:port` calls an SRT sender and `srt://:port?mode=listener` waits for one (live mode, receiver
+  only, MPEG-TS payload read as `udp://` is). Written in tree with no new dependency: handshake v5, ACK and ACKACK, NAK loss
+  reports with retransmission, timestamp-based delivery (`?latency=MS`, 120 by default) with too-late packet drop,
+  keep-alive and shutdown, and `?streamid=`. `?passphrase=` reads an AES-CTR encrypted stream (key material, PBKDF2-HMAC-SHA1
+  and the RFC 3394 key wrap; the passphrase is redacted from everything shown). A caller reconnects with back-off like RTSP,
+  addresses go through `IRONAV_NET_ALLOW`, and without a passphrase it is a plaintext transport that FIPS mode refuses.
 
 ## [0.1.1] - 2026-11-02
 

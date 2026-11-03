@@ -30,6 +30,9 @@ ironav-formats.workspace = true
 ironsocketlayer = "0.7.2"
 # the operating system's entropy through a DRBG, for Digest cnonces and WS-Security nonces
 ic-drbg = { version = "0.3.2", features = ["std"] }
+# AES and the RFC 3394 key wrap for SRT's encrypted streams (the crates IronSocketLayer uses)
+ic-cipher = "0.3.2"
+ic-core = "0.3.2"
 
 [target.'cfg(windows)'.dependencies]
 # cameras and microphones through Media Foundation

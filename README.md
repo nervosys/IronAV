@@ -99,6 +99,17 @@ Checked against EBU Tech 3341/3342 test signals (a -23 dBFS stereo sine reads -2
 The same analyzers run on media as it arrives. A source is a path, `path?follow` (a file that is still growing),
 `path?pace=realtime` (a file played as if live), `-` or `pipe:NAME`, `tcp://host:port` (connect),
 `tcp://:port` (listen, on loopback unless an address is given), or `udp://:port` / `udp://group:port` (multicast).
+`srt://host:port` calls an SRT sender (an encoder, `srt-live-transmit`, ffmpeg in listener mode) and
+`srt://:port?mode=listener` waits for one to call (on loopback unless an address is given); the MPEG-TS it carries is read
+as `udp://` is. This is SRT's live mode, receiving only, written here with no extra dependency: handshake version 5,
+ACKs, NAK loss reports and retransmission, and delivery by the sender's timestamps plus a latency (`?latency=MS`, 120 by
+default; a packet that has not come when a later one is due is dropped), `?streamid=ID`, keep-alives and shutdown.
+`?passphrase=SECRET` (10 to 79 characters) reads an AES-CTR encrypted stream (AES-128, 192 or 256 by the sender's choice,
+key material wrapped as RFC 3394, PBKDF2-HMAC-SHA1 key derivation); a sender that does not encrypt, or has another
+passphrase, is refused, and the passphrase is hidden from every status and message. A caller is reconnected with back-off
+like RTSP (`?reconnect=0` turns it off), and its address goes through `IRONAV_NET_ALLOW` like any other outbound
+connection. Not supported: rendezvous mode, the message API, AES-GCM, forward error correction, groups and handshake
+version 4 (libsrt before 1.3). Without a passphrase SRT is a plaintext transport, which FIPS mode refuses.
 `rtsp://[user:password@]host[:port]/path` plays a camera or RTSP server: RTP interleaved on the RTSP connection
 (or over UDP with `?transport=udp`, taken only from the server's address),
 Basic or Digest credentials, keepalives and TEARDOWN, with H.264, HEVC, AAC, Opus, G.711 and L16 tracks (others are
@@ -167,7 +178,7 @@ widen the list. A YouTube source is fetched by yt-dlp, which makes its own conne
 `IRONAV_FIPS=1`, or a build with the `fips` cargo feature (`cargo build -p ironav-cli --features fips`), turns on FIPS mode. TLS then runs
 IronSocketLayer's FIPS 140-3 profile, narrowed to AES-GCM suites, P-256 and P-384 key exchange, and ECDSA and RSA-PSS
 signatures (RSA PKCS#1 v1.5 stays only for certificate chains). ChaCha20-Poly1305, X25519 and the hybrid groups are not
-offered. Plaintext `http://`, `rtsp://`, `tcp://` and `udp://` sources are refused, as are YouTube sources and MD5 Digest
+offered. Plaintext `http://`, `rtsp://`, `tcp://`, `udp://` and unencrypted `srt://` sources are refused, as are YouTube sources and MD5 Digest
 authentication (SHA-256 Digest is still used). `ironav capabilities` reports `"fips": true` and the TLS profile in force.
 This restricts the algorithms and transports to FIPS-approved ones. IronCrypto, IronSocketLayer and IronPKI are not
 CMVP-validated, so an IronAV build in FIPS mode is not a FIPS 140-3 validated module, and it should not be described as one.

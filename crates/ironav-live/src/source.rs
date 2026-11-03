@@ -27,7 +27,7 @@ pub enum Chunk {
 pub struct SourceInfo {
     /// The URL with any password replaced.
     pub url: String,
-    /// `file`, `pipe`, `tcp`, `udp`, `rtsp`, `hls`, `http`, `youtube`, `device` or `test`.
+    /// `file`, `pipe`, `tcp`, `udp`, `srt`, `rtsp`, `hls`, `http`, `youtube`, `device` or `test`.
     pub kind: &'static str,
     /// Whether the bytes arrive at the pace of the media (a socket, a pipe, a followed file)
     /// rather than as fast as they can be read.
@@ -66,16 +66,16 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often a followed file is checked for new bytes.
 const FOLLOW_POLL: Duration = Duration::from_millis(20);
 
-/// Opens the source a URL names (see [`SourceUrl`]). An RTSP source, and a TCP connection with
-/// `?reconnect`, is kept up (see [`crate::reconnect`]): `stall=S` seconds without data is a stall
+/// Opens the source a URL names (see [`SourceUrl`]). An RTSP source, an SRT caller, and a TCP
+/// connection with `?reconnect`, is kept up (see [`crate::reconnect`]): `stall=S` seconds without data is a stall
 /// and twice that a loss (5 by default), `retries=N` attempts after a loss before giving up
 /// (unlimited by default), and `reconnect=0` turns it off.
 pub fn open_source(url: &str) -> Result<Box<dyn Source>> {
     let u = SourceUrl::parse(url)?;
-    let client = u.scheme == "tcp" && !u.flag("listen") && !u.target.starts_with(':');
+    let client = (u.scheme == "tcp" && !u.flag("listen") && !u.target.starts_with(':')) || (u.scheme == "srt" && !crate::srt::is_listener(&u));
     let keep_up = match u.option("reconnect") {
         Some(_) => u.flag("reconnect"),
-        None => matches!(u.scheme.as_str(), "rtsp" | "rtsps"),
+        None => matches!(u.scheme.as_str(), "rtsp" | "rtsps") || (u.scheme == "srt" && client),
     };
     if keep_up && (client || matches!(u.scheme.as_str(), "rtsp" | "rtsps")) {
         let num = |key: &str| u.option(key).map(|s| s.parse::<f64>().ok().filter(|v| *v > 0.0 && v.is_finite()).ok_or_else(|| Error::invalid_arg(format!("{key} must be a positive number, got '{s}'")))).transpose();
@@ -98,7 +98,10 @@ fn open_once(url: &str) -> Result<Box<dyn Source>> {
         crate::fips::check_youtube()?;
         return crate::youtube::open(&u, &id, shown);
     }
-    crate::fips::check_transport(&u.scheme)?;
+    // an SRT stream with a passphrase is encrypted; without one it is plaintext
+    if !(u.scheme == "srt" && u.option("passphrase").is_some()) {
+        crate::fips::check_transport(&u.scheme)?;
+    }
     Ok(match u.scheme.as_str() {
         "file" => {
             let f = std::fs::File::open(&u.target).map_err(|e| {
@@ -144,6 +147,7 @@ fn open_once(url: &str) -> Result<Box<dyn Source>> {
             };
             Box::new(UdpSource { info: SourceInfo { url: shown, kind: "udp", live: true, synthetic: false }, sock })
         }
+        "srt" => Box::new(crate::srt::open(&u, shown)?),
         "rtsp" | "rtsps" => Box::new(crate::rtsp::RtspSource::open(&u, shown)?),
         "http" | "https" => crate::hls::open(&u, shown)?,
         "device" => Box::new(crate::capture::open(&u, shown)?),
@@ -152,7 +156,7 @@ fn open_once(url: &str) -> Result<Box<dyn Source>> {
     })
 }
 
-fn host_port(target: &str) -> Result<(&str, u16)> {
+pub(crate) fn host_port(target: &str) -> Result<(&str, u16)> {
     let (host, port) = target.rsplit_once(':').ok_or_else(|| Error::invalid_arg(format!("expected host:port, got '{target}'")))?;
     let port = port.trim_end_matches('/').parse().map_err(|_| Error::invalid_arg(format!("'{port}' is not a port number")))?;
     Ok((host.trim_start_matches('[').trim_end_matches(']'), port))

@@ -1,5 +1,5 @@
 //! Live input: byte sources read as the bytes arrive, from a file (whole, or followed while it
-//! grows), standard input or a named pipe, a TCP connection, a UDP port, an RTSP camera or server, or
+//! grows), standard input or a named pipe, a TCP connection, a UDP port, an SRT sender, an RTSP camera or server, or
 //! HTTP (an HLS playlist, or a progressive download), the last two also over TLS, or a camera or
 //! microphone (`capture`).
 //!
@@ -22,6 +22,7 @@ mod rtsp;
 mod sha1;
 mod sha256;
 mod source;
+mod srt;
 pub mod synthetic;
 pub mod tls;
 mod url;

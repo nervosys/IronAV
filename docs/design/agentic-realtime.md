@@ -15,7 +15,7 @@ transcode), all within stated latency and resource budgets.
 | Area | Today | Gap for live use |
 |---|---|---|
 | Input | `open_demuxer(path)` for files (every demuxer is `Read + Seek`); Ogg, ADTS, MP3 and JPEG read the whole file | live sources exist (M2, M4): pipes, sockets, growing files, RTSP, HLS and devices; what is still missing is in §8 |
-| Containers | WAV, FLAC, Y4M, MP4 (fragmented read), Matroska/WebM, Ogg, ADTS, MP3, JPEG | MPEG-TS, RTP, RTSP and HLS exist now (M3, M4); no DASH, SRT or WebRTC |
+| Containers | WAV, FLAC, Y4M, MP4 (fragmented read), Matroska/WebM, Ogg, ADTS, MP3, JPEG | MPEG-TS, RTP, RTSP, HLS and SRT exist now (M3, M4, M6); no DASH or WebRTC |
 | Packet | `stream, pts, duration, data` | the keyframe flag and arrival time are held in `StreamPacket` (M2), not in `Packet`; `Packet` has no DTS field |
 | Muxers | all seek back at `finish` (MP4 moov, MKV sizes and Cues) | progressive fMP4 and TS recording and HLS segmenting exist (M3); the file muxers still seek back at `finish` |
 | Decoders | `decode(packet) -> Vec<Frame>`, `flush()` | low-delay output for H.264 (HEVC outputs by its SPS) and keyframe-only decoding exist (M2); the software H.264 decoder runs pictures on threads, low-delay mode on one |
@@ -93,7 +93,7 @@ Source URLs, in rough order of delivery:
 | `rtsp://` | RTSP over TCP using `std::net`; RTP over UDP or interleaved (over TLS as `rtsps://`, below) |
 | `http://` | HLS and progressive download over plain HTTP using `std::net` |
 | `https://`, `rtsps://` | the same over TLS 1.3: IronSocketLayer, with IronPKI checking the chain and name against the platform's PEM bundle and `IRONAV_CA_FILE` (`ironav-live/src/tls.rs`) |
-| `srt://` | needs a dependency decision (§10) |
+| `srt://host:port`, `srt://:port?mode=listener` | SRT live mode, receiver only, written here (`ironav-live/src/srt.rs`): handshake v5, ACK/NAK/retransmission, timestamp-based delivery (`?latency=` ms, 120), too-late drop, `?streamid=`, and AES-CTR encryption with `?passphrase=`; the payload is MPEG-TS, read as `udp://` is. A caller is kept up and reconnected like RTSP |
 | `device://video[/N]`, `device://audio[/NAME]` | capture through each platform's own API, written here (`ironav-live/src/capture/`): Media Foundation on Windows and V4L2 on Linux (done), and AVFoundation on macOS (written and compile-checked; not yet run against a camera). A camera arrives as Y4M (NV12/YUY2 converted to 4:2:0), a microphone as open-ended 16-bit WAV, so the stream demuxers read them like any other bytes |
 
 ### 3.2 Incremental demux (L1)
@@ -360,7 +360,7 @@ Each milestone is usable on its own and passes the test gate.
 | **M3: broadcast** (done) | the MPEG-TS demuxer and muxer; live fMP4 and MKV reading; a progressive fMP4/TS recorder; `stream_clip`; segmenting; the `latency: low` encode profile | none |
 | **M4: cameras and the web** (done) | RTSP and RTP depacketizers with a jitter buffer and RTCP; HLS over plain HTTP | none |
 | **M5: models** (done) | the sidecar protocol, voice-activity gating and two reference sidecars kept out of tree (speech-to-text, detection) | none in the core; each sidecar chooses its own |
-| **M6: optional transports** (in part) | HTTPS and HLS over TLS, RTSPS, and capture devices (Media Foundation, V4L2, and AVFoundation, which has not been run on a Mac) are done; SRT and WebRTC ingest are not | each one by decision (§10) |
+| **M6: optional transports** (in part) | HTTPS and HLS over TLS, RTSPS, SRT (caller and listener, with encryption), and capture devices (Media Foundation, V4L2, and AVFoundation, which has not been run on a Mac) are done; WebRTC ingest is not | each one by decision (§10) |
 
 M2 as built: the `Source` trait and every source above; `StreamDemuxer` for Annex B H.264/HEVC, ADTS, Y4M and WAV;
 live sessions with the ring buffer and log; `stream_open`, `stream_events`, `stream_status`, `stream_snapshot`,
@@ -456,3 +456,8 @@ files at once, and it fixes the event model, analyzer trait and MCP plumbing bef
 4. **Reference sidecars**: decided. faster-whisper for speech-to-text and ONNX Runtime (a YOLOv8 export) for detection,
    as Python files in `examples/sidecars/`, outside the build, plus a model-free DTMF detector in Rust that the tests use.
 5. **Persistence**: should observation logs and recordings outlive the process (a session directory), or stay in memory only?
+6. **SRT**: decided and done, in tree, with no new dependency. The receiver (live mode, caller and listener) is written in
+   `ironav-live/src/srt.rs` over `std::net::UdpSocket`; encryption (`?passphrase=`) uses AES and the RFC 3394 key wrap from
+   `ic-cipher`, which IronSocketLayer already pulls in, and a small PBKDF2-HMAC-SHA1 (IronCrypto has no SHA-1). Not done:
+   rendezvous mode, the message API, AES-GCM, packet filters (FEC), groups, and handshake version 4. Interop with libsrt has
+   not been run in CI (the `#[ignore]` test needs `srt-live-transmit` on the `PATH`).

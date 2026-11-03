@@ -38,12 +38,25 @@ fn the_module_comes_up_and_the_profile_is_the_narrowed_one() {
 
 #[test]
 fn plaintext_sources_are_refused_before_any_connection() {
-    for url in ["http://127.0.0.1:9/a.ts", "rtsp://127.0.0.1:9/live", "tcp://127.0.0.1:9", "tcp://:9", "udp://127.0.0.1:9", "udp://239.1.1.1:5000"] {
+    for url in ["http://127.0.0.1:9/a.ts", "rtsp://127.0.0.1:9/live", "tcp://127.0.0.1:9", "tcp://:9", "udp://127.0.0.1:9", "udp://239.1.1.1:5000", "srt://127.0.0.1:9", "srt://:9?mode=listener&latency=50"] {
         let e = open_error(url);
         assert_eq!(e.code, ErrorCode::InvalidArgument, "{url}");
         assert!(e.message.contains("plaintext") && e.message.contains("FIPS"), "{url}: {e:?}");
         assert!(e.hint.is_some(), "{url}");
     }
+}
+
+#[test]
+fn an_encrypted_srt_source_is_not_refused_by_the_policy() {
+    // allowed, so the failure is the connection (nothing answers on port 9), not the policy
+    net::allow_loopback_for_tests();
+    fips_on();
+    match open_source("srt://127.0.0.1:9?passphrase=0123456789&reconnect=0") {
+        Ok(_) => panic!("connected to nothing"),
+        Err(e) => assert_eq!(e.code, ErrorCode::Io, "{e:?}"),
+    }
+    // and it is listening, not refused
+    assert!(open_source("srt://127.0.0.1:0?mode=listener&passphrase=0123456789").is_ok());
 }
 
 #[test]

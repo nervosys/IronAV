@@ -90,17 +90,30 @@ claim of FIPS 140-3 validation.
 | Random numbers for TLS, tokens and nonces | SP 800-90A CTR_DRBG (AES-256), seeded from BCryptGenRandom or `/dev/urandom` | `ic-drbg` | No |
 | HTTP and RTSP Digest | SHA-256; MD5 (when a server offers only MD5), compiled out of builds with the `fips` feature | In-tree (`ironav-live`) | No |
 | ONVIF WS-Security | SHA-1 PasswordDigest (protocol-mandated) | In-tree | No |
+| SRT encryption (`srt://` with `passphrase`) | AES-128/192/256-CTR; RFC 3394 key wrap; PBKDF2-HMAC-SHA1 (2048 iterations, protocol-mandated) | `ic-cipher` for AES and the wrap; SHA-1 and PBKDF2 in-tree | No |
 | Codec noise, dither, test data | LCG, xorshift | In-tree | Not security uses |
 
-TLS is 1.3 only. SHA-1 signatures are refused. Certificate path and name validation cannot be turned off. Encrypted HLS,
-SRTP and SRT are not implemented, and such streams are refused.
+TLS is 1.3 only. SHA-1 signatures are refused. Certificate path and name validation cannot be turned off. Encrypted HLS
+and SRTP are not implemented, and such streams are refused.
+
+SRT (`srt://`) is a UDP service in `ironav-live/src/srt.rs`. Its network attack surface: a listener (`mode=listener`) binds
+a UDP port (loopback unless an address is given) and answers handshakes from anyone, though only a caller that returns a
+cookie tied to its address gets a connection and then one sender is served; a caller connects only to an address
+`IRONAV_NET_ALLOW` permits. All input is untrusted: packet and extension lengths are checked, the receive window is 8192
+packets and 32 MiB, loss reports and the queue of unread payloads are bounded, a stream whose sequence numbers leave the
+window is dropped, and the code is fuzzed with random and truncated packets (a test, not a long run). SRT's encryption is
+AES-CTR with no authentication of the data, keyed by a passphrase through PBKDF2-HMAC-SHA1 (2048 iterations) and the RFC
+3394 key wrap, which is what the protocol defines; it keeps the stream from being read, not from being altered. The
+passphrase is redacted from statuses, errors and the audit log. A sender that does not encrypt when a passphrase is given
+is refused, so the stream cannot be downgraded. Without a passphrase SRT is a plaintext transport. AES and the key wrap come
+from `ic-cipher` (not CMVP-validated); the SHA-1 is in-tree.
 
 **FIPS mode.** Turned on by `IRONAV_FIPS=1` or by building with the `fips` feature. In FIPS mode:
 
 - TLS offers only AES-GCM suites, P-256 and P-384 ECDHE, and ECDSA and RSA-PSS signatures. RSA PKCS#1 v1.5 is accepted
   only on certificates.
 - ChaCha20-Poly1305, X25519 and the hybrid groups are not offered.
-- Plaintext `http://`, `rtsp://`, `tcp://` and `udp://` sources are refused, and so are YouTube sources, which yt-dlp
+- Plaintext `http://`, `rtsp://`, `tcp://`, `udp://` and unencrypted `srt://` (no `passphrase`) sources are refused, and so are YouTube sources, which yt-dlp
   fetches outside IronAV's control.
 - MD5 Digest is refused, and in builds with the `fips` feature the MD5 code is not compiled in at all. SHA-256 Digest is
   still used. A default build with `IRONAV_FIPS=1` keeps the MD5 code and refuses it at run time.

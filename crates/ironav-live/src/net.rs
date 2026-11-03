@@ -226,6 +226,19 @@ pub fn connect(host: &str, port: u16, timeout: Duration, allow: &Allow, shown: &
     Err(Error::new(ErrorCode::Io, format!("could not connect to {shown}: {e}")).hint("check the address, and that the sender is running"))
 }
 
+/// Resolves `host:port` for a datagram peer (SRT) through the allow-list: the first address the
+/// name resolves to that is allowed, which is the only one used. `shown` is the redacted URL.
+pub fn resolve_udp(host: &str, port: u16, allow: &Allow, shown: &str) -> Result<SocketAddr> {
+    let addrs: Vec<SocketAddr> = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| Error::new(ErrorCode::Io, format!("could not resolve {shown}: {e}")).hint("check the address"))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(Error::new(ErrorCode::Io, format!("{shown} resolves to no address")));
+    }
+    addrs.iter().copied().find(|a| allow.permits(a.ip())).ok_or_else(|| allow.refused(&addrs.iter().map(|a| a.ip()).collect::<Vec<_>>(), shown))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
