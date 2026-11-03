@@ -165,6 +165,8 @@ to dispose resource" when it stops, though its DELETE was answered and ended the
 response's status line. FFmpeg 9.0.1 publishes to `whips://` (tested) only with a certificate its system trust store
 accepts, since the muxer passes neither `-ca_file` nor `-tls_verify 0` to its HTTPS request. It cannot publish in FIPS
 mode, whose SRTP must be AES-GCM: FFmpeg's DTLS offers only AES-128-CM with HMAC-SHA1-80. A browser offers AES-GCM.
+OBS Studio's WHIP output (libdatachannel) publishes H.264 and Opus to `whip://` (tested with NVENC at 1280x720), and, like
+FFmpeg, offers only AES-128-CM SRTP, so it cannot publish in FIPS mode either.
 
 An ONVIF camera need not be known in advance. `onvif_discover` (`ironav onvif`) sends a WS-Discovery probe for video
 transmitters and lists those that answer, with their device service URLs and their scopes (name, hardware, location).

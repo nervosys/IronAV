@@ -227,6 +227,41 @@ struct Record<'a> {
     body: &'a [u8],
 }
 
+/// A DER element at the start of `b`: its tag, its whole encoding and its contents.
+fn der(b: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let (&tag, rest) = b.split_first()?;
+    let (&first, rest) = rest.split_first()?;
+    let (len, head) = match first {
+        n @ 0..=0x7f => (n as usize, 2),
+        0x81..=0x84 => {
+            let k = (first & 0x7f) as usize;
+            let len = rest.get(..k)?.iter().fold(0usize, |a, &d| a << 8 | d as usize);
+            (len, 2 + k)
+        }
+        _ => return None,
+    };
+    let end = head.checked_add(len)?;
+    Some((tag, b.get(..end)?, b.get(head..end)?))
+}
+
+/// The SubjectPublicKeyInfo of a DER certificate: the seventh element of its TBSCertificate, or
+/// the sixth when the version is left out.
+fn spki_of(cert: &[u8]) -> Option<&[u8]> {
+    let (0x30, _, body) = der(cert)? else { return None };
+    let (0x30, _, mut tbs) = der(body)? else { return None };
+    let mut fields = Vec::with_capacity(7);
+    while !tbs.is_empty() && fields.len() < 7 {
+        let (tag, whole, _) = der(tbs)?;
+        fields.push((tag, whole));
+        tbs = &tbs[whole.len()..];
+    }
+    let skip = usize::from(fields.first()?.0 == 0xa0);
+    match fields.get(skip + 5) {
+        Some(&(0x30, spki)) => Some(spki),
+        _ => None,
+    }
+}
+
 /// The records of a datagram, up to the first that does not parse.
 fn records(d: &[u8]) -> Vec<Record<'_>> {
     let mut out = Vec::new();
@@ -660,8 +695,9 @@ impl Server {
                 if !ic_core::ct::verify(&sha256(first), &self.peer_fingerprint) {
                     return Err("the client's certificate is not the one its offer's fingerprint names".into());
                 }
-                let cert = x509::Certificate::parse(first).map_err(|e| format!("the client's certificate does not parse: {e}"))?;
-                let spki = cert.spki_der().to_vec();
+                // its bytes are vouched for by the fingerprint; only its key is wanted, so it is not held
+                // to RFC 5280 (OBS's, from libdatachannel, has an empty extensions list)
+                let spki = spki_of(first).ok_or("the client's certificate does not parse")?.to_vec();
                 let key = PublicKey::from_spki(&spki).map_err(|e| format!("the client's key: {e}"))?;
                 if !key.matches(SignatureScheme::EcdsaSecp256r1Sha256) {
                     return Err("the client's certificate key is not ECDSA P-256".into());
@@ -1058,6 +1094,46 @@ mod tests {
     fn unhex(s: &str) -> Vec<u8> {
         let s: String = s.split_whitespace().collect();
         (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    }
+
+    #[test]
+    fn the_client_key_is_found_in_certificates_rfc_5280_would_refuse() {
+        fn tlv(tag: u8, body: &[u8]) -> Vec<u8> {
+            let mut v = vec![tag];
+            if body.len() < 0x80 {
+                v.push(body.len() as u8);
+            } else {
+                v.extend_from_slice(&[0x82, (body.len() >> 8) as u8, body.len() as u8]);
+            }
+            v.extend_from_slice(body);
+            v
+        }
+        let id = Identity::generate("test").unwrap();
+        let spki = x509::Certificate::parse(&id.cert).unwrap().spki_der().to_vec();
+        assert_eq!(spki_of(&id.cert), Some(&spki[..]));
+        // as OBS (libdatachannel) makes them: version 3 with an empty extensions list
+        let alg = tlv(0x30, &tlv(0x06, &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02]));
+        let name = tlv(0x30, &tlv(0x31, &tlv(0x30, &[tlv(0x06, &[0x55, 0x04, 0x03]), tlv(0x0c, b"x")].concat())));
+        let validity = tlv(0x30, &[tlv(0x17, b"260101000000Z"), tlv(0x17, b"270101000000Z")].concat());
+        for (version, exts) in [(tlv(0xa0, &tlv(0x02, &[2])), tlv(0xa3, &tlv(0x30, &[]))), (Vec::new(), Vec::new())] {
+            let tbs = tlv(0x30, &[version, tlv(0x02, &[1]), alg.clone(), name.clone(), validity.clone(), name.clone(), spki.clone(), exts].concat());
+            let cert = tlv(0x30, &[tbs, alg.clone(), tlv(0x03, &[0, 1, 2])].concat());
+            assert_eq!(spki_of(&cert), Some(&spki[..]));
+        }
+        // and nothing else is taken for one
+        let mut rng = 7u32;
+        for n in 0..2000 {
+            let mut b = id.cert[..n % id.cert.len()].to_vec();
+            if n % 3 == 0 {
+                rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+                let at = rng as usize % id.cert.len();
+                b = id.cert.clone();
+                b[at] ^= (rng >> 24) as u8 | 1;
+            }
+            let _ = spki_of(&b);
+        }
+        assert_eq!(spki_of(&[]), None);
+        assert_eq!(spki_of(&[0x30, 0x84, 0xff, 0xff, 0xff, 0xff]), None);
     }
 
     #[test]
