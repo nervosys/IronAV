@@ -1,7 +1,10 @@
 //! Publishing a live session as it runs: the media the session records (or, with a transcode, the
-//! transcoder's output) is muxed into MPEG-TS and sent to a destination, `srt://` today (see
-//! `ironav_live::open_sink`). It is the same transport stream a `.ts` recording would hold, cut at
-//! no point: a receiver that joins late starts at the next video keyframe.
+//! transcoder's output) is sent to a destination. To `srt://` it is muxed into MPEG-TS (see
+//! `ironav_live::open_sink`): the transport stream a `.ts` recording would hold, cut at no point, so a
+//! receiver that joins late starts at the next video keyframe. To `whip://` or `whips://` it goes to a
+//! WHIP endpoint as H.264 access units and Opus packets (see `ironav_live::WhipPublisher`): length-prefixed
+//! H.264 is converted to Annex B, with the parameter sets before each keyframe; other audio is not sent,
+//! and video that is not H.264 ends the publishing.
 //!
 //! The work runs on its own thread behind a bounded queue, so a slow or lost destination never holds
 //! up the session: when the queue is full, video is dropped up to the next keyframe (a decoder cannot
@@ -11,8 +14,8 @@
 //! the URL says `reconnect=0`. What cannot be put right by trying again (an address the allow-list
 //! refuses, a codec a transport stream cannot hold) ends the publishing at once.
 
-use ironav_core::{Error, ErrorCode, MediaType, Muxer, Packet, Result, StreamInfo};
-use ironav_live::{open_sink, Sink, SinkPlan};
+use ironav_core::{CodecId, Error, ErrorCode, MediaType, Muxer, Packet, Rational, Result, StreamInfo};
+use ironav_live::{open_sink, whip_endpoint, Sink, SinkPlan, WhipOptions, WhipPublisher};
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::io::{Seek, SeekFrom, Write};
@@ -51,16 +54,19 @@ pub struct PublishCell {
     events: Mutex<VecDeque<Event>>,
     /// Packets the session could not queue for the publisher.
     dropped: AtomicU64,
+    /// Keyframes the destination asked for (a WHIP server's picture loss indication or full intra request).
+    keyframes: AtomicU64,
 }
 
 impl PublishCell {
     fn new(url: &str) -> PublishCell {
-        PublishCell { status: Mutex::new(json!({ "url": url, "state": "waiting" })), events: Mutex::new(VecDeque::new()), dropped: AtomicU64::new(0) }
+        PublishCell { status: Mutex::new(json!({ "url": url, "state": "waiting" })), events: Mutex::new(VecDeque::new()), dropped: AtomicU64::new(0), keyframes: AtomicU64::new(0) }
     }
 
     pub fn status(&self) -> Value {
         let mut v = lock(&self.status).clone();
         v["dropped_packets"] = json!(self.dropped.load(Ordering::Relaxed));
+        v["keyframe_requests"] = json!(self.keyframes.load(Ordering::Relaxed));
         v
     }
 
@@ -192,24 +198,205 @@ impl Seek for Capture {
     }
 }
 
-/// A destination connected, and the muxer writing to it.
+/// A destination connected: an SRT sink with the muxer writing to it, or a WHIP session.
 struct Conn {
-    sink: Box<dyn Sink>,
-    mux: Box<dyn Muxer>,
-    out: Arc<Mutex<Vec<u8>>>,
+    link: Link,
     /// Nothing is sent until a picture a decoder can start from.
     waiting_key: bool,
 }
 
+enum Link {
+    Ts { sink: Box<dyn Sink>, mux: Box<dyn Muxer>, out: Arc<Mutex<Vec<u8>>> },
+    Whip(Box<WhipLink>),
+}
+
+/// A WHIP session and what it is sent: the streams that go (H.264 video, Opus audio), and the parameter
+/// sets and length size that H.264 packets carry when they are length-prefixed (as MP4 holds them).
+struct WhipLink {
+    /// `None` once the session has been closed.
+    publisher: Option<WhipPublisher>,
+    video: Option<(usize, Rational)>,
+    audio: Option<(usize, Rational)>,
+    /// The length of each NAL unit's prefix, when the packets have one.
+    length_size: Option<usize>,
+    /// The stream's SPS and PPS in Annex B form (empty when it has none).
+    params: Vec<u8>,
+}
+
 impl Conn {
-    /// Sends what the muxer has written.
+    /// Sends one packet of the session. `Ok(None)` when this destination does not take its stream.
+    fn write(&mut self, p: &Packet) -> Result<Option<usize>> {
+        match &mut self.link {
+            Link::Ts { mux, .. } => {
+                mux.write_packet(p)?;
+                self.flush().map(Some)
+            }
+            Link::Whip(w) => w.send(p),
+        }
+    }
+
+    /// Sends what the muxer has written (nothing to send for a WHIP session).
     fn flush(&mut self) -> Result<usize> {
-        let bytes = std::mem::take(&mut *lock(&self.out));
+        let Link::Ts { sink, out, .. } = &mut self.link else { return Ok(0) };
+        let bytes = std::mem::take(&mut *lock(out));
         if !bytes.is_empty() {
-            self.sink.write(&bytes)?;
+            sink.write(&bytes)?;
         }
         Ok(bytes.len())
     }
+
+    /// Whether the destination has asked for a keyframe since it was last asked.
+    fn keyframe_requested(&mut self) -> bool {
+        match &mut self.link {
+            Link::Ts { .. } => false,
+            Link::Whip(w) => w.publisher.as_mut().is_some_and(|p| p.keyframe_requested()),
+        }
+    }
+
+    /// Ends the destination: what is queued is sent, and the destination is told goodbye.
+    fn finish(&mut self) -> Result<()> {
+        if let Link::Ts { mux, .. } = &mut self.link {
+            mux.finish()?;
+        }
+        self.flush()?;
+        match &mut self.link {
+            Link::Ts { sink, .. } => sink.finish(),
+            Link::Whip(w) => w.close(),
+        }
+    }
+
+    /// Gives up on a destination that failed: a sink is finished, and a WHIP session is ended by dropping it
+    /// (which says goodbye to the server).
+    fn abandon(self) {
+        if let Link::Ts { mut sink, .. } = self.link {
+            let _ = sink.finish();
+        }
+    }
+
+    /// The destination's status, as the publishing status reports it.
+    fn sink_status(&self) -> Value {
+        match &self.link {
+            Link::Ts { sink, .. } => json!(sink.stats()),
+            Link::Whip(w) => json!({ "kind": "whip", "connected": w.publisher.as_ref().is_some_and(|p| p.failure().is_none()) }),
+        }
+    }
+}
+
+impl WhipLink {
+    /// Sends one packet if its stream is one WHIP takes: H.264 video, or Opus audio.
+    fn send(&mut self, p: &Packet) -> Result<Option<usize>> {
+        let (video, audio) = (self.video, self.audio);
+        match (video, audio) {
+            (Some((s, tb)), _) if s == p.stream => {
+                let au = annexb_access_unit(&p.data, self.length_size, &self.params)?;
+                let pts = to_clock(p.pts, tb, 90_000);
+                self.open()?.send_h264_access_unit(&au, pts)?;
+                Ok(Some(au.len()))
+            }
+            (_, Some((s, tb))) if s == p.stream => {
+                let pts = to_clock(p.pts, tb, 48_000);
+                self.open()?.send_opus(&p.data, pts)?;
+                Ok(Some(p.data.len()))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn open(&mut self) -> Result<&mut WhipPublisher> {
+        self.publisher.as_mut().ok_or_else(|| Error::new(ErrorCode::Io, "the WHIP session is closed"))
+    }
+
+    fn close(&mut self) -> Result<()> {
+        match self.publisher.take() {
+            Some(p) => p.close(),
+            None => Ok(()),
+        }
+    }
+}
+
+/// An H.264 access unit as a WHIP publisher takes it: Annex B. A packet that is length-prefixed is converted,
+/// and an IDR picture gets the stream's parameter sets in front of it when it has none of its own.
+fn annexb_access_unit(data: &[u8], length_size: Option<usize>, params: &[u8]) -> Result<Vec<u8>> {
+    let au = match length_size {
+        Some(n) if !starts_with_start_code(data) => avcc_to_annexb(data, n)?,
+        _ => data.to_vec(),
+    };
+    let types = nal_types(&au);
+    if params.is_empty() || !types.contains(&5) || types.contains(&7) {
+        return Ok(au);
+    }
+    let mut out = params.to_vec();
+    out.extend_from_slice(&au);
+    Ok(out)
+}
+
+/// Whether `d` starts with an Annex B start code.
+fn starts_with_start_code(d: &[u8]) -> bool {
+    d.starts_with(&[0, 0, 1]) || d.starts_with(&[0, 0, 0, 1])
+}
+
+/// The NAL unit types of an Annex B access unit, in order.
+fn nal_types(au: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 3 <= au.len() {
+        if au[i..i + 3] == [0, 0, 1] {
+            if let Some(h) = au.get(i + 3) {
+                out.push(h & 31);
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Length-prefixed NAL units (`length_size` bytes of length before each) in Annex B form.
+fn avcc_to_annexb(data: &[u8], length_size: usize) -> Result<Vec<u8>> {
+    let bad = || Error::invalid_input("an H.264 packet's length prefixes do not match its size");
+    let mut out = Vec::with_capacity(data.len() + 8);
+    let mut rest = data;
+    while !rest.is_empty() {
+        let len = rest.get(..length_size).ok_or_else(bad)?.iter().fold(0usize, |n, b| n << 8 | *b as usize);
+        let nal = rest.get(length_size..length_size + len).ok_or_else(bad)?;
+        if !nal.is_empty() {
+            out.extend_from_slice(&[0, 0, 0, 1]);
+            out.extend_from_slice(nal);
+        }
+        rest = &rest[length_size + len..];
+    }
+    Ok(out)
+}
+
+/// The NAL unit length size, and the SPS and PPS, of an `avcC` configuration record (the codec extradata an
+/// MP4 stream carries); the parameter sets come in Annex B form. `None` when there is no such record.
+fn avcc_config(extra: &[u8]) -> Option<(usize, Vec<u8>)> {
+    if extra.len() < 7 || extra[0] != 1 || (extra[4] & 3) == 2 {
+        return None;
+    }
+    let length_size = (extra[4] & 3) as usize + 1;
+    let mut out = Vec::new();
+    let mut r = &extra[5..];
+    // the SPS count is in the low five bits of its byte, the PPS count is the whole byte
+    for sps in [true, false] {
+        let n = if sps { *r.first()? & 31 } else { *r.first()? };
+        r = &r[1..];
+        for _ in 0..n {
+            let len = u16::from_be_bytes([*r.first()?, *r.get(1)?]) as usize;
+            let nal = r.get(2..2 + len)?;
+            out.extend_from_slice(&[0, 0, 0, 1]);
+            out.extend_from_slice(nal);
+            r = &r[2 + len..];
+        }
+    }
+    Some((length_size, out))
+}
+
+/// A presentation time in a stream's time base, as ticks of a clock at `rate` (never negative).
+fn to_clock(pts: i64, tb: Rational, rate: i64) -> u64 {
+    let den = i128::from(tb.den.max(1));
+    (i128::from(pts) * i128::from(tb.num) * i128::from(rate) / den).max(0) as u64
 }
 
 struct Work {
@@ -227,6 +414,19 @@ fn permanent(e: &Error) -> bool {
 
 impl Work {
     fn connect(&self) -> Result<Conn> {
+        if self.whip() {
+            self.connect_whip()
+        } else {
+            self.connect_ts()
+        }
+    }
+
+    /// Whether the destination is a WHIP endpoint (`whip://`, `whips://`), not a byte sink.
+    fn whip(&self) -> bool {
+        matches!(self.plan.scheme.as_str(), "whip" | "whips")
+    }
+
+    fn connect_ts(&self) -> Result<Conn> {
         let fmt = ironav_formats::find_format("mpegts")?;
         if let Some(s) = self.streams.iter().find(|s| !fmt.codecs.contains(&s.codec)) {
             return Err(Error::new(ErrorCode::UnsupportedFormat, format!("a transport stream cannot hold {}", s.codec.name()))
@@ -236,11 +436,56 @@ impl Work {
         let out = Arc::new(Mutex::new(Vec::new()));
         let mut mux: Box<dyn Muxer> = Box::new(ironav_formats::ts::TsMuxer::new(Box::new(Capture(out.clone()))));
         mux.write_header(&self.streams)?;
-        Ok(Conn { sink, mux, out, waiting_key: true })
+        Ok(Conn { link: Link::Ts { sink, mux, out }, waiting_key: true })
+    }
+
+    /// A WHIP session to the endpoint the URL names. The video must be H.264; Opus audio is sent, and
+    /// other audio is not (see [`Work::say_unsent_audio`]).
+    fn connect_whip(&self) -> Result<Conn> {
+        let ep = whip_endpoint(&self.url)?;
+        if let Some(i) = self.video {
+            let s = &self.streams[i];
+            if s.codec != CodecId::H264 {
+                return Err(Error::new(ErrorCode::UnsupportedCodec, format!("WHIP carries H.264 video, and this video is {}", s.codec.name()))
+                    .hint("publish with --transcode OUT.ts: its output is H.264, and that is what is sent"));
+            }
+        }
+        let audio = self.streams.iter().position(|s| s.codec == CodecId::Opus);
+        if self.video.is_none() && audio.is_none() {
+            return Err(Error::new(ErrorCode::UnsupportedFormat, "nothing to send over WHIP: the source has no H.264 video and no Opus audio")
+                .hint("WHIP carries H.264 video and Opus audio; --transcode makes H.264 video from any video"));
+        }
+        let mut opts = WhipOptions::default();
+        opts.video = self.video.is_some();
+        opts.audio = audio.is_some();
+        let publisher = WhipPublisher::connect(&ep.url, ep.token.as_deref(), opts)?;
+        let (length_size, params) = match self.video.and_then(|i| avcc_config(&self.streams[i].extradata)) {
+            Some((n, p)) => (Some(n), p),
+            None => (None, Vec::new()),
+        };
+        let link = WhipLink {
+            publisher: Some(publisher),
+            video: self.video.map(|i| (i, self.streams[i].time_base)),
+            audio: audio.map(|i| (i, self.streams[i].time_base)),
+            length_size,
+            params,
+        };
+        Ok(Conn { link: Link::Whip(Box::new(link)), waiting_key: true })
+    }
+
+    /// Says, once, that the audio WHIP does not take is not sent.
+    fn say_unsent_audio(&self) {
+        let codecs: Vec<&str> = self.streams.iter().filter(|s| s.params.media_type() == MediaType::Audio && s.codec != CodecId::Opus).map(|s| s.codec.name()).collect();
+        if !codecs.is_empty() {
+            self.cell.event("publish_audio_skipped", json!({ "codecs": codecs, "reason": "WHIP carries Opus audio only, so this audio is not sent; the video is" }));
+        }
     }
 
     fn run(self, rx: std::sync::mpsc::Receiver<(Packet, bool)>) {
         let started = Instant::now();
+        if self.whip() {
+            self.say_unsent_audio();
+        }
         let (mut conn, mut failed): (Option<Conn>, Option<Error>) = (None, None);
         let (mut next_try, mut backoff, mut attempts, mut reconnects) = (Instant::now(), FIRST_BACKOFF, 0u32, 0u32);
         // whether the destination has been up at all, and whether its loss has been reported
@@ -285,6 +530,11 @@ impl Work {
                 Err(RecvTimeoutError::Timeout) => continue,
                 Err(RecvTimeoutError::Disconnected) => break,
             };
+            if let Some(c) = conn.as_mut() {
+                if c.keyframe_requested() {
+                    self.cell.keyframes.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             let Some(c) = conn.as_mut() else {
                 skipped += 1;
                 continue;
@@ -296,15 +546,16 @@ impl Work {
                 }
                 c.waiting_key = false;
             }
-            match c.mux.write_packet(&p).and_then(|_| c.flush()) {
-                Ok(n) => {
+            match c.write(&p) {
+                Ok(Some(n)) => {
                     packets += 1;
                     bytes += n as u64;
                 }
+                Ok(None) => {}
                 Err(e) => {
                     last_error = Some(e.message.clone());
-                    if let Some(mut c) = conn.take() {
-                        let _ = c.sink.finish();
+                    if let Some(c) = conn.take() {
+                        c.abandon();
                     }
                     if self.plan.reconnect && !permanent(&e) {
                         lost_reported = true;
@@ -318,11 +569,11 @@ impl Work {
             }
         }
         if let Some(mut c) = conn.take() {
-            if let Err(e) = c.mux.finish().and_then(|_| c.flush()).and_then(|_| c.sink.finish()) {
+            if let Err(e) = c.finish() {
                 last_error = Some(e.message.clone());
             }
-            let st = c.sink.stats();
-            *lock(&self.cell.status) = self.status("finished", &failed, &last_error, (packets, bytes, skipped), (attempts, reconnects), Some(json!(st)), started);
+            let st = c.sink_status();
+            *lock(&self.cell.status) = self.status("finished", &failed, &last_error, (packets, bytes, skipped), (attempts, reconnects), Some(st), started);
         } else {
             *lock(&self.cell.status) = self.status(if failed.is_some() { "failed" } else { "finished" }, &failed, &last_error, (packets, bytes, skipped), (attempts, reconnects), None, started);
         }
@@ -346,16 +597,16 @@ impl Work {
     }
 
     fn report(&self, conn: &Option<Conn>, failed: &Option<Error>, last_error: &Option<String>, counts: (u64, u64, u64), tries: (u32, u32), started: Instant) {
-        let stats = conn.as_ref().map(|c| c.sink.stats());
+        let stats = conn.as_ref().map(Conn::sink_status);
         let state = match (&stats, failed) {
             (_, Some(_)) => "failed",
-            (Some(s), None) if s.connected => "connected",
+            (Some(s), None) if s["connected"] == true => "connected",
             // a listener with no receiver yet
             (Some(_), None) => "listening",
             (None, None) if tries.1 > 0 || last_error.is_some() => "reconnecting",
             (None, None) => "connecting",
         };
-        let st = self.status(state, failed, last_error, counts, tries, stats.map(|s| json!(s)), started);
+        let st = self.status(state, failed, last_error, counts, tries, stats, started);
         *lock(&self.cell.status) = st;
     }
 }
@@ -498,5 +749,37 @@ mod tests {
         assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
         assert!(cell.status()["dropped_packets"].as_u64().unwrap() > 0);
         drop(p);
+    }
+
+    #[test]
+    fn length_prefixed_h264_becomes_annex_b_with_the_parameter_sets_before_each_idr() {
+        // an avcC record: version 1, profile, compatibility, level, 4-byte length prefixes, one SPS, one PPS
+        let extra = [1, 0x42, 0xC0, 0x1F, 0xFF, 0xE1, 0, 4, 0x67, 1, 2, 3, 1, 0, 3, 0x68, 4, 5];
+        let (n, params) = avcc_config(&extra).unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(params, [0, 0, 0, 1, 0x67, 1, 2, 3, 0, 0, 0, 1, 0x68, 4, 5]);
+        // an IDR picture of two NAL units, with no parameter sets of its own: they go in front
+        let idr = [0, 0, 0, 2, 0x65, 0x88, 0, 0, 0, 1, 0x41];
+        assert_eq!(annexb_access_unit(&idr, Some(4), &params).unwrap(), [0, 0, 0, 1, 0x67, 1, 2, 3, 0, 0, 0, 1, 0x68, 4, 5, 0, 0, 0, 1, 0x65, 0x88, 0, 0, 0, 1, 0x41]);
+        // a non-IDR picture gets none
+        let p = [0, 0, 0, 2, 0x41, 0x9A];
+        assert_eq!(annexb_access_unit(&p, Some(4), &params).unwrap(), [0, 0, 0, 1, 0x41, 0x9A]);
+        // an Annex B picture is taken as it is, and an IDR that carries its own SPS gets no second one
+        let own = [0, 0, 0, 1, 0x67, 9, 0, 0, 0, 1, 0x65, 1];
+        assert_eq!(annexb_access_unit(&own, Some(4), &params).unwrap(), own);
+        // a length that runs past the packet, or a packet too short for its prefix, is refused
+        assert!(annexb_access_unit(&[0, 0, 0, 9, 0x41], Some(4), &params).is_err());
+        assert!(avcc_to_annexb(&[0, 0, 1], 4).is_err());
+        // a record that is not avcC is no configuration
+        assert!(avcc_config(&[0, 0, 0, 1, 0x67]).is_none());
+    }
+
+    #[test]
+    fn times_are_converted_to_the_clocks_of_the_two_codecs() {
+        // 40 ms of a 1 kHz stream is 3600 ticks of 90 kHz and 1920 of 48 kHz
+        assert_eq!(to_clock(40, Rational::new(1, 1000), 90_000), 3600);
+        assert_eq!(to_clock(40, Rational::new(1, 1000), 48_000), 1920);
+        assert_eq!(to_clock(3000, Rational::new(1, 90_000), 90_000), 3000);
+        assert_eq!(to_clock(-5, Rational::new(1, 90_000), 90_000), 0);
     }
 }

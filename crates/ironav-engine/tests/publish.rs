@@ -2,6 +2,7 @@
 //! source) takes the transport stream and it demuxes to the media that went in.
 
 use ironav_core::{CodecId, Demuxer, Packet};
+use ironav_formats::stream::StreamDemuxer;
 use ironav_engine::live::{close, open, OpenArgs};
 use ironav_live::{open_source, Chunk};
 use serde_json::{json, Value};
@@ -142,10 +143,81 @@ fn a_destination_that_cannot_be_reached_is_reported_and_the_session_goes_on() {
     assert!(st["publish"]["error"]["hint"].as_str().is_some_and(|h| h.contains("IRONAV_NET_ALLOW")), "{st}");
 }
 
+/// What a source gives until it ends, or until the limit passes.
+fn read_until_end(s: &mut dyn ironav_live::Source, limit: Duration) -> Vec<u8> {
+    let (mut out, mut buf, start) = (Vec::new(), vec![0u8; 64 << 10], Instant::now());
+    while start.elapsed() < limit {
+        match s.read(&mut buf, Duration::from_millis(20)).unwrap() {
+            Chunk::Data(n) => out.extend_from_slice(&buf[..n]),
+            Chunk::Idle | Chunk::Restart => {}
+            Chunk::End => break,
+        }
+    }
+    out
+}
+
+#[test]
+fn a_session_publishes_its_h264_to_a_whip_endpoint() {
+    ironav_live::net::allow_loopback_for_tests();
+    let port = free_port();
+    let token = "s3cret";
+    // the endpoint is listening before the session calls it; it ends when the session says goodbye
+    let mut endpoint = open_source(&format!("whip://127.0.0.1:{port}/live?token={token}")).unwrap();
+    let reader = std::thread::spawn(move || read_until_end(endpoint.as_mut(), Duration::from_secs(30)));
+    let s = open(&args(json!({
+        "source": FIXTURE, "pace": "realtime", "analyzers": ["structure"],
+        "publish": format!("whip://127.0.0.1:{port}/live?token={token}"),
+    })))
+    .unwrap();
+    wait_end(&s.id);
+    let got = reader.join().unwrap();
+    let skipped = events(&s.id, "publish_audio_skipped");
+    let st = close(&s.id).unwrap();
+    assert_eq!(st["state"], "ended", "{st}");
+    assert_eq!(st["publish"]["state"], "finished", "{st}");
+    assert_eq!(st["publish"]["error"], Value::Null, "{st}");
+    // the fixture's 50 pictures; its AAC is not sent over WHIP, and said so once
+    assert_eq!(st["publish"]["packets"], 50, "{st}");
+    assert_eq!(skipped.len(), 1, "{st}");
+    // the token stays out of what is shown
+    assert!(!st.to_string().contains(token), "{st}");
+    // what the endpoint received: H.264 only, every picture, and the first one a keyframe
+    let mut r = ironav_formats::rtp::RtpStream::default();
+    r.feed(&got).unwrap();
+    r.end();
+    let mut out = Vec::new();
+    while let Some(p) = r.next_packet().unwrap() {
+        out.push(p);
+    }
+    let codecs: Vec<_> = r.streams().iter().map(|s| s.codec).collect();
+    assert_eq!(codecs, [CodecId::H264]);
+    let video: Vec<_> = out.iter().filter(|p| p.packet.stream == 0).collect();
+    assert_eq!(video.len(), 50, "{st}");
+    assert_eq!(ironav_formats::is_keyframe(CodecId::H264, &video[0].packet.data), Some(true));
+}
+
+#[test]
+fn a_video_that_is_not_h264_ends_publishing_with_a_hint_to_transcode() {
+    ironav_live::net::allow_loopback_for_tests();
+    // nothing listens: the codec is refused before anything is connected to
+    let s = open(&args(json!({ "source": "test://video?duration=1", "publish": "whip://127.0.0.1:9/live" }))).unwrap();
+    wait_end(&s.id);
+    let failed = events(&s.id, "publish_failed");
+    let st = close(&s.id).unwrap();
+    assert_eq!(st["state"], "ended", "{st}");
+    assert_eq!(st["publish"]["state"], "failed", "{st}");
+    assert_eq!(st["publish"]["error"]["code"], "unsupported-codec", "{st}");
+    assert!(st["publish"]["error"]["hint"].as_str().is_some_and(|h| h.contains("--transcode")), "{st}");
+    assert_eq!(failed.len(), 1, "{st}");
+}
+
 #[test]
 fn a_destination_is_checked_before_the_session_starts() {
     ironav_live::net::allow_loopback_for_tests();
-    for bad in ["udp://127.0.0.1:9", "out.ts", "srt://127.0.0.1", "srt://127.0.0.1:9?latency=x", "srt://127.0.0.1:9?format=h264&passphrase=0123456789", "srt://127.0.0.1:9?pbkeylen=7&passphrase=0123456789"] {
+    for bad in [
+        "udp://127.0.0.1:9", "out.ts", "srt://127.0.0.1", "srt://127.0.0.1:9?latency=x", "srt://127.0.0.1:9?format=h264&passphrase=0123456789", "srt://127.0.0.1:9?pbkeylen=7&passphrase=0123456789",
+        "whip://127.0.0.1:9?cert=a.pem&key=b.pem", "whips://:9/live", "whip://127.0.0.1:9/live?latency=1",
+    ] {
         let e = open(&args(json!({ "source": FIXTURE, "publish": bad }))).err().unwrap_or_else(|| panic!("{bad} was accepted"));
         assert_eq!(e.code, ironav_core::ErrorCode::InvalidArgument, "{bad}: {e:?}");
     }

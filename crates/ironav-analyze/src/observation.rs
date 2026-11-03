@@ -120,6 +120,7 @@ pub const KINDS: &[KindInfo] = &[
     KindInfo { name: "publish_lost", level: Level::Events, description: "The destination the session publishes to was lost (`data.reason`); a caller is being opened again, with backoff, and the session goes on." },
     KindInfo { name: "publish_restored", level: Level::Events, description: "A lost publish destination is back after `data.attempts` attempts (`data.reconnects` in all); it receives the stream from the next video keyframe." },
     KindInfo { name: "publish_failed", level: Level::Events, description: "Publishing ended (`data.reason`): the destination cannot be reached again or was refused; the session goes on." },
+    KindInfo { name: "publish_audio_skipped", level: Level::Events, description: "A WHIP destination takes Opus audio only: the audio codecs in `data.codecs` are not sent; the video is." },
     KindInfo { name: "loudness", level: Level::Raw, description: "Momentary and short-term loudness (LUFS), once a second." },
     KindInfo { name: "change", level: Level::Raw, description: "How much each picture differs from the last (`data.score`: 0 still, above 0.8 a cut)." },
 ];

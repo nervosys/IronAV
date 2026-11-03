@@ -26,7 +26,11 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   `publish_lost`, `publish_restored` or `publish_failed` event and never stops the session, and a caller is retried
   with back-off. Destinations are checked by `IRONAV_NET_ALLOW`, and FIPS mode refuses a plaintext one. Tested against
   FFmpeg 9.0.1 (libsrt) receiving, in both roles, in the clear and with 16, 24 and 32 byte keys. The receiver's shutdown
-  packet now carries the 4-byte body libsrt requires.
+  packet now carries the 4-byte body libsrt requires. `publish` also takes `whip://host:port/path` and `whips://` (with
+  `?token=T`) and sends the session's H.264 and Opus through the WHIP publisher below, on its own thread with the same queue,
+  back-off and status: length-prefixed H.264 becomes Annex B with the parameter sets before each keyframe, other audio is not
+  sent (a `publish_audio_skipped` event), other video ends the publishing with a hint to transcode, and the server's keyframe
+  requests are counted (`keyframe_requests`). FIPS mode refuses `whip://`. Tested against IronAV's own WHIP endpoint.
 - **WHIP publisher (library):** `ironav_live::WhipPublisher::connect(url, token, WhipOptions)` pushes H.264 and Opus to a WHIP
   endpoint: `send_h264_access_unit` (Annex B, 90 kHz), `send_opus` (48 kHz), `keyframe_requested` (a picture loss indication or
   full intra request from the server, polled), and `close` (RTCP BYE, DTLS close_notify, DELETE of the session). It POSTs an offer

@@ -344,7 +344,19 @@ so a slow receiver costs dropped packets (`publish.dropped_packets`), not a slow
 until a receiver comes, and what is made meanwhile is not kept. `publish` is set when the session opens; `stream_configure`
 does not change it. From Rust, `ironav_live::open_sink(url)` gives a `Sink` (`write` MPEG-TS bytes, `finish`) for the same URLs.
 
+A session can also publish to a WHIP endpoint (RFC 9725, the protocol OBS and FFmpeg publish with): `publish` takes
+`whip://host:port/path?token=T` or `whips://host:port/path?token=T` (over TLS, the certificate checked against the platform's
+roots and `IRONAV_CA_FILE`), and `--publish` takes the same for `watch`. The video goes as H.264 access units and the audio
+as Opus packets. Length-prefixed H.264 (as MP4 holds it) is written in Annex B form, with the stream's parameter sets before
+each keyframe. The video has to be H.264, so a source with other video needs `--transcode`, whose output is H.264. Other
+audio is not sent, and a `publish_audio_skipped` event says so. The token goes only to the endpoint's host and port and is
+redacted wherever the URL is shown. FIPS mode refuses `whip://` (its signalling is plaintext) and takes `whips://`. A caller
+goes through `IRONAV_NET_ALLOW` as SRT does, and the same events, back-off and status apply. The server's requests for a
+keyframe are counted as `keyframe_requests` in the status; the encoder is not told to make one. Tested end to end against
+IronAV's own WHIP endpoint; not yet against OBS, FFmpeg or a browser as the receiver.
+
 ```sh
+ironav watch rtsp://cam/stream --publish "whips://relay.example:8443/live?token=SECRET"
 ironav watch rtsp://cam/stream --publish "srt://relay.example:9000?streamid=cam1&passphrase=0123456789abcdef"
 ffmpeg -i "srt://:9000?mode=listener&passphrase=0123456789abcdef" -c copy out.mkv   # the receiving end
 ```

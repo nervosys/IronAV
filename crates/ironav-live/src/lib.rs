@@ -34,7 +34,7 @@ mod youtube;
 
 pub use net::{Allow, ALLOW_VAR, METADATA_VAR};
 pub use reconnect::{Health, HealthState, Policy};
-pub use sink::{open_sink, plan_sink, Sink, SinkInfo, SinkPlan, SinkStats};
+pub use sink::{open_sink, plan_sink, whip_endpoint, Sink, SinkInfo, SinkPlan, SinkStats, WhipEndpoint};
 pub use source::{open_source, Caption, Chunk, Source, SourceInfo};
 pub use tls::CA_FILE_VAR;
 pub use url::{redact, SourceUrl};

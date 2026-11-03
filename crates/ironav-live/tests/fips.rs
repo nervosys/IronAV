@@ -4,7 +4,7 @@
 //! which the `fips` feature runs with the FIPS profile.
 
 use ironav_core::ErrorCode;
-use ironav_live::{fips, net, onvif, open_sink, open_source, plan_sink, Allow};
+use ironav_live::{fips, net, onvif, open_sink, open_source, plan_sink, whip_endpoint, Allow};
 use std::time::Duration;
 
 fn fips_on() {
@@ -93,6 +93,19 @@ fn plaintext_srt_outputs_are_refused_and_an_encrypted_one_is_not() {
     assert!(open_sink("srt://127.0.0.1:0?mode=listener&passphrase=0123456789").is_ok());
     // other schemes are not outputs at all
     assert_eq!(plan_sink("udp://127.0.0.1:9").unwrap_err().code, ErrorCode::InvalidArgument);
+}
+
+#[test]
+fn plaintext_whip_publishing_is_refused_and_whips_is_not() {
+    fips_on();
+    let e = plan_sink("whip://127.0.0.1:9/live?token=t").unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidArgument);
+    assert!(e.message.contains("plaintext") && e.message.contains("FIPS"), "{e:?}");
+    assert!(e.hint.as_deref().is_some_and(|h| h.contains("whips://")), "{e:?}");
+    // TLS signalling is past the policy, and the endpoint is what it says (no network is touched)
+    let plan = plan_sink("whips://127.0.0.1:9/live?token=t").expect("whips:// may publish in FIPS mode");
+    assert_eq!(plan.shown, "whips://127.0.0.1:9/live?token=***");
+    assert_eq!(whip_endpoint("whips://127.0.0.1:9/live?token=t").unwrap().url, "https://127.0.0.1:9/live");
 }
 
 #[test]
