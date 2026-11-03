@@ -1,7 +1,7 @@
 //! Live input: byte sources read as the bytes arrive, from a file (whole, or followed while it
 //! grows), standard input or a named pipe, a TCP connection, a UDP port, an SRT sender, an RTSP camera or server, or
 //! HTTP (an HLS playlist, or a progressive download), the last two also over TLS, or a camera or
-//! microphone (`capture`).
+//! microphone (`capture`), or a WebRTC publisher through a WHIP endpoint (`whip://`).
 //!
 //! A source only moves bytes. Parsing them is the stream demuxers' job (`ironav_formats::stream`),
 //! and pacing, decoding and analysis belong to the session that owns the source. Every read takes
@@ -27,6 +27,7 @@ pub mod synthetic;
 pub mod tls;
 mod url;
 pub mod webvtt;
+mod webrtc;
 mod youtube;
 
 pub use net::{Allow, ALLOW_VAR, METADATA_VAR};

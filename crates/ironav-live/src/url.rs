@@ -2,8 +2,8 @@
 //! `rtsp://[user:password@]host[:port]/path`,
 //! `http://host[:port]/path` (HLS or a download; a YouTube video or live stream by its watch URL,
 //! through yt-dlp), `device://video[/NAME]` or
-//! `device://audio[/NAME]` (a camera or microphone), `pipe:`,
-//! `-`, `file:path` or a bare path, each
+//! `device://audio[/NAME]` (a camera or microphone), `whip://[host]:port[/path]` (a WHIP endpoint
+//! a WebRTC publisher sends to), `pipe:`, `-`, `file:path` or a bare path, each
 //! optionally followed by `?key=value&...` options.
 
 use ironav_core::{Error, Result};
@@ -26,8 +26,9 @@ use std::collections::BTreeMap;
 /// - `mode`: for SRT, `caller` (the default with a host) or `listener` (the default with none);
 /// - `latency`: for SRT, the milliseconds a packet is held for retransmissions (120);
 /// - `streamid`: for SRT, the stream ID to give the sender;
-/// - `passphrase`: for SRT, the passphrase of an encrypted stream (redacted from what is shown).
-pub const OPTIONS: [&str; 21] = ["format", "fps", "pace", "follow", "idle", "listen", "transport", "audio", "size", "reconnect", "stall", "retries", "rate", "duration", "height", "cookies", "captions", "mode", "latency", "streamid", "passphrase"];
+/// - `passphrase`: for SRT, the passphrase of an encrypted stream (redacted from what is shown);
+/// - `token`: the bearer token a WHIP publisher must send (redacted wherever the URL is shown).
+pub const OPTIONS: [&str; 22] = ["format", "fps", "pace", "follow", "idle", "listen", "transport", "audio", "size", "reconnect", "stall", "retries", "rate", "duration", "height", "cookies", "captions", "mode", "latency", "streamid", "passphrase", "token"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SourceUrl {
@@ -63,12 +64,12 @@ impl SourceUrl {
             ("file".to_string(), base.to_string())
         };
         match scheme.as_str() {
-            "file" | "pipe" | "tcp" | "udp" | "srt" | "rtsp" | "rtsps" | "http" | "https" | "device" | "test" => {}
+            "file" | "pipe" | "tcp" | "udp" | "srt" | "rtsp" | "rtsps" | "http" | "https" | "device" | "test" | "whip" => {}
             other => {
-                return Err(Error::invalid_arg(format!("'{other}' sources are not supported")).alternatives(["file", "pipe", "tcp", "udp", "srt", "rtsp", "rtsps", "http", "https", "device", "test"]));
+                return Err(Error::invalid_arg(format!("'{other}' sources are not supported")).alternatives(["file", "pipe", "tcp", "udp", "srt", "rtsp", "rtsps", "http", "https", "device", "test", "whip"]));
             }
         }
-        if matches!(scheme.as_str(), "tcp" | "udp" | "srt") && !target.contains(':') {
+        if matches!(scheme.as_str(), "tcp" | "udp" | "srt" | "whip") && !target.contains(':') {
             return Err(Error::invalid_arg(format!("{scheme} sources need host:port (or :port), got '{target}'")));
         }
         Ok(SourceUrl { scheme, target, options: opts })
@@ -129,9 +130,10 @@ fn redact_passphrase(url: &str) -> String {
 }
 
 /// `url` with any password replaced by `***`, so it can be echoed in observations, statuses and
-/// errors. User information with no `:` may itself be a token, so all of it is replaced.
+/// errors. User information with no `:` may itself be a token, so all of it is replaced, and so is
+/// the value of a `token=` option.
 pub fn redact(url: &str) -> String {
-    let url = &redact_passphrase(url);
+    let url = &redact_token(&redact_passphrase(url));
     let Some((scheme, rest)) = url.split_once("://") else { return url.to_string() };
     match split_authority(rest) {
         (Some(cred), host, tail) => match cred.split_once(':') {
@@ -140,6 +142,19 @@ pub fn redact(url: &str) -> String {
         },
         (None, ..) => url.to_string(),
     }
+}
+
+/// `url` with the value of each `token=` in its query replaced by `***`.
+fn redact_token(url: &str) -> String {
+    let Some((base, query)) = url.split_once('?') else { return url.to_string() };
+    let parts: Vec<String> = query
+        .split('&')
+        .map(|kv| match kv.split_once('=') {
+            Some((k, _)) if k.eq_ignore_ascii_case("token") => format!("{k}=***"),
+            _ => kv.to_string(),
+        })
+        .collect();
+    format!("{base}?{}", parts.join("&"))
 }
 
 #[cfg(test)]
@@ -175,5 +190,9 @@ mod tests {
         assert_eq!(redact("rtsp://3f9aTOKEN@cam/live"), "rtsp://***@cam/live");
         // an unescaped '/' in the password must not end the user information early
         assert_eq!(redact("rtsp://bob:pa/ss@cam:554/live?x=a@b"), "rtsp://bob:***@cam:554/live?x=a@b");
+        assert_eq!(redact("whip://0.0.0.0:8080/live?token=s3cret&format=rtp"), "whip://0.0.0.0:8080/live?token=***&format=rtp");
+        let u = SourceUrl::parse("whip://:8080/live?token=abc").unwrap();
+        assert_eq!((u.scheme.as_str(), u.target.as_str(), u.option("token")), ("whip", ":8080/live", Some("abc")));
+        assert!(SourceUrl::parse("whip://live").is_err());
     }
 }

@@ -27,7 +27,7 @@ pub enum Chunk {
 pub struct SourceInfo {
     /// The URL with any password replaced.
     pub url: String,
-    /// `file`, `pipe`, `tcp`, `udp`, `srt`, `rtsp`, `hls`, `http`, `youtube`, `device` or `test`.
+    /// `file`, `pipe`, `tcp`, `udp`, `srt`, `rtsp`, `hls`, `http`, `youtube`, `device`, `whip` or `test`.
     pub kind: &'static str,
     /// Whether the bytes arrive at the pace of the media (a socket, a pipe, a followed file)
     /// rather than as fast as they can be read.
@@ -152,6 +152,7 @@ fn open_once(url: &str) -> Result<Box<dyn Source>> {
         "http" | "https" => crate::hls::open(&u, shown)?,
         "device" => Box::new(crate::capture::open(&u, shown)?),
         "test" => Box::new(crate::synthetic::open(&u, shown)?),
+        "whip" => Box::new(crate::webrtc::open(&u, shown)?),
         _ => unreachable!("SourceUrl::parse accepts only these schemes"),
     })
 }

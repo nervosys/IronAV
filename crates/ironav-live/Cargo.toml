@@ -30,16 +30,17 @@ ironav-formats.workspace = true
 ironsocketlayer = "0.7.2"
 # the operating system's entropy through a DRBG, for Digest cnonces and WS-Security nonces
 ic-drbg = { version = "0.3.2", features = ["std"] }
-# AES and the RFC 3394 key wrap for SRT's encrypted streams (the crates IronSocketLayer uses)
+# AES, AES-GCM, AES-CTR and the RFC 3394 key wrap for SRT's encrypted streams and for WebRTC ingest's
+# DTLS and SRTP (whip://), through the same IronCrypto primitives IronSocketLayer uses
 ic-cipher = "0.3.2"
 ic-core = "0.3.2"
 
 [target.'cfg(windows)'.dependencies]
-# cameras and microphones through Media Foundation
-windows = { version = "0.62", features = ["Win32_Media_MediaFoundation", "Win32_System_Com"] }
+# cameras and microphones through Media Foundation, and a WHIP endpoint's UDP receive buffer
+windows = { version = "0.62", features = ["Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_Networking_WinSock"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# cameras through Video4Linux2's ioctls
+# cameras through Video4Linux2's ioctls, and a WHIP endpoint's UDP receive buffer
 libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]

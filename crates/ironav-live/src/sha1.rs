@@ -1,5 +1,6 @@
-//! SHA-1 (FIPS 180-4), for ONVIF's WS-Security password digest, which still requires it. Not for
-//! anything that needs a secure hash.
+//! SHA-1 (FIPS 180-4), for ONVIF's WS-Security password digest, which still requires it, and HMAC-SHA-1
+//! (FIPS 198-1) for WebRTC's STUN message integrity and SRTP's AES-CM profile, which are defined with
+//! it. Not for anything that needs a collision-resistant hash.
 
 /// The digest of `data`.
 pub fn sha1(data: &[u8]) -> [u8; 20] {
@@ -40,9 +41,26 @@ pub fn sha1(data: &[u8]) -> [u8; 20] {
     out
 }
 
+/// HMAC-SHA-1 of the concatenation of `parts` under `key` (RFC 2104).
+pub fn hmac_sha1(key: &[u8], parts: &[&[u8]]) -> [u8; 20] {
+    let mut k = [0u8; 64];
+    if key.len() > 64 {
+        k[..20].copy_from_slice(&sha1(key));
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let mut inner: Vec<u8> = k.iter().map(|b| b ^ 0x36).collect();
+    for p in parts {
+        inner.extend_from_slice(p);
+    }
+    let mut outer: Vec<u8> = k.iter().map(|b| b ^ 0x5c).collect();
+    outer.extend_from_slice(&sha1(&inner));
+    sha1(&outer)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::sha1;
+    use super::{hmac_sha1, sha1};
 
     fn hex(d: &[u8]) -> String {
         d.iter().map(|b| format!("{b:02x}")).collect()
@@ -54,5 +72,13 @@ mod tests {
         assert_eq!(hex(&sha1(b"abc")), "a9993e364706816aba3e25717850c26c9cd0d89d");
         assert_eq!(hex(&sha1(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")), "84983e441c3bd26ebaae4aa1f95129e5e54670f1");
         assert_eq!(hex(&sha1(&vec![b'a'; 1_000_000])), "34aa973cd4c4daa4f61eeb2bdbad27316534016f");
+    }
+
+    #[test]
+    fn hmac_known_answers() {
+        // RFC 2202, test cases 1, 2 and 6
+        assert_eq!(hex(&hmac_sha1(&[0x0b; 20], &[b"Hi There"])), "b617318655057264e28bc0b6fb378c8ef146be00");
+        assert_eq!(hex(&hmac_sha1(b"Jefe", &[b"what do ya want ", b"for nothing?"])), "effcdf6ae5eb2fa2d27416d5f184df9c259a7c79");
+        assert_eq!(hex(&hmac_sha1(&[0xaa; 80], &[b"Test Using Larger Than Block-Size Key - Hash Key First"])), "aa4ae5e15272d00e95705637ce8a3b55ed402112");
     }
 }
