@@ -485,6 +485,58 @@ fn publishes_over_srtp_aes_cm_hmac_sha1() {
 }
 
 #[test]
+fn a_delete_that_comes_after_the_session_ended_is_still_answered() {
+    // a browser may close DTLS and then DELETE; here the session ends by its media stopping instead
+    crate::net::allow_loopback_for_tests();
+    let port = free_port();
+    let mut s = open_whip(port, "?token=t0k", cfg!(feature = "fips"));
+    let p = publish(port, "/", Some("t0k"), &[0x0007]);
+    let started = Instant::now();
+    let mut buf = vec![0u8; 65536];
+    // the media timeout ends the source with an error
+    while started.elapsed() < MEDIA_TIMEOUT + Duration::from_secs(10) {
+        match s.read(&mut buf, Duration::from_millis(50)) {
+            Ok(Chunk::End) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+    // counted from the handshake, a little before `started`
+    assert!(started.elapsed() + Duration::from_secs(2) >= MEDIA_TIMEOUT && started.elapsed() < MEDIA_TIMEOUT + Duration::from_secs(10), "{:?}", started.elapsed());
+    assert_eq!(request(port, "DELETE", "/session/nope", Some("t0k"), "").0, 404);
+    assert_eq!(request(port, "DELETE", &p.location, Some("t0k"), "").0, 200);
+}
+
+#[test]
+fn cors_is_offered_only_to_the_origin_given() {
+    for o in ["https://studio.example.com", "http://localhost:3000", "http://[::1]:8080", "http://127.0.0.1"] {
+        assert!(is_origin(o), "{o}");
+    }
+    for o in ["", "studio.example.com", "https://", "https://a.example/path", "https://a.example:", "https://a b", "https://a\r\nX: y", "ftp://a.example", "https://a.example:123456"] {
+        assert!(!is_origin(o), "{o:?}");
+    }
+    crate::net::allow_loopback_for_tests();
+    let tls = cfg!(feature = "fips");
+    let preflight = |port: u16| request(port, "OPTIONS", "/live", None, "");
+    let port = free_port();
+    let _s = open_whip(port, "/live?cors=http%3A%2F%2Flocalhost%3A3000&token=t0k", tls);
+    let (status, headers, _) = preflight(port);
+    let h = |k: &str| headers.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+    assert_eq!(status, 204);
+    assert_eq!(h("access-control-allow-origin"), Some("http://localhost:3000"));
+    assert_eq!(h("vary"), Some("Origin"));
+    assert!(h("access-control-allow-headers").is_some_and(|v| v.contains("Authorization")));
+    assert!(h("access-control-expose-headers").is_some_and(|v| v.contains("Location")));
+    // a refusal carries them too, so the page can read why
+    let (status, headers, _) = request(port, "POST", "/live", None, "v=0\r\n");
+    assert_eq!(status, 401);
+    assert!(headers.iter().any(|(k, _)| k == "access-control-allow-origin"));
+    let port = free_port();
+    let _s = open_whip(port, "/live", tls);
+    assert!(preflight(port).1.iter().all(|(k, _)| !k.starts_with("access-control-")));
+    assert!(crate::open_source(&format!("whip://127.0.0.1:{}/live?cors=evil.example", free_port())).is_err());
+}
+
+#[test]
 fn a_publisher_that_never_connects_frees_the_endpoint() {
     crate::net::allow_loopback_for_tests();
     let port = free_port();

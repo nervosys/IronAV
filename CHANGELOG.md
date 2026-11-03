@@ -17,12 +17,17 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   failed handshake drops that connection only; the request size, deadline and connection limits are unchanged. In FIPS
   mode it uses IronSocketLayer's FIPS 140-3 profile, narrowed as the client's is. `cert` and `key` are options of the
   source URL (the paths are not secret; `token` stays redacted), and the engine's file policy applies to them.
+- **WHIP from a web page:** `cors=ORIGIN` (or `*`) on `whip://` and `whips://` sends the CORS headers a browser needs to
+  publish from a page on another origin, its preflight included, and lets the page read `Location`. Off by default, so a
+  web page elsewhere cannot publish to a local endpoint. Tested with headless Chrome over `whips://` in FIPS mode.
 
 ### Changed
 
 - **FIPS mode refuses `whip://` (security):** its HTTP signalling is plaintext, which the SDP fingerprints and the bearer
   token should not cross. The error says to use `whips://` with `cert=` and `key=`. `whips://` is allowed, with AES-GCM SRTP
-  only as before.
+  only as before. FFmpeg 9.0.1 cannot publish in FIPS mode, since its DTLS offers only AES-128-CM SRTP.
+- **WHIP, after the session ends:** for 2 s the endpoint still answers a DELETE of the session that ended, so a publisher
+  that closes DTLS before it DELETEs (as a browser closing its peer connection may) gets its answer.
 
 ### Fixed
 

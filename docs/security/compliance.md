@@ -133,7 +133,9 @@ from `ic-cipher` (not CMVP-validated); the SHA-1 is in-tree.
   AEAD_AES_128_GCM SRTP profile. AES128_CM_HMAC_SHA1_80 is not offered, since its HMAC-SHA-1 runs over IronAV's own SHA-1.
   STUN still uses HMAC-SHA-1 and CRC-32 as ICE requires; they authenticate connectivity checks, not media. The DTLS and
   SRTP protocol code is in-tree, over IronCrypto primitives, and like the rest is not CMVP-validated. The HTTP signalling
-  is TLS under `whips://`.
+  is TLS under `whips://`. Tested in FIPS mode with headless Chrome publishing from a web page (`cors=`): TLS 1.3 for the
+  signalling, DTLS 1.2 with ECDHE-ECDSA and AES-128-GCM, and AEAD_AES_128_GCM SRTP. FFmpeg 9.0.1 cannot publish in FIPS
+  mode, since its DTLS offers only AES128_CM_HMAC_SHA1_80.
 - `ironav capabilities` reports `"fips": true` and the TLS profile in force.
 
 FIPS mode limits IronAV to approved algorithms and transports, implemented by an unvalidated module. Where validated
@@ -193,6 +195,7 @@ update checks, crash upload, or files in the home directory. Test media in the r
   tested against RFC vectors (STUN RFC 5769, SRTP RFC 3711 and RFC 7714, the TLS 1.2 PRF), an in-process publisher with
   loss, reordering and garbage, and FFmpeg's WHIP muxer, but have had no independent review or fuzzing campaign. Its HTTP
   signalling is plaintext under `whip://` (served over TLS under `whips://`, whose server is IronSocketLayer's and was not
-  reviewed here), and with no `?token=` anyone who can reach the port can publish.
+  reviewed here), and with no `?token=` anyone who can reach the port can publish. CORS headers are sent only with
+  `cors=ORIGIN` (or `*`), so a web page elsewhere cannot publish to a local endpoint unless that is asked for.
 - The MD5 code (RFC 1321, for Digest) is in the default build, and refused only at run time when `IRONAV_FIPS=1` is set.
   Build with the `fips` feature to compile it out. ONVIF WS-Security still uses SHA-1, which the `fips` feature keeps.

@@ -62,6 +62,9 @@ const ALIGN_WAIT: Duration = Duration::from_millis(1500);
 const MAX_HELD: usize = 4096;
 /// How long each turn of the endpoint's loop waits on its UDP socket.
 const POLL: Duration = Duration::from_millis(5);
+/// How long the endpoint still answers HTTP after its session ends, so a publisher that closes DTLS
+/// before it DELETEs (a browser that closes its peer connection first) has its DELETE answered.
+const LINGER: Duration = Duration::from_secs(2);
 /// Addresses a session takes media from: those that passed a STUN check, at most this many.
 const MAX_PEERS: usize = 4;
 /// A video gap up to this many packets is NACKed; a larger one asks for a keyframe instead.
@@ -162,6 +165,11 @@ pub(crate) fn open(u: &SourceUrl, shown: String) -> Result<WhipSource> {
     if token.as_ref().is_some_and(|t| t.is_empty() || t.len() > 512 || !t.bytes().all(|b| b.is_ascii_graphic())) {
         return Err(Error::invalid_arg("the WHIP token must be 1 to 512 printable characters, without spaces"));
     }
+    let cors = match u.option("cors").map(crate::url::percent_decode) {
+        None => None,
+        Some(o) if o == "*" || is_origin(&o) => Some(o),
+        Some(_) => return Err(Error::invalid_arg("cors= takes an origin, such as https://studio.example.com or http://localhost:3000, or *").hint("an origin is a scheme, a host and perhaps a port, without a path")),
+    };
     let allow = Allow::from_env()?;
     let unreachable = |e: std::io::Error| Error::new(ErrorCode::Io, format!("could not listen on {shown}: {e}")).hint("check the address, and that nothing else uses the port (TCP for HTTP, UDP for the media)");
     let listener = TcpListener::bind((host.as_str(), port)).map_err(unreachable)?;
@@ -172,7 +180,7 @@ pub(crate) fn open(u: &SourceUrl, shown: String) -> Result<WhipSource> {
     let http = http::Server::new(listener, allow.clone(), sdp::MAX_OFFER, tls)?;
     let (tx, rx) = sync_channel(1024);
     let stop = Arc::new(AtomicBool::new(false));
-    let mut endpoint = Endpoint { shown: shown.clone(), path, token, http, udp, id: Arc::new(id), allow, session: None, tx, stop: stop.clone(), start: Instant::now() };
+    let mut endpoint = Endpoint { shown: shown.clone(), path, token, cors, http, udp, id: Arc::new(id), allow, session: None, tx, stop: stop.clone(), start: Instant::now() };
     let worker = std::thread::Builder::new().name("ironav-whip".into()).spawn(move || endpoint.run()).map_err(|e| Error::new(ErrorCode::Internal, format!("could not start the WHIP endpoint: {e}")))?;
     Ok(WhipSource { info: SourceInfo { url: shown, kind: "whip", live: true, synthetic: false }, rx, held: Vec::new(), at: 0, ended: false, stop, worker: Some(worker) })
 }
@@ -306,6 +314,37 @@ impl Session {
     }
 }
 
+/// Whether `o` is a web origin: `http` or `https`, a host of letters, digits, dots, hyphens (or an
+/// IPv6 address in brackets) and perhaps a port, and nothing more, so it is safe in a header.
+fn is_origin(o: &str) -> bool {
+    let Some(rest) = o.strip_prefix("https://").or_else(|| o.strip_prefix("http://")) else { return false };
+    let (host, port) = match rest.rsplit_once(':') {
+        Some((h, p)) if !h.is_empty() && !p.is_empty() && !h.ends_with(':') && p.bytes().all(|b| b.is_ascii_digit()) && (!h.contains(':') || h.starts_with('[')) => (h, Some(p)),
+        _ => (rest, None),
+    };
+    let host_ok = if let Some(v6) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        !v6.is_empty() && v6.bytes().all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.')
+    } else {
+        !host.is_empty() && host.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+    };
+    o.len() <= 253 && host_ok && port.is_none_or(|p| p.len() <= 5)
+}
+
+/// Adds the CORS headers for `origin` to a whole response, after its status line, so a web page
+/// there can publish: its preflight is answered, and it may read the `Location` it is given.
+fn with_cors(resp: Vec<u8>, origin: &str) -> Vec<u8> {
+    let Some(at) = resp.windows(2).position(|w| w == b"\r\n") else { return resp };
+    let vary = if origin == "*" { "" } else { "Vary: Origin\r\n" };
+    let headers = format!(
+        "\r\nAccess-Control-Allow-Origin: {origin}\r\n{vary}Access-Control-Allow-Methods: OPTIONS, POST, DELETE, PATCH\r\nAccess-Control-Allow-Headers: Authorization, Content-Type, If-Match\r\nAccess-Control-Expose-Headers: Location, Link, ETag, Accept-Post, Accept-Patch\r\nAccess-Control-Max-Age: 600"
+    );
+    let mut out = Vec::with_capacity(resp.len() + headers.len());
+    out.extend_from_slice(&resp[..at]);
+    out.extend_from_slice(headers.as_bytes());
+    out.extend_from_slice(&resp[at..]);
+    out
+}
+
 /// Random text from the ICE character set, for credentials and the session's id.
 fn random_text(n: usize) -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
@@ -317,6 +356,8 @@ struct Endpoint {
     shown: String,
     path: String,
     token: Option<String>,
+    /// The origin a web page publishing from may have (`*` for any), for the CORS headers.
+    cors: Option<String>,
     http: http::Server,
     udp: UdpSocket,
     id: Arc<dtls::Identity>,
@@ -344,9 +385,10 @@ impl Endpoint {
             let now = Instant::now();
             for (req, peer, responder) in self.http.poll(now) {
                 let (resp, flow) = self.route(&req, peer, now);
-                responder.send(&resp);
+                responder.send(&self.cors(resp));
                 if let Flow::End(e) = flow {
-                    return self.finish(e);
+                    // a DELETE has had its answer; nothing is left to linger for
+                    return self.finish(e, req.method != "DELETE");
                 }
             }
             // a burst of datagrams, then the timers
@@ -354,33 +396,56 @@ impl Endpoint {
                 match crate::net::recv_from_within(&self.udp, &mut buf, POLL) {
                     Ok((n, from)) => {
                         if let Flow::End(e) = self.datagram(&buf[..n], from, Instant::now()) {
-                            return self.finish(e);
+                            return self.finish(e, true);
                         }
                     }
                     Err(_) => break, // timed out, or an ICMP error from an earlier send
                 }
             }
             if let Flow::End(e) = self.timers(Instant::now()) {
-                return self.finish(e);
+                return self.finish(e, true);
             }
         }
-        self.finish(None);
+        self.finish(None, false);
     }
 
-    /// Ends the source: says goodbye to the publisher, and tells the reader.
-    fn finish(&mut self, e: Option<Error>) {
+    /// Ends the source: says goodbye to the publisher, and tells the reader. Then, if `linger`, for
+    /// [`LINGER`] a DELETE of the session that ended is still answered (anything else is told it has
+    /// gone).
+    fn finish(&mut self, e: Option<Error>, linger: bool) {
+        let mut ended = None;
         if let Some(s) = &mut self.session {
             if let Some(to) = s.selected {
                 for d in s.dtls.close_notify() {
                     let _ = self.udp.send_to(&d, to);
                 }
             }
+            ended = Some(format!("{}/session/{}", self.path.trim_end_matches('/'), s.id));
         }
         self.session = None;
         let _ = self.send(match e {
             Some(e) => Msg::Error(e),
             None => Msg::End,
         });
+        let Some(ended) = ended.filter(|_| linger) else { return };
+        let until = Instant::now() + LINGER;
+        while Instant::now() < until && !self.stop.load(Ordering::Relaxed) {
+            for (req, _, responder) in self.http.poll(Instant::now()) {
+                if req.method == "DELETE" && req.path == ended && self.authorized(&req) {
+                    responder.send(&self.cors(http::response(200, &[], b"")));
+                    return;
+                }
+                responder.send(&self.cors(http::response(404, &[("Content-Type", "text/plain")], b"the session has ended")));
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+
+    fn cors(&self, resp: Vec<u8>) -> Vec<u8> {
+        match &self.cors {
+            Some(o) => with_cors(resp, o),
+            None => resp,
+        }
     }
 
     fn send(&self, m: Msg) -> Flow {

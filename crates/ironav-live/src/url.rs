@@ -29,7 +29,7 @@ use std::collections::BTreeMap;
 /// - `passphrase`: for SRT, the passphrase of an encrypted stream (redacted from what is shown);
 /// - `token`: the bearer token a WHIP publisher must send (redacted wherever the URL is shown);
 /// - `cert`, `key`: for `whips://`, the PEM files of the endpoint's TLS certificate chain and private key.
-pub const OPTIONS: [&str; 24] = ["format", "fps", "pace", "follow", "idle", "listen", "transport", "audio", "size", "reconnect", "stall", "retries", "rate", "duration", "height", "cookies", "captions", "mode", "latency", "streamid", "passphrase", "token", "cert", "key"];
+pub const OPTIONS: [&str; 25] = ["format", "fps", "pace", "follow", "idle", "listen", "transport", "audio", "size", "reconnect", "stall", "retries", "rate", "duration", "height", "cookies", "captions", "mode", "latency", "streamid", "passphrase", "token", "cert", "key", "cors"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SourceUrl {

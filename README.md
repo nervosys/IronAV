@@ -145,7 +145,10 @@ exchange of `whip://` is not encrypted (the media is), so the token and the offe
 (PKCS#8 `PRIVATE KEY`, or SEC1 `EC PRIVATE KEY`; ECDSA P-256 or P-384, or RSA as PKCS#8), both read once when it opens.
 Publishers then use `https://HOST:port/path`, and need to trust the certificate. Each connection gets its own handshake,
 limited to 3 s, and one that fails or stalls is dropped without holding up the others; the request limits and the
-connection limit are the same as for `whip://`. Use `whips://` beyond a trusted network.
+connection limit are the same as for `whip://`. Use `whips://` beyond a trusted network. A web page publishes from
+another origin only with `cors=ORIGIN` (such as `cors=https://studio.example.com`, or `*` for any), which adds the CORS
+headers a browser asks for, its preflight included; without it a page elsewhere cannot publish to the endpoint. Headless
+Chrome has published from a page to `whips://` in FIPS mode (AES-GCM throughout).
 
 ```sh
 ironav watch "whip://0.0.0.0:8080/live?token=s3cret" --analyzers scene,loudness
@@ -157,8 +160,11 @@ ffmpeg -re -i in.mp4 -c:v libx264 -profile:v baseline -pix_fmt yuv420p -bf 0 -g 
 ```
 
 FFmpeg's WHIP muxer (FFmpeg 8 and later) offers `a=setup:passive` unless given `-whip_flags dtls_active`; this endpoint is
-always the DTLS server, so FFmpeg needs that flag. FFmpeg may log "Failed to dispose resource" when it stops, even though
-its DELETE was received and ended the source.
+always the DTLS server, so FFmpeg needs that flag. FFmpeg 9.0.1 logs "Failed to read response from DELETE" and "Failed
+to dispose resource" when it stops, though its DELETE was answered and ended the source: its muxer does not read the
+response's status line. FFmpeg 9.0.1 publishes to `whips://` (tested) only with a certificate its system trust store
+accepts, since the muxer passes neither `-ca_file` nor `-tls_verify 0` to its HTTPS request. It cannot publish in FIPS
+mode, whose SRTP must be AES-GCM: FFmpeg's DTLS offers only AES-128-CM with HMAC-SHA1-80. A browser offers AES-GCM.
 
 An ONVIF camera need not be known in advance. `onvif_discover` (`ironav onvif`) sends a WS-Discovery probe for video
 transmitters and lists those that answer, with their device service URLs and their scopes (name, hardware, location).
