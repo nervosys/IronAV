@@ -1682,7 +1682,7 @@ mod tests {
             let mut saw = Saw::default();
             let t_start = Instant::now();
             let ts_now = |t: Instant| t.duration_since(t_start).as_micros() as u32;
-            sock.set_read_timeout(Some(Duration::from_millis(5))).unwrap();
+            // waits go through recv_from_within: on Windows a receive timeout can lose a datagram
             let mut buf = vec![0u8; 65536];
             let my_id = 0x2222u32;
             let mut enc = None;
@@ -1691,7 +1691,7 @@ mod tests {
                 Role::Listen => {
                     let (mut peer_id, mut cookie) = (0, 0);
                     loop {
-                        let (n, from) = match sock.recv_from(&mut buf) {
+                        let (n, from) = match crate::net::recv_from_within(&sock, &mut buf, Duration::from_millis(5)) {
                             Ok(x) => x,
                             Err(_) => continue,
                         };
@@ -1759,7 +1759,7 @@ mod tests {
                             sock.send_to(&pkt, target).unwrap();
                             last = Some(Instant::now());
                         }
-                        let Ok((n, _)) = sock.recv_from(&mut buf) else { continue };
+                        let Ok((n, _)) = crate::net::recv_from_within(&sock, &mut buf, Duration::from_millis(5)) else { continue };
                         let Some(Packet::Control { kind: C_HANDSHAKE, cif, .. }) = parse(&buf[..n]) else { continue };
                         let h = Handshake::parse(cif).unwrap();
                         if h.kind == HS_INDUCTION && cookie.is_none() {
@@ -1820,7 +1820,7 @@ mod tests {
                         }
                     }
                 }
-                let Ok((n, _)) = sock.recv_from(&mut buf) else { continue };
+                let Ok((n, _)) = crate::net::recv_from_within(&sock, &mut buf, Duration::from_millis(5)) else { continue };
                 match parse(&buf[..n]) {
                     Some(Packet::Control { kind: C_NAK, cif, .. }) => {
                         saw.naks += 1;
