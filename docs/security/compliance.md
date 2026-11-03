@@ -134,8 +134,8 @@ from `ic-cipher` (not CMVP-validated); the SHA-1 is in-tree.
   STUN still uses HMAC-SHA-1 and CRC-32 as ICE requires; they authenticate connectivity checks, not media. The DTLS and
   SRTP protocol code is in-tree, over IronCrypto primitives, and like the rest is not CMVP-validated. The HTTP signalling
   is TLS under `whips://`. Tested in FIPS mode with headless Chrome publishing from a web page (`cors=`): TLS 1.3 for the
-  signalling, DTLS 1.2 with ECDHE-ECDSA and AES-128-GCM, and AEAD_AES_128_GCM SRTP. FFmpeg 9.0.1 cannot publish in FIPS
-  mode, since its DTLS offers only AES128_CM_HMAC_SHA1_80.
+  signalling, DTLS 1.2 with ECDHE-ECDSA and AES-128-GCM, and AEAD_AES_128_GCM SRTP. FFmpeg 9.0.1 and OBS Studio
+  (libdatachannel) cannot publish in FIPS mode, since their DTLS offers only AES128_CM_HMAC_SHA1_80.
 - `ironav capabilities` reports `"fips": true` and the TLS profile in force.
 
 FIPS mode limits IronAV to approved algorithms and transports, implemented by an unvalidated module. Where validated

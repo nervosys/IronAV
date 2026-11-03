@@ -31,6 +31,10 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Fixed
 
+- **WHIP with OBS Studio:** OBS's DTLS certificate (libdatachannel's) has an empty extensions list, which the strict X.509
+  parser refused, so OBS could not publish. The publisher's certificate is vouched for by its offer's fingerprint and only
+  its key is used, so the key is now read from it without holding it to RFC 5280. OBS publishes to `whip://`; it offers
+  only AES-128-CM SRTP, so not in FIPS mode.
 - **SRT with libsrt:** a caller sent its handshake conclusion to its own socket ID instead of 0, which libsrt drops, so
   `srt://host:port` could not connect to a libsrt listener, and the listener took a conclusion only if it was addressed to
   its own ID, which a libsrt caller does not do. Both now follow libsrt, and the sender's socket ID is taken from its
