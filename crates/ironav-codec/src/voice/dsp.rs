@@ -21,7 +21,8 @@ fn level_db(x: &[f32]) -> f32 {
 /// to their mean. Speech does not hold that
 /// still, since syllables come and go a few times a second (a sung or long-held vowel can). A
 /// caller that already knows the floor, say from the last press, can start there with
-/// [`with_floor`](Self::with_floor).
+/// [`with_floor`](Self::with_floor). Until then such noise reads as speech, so level control
+/// should follow [`measurable`](Self::measurable) rather than [`process`](Self::process).
 pub struct Vad {
     floor: f32,
     /// Floor rise per frame (1 dB a second).
@@ -34,6 +35,8 @@ pub struct Vad {
     quiet: u32,
     hangover: u32,
     speaking: bool,
+    /// Whether the last frame itself stood above the floor.
+    active: bool,
     level: f32,
 }
 
@@ -64,6 +67,7 @@ impl Vad {
             quiet: 0,
             hangover: (hangover_ms / frame_ms).ceil() as u32,
             speaking: false,
+            active: false,
             level: -120.0,
         }
     }
@@ -88,6 +92,7 @@ impl Vad {
             }
         }
         let active = e > self.floor + 10.0 && e > -55.0 && zcr < 0.35;
+        self.active = active;
         if active {
             self.run += 1;
             self.quiet = 0;
@@ -108,6 +113,14 @@ impl Vad {
 
     pub fn speaking(&self) -> bool {
         self.speaking
+    }
+
+    /// Whether the last frame is speech to measure a level from, as [`Agc`] does: speech is under
+    /// way, this frame itself stands above the floor (it is not the quiet tail the hangover
+    /// keeps), and the detector has heard [`STEADY_MS`](Self::STEADY_MS), so steady noise at the
+    /// start of a stream has had time to be learned.
+    pub fn measurable(&self) -> bool {
+        self.speaking && self.active && self.seen == self.recent.len()
     }
 
     /// The last frame's level and the noise floor, in dBFS.
@@ -212,9 +225,11 @@ impl Gate {
 }
 
 /// Automatic gain control: brings speech to `target_dbfs`, measuring only frames the caller says
-/// are speech, so pauses and noise are not pumped up. The gain falls quickly when the voice is too
-/// loud and rises slowly (about 6 dB a second at 20 ms frames), changes smoothly within a frame,
-/// and is held down so no sample clips.
+/// are speech (best [`Vad::measurable`]), so pauses and noise are not pumped up. The gain falls
+/// quickly when the voice is too loud and rises slowly (about 6 dB a second at 20 ms frames),
+/// changes smoothly within a frame, and is held down so no sample clips. Over frames that are not
+/// speech, a gain above 0 dB relaxes toward it (by half a percent a frame, about a fifth of it a
+/// second at 20 ms frames), so a gain reached on noise taken for speech does not stay.
 pub struct Agc {
     target: f32,
     max_gain: f32,
@@ -238,6 +253,8 @@ impl Agc {
         if speech {
             let want = (self.target - level_db(frame)).clamp(-20.0, self.max_gain);
             self.gain += (want - self.gain) * if want < self.gain { 0.5 } else { 0.02 };
+        } else if self.gain > 0.0 {
+            self.gain *= 0.995;
         }
         // no sample may go past full scale
         let peak = frame.iter().fold(0f32, |m, v| m.max(v.abs()));

@@ -288,3 +288,33 @@ fn vad_learns_a_fan_through_the_denoiser_at_48k() {
     }
     assert!(active <= 70, "{active}");
 }
+
+#[test]
+fn agc_does_not_raise_a_fan_at_the_start_of_a_press() {
+    // a fan, then a quiet voice over it, each through the chain from a fresh detector
+    for (voiced, rule) in [(false, "a fan alone"), (true, "a quiet voice over a softer fan")] {
+        let n = 48_000 * 3;
+        let mut x = fan(n, if voiced { -60.0 } else { -31.5 });
+        if voiced {
+            let v = voice(n, 0.05);
+            for (o, s) in x.iter_mut().zip(&v) {
+                *o += s;
+            }
+        }
+        let mut dn = Denoiser::new(48_000, 240, -12.0).unwrap();
+        let mut vad = Vad::new(10.0, 200.0);
+        let mut agc = Agc::new(-20.0, 20.0);
+        let mut out = x.clone();
+        for f in out.chunks_mut(480) {
+            dn.process(f).unwrap();
+            vad.process(f);
+            agc.process(f, vad.measurable());
+        }
+        let (before, after) = (level_db(&x[n - 24_000..]), level_db(&out[n - 24_000..]));
+        if voiced {
+            assert!(after > before + 6.0, "{rule}: {before:.1} dBFS to {after:.1} dBFS");
+        } else {
+            assert!(after < before + 1.0, "{rule}: {before:.1} dBFS to {after:.1} dBFS, gain {:.1} dB", agc.gain_db());
+        }
+    }
+}
