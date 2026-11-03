@@ -3,13 +3,26 @@
 Audio and video conversion in Rust, built to be driven by AI agents as well as people.
 A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so they cannot drift apart.
 
-> **Status: foundation (v0.1).** The architecture, agent interface, ontology, hardware model, CLI, MCP server
+> **Status: foundation (v0.1.1).** The architecture, agent interface, ontology, hardware model, CLI, MCP server
 > and both GUIs are working and tested. Containers: **WAV, FLAC, Y4M, MP4, QuickTime MOV (read and write), Matroska/WebM (read and write), Ogg, ADTS, MP3, JPEG and MPEG transport streams (read and write); raw H.264 and HEVC (Annex B: read and written as files, and read as live sources).**
 > Audio codecs, each decoded and encoded: **PCM, FLAC, ALAC, AAC-LC (plus HE-AAC v1 decode), MP3, MP2, AC-3, Opus and Vorbis.**
 > Video: **software decoders for H.264, HEVC (including 4:2:2 and 4:4:4), VP8 and VP9; a software H.264 encoder (High profile: CABAC and the 8x8 transform), a software HEVC encoder (Main profile, 8-bit 4:2:0, merge and skip, SAO), a software VP8 encoder, and a software VP9 encoder (key and inter frames), and a software AV1 encoder (key and inter frames, profile 0, 8-bit 4:2:0); JPEG/Motion-JPEG and Apple ProRes decoded and encoded in software; MPEG-4 Part 2 (Simple and Advanced Simple profiles) decoded in software, and Simple profile I and P pictures encoded in software, with Advanced Simple B pictures as an option (MP4 and Matroska); MPEG-1 and MPEG-2 video (frame and field pictures, 4:2:0 and 4:2:2) decoded in software, and MPEG-2 video (Main profile, 4:2:0, progressive frames, optional B pictures) encoded in software.**
 > NVIDIA GPUs encode H.264 and HEVC (NVENC, preferred when usable) and decode H.264, HEVC and AV1 (NVDEC).
 > AV1 is decoded on NVIDIA GPUs (NVDEC) or in software (key, intra-only and inter frames, superres included). VP9 and AV1 copy between WebM, Matroska and MP4.
 > IronAV is not yet a drop-in replacement for FFmpeg or HandBrake.
+
+## Install
+
+The current release is **0.1.1** ([release notes and SBOM](https://github.com/nervosys/IronAV/releases/latest),
+[CHANGELOG.md](CHANGELOG.md)). All twelve crates are on [crates.io](https://crates.io/crates/ironav-cli).
+
+- Command line, native GUI and player: `cargo install ironav-cli` (gives `ironav` and `ironav-gui`; on Linux the
+  sound output needs the ALSA development files).
+- Without the graphics or sound stack, for servers and agents: `cargo install ironav-cli --no-default-features`.
+- As a library: `cargo add ironav-engine`, or only the codecs you need, as `ironav-codec` with features (see Layout).
+- From source: `git clone https://github.com/nervosys/IronAV && cd IronAV && cargo build --release`.
+
+Each release carries a CycloneDX SBOM of the locked dependency graph, made by `tools/cyclonedx_sbom.py`.
 
 ## Interfaces
 

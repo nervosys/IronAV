@@ -1,6 +1,6 @@
 # IronAV security assessment and compliance mapping
 
-This document records the pre-release security review of IronAV 0.1.0. It covers the weaknesses found (by CWE) and how
+This document records the pre-release security review of IronAV 0.1.0, updated for 0.1.1 (MD5 compiled out of FIPS builds, sidecar resource limits). It covers the weaknesses found (by CWE) and how
 each was fixed, the threat model (MITRE ATT&CK), the cryptography (NIST FIPS 140-3), and how IronAV supports the
 practices of CMMC 2.0 Level 2 (NIST SP 800-171 Rev. 2) and the NIST Secure Software Development Framework (SP 800-218).
 
