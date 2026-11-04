@@ -588,7 +588,9 @@ impl Work {
                 skipped += 1;
                 continue;
             };
-            if c.waiting_key {
+            // Opus goes to a WHIP receiver from its first packet: it needs no keyframe to be decoded
+            let opus = self.whip() && self.video != Some(p.stream) && self.streams.get(p.stream).is_some_and(|s| s.codec == CodecId::Opus);
+            if c.waiting_key && !opus {
                 if !(key && self.video.is_none_or(|v| v == p.stream)) {
                     skipped += 1;
                     continue;

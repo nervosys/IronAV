@@ -1,7 +1,7 @@
 //! A live session that sends what it makes out over SRT, end to end: a receiver (IronAV's own `srt://`
 //! source) takes the transport stream and it demuxes to the media that went in.
 
-use ironav_core::{CodecId, Demuxer, Packet};
+use ironav_core::{CodecId, Demuxer, Packet, Rational, StreamInfo, StreamParams};
 use ironav_formats::stream::StreamDemuxer;
 use ironav_engine::live::{close, open, OpenArgs};
 use ironav_live::{open_source, Chunk};
@@ -194,6 +194,109 @@ fn a_session_publishes_its_h264_to_a_whip_endpoint() {
     let video: Vec<_> = out.iter().filter(|p| p.packet.stream == 0).collect();
     assert_eq!(video.len(), 50, "{st}");
     assert_eq!(ironav_formats::is_keyframe(CodecId::H264, &video[0].packet.data), Some(true));
+}
+
+/// A Matroska file holding the fixture's H.264 video and two seconds of a stereo tone as Opus (20 ms
+/// packets), interleaved by time. Returns the Opus packets it holds, in order.
+fn h264_and_opus_source(path: &std::path::Path) -> Vec<Vec<u8>> {
+    let mut d = ironav_formats::open_demuxer(std::path::Path::new(FIXTURE)).unwrap();
+    let video = d.streams()[0].clone();
+    assert_eq!(video.codec, CodecId::H264);
+    let vid: Vec<Packet> = std::iter::from_fn(|| d.read_packet().unwrap()).filter(|p| p.stream == 0).collect();
+    let mut enc = ironav_codec::opus::OpusEncoder::new(48_000, 2, 96_000).unwrap();
+    let n = enc.frame_samples();
+    let mut opus = Vec::new();
+    let mut pcm = vec![0i16; n * 2];
+    for k in 0..100 {
+        for i in 0..n {
+            let t = (k * n + i) as f64 / 48_000.0;
+            let v = ((t * 2.0 * std::f64::consts::PI * 440.0).sin() * 8000.0) as i16;
+            (pcm[2 * i], pcm[2 * i + 1]) = (v, v / 2);
+        }
+        let mut out = vec![0u8; enc.packet_bytes()];
+        let len = enc.encode_frame_into_i16(&pcm, &mut out).unwrap();
+        out.truncate(len);
+        opus.push(out);
+    }
+    let audio = StreamInfo {
+        index: 1,
+        codec: CodecId::Opus,
+        time_base: Rational::new(1, 48_000),
+        duration: None,
+        bits: None,
+        extradata: enc.head(),
+        lead_in: 0,
+        params: StreamParams::Audio { sample_rate: 48_000, channels: 2 },
+    };
+    // by time: the video's own times and the audio's 20 ms steps; the video first at a tie
+    let mut all: Vec<(f64, Packet)> = vid.into_iter().map(|p| (p.pts as f64 * video.time_base.as_f64(), p)).collect();
+    for (k, data) in opus.iter().enumerate() {
+        let pts = (k * n) as i64;
+        all.push((pts as f64 / 48_000.0, Packet { stream: 1, pts, duration: n as i64, data: data.clone() }));
+    }
+    all.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut m = ironav_formats::create_muxer(path, "mkv").unwrap();
+    m.write_header(&[video, audio]).unwrap();
+    for (_, p) in &all {
+        m.write_packet(p).unwrap();
+    }
+    m.finish().unwrap();
+    opus
+}
+
+#[test]
+fn a_session_publishes_its_h264_and_opus_to_a_whip_endpoint() {
+    ironav_live::net::allow_loopback_for_tests();
+    let dir = std::env::temp_dir().join(format!("ironav-whip-opus-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("av.mkv");
+    let sent = h264_and_opus_source(&path);
+    let port = free_port();
+    let token = "s3cret";
+    let mut endpoint = open_source(&format!("whip://127.0.0.1:{port}/live?token={token}")).unwrap();
+    let reader = std::thread::spawn(move || read_until_end(endpoint.as_mut(), Duration::from_secs(30)));
+    let s = open(&args(json!({
+        "source": path.to_str().unwrap(), "pace": "realtime", "analyzers": ["structure"],
+        "publish": format!("whip://127.0.0.1:{port}/live?token={token}"),
+    })))
+    .unwrap();
+    wait_end(&s.id);
+    let got = reader.join().unwrap();
+    let skipped = events(&s.id, "publish_audio_skipped");
+    let st = close(&s.id).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(st["state"], "ended", "{st}");
+    assert_eq!(st["publish"]["state"], "finished", "{st}");
+    assert_eq!(st["publish"]["error"], Value::Null, "{st}");
+    // the fixture's 50 pictures and the 100 Opus packets: nothing is skipped, and no audio is said to be unsent
+    assert_eq!(st["publish"]["packets"], 50 + sent.len(), "{st}");
+    assert_eq!(st["publish"]["skipped_packets"], 0, "{st}");
+    assert!(skipped.is_empty(), "{st}");
+    // the token stays out of what is shown
+    assert!(!st.to_string().contains(token), "{st}");
+    let mut r = ironav_formats::rtp::RtpStream::default();
+    r.feed(&got).unwrap();
+    r.end();
+    let mut out = Vec::new();
+    while let Some(p) = r.next_packet().unwrap() {
+        out.push(p);
+    }
+    let codecs: Vec<_> = r.streams().iter().map(|s| s.codec).collect();
+    assert_eq!(codecs, [CodecId::H264, CodecId::Opus]);
+    // Opus: every packet the source held, byte for byte and in order, on a 48 kHz clock (20 ms is 960 ticks)
+    let audio: Vec<&Packet> = out.iter().map(|p| &p.packet).filter(|p| p.stream == 1).collect();
+    assert_eq!(r.streams()[1].time_base, Rational::new(1, 48_000));
+    assert_eq!(audio.len(), sent.len(), "{st}");
+    for (p, want) in audio.iter().zip(&sent) {
+        assert_eq!(&p.data, want);
+    }
+    for w in audio.windows(2) {
+        assert_eq!(w[1].pts - w[0].pts, 960, "{} {}", w[0].pts, w[1].pts);
+    }
+    // H.264 still arrives whole: every picture, the first one a keyframe
+    let video: Vec<&Packet> = out.iter().map(|p| &p.packet).filter(|p| p.stream == 0).collect();
+    assert_eq!(video.len(), 50, "{st}");
+    assert_eq!(ironav_formats::is_keyframe(CodecId::H264, &video[0].data), Some(true));
 }
 
 #[test]

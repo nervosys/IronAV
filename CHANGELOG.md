@@ -35,7 +35,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   per half second (`keyframes_forced`; `keyframes_ignored` counts a request that came while one waited, or was still
   waiting at the end). Without a transcode nothing can be forced, so `keyframes_forced` stays 0. The H.264 encoder has
   `force_idr`: the next picture is an IDR picture with the parameter sets, and the GOP count starts again from it.
-  FIPS mode refuses `whip://`. Tested against IronAV's own WHIP endpoint.
+  Opus goes from the first packet, not from the first keyframe. FIPS mode refuses `whip://`. Tested against IronAV's own
+  WHIP endpoint with H.264 and Opus.
 - **WHIP publisher (library):** `ironav_live::WhipPublisher::connect(url, token, WhipOptions)` pushes H.264 and Opus to a WHIP
   endpoint: `send_h264_access_unit` (Annex B, 90 kHz), `send_opus` (48 kHz), `keyframe_requested` (a picture loss indication or
   full intra request from the server, polled), and `close` (RTCP BYE, DTLS close_notify, DELETE of the session). It POSTs an offer

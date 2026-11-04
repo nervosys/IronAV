@@ -357,7 +357,8 @@ the transcoder makes an IDR picture for each, with the parameter sets ahead of i
 it, at most one per half second (`keyframes_forced`); a request that comes while one is waiting, or that is still waiting
 when the session ends, is counted as `keyframes_ignored`. Without a transcode nothing can be forced: the requests are
 counted, and `keyframes_forced` stays 0. Tested end to end against
-IronAV's own WHIP endpoint; not yet against OBS, FFmpeg or a browser as the receiver.
+IronAV's own WHIP endpoint with H.264 and Opus (the Opus goes from the source's first packet, not from its first keyframe);
+not yet against OBS, FFmpeg or a browser as the receiver.
 
 ```sh
 ironav watch rtsp://cam/stream --publish "whips://relay.example:8443/live?token=SECRET"
