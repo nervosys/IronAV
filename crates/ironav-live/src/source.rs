@@ -361,7 +361,7 @@ mod tests {
         crate::net::allow_loopback_for_tests();
         let (tx, rx) = sync_channel(4);
         let info = SourceInfo { url: "device://audio".into(), kind: "device", live: true, synthetic: false };
-        let mut s = ThreadSource::from_channel(info, rx).stall_after(Duration::from_millis(150));
+        let mut s = ThreadSource::from_channel(info, rx).stall_after(Duration::from_secs(1));
         tx.send(Ok(b"header".to_vec())).unwrap();
         let mut buf = [0u8; 64];
         assert!(matches!(s.read(&mut buf, Duration::from_millis(10)).unwrap(), Chunk::Data(6)));

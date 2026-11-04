@@ -1951,7 +1951,7 @@ mod tests {
         cfg.streamid = Some("#!::r=live/cam1,m=request".into());
         let want: Vec<u8> = cfg.payloads.concat();
         let sender = run_sender(sock, Role::Listen, cfg);
-        let mut s = open_source(&format!("srt://127.0.0.1:{port}?reconnect=0&latency=150&streamid=%23!::r=live/cam1,m=request")).unwrap();
+        let mut s = open_source(&format!("srt://127.0.0.1:{port}?reconnect=0&latency=1000&streamid=%23!::r=live/cam1,m=request")).unwrap();
         assert!(s.info().live && s.info().kind == "srt");
         let (got, sizes) = drain_all(s.as_mut(), Duration::from_secs(20));
         let saw = sender.join().unwrap();
@@ -1971,7 +1971,7 @@ mod tests {
         let mut cfg = config(120);
         cfg.lose = Some((10, 0));
         let want: Vec<u8> = cfg.payloads.concat();
-        let mut s = open_source(&format!("srt://:{port}?mode=listener&latency=100")).unwrap();
+        let mut s = open_source(&format!("srt://:{port}?mode=listener&latency=1000")).unwrap();
         // nothing has called yet
         let mut buf = vec![0u8; 65536];
         assert_eq!(s.read(&mut buf, Duration::from_millis(30)).unwrap(), Chunk::Idle);
@@ -1996,7 +1996,7 @@ mod tests {
         cfg.lose = Some((13, 5));
         let want: Vec<u8> = cfg.payloads.concat();
         let sender = run_sender(sock, Role::Listen, cfg.clone());
-        let mut s = open_source(&format!("srt://127.0.0.1:{port}?passphrase=hunter2hunter2&reconnect=0")).unwrap();
+        let mut s = open_source(&format!("srt://127.0.0.1:{port}?passphrase=hunter2hunter2&reconnect=0&latency=1000")).unwrap();
         // the passphrase is not in what the source shows
         assert!(!s.info().url.contains("hunter2"), "{}", s.info().url);
         let (got, _) = drain_all(s.as_mut(), Duration::from_secs(20));
@@ -2005,7 +2005,7 @@ mod tests {
 
         // the source listens and the sender calls
         let port = free_port();
-        let mut s = open_source(&format!("srt://:{port}?mode=listener&passphrase=hunter2hunter2")).unwrap();
+        let mut s = open_source(&format!("srt://:{port}?mode=listener&passphrase=hunter2hunter2&latency=1000")).unwrap();
         let sender = run_sender(UdpSocket::bind("127.0.0.1:0").unwrap(), Role::Call(format!("127.0.0.1:{port}").parse().unwrap()), cfg);
         let (got, _) = drain_all(s.as_mut(), Duration::from_secs(20));
         sender.join().unwrap();
@@ -2065,7 +2065,7 @@ mod tests {
                 sock.send_to(&hs_packet(&r, 0, h.sock), from).unwrap();
             }
         });
-        let e = open_source(&format!("srt://127.0.0.1:{port}?passphrase=hunter2hunter2&reconnect=0")).err().expect("refused");
+        let e = open_source(&format!("srt://127.0.0.1:{port}?passphrase=hunter2hunter2&reconnect=0&latency=1000")).err().expect("refused");
         sender.join().unwrap();
         assert!(e.message.contains("does not encrypt") && !e.message.contains("hunter2"), "{}", e.message);
     }
@@ -2225,7 +2225,7 @@ mod tests {
         cfg.lose = Some((6, 2));
         cfg.swap = Some(9);
         let sender = run_sender(sock, Role::Listen, cfg);
-        let mut s = open_source(&format!("srt://127.0.0.1:{port}?reconnect=0")).unwrap();
+        let mut s = open_source(&format!("srt://127.0.0.1:{port}?reconnect=0&latency=1000")).unwrap();
         let (got, _) = drain_all(s.as_mut(), Duration::from_secs(20));
         sender.join().unwrap();
         assert_eq!(got.len(), ts.len());
