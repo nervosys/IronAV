@@ -65,7 +65,7 @@ filters = ["serde", "resample"]
 serde = ["dep:serde", "dep:serde_json", "ironav-core/serde"]
 
 [dependencies]
-ironav-core = { path = "../ironav-core", version = "0.1.2", default-features = false }
+ironav-core = { path = "../ironav-core", version = "0.1.3", default-features = false }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 

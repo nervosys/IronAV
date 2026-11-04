@@ -224,7 +224,6 @@ mod imp {
     pub(super) use super::super::x11::{list, open};
 }
 
-/// The displays present; none when the platform cannot say.
 /// The most a `wait` may be; a longer one is cut to this.
 const MAX_WAIT: Duration = Duration::from_secs(3600);
 
