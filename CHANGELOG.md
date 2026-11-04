@@ -9,6 +9,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Added
 
+- **Screen capture API:** `ironav_live::capture::list_screens()` lists the displays, and `ScreenCapture::open(index, ScreenOptions { cursor })` opens one. `next_frame(wait)` gives each picture as 32-bit BGRA with the rectangles that changed since the last (`dirty`, and `moved` for a display's own moves), and a `whole` flag for a frame whose changes are not known (the first frame, and the first after a lost duplication); it returns `None` when nothing changed within `wait`. Windows reads the rectangles from DXGI Desktop Duplication, and a mouse-only update is a frame only when the cursor is drawn. X11 and macOS report every frame as whole and do not return `None`. The capture is not `Send`. `device://screen` is unchanged.
 - **Screen capture:** `device://screen` (the primary display) and `device://screen/N` as a live source, listed by
   `ironav devices` and the `devices` tool with each display's name, index and native size. Y4M 4:2:0 (BT.709, limited
   range) at a constant rate: `fps=` (30, at most 60), `size=WxH` (scaled down to fit with the aspect kept; by default the

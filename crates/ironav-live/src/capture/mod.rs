@@ -12,6 +12,9 @@
 //! `device://screen[/N]` is a display, as Y4M too (see [`screen`]): DXGI Desktop Duplication on
 //! Windows, CoreGraphics on macOS, X11 on Linux.
 //!
+//! A Rust program that wants the pictures themselves, and what changed in them, opens a
+//! [`ScreenCapture`] instead.
+//!
 //! Y4M carries no timestamps, so pictures are timed at the mode's frame rate: a camera that
 //! drops frames (in low light, say) runs behind the clock by as many.
 
@@ -31,6 +34,8 @@ mod screen;
 mod v4l2;
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 mod x11;
+
+pub use screen::{list_screens, MoveRect, Rect, ScreenCapture, ScreenFrame, ScreenInfo, ScreenOptions};
 
 use crate::source::{SourceInfo, ThreadSource};
 use crate::url::SourceUrl;

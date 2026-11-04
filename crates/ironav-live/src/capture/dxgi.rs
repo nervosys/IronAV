@@ -6,19 +6,19 @@
 //! lost (a mode change, or the secure desktop of a UAC prompt or the lock screen), it is made again
 //! on the following pictures, and the last picture is repeated meanwhile.
 
-use super::screen::{display_name, Grabber, Listed, Shot};
+use super::screen::{clipped, display_name, fill_buffer, Changes, Fill, Grabber, Listed, MoveRect, Rect, Shot};
 use ironav_core::{Error, ErrorCode, Result};
 use std::time::{Duration, Instant};
 use windows::core::Interface;
-use windows::Win32::Foundation::HMODULE;
+use windows::Win32::Foundation::{HMODULE, RECT};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_FLAG, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, DXGI_ERROR_SESSION_DISCONNECTED, DXGI_ERROR_UNSUPPORTED,
-    DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
+    CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_MORE_DATA, DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, DXGI_ERROR_SESSION_DISCONNECTED, DXGI_ERROR_UNSUPPORTED,
+    DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_MOVE_RECT, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
 };
 
 /// How long a duplication may stay lost before the stream fails: a UAC prompt or the lock screen
@@ -97,6 +97,14 @@ struct Pointer {
     visible: bool,
 }
 
+impl Pointer {
+    /// The rectangle the cursor covers on a `w` by `h` picture.
+    fn rect(&self, w: u32, h: u32) -> Option<Rect> {
+        let rows = if self.kind == 1 { self.height / 2 } else { self.height };
+        clipped(self.x as i64, self.y as i64, self.x as i64 + self.width as i64, self.y as i64 + rows as i64, w, h)
+    }
+}
+
 /// Draws the cursor into 32-bit BGRA pixels `stride` bytes apart (`w` by `h`), clipping at the
 /// edges. Colour cursors blend by their alpha; masked colour cursors replace the picture where
 /// their alpha is 0 and exclusive-or it where it is 255; monochrome ones are an AND mask over an
@@ -144,6 +152,17 @@ fn draw_pointer(canvas: &mut [u8], stride: usize, w: usize, h: usize, p: &Pointe
     }
 }
 
+/// What an acquired frame brought.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    /// Nothing to report: a timeout, a duplication that was lost, or a cursor the caller does not draw.
+    Nothing,
+    /// The desktop changed, and the cursor may have moved with it.
+    Desktop,
+    /// Only the cursor moved or changed its shape.
+    Cursor,
+}
+
 pub(super) struct Dxgi {
     device: ID3D11Device,
     ctx: ID3D11DeviceContext,
@@ -157,7 +176,15 @@ pub(super) struct Dxgi {
     size: (u32, u32),
     cursor: bool,
     pointer: Option<Pointer>,
-    changed: bool,
+    /// The rectangles of a frame, kept between frames.
+    dirty_buf: Vec<RECT>,
+    move_buf: Vec<DXGI_OUTDUPL_MOVE_RECT>,
+    /// The changes of a `grab` that has no caller to write them to.
+    scratch: Changes,
+    /// The next frame is whole: the first, and the first after the duplication was lost.
+    whole_pending: bool,
+    /// The picture taken at open has not been given yet.
+    first_ready: bool,
     lost_since: Option<Instant>,
 }
 
@@ -173,10 +200,10 @@ pub(super) fn open(index: usize, cursor: bool) -> Result<Dxgi> {
         return Err(Error::new(ErrorCode::HardwareUnavailable, "the display adapter gave no Direct3D device"));
     };
     let output = f.output.cast::<IDXGIOutput1>().map_err(|e| fail("Desktop Duplication needs DXGI 1.2", e))?;
-    let mut d = Dxgi { device, ctx, output, dup: None, staging: None, desktop: Vec::new(), shown: Vec::new(), size: (f.width, f.height), cursor, pointer: None, changed: false, lost_since: None };
+    let mut d = Dxgi { device, ctx, output, dup: None, staging: None, desktop: Vec::new(), shown: Vec::new(), size: (f.width, f.height), cursor, pointer: None, dirty_buf: Vec::new(), move_buf: Vec::new(), scratch: Changes::default(), whole_pending: true, first_ready: false, lost_since: None };
     d.dup = Some(d.duplicate()?);
     // a still desktop may not have a picture ready at once: give the first one a moment
-    d.acquire(500)?;
+    d.first_ready = matches!(d.acquire(500, &mut Changes::default())?, Outcome::Desktop);
     Ok(d)
 }
 
@@ -185,8 +212,12 @@ impl Dxgi {
         unsafe { self.output.DuplicateOutput(&self.device) }.map_err(|e| fail("could not duplicate the display", e))
     }
 
-    /// Takes the next picture or cursor change if there is one within `ms`.
-    fn acquire(&mut self, ms: u32) -> Result<()> {
+    /// Takes the next frame if one comes within `ms` (0: only one that is ready), and writes what it
+    /// changed into `out`, which is left empty when nothing shows.
+    fn acquire(&mut self, ms: u32, out: &mut Changes) -> Result<Outcome> {
+        out.whole = false;
+        out.dirty.clear();
+        out.moved.clear();
         if self.dup.is_none() {
             match self.duplicate() {
                 Ok(d) => {
@@ -196,7 +227,11 @@ impl Dxgi {
                 Err(e) => {
                     // the picture stays as it was until the secure desktop is gone
                     let since = *self.lost_since.get_or_insert_with(Instant::now);
-                    return if since.elapsed() > LOST_FOR { Err(e) } else { Ok(()) };
+                    if since.elapsed() > LOST_FOR {
+                        return Err(e);
+                    }
+                    std::thread::sleep(Duration::from_millis(u64::from(ms.min(50))));
+                    return Ok(Outcome::Nothing);
                 }
             }
         }
@@ -204,43 +239,123 @@ impl Dxgi {
         let (mut info, mut res) = (DXGI_OUTDUPL_FRAME_INFO::default(), None::<IDXGIResource>);
         match unsafe { dup.AcquireNextFrame(ms, &mut info, &mut res) } {
             Ok(()) => {}
-            Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(()),
+            Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(Outcome::Nothing),
             Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => {
+                // the duplication is made again for the next frame, which is whole
                 self.dup = None;
+                self.whole_pending = true;
                 self.lost_since.get_or_insert_with(Instant::now);
-                return Ok(());
+                return Ok(Outcome::Nothing);
             }
             Err(e) => return Err(fail("reading the screen", e)),
         }
-        let got = self.take(&dup, &info, res);
+        let got = self.take(&dup, &info, res, out);
         unsafe {
             let _ = dup.ReleaseFrame();
         }
         got
     }
 
-    fn take(&mut self, dup: &IDXGIOutputDuplication, info: &DXGI_OUTDUPL_FRAME_INFO, res: Option<IDXGIResource>) -> Result<()> {
-        if info.LastPresentTime != 0 {
-            if let Some(res) = res {
+    /// Reads an acquired frame: its picture when the desktop changed, and the cursor when it moved.
+    /// A cursor update has a last-present time of zero, and is reported only when the cursor is drawn.
+    fn take(&mut self, dup: &IDXGIOutputDuplication, info: &DXGI_OUTDUPL_FRAME_INFO, res: Option<IDXGIResource>, out: &mut Changes) -> Result<Outcome> {
+        let before = self.cursor_rect();
+        let pointer = self.cursor && info.LastMouseUpdateTime != 0;
+        if pointer {
+            self.update_pointer(dup, info);
+        }
+        let old_size = self.size;
+        let picture = match res {
+            Some(res) if info.LastPresentTime != 0 => {
                 self.copy(&res)?;
-                self.changed = true;
+                true
+            }
+            _ => false,
+        };
+        if !picture && (!pointer || self.desktop.is_empty()) {
+            return Ok(Outcome::Nothing);
+        }
+        let known = picture && self.read_rects(dup, out);
+        out.whole = self.whole_pending || (picture && (!known || self.size != old_size));
+        if out.whole {
+            out.dirty.clear();
+            out.moved.clear();
+        } else if pointer {
+            // the cursor's old and new places are both changed
+            out.dirty.extend([before, self.cursor_rect()].into_iter().flatten());
+        }
+        Ok(if picture { Outcome::Desktop } else { Outcome::Cursor })
+    }
+
+    /// Reads the frame's dirty and move rectangles into `out`, clipped to the picture; false when the
+    /// duplication does not give them or a move's source is not on the picture (the frame is then whole).
+    fn read_rects(&mut self, dup: &IDXGIOutputDuplication, out: &mut Changes) -> bool {
+        let (w, h) = self.size;
+        let dirty = fill_buffer(&mut self.dirty_buf, |b| {
+            let mut need = 0u32;
+            match unsafe { dup.GetFrameDirtyRects(std::mem::size_of_val(b) as u32, b.as_mut_ptr(), &mut need) } {
+                Ok(()) => Ok(Fill::Done(need as usize / std::mem::size_of::<RECT>())),
+                Err(e) if e.code() == DXGI_ERROR_MORE_DATA => Ok(Fill::Need((need as usize).div_ceil(std::mem::size_of::<RECT>()))),
+                Err(e) => Err(e),
+            }
+        });
+        let moves = fill_buffer(&mut self.move_buf, |b| {
+            let mut need = 0u32;
+            match unsafe { dup.GetFrameMoveRects(std::mem::size_of_val(b) as u32, b.as_mut_ptr(), &mut need) } {
+                Ok(()) => Ok(Fill::Done(need as usize / std::mem::size_of::<DXGI_OUTDUPL_MOVE_RECT>())),
+                Err(e) if e.code() == DXGI_ERROR_MORE_DATA => Ok(Fill::Need((need as usize).div_ceil(std::mem::size_of::<DXGI_OUTDUPL_MOVE_RECT>()))),
+                Err(e) => Err(e),
+            }
+        });
+        match (dirty, moves) {
+            (Ok(Some(n)), Ok(Some(m))) => {
+                rects_of(&self.dirty_buf[..n], w, h, &mut out.dirty);
+                moves_of(&self.move_buf[..m], w, h, &mut out.moved)
+            }
+            _ => false,
+        }
+    }
+
+    /// Takes the cursor's place and, when the duplication gives it, its picture.
+    fn update_pointer(&mut self, dup: &IDXGIOutputDuplication, info: &DXGI_OUTDUPL_FRAME_INFO) {
+        let pos = info.PointerPosition;
+        if info.PointerShapeBufferSize > 0 {
+            let mut data = vec![0u8; info.PointerShapeBufferSize as usize];
+            let (mut need, mut shape) = (0u32, DXGI_OUTDUPL_POINTER_SHAPE_INFO::default());
+            if unsafe { dup.GetFramePointerShape(data.len() as u32, data.as_mut_ptr().cast(), &mut need, &mut shape) }.is_ok() {
+                self.pointer = Some(Pointer { kind: shape.Type, width: shape.Width as usize, height: shape.Height as usize, pitch: shape.Pitch as usize, data, x: 0, y: 0, visible: false });
             }
         }
-        if self.cursor && info.LastMouseUpdateTime != 0 {
-            let pos = info.PointerPosition;
-            if info.PointerShapeBufferSize > 0 {
-                let mut data = vec![0u8; info.PointerShapeBufferSize as usize];
-                let (mut need, mut shape) = (0u32, DXGI_OUTDUPL_POINTER_SHAPE_INFO::default());
-                if unsafe { dup.GetFramePointerShape(data.len() as u32, data.as_mut_ptr().cast(), &mut need, &mut shape) }.is_ok() {
-                    self.pointer = Some(Pointer { kind: shape.Type, width: shape.Width as usize, height: shape.Height as usize, pitch: shape.Pitch as usize, data, x: 0, y: 0, visible: false });
-                }
-            }
-            if let Some(p) = &mut self.pointer {
-                (p.x, p.y, p.visible) = (pos.Position.x, pos.Position.y, pos.Visible.as_bool());
-            }
-            self.changed = true;
+        if let Some(p) = &mut self.pointer {
+            (p.x, p.y, p.visible) = (pos.Position.x, pos.Position.y, pos.Visible.as_bool());
         }
-        Ok(())
+    }
+
+    /// Where the cursor is drawn on the picture, when it is shown.
+    fn cursor_rect(&self) -> Option<Rect> {
+        if !self.cursor {
+            return None;
+        }
+        self.pointer.as_ref().filter(|p| p.visible).and_then(|p| p.rect(self.size.0, self.size.1))
+    }
+
+    /// The latest picture, with the cursor drawn into it when it is shown.
+    fn shot(&mut self) -> Option<Shot<'_>> {
+        if self.desktop.is_empty() {
+            return None;
+        }
+        let (w, h) = self.size;
+        let stride = w as usize * 4;
+        let data = match &self.pointer {
+            Some(p) if self.cursor && p.visible => {
+                self.shown.clear();
+                self.shown.extend_from_slice(&self.desktop);
+                draw_pointer(&mut self.shown, stride, w as usize, h as usize, p);
+                &self.shown
+            }
+            _ => &self.desktop,
+        };
+        Some(Shot { data, stride, width: w, height: h })
     }
 
     /// Copies the desktop texture into `desktop`.
@@ -294,28 +409,113 @@ impl Grabber for Dxgi {
     }
 
     fn grab(&mut self) -> Result<Option<Shot<'_>>> {
-        self.acquire(0)?;
-        if !std::mem::take(&mut self.changed) || self.desktop.is_empty() {
+        // the device's own loop takes whatever is ready, and does not say what changed
+        let mut scratch = std::mem::take(&mut self.scratch);
+        let fresh = if std::mem::take(&mut self.first_ready) { Ok(true) } else { self.acquire(0, &mut scratch).map(|o| o != Outcome::Nothing) };
+        self.scratch = scratch;
+        if !fresh? {
             return Ok(None);
         }
-        let (w, h) = self.size;
-        let stride = w as usize * 4;
-        let data = match &self.pointer {
-            Some(p) if self.cursor && p.visible => {
-                self.shown.clear();
-                self.shown.extend_from_slice(&self.desktop);
-                draw_pointer(&mut self.shown, stride, w as usize, h as usize, p);
-                &self.shown
-            }
-            _ => &self.desktop,
-        };
-        Ok(Some(Shot { data, stride, width: w, height: h }))
+        self.whole_pending = false;
+        Ok(self.shot())
     }
+
+    fn grab_within(&mut self, wait: Duration, changes: &mut Changes) -> Result<Option<Shot<'_>>> {
+        if std::mem::take(&mut self.first_ready) {
+            changes.whole = true;
+            changes.dirty.clear();
+            changes.moved.clear();
+            self.whole_pending = false;
+            return Ok(self.shot());
+        }
+        let deadline = Instant::now() + wait;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let ms = u32::try_from(left.as_micros().div_ceil(1000)).unwrap_or(u32::MAX);
+            if self.acquire(ms, changes)? != Outcome::Nothing {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+        }
+        self.whole_pending = false;
+        Ok(self.shot())
+    }
+}
+
+/// The dirty rectangles DXGI gave, clipped to the `w` by `h` picture; empty ones are left out.
+fn rects_of(raw: &[RECT], w: u32, h: u32, out: &mut Vec<Rect>) {
+    out.extend(raw.iter().filter_map(|r| clipped(r.left as i64, r.top as i64, r.right as i64, r.bottom as i64, w, h)));
+}
+
+/// The move rectangles DXGI gave, clipped to the picture. Each keeps its source: a clipped destination
+/// moves its source by the same amount. False when a source is not on the picture, which the caller
+/// takes as an unknown frame.
+fn moves_of(raw: &[DXGI_OUTDUPL_MOVE_RECT], w: u32, h: u32, out: &mut Vec<MoveRect>) -> bool {
+    for m in raw {
+        let d = m.DestinationRect;
+        let Some(to) = clipped(d.left as i64, d.top as i64, d.right as i64, d.bottom as i64, w, h) else {
+            continue;
+        };
+        let fx = m.SourcePoint.x as i64 + (to.x as i64 - d.left as i64);
+        let fy = m.SourcePoint.y as i64 + (to.y as i64 - d.top as i64);
+        if fx < 0 || fy < 0 || fx >= w as i64 || fy >= h as i64 {
+            return false;
+        }
+        out.push(MoveRect { from: (fx as u32, fy as u32), to });
+    }
+    true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::Foundation::POINT;
+
+    fn rc(left: i32, top: i32, right: i32, bottom: i32) -> RECT {
+        RECT { left, top, right, bottom }
+    }
+
+    fn mv(sx: i32, sy: i32, dest: RECT) -> DXGI_OUTDUPL_MOVE_RECT {
+        DXGI_OUTDUPL_MOVE_RECT { SourcePoint: POINT { x: sx, y: sy }, DestinationRect: dest }
+    }
+
+    #[test]
+    fn dirty_rectangles_are_read_clipped_to_the_picture() {
+        // a rectangle reaching past the left and top edges, one wholly right of the picture, one empty
+        let raw = [rc(0, 0, 10, 10), rc(-5, -5, 5, 5), rc(90, 90, 120, 120), rc(200, 0, 300, 10), rc(5, 5, 5, 9)];
+        let mut out = Vec::new();
+        rects_of(&raw, 100, 100, &mut out);
+        assert_eq!(out, [Rect { x: 0, y: 0, width: 10, height: 10 }, Rect { x: 0, y: 0, width: 5, height: 5 }, Rect { x: 90, y: 90, width: 10, height: 10 }]);
+    }
+
+    #[test]
+    fn move_rectangles_keep_their_source_when_clipped() {
+        let mut out = Vec::new();
+        assert!(moves_of(&[mv(10, 20, rc(30, 40, 50, 60))], 100, 100, &mut out));
+        assert_eq!(out, [MoveRect { from: (10, 20), to: Rect { x: 30, y: 40, width: 20, height: 20 } }]);
+        // the destination's left edge is 4 off the picture: its source moves with it
+        out.clear();
+        assert!(moves_of(&[mv(10, 20, rc(-4, 0, 6, 10))], 100, 100, &mut out));
+        assert_eq!(out, [MoveRect { from: (14, 20), to: Rect { x: 0, y: 0, width: 6, height: 10 } }]);
+        // a source off the picture makes the frame unknown
+        assert!(!moves_of(&[mv(-1, 0, rc(0, 0, 5, 5))], 100, 100, &mut out));
+        assert!(!moves_of(&[mv(100, 0, rc(0, 0, 5, 5))], 100, 100, &mut out));
+        // a destination wholly off the picture is nothing, and known
+        out.clear();
+        assert!(moves_of(&[mv(0, 0, rc(200, 0, 210, 10))], 100, 100, &mut out));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn the_cursor_covers_its_picture_clipped_to_the_frame() {
+        let p = pointer(2, 2, 3, 8, vec![0; 24], -1, 1);
+        assert_eq!(p.rect(10, 10), Some(Rect { x: 0, y: 1, width: 1, height: 3 }));
+        // a monochrome cursor's height is twice its picture
+        let m = pointer(1, 4, 8, 1, vec![0; 64], 2, 2);
+        assert_eq!(m.rect(10, 10), Some(Rect { x: 2, y: 2, width: 4, height: 4 }));
+    }
 
     fn pointer(kind: u32, width: usize, height: usize, pitch: usize, data: Vec<u8>, x: i32, y: i32) -> Pointer {
         Pointer { kind, width, height, pitch, data, x, y, visible: true }

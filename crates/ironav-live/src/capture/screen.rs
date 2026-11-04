@@ -59,6 +59,18 @@ pub(crate) trait Grabber {
     /// The latest picture, or `None` when the display has not changed since the last call (or has
     /// shown nothing yet).
     fn grab(&mut self) -> Result<Option<Shot<'_>>>;
+    /// Waits up to `wait` for the display to change, then gives its latest picture, and writes what
+    /// changed since the last call into `changes`. A backend that cannot tell what changed (the
+    /// default) takes a picture after `wait` and reports the frame as whole.
+    fn grab_within(&mut self, wait: Duration, changes: &mut Changes) -> Result<Option<Shot<'_>>> {
+        if !wait.is_zero() {
+            std::thread::sleep(wait);
+        }
+        changes.whole = true;
+        changes.dirty.clear();
+        changes.moved.clear();
+        self.grab()
+    }
 }
 
 /// `screen` or `screen/N`: the display's index.
@@ -213,18 +225,187 @@ mod imp {
 }
 
 /// The displays present; none when the platform cannot say.
-pub(crate) fn list() -> Vec<Listed> {
-    #[cfg(any(windows, target_os = "macos", all(target_os = "linux", target_pointer_width = "64")))]
-    {
-        imp::list().unwrap_or_default()
-    }
-    #[cfg(not(any(windows, target_os = "macos", all(target_os = "linux", target_pointer_width = "64"))))]
-    {
-        Vec::new()
+/// The most a `wait` may be; a longer one is cut to this.
+const MAX_WAIT: Duration = Duration::from_secs(3600);
+
+/// A rectangle of pixels in a frame's own coordinates (the top-left pixel is at 0, 0).
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// A rectangle the display moved, as scrolling does: the pixels of `to` are those of the same size
+/// whose top-left pixel was at `from` in the previous frame. `to` is clipped to the frame, and `from`
+/// moves with its top-left pixel.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MoveRect {
+    pub from: (u32, u32),
+    pub to: Rect,
+}
+
+/// A display, as [`list_screens`] lists it.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenInfo {
+    /// The index that [`ScreenCapture::open`] takes.
+    pub index: usize,
+    pub name: String,
+    /// The display's native size in pixels.
+    pub width: u32,
+    pub height: u32,
+    /// Whether this is the primary display (index 0).
+    pub primary: bool,
+}
+
+/// What a [`ScreenCapture`] shows of the display.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScreenOptions {
+    /// Whether the mouse cursor is drawn into the pictures. Windows and X11 draw it here; macOS
+    /// leaves it out whatever this says.
+    pub cursor: bool,
+}
+
+impl Default for ScreenOptions {
+    fn default() -> ScreenOptions {
+        ScreenOptions { cursor: true }
     }
 }
 
-/// Opens `device://screen[/N]`.
+/// One picture of a display, as [`ScreenCapture::next_frame`] gives it. It borrows the capture, so
+/// it is valid until the next call.
+///
+/// The pixels are 32-bit BGRA (blue first in each pixel, the alpha byte not meaningful), rows
+/// `stride` bytes apart. `dirty` and `moved` list what changed since the previous frame; when `whole`
+/// is true they are empty and the whole frame must be taken as changed. This type has no `Debug`
+/// output, so that pixels are not printed by accident.
+#[non_exhaustive]
+pub struct ScreenFrame<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub stride: usize,
+    pub bgra: &'a [u8],
+    pub dirty: &'a [Rect],
+    pub moved: &'a [MoveRect],
+    pub whole: bool,
+    /// When the picture was taken.
+    pub at: Instant,
+}
+
+/// What changed since the previous frame, as a backend reports it.
+#[derive(Default)]
+pub(crate) struct Changes {
+    pub whole: bool,
+    pub dirty: Vec<Rect>,
+    pub moved: Vec<MoveRect>,
+}
+
+/// An open display, read a picture at a time with what changed in each. Opening it reads everything
+/// on the display, so open only a display the person has asked to have captured.
+///
+/// It is not `Send`: it is used on the thread that opened it.
+#[non_exhaustive]
+pub struct ScreenCapture {
+    grabber: Box<dyn Grabber>,
+    changes: Changes,
+}
+
+/// The displays present, the primary one first. A display's index is what
+/// [`ScreenCapture::open`] takes.
+pub fn list_screens() -> Result<Vec<ScreenInfo>> {
+    Ok(list_result()?.into_iter().enumerate().map(|(index, d)| ScreenInfo { index, name: d.name, width: d.width, height: d.height, primary: index == 0 }).collect())
+}
+
+/// The displays present, or an error when the platform cannot list them.
+pub(crate) fn list_result() -> Result<Vec<Listed>> {
+    #[cfg(any(windows, target_os = "macos", all(target_os = "linux", target_pointer_width = "64")))]
+    {
+        imp::list()
+    }
+    #[cfg(not(any(windows, target_os = "macos", all(target_os = "linux", target_pointer_width = "64"))))]
+    {
+        Err(Error::new(ErrorCode::HardwareUnavailable, "screen capture is not supported on this platform yet").hint("Windows, macOS and 64-bit Linux (X11) are supported"))
+    }
+}
+
+/// The displays present; none when the platform cannot say.
+pub(crate) fn list() -> Vec<Listed> {
+    list_result().unwrap_or_default()
+}
+
+impl ScreenCapture {
+    /// Opens the display at `index` (see [`list_screens`]).
+    pub fn open(index: usize, options: ScreenOptions) -> Result<ScreenCapture> {
+        #[cfg(any(windows, target_os = "macos", all(target_os = "linux", target_pointer_width = "64")))]
+        {
+            let grabber = imp::open(index, options.cursor)?;
+            Ok(ScreenCapture { grabber: Box::new(grabber), changes: Changes::default() })
+        }
+        #[cfg(not(any(windows, target_os = "macos", all(target_os = "linux", target_pointer_width = "64"))))]
+        {
+            let _ = (index, options);
+            Err(Error::new(ErrorCode::HardwareUnavailable, "screen capture is not supported on this platform yet").hint("Windows, macOS and 64-bit Linux (X11) are supported"))
+        }
+    }
+
+    /// The display's next picture. Waits up to `wait` (at most an hour) for the display to change, and
+    /// returns `Ok(None)` when nothing changed within that time. The first frame that comes back is
+    /// the display as it is at the call, and it is whole.
+    ///
+    /// On Windows the rectangles come from DXGI Desktop Duplication. The first frame, and the first
+    /// after the duplication was lost (a mode change, the secure desktop), is `whole`. A mouse-only
+    /// update has no picture change: it is a frame only when the cursor is drawn (`ScreenOptions::cursor`),
+    /// and then its `dirty` lists the cursor's old and new places; otherwise it is not reported.
+    ///
+    /// On X11 and macOS no rectangles are available, so every frame is `whole`. The call waits `wait`
+    /// and then takes a picture, so it never returns `None` there; pass a `wait` to pace the loop.
+    pub fn next_frame(&mut self, wait: Duration) -> Result<Option<ScreenFrame<'_>>> {
+        let wait = wait.min(MAX_WAIT);
+        let Some(shot) = self.grabber.grab_within(wait, &mut self.changes)? else {
+            return Ok(None);
+        };
+        let c = &self.changes;
+        Ok(Some(ScreenFrame { width: shot.width, height: shot.height, stride: shot.stride, bgra: shot.data, dirty: &c.dirty, moved: &c.moved, whole: c.whole, at: Instant::now() }))
+    }
+}
+
+/// What a call that fills a buffer reports: the entries written, or the number it needs.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) enum Fill {
+    Done(usize),
+    Need(usize),
+}
+
+/// Fills `buf` by calling `call` with it, growing `buf` and calling again when the call says it needs
+/// more entries (a few times at most). Returns the number of entries written, or `None` when the
+/// buffer still does not hold them.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn fill_buffer<T: Default + Clone, E>(buf: &mut Vec<T>, mut call: impl FnMut(&mut [T]) -> std::result::Result<Fill, E>) -> std::result::Result<Option<usize>, E> {
+    for _ in 0..4 {
+        match call(buf.as_mut_slice())? {
+            Fill::Done(n) => return Ok((n <= buf.len()).then_some(n)),
+            Fill::Need(n) if n > buf.len() => buf.resize(n, T::default()),
+            Fill::Need(_) => return Ok(None),
+        }
+    }
+    Ok(None)
+}
+
+/// The rectangle with the given edges (right and bottom exclusive) clipped to a `w` by `h` picture;
+/// `None` when none of it lies on the picture.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn clipped(left: i64, top: i64, right: i64, bottom: i64, w: u32, h: u32) -> Option<Rect> {
+    let (l, t) = (left.max(0), top.max(0));
+    let (r, b) = (right.min(w as i64), bottom.min(h as i64));
+    (r > l && b > t).then(|| Rect { x: l as u32, y: t as u32, width: (r - l) as u32, height: (b - t) as u32 })
+}
+
+/// Opens `device://screen[/N]`./// Opens `device://screen[/N]`.
 pub(crate) fn open(u: &SourceUrl, shown: String) -> Result<ThreadSource> {
     let wants = parse_wants(u, parse_target(&u.target)?)?;
     #[cfg(any(windows, target_os = "macos", all(target_os = "linux", target_pointer_width = "64")))]
@@ -279,6 +460,64 @@ mod tests {
     use super::*;
     use crate::capture::y4m_header;
     use std::sync::mpsc::sync_channel;
+
+    #[test]
+    fn rectangles_are_clipped_to_the_picture() {
+        let r = |x, y, width, height| Some(Rect { x, y, width, height });
+        assert_eq!(clipped(0, 0, 10, 10, 100, 100), r(0, 0, 10, 10));
+        assert_eq!(clipped(-5, -5, 5, 5, 100, 100), r(0, 0, 5, 5));
+        assert_eq!(clipped(95, 90, 120, 120, 100, 100), r(95, 90, 5, 10));
+        assert_eq!(clipped(-20, 0, -10, 5, 100, 100), None, "left of the picture");
+        assert_eq!(clipped(100, 0, 110, 5, 100, 100), None, "the right edge is exclusive");
+        assert_eq!(clipped(5, 5, 5, 9, 100, 100), None, "empty");
+        assert_eq!(clipped(i64::MIN, i64::MIN, i64::MAX, i64::MAX, u32::MAX, 1), r(0, 0, u32::MAX, 1));
+    }
+
+    #[test]
+    fn a_buffer_grows_to_what_a_call_needs() {
+        let mut buf = vec![0u8; 2];
+        let mut calls = 0;
+        let got = fill_buffer(&mut buf, |b: &mut [u8]| -> std::result::Result<Fill, ()> {
+            calls += 1;
+            if b.len() < 5 {
+                return Ok(Fill::Need(5));
+            }
+            b[..3].copy_from_slice(&[1, 2, 3]);
+            Ok(Fill::Done(3))
+        });
+        assert_eq!(got, Ok(Some(3)));
+        assert_eq!((buf.len(), calls, &buf[..3]), (5, 2, &[1u8, 2, 3][..]));
+        // a count past the buffer is refused, a call that keeps asking for more gives up, and an error passes
+        let mut two = vec![0u8; 2];
+        assert_eq!(fill_buffer(&mut two, |_: &mut [u8]| Ok::<_, ()>(Fill::Done(3))), Ok(None));
+        assert_eq!(fill_buffer(&mut two, |_: &mut [u8]| Ok::<_, ()>(Fill::Need(1 << 20))), Ok(None));
+        assert_eq!(fill_buffer(&mut two, |_: &mut [u8]| Err::<Fill, _>("gone")), Err("gone"));
+    }
+
+    #[test]
+    #[ignore = "needs an interactive desktop"]
+    fn the_primary_display_gives_a_whole_first_frame_and_its_size() {
+        // only counts, sizes and timing are looked at; no picture is kept or printed
+        let mut cap = ScreenCapture::open(0, ScreenOptions::default()).expect("the primary display");
+        let start = Instant::now();
+        let (mut frames, mut first_whole, mut size, mut sizes_ok) = (0usize, None::<bool>, None::<(u32, u32)>, true);
+        while start.elapsed() < Duration::from_secs(2) {
+            let Some(f) = cap.next_frame(Duration::from_millis(100)).expect("a frame") else {
+                continue;
+            };
+            frames += 1;
+            first_whole.get_or_insert(f.whole);
+            let s = (f.width, f.height);
+            sizes_ok &= *size.get_or_insert(s) == s;
+            sizes_ok &= f.stride >= f.width as usize * 4 && f.bgra.len() >= f.stride * f.height as usize;
+            sizes_ok &= f.dirty.iter().all(|r| r.x + r.width <= f.width && r.y + r.height <= f.height);
+        }
+        let took = start.elapsed();
+        println!("screen: {frames} frames in {:.2} s, first frame whole: {first_whole:?}, size {size:?}", took.as_secs_f64());
+        assert!(frames > 0, "no frame in {took:?}");
+        assert_eq!(first_whole, Some(true));
+        assert!(sizes_ok);
+    }
 
     fn shot(px: &[[u8; 4]], w: u32, h: u32) -> Vec<u8> {
         assert_eq!(px.len(), (w * h) as usize);
