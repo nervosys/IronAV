@@ -104,7 +104,8 @@ The same analyzers run on media as it arrives. A source is a path, `path?follow`
 `srt://:port?mode=listener` waits for one to call (on loopback unless an address is given); the MPEG-TS it carries is read
 as `udp://` is. This is SRT's live mode, written here with no extra dependency: handshake version 5,
 ACKs, NAK loss reports and retransmission, and delivery by the sender's timestamps plus a latency (`?latency=MS`, 120 by
-default; a packet that has not come when a later one is due is dropped), `?streamid=ID`, keep-alives and shutdown.
+default; a packet that has not come when a later one is due is dropped, so raise it for a lossy link or a heavily loaded
+machine: at 100% CPU the default lost data in our tests where 1000 did not), `?streamid=ID`, keep-alives and shutdown.
 `?passphrase=SECRET` (10 to 79 characters) reads an AES-CTR encrypted stream (AES-128, 192 or 256 by the sender's choice,
 key material wrapped as RFC 3394, PBKDF2-HMAC-SHA1 key derivation); a sender that does not encrypt, or has another
 passphrase, is refused, and the passphrase is hidden from every status and message. A caller is reconnected with back-off
