@@ -359,7 +359,9 @@ it, at most one per half second (`keyframes_forced`); a request that comes while
 when the session ends, is counted as `keyframes_ignored`. Without a transcode nothing can be forced: the requests are
 counted, and `keyframes_forced` stays 0. Tested end to end against
 IronAV's own WHIP endpoint with H.264 and Opus (the Opus goes from the source's first packet, not from its first keyframe);
-not yet against OBS, FFmpeg or a browser as the receiver.
+also against MediaMTX v1.21.3 on loopback (plain `whip://`, and `whips://` with a throwaway CA), which answers `a=setup:active` and
+checks the publisher with ICE of its own: the publisher is then the DTLS server (the answer's `passive` still makes it the DTLS
+client) and answers MediaMTX's STUN checks. Not yet against OBS, FFmpeg or a browser as the receiver.
 
 ```sh
 ironav watch rtsp://cam/stream --publish "whips://relay.example:8443/live?token=SECRET"

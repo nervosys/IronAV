@@ -482,8 +482,10 @@ files at once, and it fixes the event model, analyzer trait and MCP plumbing bef
    tools) pushes H.264 and Opus to a WHIP endpoint. It POSTs an offer (send-only, BUNDLE, `rtcp-mux`, `setup:actpass`) over `http://` or
    `https://` (the TLS stack `https://` sources use; FIPS mode refuses `http://`), sends ICE checks with USE-CANDIDATE to the answer's host
    candidates (consent every 5 s, 30 s without an answer ends it), runs the DTLS 1.2 client (the server's certificate must have the
-   answer's SHA-256 fingerprint; GCM only in FIPS mode), and sends SRTP: H.264 as single NAL units and FU-A (RFC 6184, 1200-byte
+   answer's SHA-256 fingerprint; GCM only in FIPS mode; the answer's `a=setup:active`, which Pion answers, makes the publisher the DTLS server
+   with the same fingerprint check and the SRTP keys swapped, and it answers a full ICE agent's own STUN checks and settles a role conflict
+   by tiebreaker; checked against MediaMTX v1.21.3 on loopback over `whip://` and `whips://` and in FIPS mode), and sends SRTP: H.264 as single NAL units and FU-A (RFC 6184, 1200-byte
    payloads), Opus as is (RFC 7587), sender reports each second. Picture loss and full intra requests surface through
    `keyframe_requested()`, NACKs are answered from the last 512 packets of each stream, and `close()` says goodbye and DELETEs the
    session. It adds no crate, and shares the DTLS, SRTP, STUN and SDP code with the endpoint. Not done: redirects, RTX, STAP-A,
-   trickle ICE, TURN, and a server that insists on being the DTLS client.
+   trickle ICE and TURN.

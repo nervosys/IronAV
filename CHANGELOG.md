@@ -50,6 +50,19 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   units and FU-A fragments of at most 1200 bytes (a keyframe without parameter sets gets the last ones seen), RTCP sender
   reports go out every second, and NACKs are answered from the last 512 packets of each stream. Tested against the in-process
   WHIP endpoint over `http://` and `https://`. Not wired into the engine, CLI or tools yet.
+  The DTLS role follows the answer's `a=setup` (RFC 5763): `passive` makes the publisher the DTLS client, as above, and `active`
+  (what a full ICE agent such as Pion answers, being told to prefer it) makes it the DTLS server, with the same checks
+  (the peer's certificate must have the answer's SHA-256 fingerprint, GCM only in FIPS mode, the handshake bounded and its flights
+  sent again) and the SRTP keys and salts swapped to the server's side; `actpass` in an answer is refused. A full ICE agent's own
+  checks are answered (success with MESSAGE-INTEGRITY under the local password and FINGERPRINT, only for a request that
+  authenticates), a role conflict is settled by the tiebreakers (487, or the publisher becomes the controlled agent), and
+  demultiplexing is by first byte (RFC 7983) during the handshake as well. Server-reflexive candidates are taken with host ones;
+  relayed, peer-reflexive and TCP ones, and the second component Pion lists for `rtcp-mux`, are skipped. `close()` now DELETEs the
+  session before saying goodbye on the media path, since MediaMTX ends the session on close_notify and then answers a DELETE with 404.
+  Tested against MediaMTX v1.21.3 (Windows, loopback only): plain `whip://`, `whips://` (`webrtcEncryption: yes`, throwaway CA via
+  `IRONAV_CA_FILE`) and a `--features fips` build with `IRONAV_FIPS=1` over `whips://`; the path became ready with H264 and Opus,
+  FFmpeg 9.0.1 read both back over RTSP without decode errors, and the DELETE was answered 200 (an `#[ignore]`d test,
+  `interop_with_mediamtx`, takes the executable from `IRONAV_MEDIAMTX`).
 - **`whips://`, WHIP signalling over TLS:** `whips://[host]:port[/path]?cert=CHAIN.pem&key=KEY.pem[&token=...]` is the WHIP
   endpoint with each accepted connection wrapped in a TLS 1.3 server session (IronSocketLayer) before the HTTP/1.1
   parsing, so the offer, the answer and the bearer token no longer cross the network in the clear. `cert` is a PEM

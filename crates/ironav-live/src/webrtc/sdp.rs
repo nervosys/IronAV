@@ -326,10 +326,22 @@ pub(crate) struct Answer {
     pub ufrag: String,
     pub pwd: String,
     pub fingerprint: [u8; 32],
-    /// UDP host candidates (component 1), or the connection address and the media port if the
-    /// answer lists none; at most [`MAX_CANDIDATES`], in the order given.
+    /// UDP host and server-reflexive candidates (component 1), or the connection address and the media
+    /// port if the answer lists none; at most [`MAX_CANDIDATES`], in the order given.
     pub candidates: Vec<std::net::SocketAddr>,
     pub media: Vec<AnswerMedia>,
+    /// The DTLS role the answer took (RFC 5763 §5): `passive` makes the publisher the DTLS client,
+    /// `active` makes it the DTLS server.
+    pub setup: Setup,
+}
+
+/// The DTLS role an answer gives itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Setup {
+    /// The answerer connects: the publisher is the DTLS server.
+    Active,
+    /// The answerer waits: the publisher is the DTLS client.
+    Passive,
 }
 
 impl Answer {
@@ -359,14 +371,16 @@ struct AnswerSection {
     inactive: bool,
 }
 
-/// `a=candidate:` values: a UDP host candidate of component 1 with an address (not a name) that
-/// something could be sent to.
+/// `a=candidate:` values: a UDP host or server-reflexive candidate of component 1 with an address (not a
+/// name) that something could be sent to. Relayed and peer-reflexive ones, TCP ones and the second
+/// component (a server that ignores `rtcp-mux` in its candidates, as Pion does) are left out.
+/// Anything after the type (`raddr`, `rport`, `generation`, `network-cost`, ...) is not looked at.
 fn parse_candidate(v: &str) -> Option<std::net::SocketAddr> {
     let w: Vec<&str> = v.split_whitespace().collect();
     let (component, transport, ip, port, typ) = (w.get(1)?, w.get(2)?, w.get(4)?, w.get(5)?, w.get(7)?);
     let ip: std::net::IpAddr = ip.parse().ok()?;
     let port: u16 = port.parse().ok()?;
-    let good = *component == "1" && transport.eq_ignore_ascii_case("udp") && *w.get(6)? == "typ" && typ.eq_ignore_ascii_case("host");
+    let good = *component == "1" && transport.eq_ignore_ascii_case("udp") && *w.get(6)? == "typ" && (typ.eq_ignore_ascii_case("host") || typ.eq_ignore_ascii_case("srflx"));
     (good && port != 0 && !ip.is_unspecified() && !ip.is_multicast()).then_some(std::net::SocketAddr::new(ip, port))
 }
 
@@ -379,8 +393,10 @@ fn credential(v: Option<String>, what: &str, min: usize) -> Result<String, Strin
 }
 
 /// Reads a server's answer to [`offer`]: what the server chose for each section, its ICE
-/// credentials and fingerprint (SHA-256) and its candidates. A server that wants to be the DTLS
-/// client (`a=setup:active`) is refused, as this publisher takes that role itself.
+/// credentials and fingerprint (SHA-256), its candidates and its DTLS role: `a=setup:active` (what an
+/// answerer is told to prefer, and what Pion answers) or `passive`. `actpass` is the offerer's value
+/// and is refused in an answer (RFC 5763 §5). An answer without any `a=setup` is taken as `passive`.
+/// Attributes about trickle ICE (`ice-options`, `end-of-candidates`) are read past.
 pub(crate) fn parse_answer(text: &str) -> Result<Answer, String> {
     if text.len() > MAX_OFFER {
         return Err("the answer is too long".into());
@@ -457,10 +473,12 @@ pub(crate) fn parse_answer(text: &str) -> Result<Answer, String> {
     let ufrag = credential(live.ufrag.clone().or_else(|| session.ufrag.clone()), "ice-ufrag", 4)?;
     let pwd = credential(live.pwd.clone().or_else(|| session.pwd.clone()), "ice-pwd", 22)?;
     let fingerprint = live.fingerprint.or(session.fingerprint).ok_or("the answer has no sha-256 a=fingerprint")?;
-    match live.setup.clone().or_else(|| session.setup.clone()).as_deref() {
-        Some("passive") | Some("actpass") | None => {}
-        Some(other) => return Err(format!("the answer has a=setup:{other}; this publisher is the DTLS client, so the server must be passive")),
-    }
+    let setup = match live.setup.clone().or_else(|| session.setup.clone()).as_deref() {
+        Some("passive") | None => Setup::Passive,
+        Some("active") => Setup::Active,
+        Some("actpass") => return Err("the answer has a=setup:actpass, which only an offer may say; an answer chooses active or passive".into()),
+        Some(other) => return Err(format!("the answer has a=setup:{other}; it must be active or passive")),
+    };
     let mut candidates: Vec<std::net::SocketAddr> = Vec::new();
     for c in sections.iter().chain(std::iter::once(&session)).flat_map(|s| s.candidates.iter()) {
         if candidates.len() < MAX_CANDIDATES && !candidates.contains(c) {
@@ -500,7 +518,7 @@ pub(crate) fn parse_answer(text: &str) -> Result<Answer, String> {
             .flatten();
         media.push(AnswerMedia { kind, mid, payload });
     }
-    Ok(Answer { ufrag, pwd, fingerprint, candidates, media })
+    Ok(Answer { ufrag, pwd, fingerprint, candidates, media, setup })
 }
 
 #[cfg(test)]
@@ -680,9 +698,78 @@ a=inactive\r
     }
 
     #[test]
+    fn an_answer_may_be_active_or_passive_and_never_actpass() {
+        assert_eq!(parse_answer(ANSWER).unwrap().setup, Setup::Passive);
+        assert_eq!(parse_answer(&ANSWER.replace("a=setup:passive", "a=setup:active")).unwrap().setup, Setup::Active);
+        // the section's value wins over the session's, and none at all is passive
+        let in_section = ANSWER.replace("a=mid:0\r\n", "a=mid:0\r\na=setup:active\r\n");
+        assert_eq!(parse_answer(&in_section).unwrap().setup, Setup::Active);
+        let none: String = ANSWER.lines().filter(|l| !l.starts_with("a=setup")).map(|l| format!("{l}\r\n")).collect();
+        assert_eq!(parse_answer(&none).unwrap().setup, Setup::Passive);
+        let e = parse_answer(&ANSWER.replace("a=setup:passive", "a=setup:actpass")).unwrap_err();
+        assert!(e.contains("actpass") && e.contains("offer"), "{e}");
+    }
+
+    /// What MediaMTX v1.21.3 (Pion) answered a publisher's offer with, as it came: active, one host
+    /// candidate listed for both components, `end-of-candidates`, no ICE-lite.
+    const MEDIAMTX_ANSWER: &str = "v=0\r
+o=- 2030033224607173941 1793807081 IN IP4 0.0.0.0\r
+s=-\r
+t=0 0\r
+a=msid-semantic:WMS *\r
+a=fingerprint:sha-256 BB:18:A8:BF:5D:0A:BB:D8:AE:88:6A:CE:34:92:E0:44:E6:23:1B:8A:FA:B2:4C:6F:89:D2:08:07:DD:C8:18:5F\r
+a=group:BUNDLE 0 1\r
+m=video 9 UDP/TLS/RTP/SAVPF 102\r
+c=IN IP4 0.0.0.0\r
+a=setup:active\r
+a=mid:0\r
+a=ice-ufrag:vRcVOBnQdslKPfhL\r
+a=ice-pwd:rYbCsQmMdtQjQOgRSEMjjTqanYeYUGuI\r
+a=rtcp-mux\r
+a=rtcp-rsize\r
+a=rtpmap:102 H264/90000\r
+a=fmtp:102 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\r
+a=rtcp-fb:102 nack\r
+a=rtcp-fb:102 nack pli\r
+a=recvonly\r
+a=candidate:1502218671 1 udp 2130706431 127.0.0.1 8189 typ host\r
+a=candidate:1502218671 2 udp 2130706431 127.0.0.1 8189 typ host\r
+a=end-of-candidates\r
+m=audio 9 UDP/TLS/RTP/SAVPF 111\r
+c=IN IP4 0.0.0.0\r
+a=setup:active\r
+a=mid:1\r
+a=ice-ufrag:vRcVOBnQdslKPfhL\r
+a=ice-pwd:rYbCsQmMdtQjQOgRSEMjjTqanYeYUGuI\r
+a=rtcp-mux\r
+a=rtcp-rsize\r
+a=rtpmap:111 opus/48000/2\r
+a=fmtp:111 minptime=10;useinbandfec=1\r
+a=recvonly\r
+";
+
+    #[test]
+    fn mediamtxs_answer_is_read() {
+        let a = parse_answer(MEDIAMTX_ANSWER).unwrap();
+        assert_eq!(a.setup, Setup::Active);
+        assert_eq!(a.candidates, ["127.0.0.1:8189".parse::<std::net::SocketAddr>().unwrap()], "the component 2 duplicate is left out");
+        assert_eq!((a.payload(Kind::Video), a.payload(Kind::Audio)), (Some(102), Some(111)));
+        assert_eq!(a.ufrag, "vRcVOBnQdslKPfhL");
+        assert_eq!(a.fingerprint[0], 0xBB);
+    }
+
+    #[test]
+    fn several_candidates_of_several_types_are_sorted_out() {
+        let text = ANSWER.replace("a=candidate:4 1 udp 1 198.51.100.3 50003 typ relay raddr 0.0.0.0 rport 0\r\n", "a=candidate:4 1 udp 1 198.51.100.3 50003 typ relay raddr 0.0.0.0 rport 0\r\na=candidate:6 1 udp 1694498815 203.0.113.50 50006 typ srflx raddr 10.0.0.2 rport 50006 generation 0 network-cost 10\r\na=candidate:7 1 udp 1 203.0.113.51 50007 typ prflx\r\na=ice-options:trickle\r\na=end-of-candidates\r\n");
+        let a = parse_answer(&text).unwrap();
+        assert_eq!(a.candidates, ["198.51.100.2:50001".parse::<std::net::SocketAddr>().unwrap(), "203.0.113.50:50006".parse().unwrap(), "[2001:db8::5]:50004".parse().unwrap()]);
+    }
+
+    #[test]
     fn an_unusable_answer_is_refused_with_a_reason() {
         for (from, to, why) in [
-            ("a=setup:passive", "a=setup:active", "setup"),
+            ("a=setup:passive", "a=setup:actpass", "actpass"),
+            ("a=setup:passive", "a=setup:holdconn", "setup"),
             ("a=ice-pwd:abcdefghijklmnopqrstuv", "a=ice-pwd:short", "ice-pwd"),
             ("a=ice-ufrag:abcd", "a=ice-ufrag:ab:cd", "ice-ufrag"),
             ("sha-256 00:11", "sha-512 00:11", "fingerprint"),

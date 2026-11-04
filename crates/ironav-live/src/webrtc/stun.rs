@@ -9,12 +9,15 @@ use std::net::SocketAddr;
 pub(crate) const MAGIC: u32 = 0x2112_A442;
 const BINDING_REQUEST: u16 = 0x0001;
 const BINDING_SUCCESS: u16 = 0x0101;
+const BINDING_ERROR: u16 = 0x0111;
+const ERROR_CODE: u16 = 0x0009;
 const USERNAME: u16 = 0x0006;
 const MESSAGE_INTEGRITY: u16 = 0x0008;
 const XOR_MAPPED_ADDRESS: u16 = 0x0020;
 const PRIORITY: u16 = 0x0024;
 const USE_CANDIDATE: u16 = 0x0025;
 const FINGERPRINT: u16 = 0x8028;
+const ICE_CONTROLLED: u16 = 0x8029;
 const ICE_CONTROLLING: u16 = 0x802A;
 const FINGERPRINT_XOR: u32 = 0x5354_554e;
 /// The largest message looked at: a binding request is a hundred bytes or so.
@@ -30,6 +33,10 @@ pub(crate) fn is_stun(b: &[u8]) -> bool {
 pub(crate) struct Binding {
     pub txid: [u8; 12],
     pub use_candidate: bool,
+    /// The tiebreaker of the request's ICE-CONTROLLING, if it has one: the sender claims that role.
+    pub controlling: Option<[u8; 8]>,
+    /// The tiebreaker of the request's ICE-CONTROLLED, if it has one.
+    pub controlled: Option<[u8; 8]>,
 }
 
 /// CRC-32 (ISO-HDLC, as Ethernet and zlib use), for FINGERPRINT.
@@ -106,7 +113,8 @@ pub(crate) fn check_request(msg: &[u8], local_ufrag: &str, remote_ufrag: &str, l
     }
     let mut txid = [0u8; 12];
     txid.copy_from_slice(&msg[8..20]);
-    Some(Binding { txid, use_candidate: attrs.iter().any(|a| a.0 == USE_CANDIDATE) })
+    let tiebreaker = |t: u16| attrs.iter().find(|a| a.0 == t).and_then(|a| <[u8; 8]>::try_from(a.1).ok());
+    Some(Binding { txid, use_candidate: attrs.iter().any(|a| a.0 == USE_CANDIDATE), controlling: tiebreaker(ICE_CONTROLLING), controlled: tiebreaker(ICE_CONTROLLED) })
 }
 
 fn push_attr(out: &mut Vec<u8>, t: u16, value: &[u8]) {
@@ -167,14 +175,38 @@ pub(crate) fn success(txid: &[u8; 12], from: SocketAddr, local_pwd: &str) -> Vec
     seal(out, local_pwd.as_bytes())
 }
 
+/// The 487 (Role Conflict) error response to a binding request (RFC 8445 §7.3.1.1), signed with the
+/// local password, so the sender can tell it is ours.
+pub(crate) fn role_conflict(txid: &[u8; 12], local_pwd: &str) -> Vec<u8> {
+    let mut out = header(BINDING_ERROR, txid);
+    push_attr(&mut out, ERROR_CODE, &[0, 0, 4, 87, b'R', b'o', b'l', b'e', b' ', b'C', b'o', b'n', b'f', b'l', b'i', b'c', b't']);
+    let len = (out.len() - 20) as u16;
+    out[2..4].copy_from_slice(&len.to_be_bytes());
+    seal(out, local_pwd.as_bytes())
+}
+
+/// Whether `msg` is a 487 (Role Conflict) answer to the request `txid` that checks out under `password`.
+pub(crate) fn is_role_conflict(msg: &[u8], txid: &[u8; 12], password: &str) -> bool {
+    if msg.len() > MAX_MESSAGE || !is_stun(msg) || u16::from_be_bytes([msg[0], msg[1]]) != BINDING_ERROR || msg[8..20] != txid[..] {
+        return false;
+    }
+    verify(msg, password.as_bytes()).is_some_and(|attrs| attrs.iter().any(|a| a.0 == ERROR_CODE && a.1.len() >= 4 && a.1[2] & 7 == 4 && a.1[3] == 87))
+}
+
 /// A binding request as a controlling agent sends it (RFC 8445 §7.2.4, with `tiebreaker` in ICE-CONTROLLING),
 /// signed with the peer's password. `username` is `remote:local`. A WHIP publisher sends these as its
 /// connectivity checks and its consent checks (RFC 7675).
+#[cfg(test)]
 pub(crate) fn request(txid: &[u8; 12], username: &str, password: &str, use_candidate: bool, tiebreaker: [u8; 8]) -> Vec<u8> {
+    request_as(txid, username, password, use_candidate, true, tiebreaker)
+}
+
+/// [`request`] from a controlling agent (`controlling`) or a controlled one (ICE-CONTROLLED, never with USE-CANDIDATE).
+pub(crate) fn request_as(txid: &[u8; 12], username: &str, password: &str, use_candidate: bool, controlling: bool, tiebreaker: [u8; 8]) -> Vec<u8> {
     let mut out = header(BINDING_REQUEST, txid);
     push_attr(&mut out, USERNAME, username.as_bytes());
     push_attr(&mut out, PRIORITY, &0x6e00_01ffu32.to_be_bytes());
-    push_attr(&mut out, ICE_CONTROLLING, &tiebreaker);
+    push_attr(&mut out, if controlling { ICE_CONTROLLING } else { ICE_CONTROLLED }, &tiebreaker);
     if use_candidate {
         push_attr(&mut out, USE_CANDIDATE, &[]);
     }

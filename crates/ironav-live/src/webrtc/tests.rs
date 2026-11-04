@@ -816,6 +816,99 @@ fn a_publisher_publishes_to_our_whips_endpoint() {
     publisher_publishes(true, None);
 }
 
+/// The body of a plain `GET` of `path` on `port`, with the status.
+fn get(port: u16, path: &str) -> (u16, String) {
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    c.write_all(format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n").as_bytes()).unwrap();
+    let mut got = Vec::new();
+    let _ = c.read_to_end(&mut got);
+    let text = String::from_utf8_lossy(&got).to_string();
+    let status = text.split(' ').nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+    (status, text.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default())
+}
+
+/// The number after `"name":` in a JSON text.
+fn number_after(json: &str, name: &str) -> Option<u64> {
+    let rest = json.split(&format!("\"{name}\":")).nth(1)?;
+    rest.chars().take_while(char::is_ascii_digit).collect::<String>().parse().ok()
+}
+
+/// With MediaMTX (a full ICE agent and a DTLS client, answering `a=setup:active`) at the path in
+/// `IRONAV_MEDIAMTX`, on a loopback-only configuration written for the test: the publisher connects, the
+/// path becomes ready with H264 and Opus and takes bytes, and closing frees it.
+/// Run it with `IRONAV_MEDIAMTX=/path/to/mediamtx cargo test -p ironav-live interop_with_mediamtx -- --ignored`.
+#[ignore = "needs MediaMTX: set IRONAV_MEDIAMTX to its executable"]
+#[test]
+fn interop_with_mediamtx() {
+    let Ok(exe) = std::env::var("IRONAV_MEDIAMTX") else { panic!("IRONAV_MEDIAMTX is not set") };
+    crate::net::allow_loopback_for_tests();
+    let (http, udp, api) = (free_port(), free_port(), free_port());
+    let dir = std::env::temp_dir().join(format!("ironav-mediamtx-{http}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = dir.join("mtx.yml");
+    std::fs::write(
+        &cfg,
+        format!("logLevel: warn\napi: yes\napiAddress: 127.0.0.1:{api}\nrtsp: no\nrtmp: no\nhls: no\nsrt: no\nmoq: no\nwebrtc: yes\nwebrtcAddress: 127.0.0.1:{http}\nwebrtcLocalUDPAddress: 127.0.0.1:{udp}\nwebrtcIPsFromInterfaces: no\nwebrtcAdditionalHosts: [127.0.0.1]\npaths:\n  live:\n    source: publisher\n"),
+    )
+    .unwrap();
+    struct Server(std::process::Child, std::path::PathBuf);
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+            let _ = std::fs::remove_dir_all(&self.1);
+        }
+    }
+    let _server = Server(std::process::Command::new(&exe).arg(&cfg).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().expect("MediaMTX starts"), dir);
+    // the API answers once it is up (a loaded machine takes a while)
+    let up = Instant::now();
+    while get_status(api) != 200 {
+        assert!(up.elapsed() < Duration::from_secs(60), "MediaMTX did not come up");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    let (aus, (_, audio)) = (access_units(), media());
+    let mut p = WhipPublisher::connect(&format!("http://127.0.0.1:{http}/live/whip"), None, WhipOptions::default()).expect("MediaMTX takes the offer");
+    let started = Instant::now();
+    let mut seen = (false, 0u64);
+    let span = aus.last().map_or(0, |a| a.1) + 3000;
+    let (mut sent, mut opus) = (0usize, 0u64);
+    'send: for round in 0..20u64 {
+        for (i, (au, pts)) in aus.iter().enumerate() {
+            p.send_h264_access_unit(au, pts + round * span).unwrap();
+            if i % 2 == 0 {
+                p.send_opus(&audio[(opus as usize) % audio.len()], 960 * opus).unwrap();
+                opus += 1;
+            }
+            sent += 1;
+            std::thread::sleep(Duration::from_millis(20));
+            if sent % 20 == 0 {
+                let (status, body) = get(api, "/v3/paths/get/live");
+                assert_eq!(status, 200, "{body}");
+                seen = (body.contains("\"ready\":true") && body.contains("H264") && body.contains("Opus"), number_after(&body, "inboundBytes").unwrap_or(0));
+                assert_eq!(number_after(&body, "inboundFramesInError").unwrap_or(0), 0, "{body}");
+                if seen.0 && seen.1 > 20_000 {
+                    break 'send;
+                }
+            }
+            assert!(started.elapsed() < Duration::from_secs(120), "no media reached MediaMTX: {seen:?}");
+        }
+    }
+    assert!(seen.0 && seen.1 > 0, "the path is ready with video and takes bytes: {seen:?}");
+    assert_eq!(p.failure(), None);
+    p.close().unwrap();
+    let (_, body) = get(api, "/v3/paths/get/live");
+    assert!(body.contains("\"ready\":false"), "closing frees the path: {body}");
+}
+
+fn get_status(port: u16) -> u16 {
+    match TcpStream::connect(("127.0.0.1", port)) {
+        Ok(_) => get(port, "/v3/paths/list").0,
+        Err(_) => 0,
+    }
+}
+
 /// A server of one scripted answer after another on a port of its own: each reply is sent to the
 /// next connection, and the request heads (and bodies) it saw are returned when it has served them all.
 fn scripted_server(replies: Vec<String>) -> (u16, std::thread::JoinHandle<Vec<String>>) {

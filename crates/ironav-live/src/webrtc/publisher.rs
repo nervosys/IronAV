@@ -177,8 +177,10 @@ impl Shared {
     }
 }
 
-/// ICE as a controlling agent toward an ICE-lite server (RFC 8445 §2.5): connectivity checks, and the
-/// consent checks (RFC 7675) that follow.
+/// ICE as the offerer's agent, controlling (RFC 8445 §6.1.1): connectivity checks, and the consent checks
+/// (RFC 7675) that follow, and the answers to the checks a full ICE agent sends back (an ICE-lite server,
+/// such as this crate's own endpoint, sends none). A role conflict (§7.3.1.1) is settled by the tiebreakers,
+/// and the agent may end up controlled, which sends no USE-CANDIDATE.
 pub(crate) struct Ice {
     username: String,
     local_ufrag: String,
@@ -186,6 +188,7 @@ pub(crate) struct Ice {
     remote_pwd: String,
     local_pwd: String,
     tiebreaker: [u8; 8],
+    controlling: bool,
     /// Transaction ids of requests sent that have no answer yet, the last few.
     pending: VecDeque<[u8; 12]>,
     last_sent: Option<Instant>,
@@ -201,13 +204,14 @@ impl Ice {
             remote_pwd: remote.pwd.clone(),
             local_pwd: local_pwd.into(),
             tiebreaker: crate::auth::random_bytes::<8>(),
+            controlling: true,
             pending: VecDeque::new(),
             last_sent: None,
             last_answer: now,
         }
     }
 
-    /// A connectivity or consent check, with USE-CANDIDATE, signed with the server's password.
+    /// A connectivity or consent check (with USE-CANDIDATE while controlling), signed with the server's password.
     pub(crate) fn request(&mut self, now: Instant) -> Vec<u8> {
         let txid = crate::auth::random_bytes::<12>();
         if self.pending.len() == 16 {
@@ -215,7 +219,7 @@ impl Ice {
         }
         self.pending.push_back(txid);
         self.last_sent = Some(now);
-        stun::request(&txid, &self.username, &self.remote_pwd, true, self.tiebreaker)
+        stun::request_as(&txid, &self.username, &self.remote_pwd, self.controlling, self.controlling, self.tiebreaker)
     }
 
     /// Whether `d` is an answer to a request sent, signed with the server's password; it counts as
@@ -225,6 +229,12 @@ impl Ice {
             return false;
         }
         let Some(i) = self.pending.iter().position(|t| d[8..20] == t[..]) else { return false };
+        // 487: the server holds the role this agent has, and its tiebreaker was the larger; take the other, and ask again
+        if stun::is_role_conflict(d, &self.pending[i], &self.remote_pwd) {
+            self.pending.remove(i);
+            self.controlling = !self.controlling;
+            return false;
+        }
         if !stun::is_success(d, &self.pending[i], &self.remote_pwd) {
             return false;
         }
@@ -233,9 +243,28 @@ impl Ice {
         true
     }
 
-    /// The success response to a check the server sent (a full ICE agent does), if `d` is one for us.
-    pub(crate) fn respond(&self, d: &[u8], from: SocketAddr) -> Option<Vec<u8>> {
+    /// The response to a check the server sent (a full ICE agent does), if `d` is one for us: it
+    /// must carry our user name and authenticate under our password, which is checked before anything
+    /// else is looked at; the answer is a success carrying the address it came from, or a 487 when both
+    /// ends claim a role and the tiebreakers say it is ours (otherwise this agent changes roles).
+    pub(crate) fn respond(&mut self, d: &[u8], from: SocketAddr) -> Option<Vec<u8>> {
         let b = stun::check_request(d, &self.local_ufrag, &self.remote_ufrag, &self.local_pwd)?;
+        match (self.controlling, b.controlling, b.controlled) {
+            (true, Some(theirs), _) | (false, _, Some(theirs)) => {
+                if self.tiebreaker >= theirs {
+                    // the larger tiebreaker is the controlling agent
+                    if self.controlling {
+                        return Some(stun::role_conflict(&b.txid, &self.local_pwd));
+                    }
+                    self.controlling = true;
+                } else if self.controlling {
+                    self.controlling = false;
+                } else {
+                    return Some(stun::role_conflict(&b.txid, &self.local_pwd));
+                }
+            }
+            _ => {}
+        }
         Some(stun::success(&b.txid, from, &self.local_pwd))
     }
 
@@ -354,12 +383,18 @@ impl WhipPublisher {
         if video.is_none() && audio.is_none() {
             return Err(Error::new(ErrorCode::Io, format!("{shown} accepted neither the H.264 video nor the Opus audio offered")));
         }
-        let (sock, peer, ice) = find_server(&http.allow, &answer, creds, shown)?;
-        let mut client = dtls::Client::new(id.clone(), answer.fingerprint).map_err(|e| Error::new(ErrorCode::Internal, format!("DTLS: {e}")))?;
-        let keys = handshake(&sock, peer, &mut client).map_err(|e| Error::new(ErrorCode::Io, format!("DTLS with {shown} failed: {e}")).hint("the server's certificate must be the one its answer's fingerprint names"))?;
-        let ctx = |key: &[u8], salt: &[u8]| srtp::Context::new(keys.profile, key, salt).map_err(|e| Error::new(ErrorCode::Internal, format!("SRTP keys: {e:?}")));
-        let shared = Arc::new(Shared { media: Mutex::new(Media { tx: ctx(&keys.client_key, &keys.client_salt)?, video, audio }), keyframe: AtomicBool::new(false), stop: AtomicBool::new(false), failure: Mutex::new(None) });
-        let session = Session { sock: sock.try_clone()?, peer, client, ice, rx: ctx(&keys.server_key, &keys.server_salt)?, shared: shared.clone(), cname, last_report: Instant::now() };
+        let (sock, peer, mut ice) = find_server(&http.allow, &answer, creds, shown)?;
+        // the answer's setup decides the role: passive, the server waits and this end is the DTLS client;
+        // active, the server connects and this end is the DTLS server. Either way only the server named
+        // in the answer is taken: the other end's certificate must have the answer's fingerprint.
+        let mut dtls = match answer.setup {
+            sdp::Setup::Passive => Dtls::Client(dtls::Client::new(id.clone(), answer.fingerprint).map_err(|e| Error::new(ErrorCode::Internal, format!("DTLS: {e}")))?),
+            sdp::Setup::Active => Dtls::Server(dtls::Server::new(id.clone(), answer.fingerprint).map_err(|e| Error::new(ErrorCode::Internal, format!("DTLS: {e}")))?, peer.to_string().into_bytes()),
+        };
+        let keys = handshake(&sock, peer, &mut dtls, &mut ice).map_err(|e| Error::new(ErrorCode::Io, format!("DTLS with {shown} failed: {e}")).hint("the server's certificate must be the one its answer's fingerprint names"))?;
+        let (tx, rx) = contexts(&dtls, &keys)?;
+        let shared = Arc::new(Shared { media: Mutex::new(Media { tx, video, audio }), keyframe: AtomicBool::new(false), stop: AtomicBool::new(false), failure: Mutex::new(None) });
+        let session = Session { sock: sock.try_clone()?, peer, dtls, ice, rx, shared: shared.clone(), cname, last_report: Instant::now() };
         let worker = std::thread::Builder::new().name("ironav-whip-publisher".into()).spawn(move || session.run()).map_err(|e| Error::new(ErrorCode::Internal, format!("could not start the WHIP publisher: {e}")))?;
         Ok((shared, sock, peer, worker))
     }
@@ -438,12 +473,15 @@ impl WhipPublisher {
     }
 
     fn shutdown(&mut self) -> Result<()> {
+        // The DELETE goes first: a server that sees the DTLS close_notify ends the session on its own
+        // (MediaMTX does), and the DELETE after that is answered 404, where it should be a plain 200.
+        let deleted = self.resource.take().map(|r| request(&self.http, "DELETE", &r.url, &self.shown, None, r.token.as_deref()));
         self.shared.stop.store(true, Ordering::Relaxed);
         if let Some(w) = self.worker.take() {
             let _ = w.join();
         }
-        let Some(r) = self.resource.take() else { return Ok(()) };
-        let reply = request(&self.http, "DELETE", &r.url, &self.shown, None, r.token.as_deref())?;
+        let Some(reply) = deleted else { return Ok(()) };
+        let reply = reply?;
         // gone already is as good as deleted
         match reply.status {
             200..=299 | 404 | 410 => Ok(()),
@@ -481,8 +519,14 @@ fn find_server(allow: &Allow, answer: &sdp::Answer, creds: (&str, &str), shown: 
         while let Some(left) = until.checked_duration_since(Instant::now()) {
             match net::recv_from_within(&sock, &mut buf, left) {
                 Ok((n, from)) => {
-                    if permitted.contains(&from) && stun::is_stun(&buf[..n]) && ice.answered(&buf[..n], Instant::now()) {
-                        return Ok((sock, from, ice));
+                    if permitted.contains(&from) && stun::is_stun(&buf[..n]) {
+                        if ice.answered(&buf[..n], Instant::now()) {
+                            return Ok((sock, from, ice));
+                        }
+                        // a full ICE agent checks this end too, and needs its answer to go on
+                        if let Some(r) = ice.respond(&buf[..n], from) {
+                            let _ = sock.send_to(&r, from);
+                        }
                     }
                 }
                 Err(e) if transient(&e) => {}
@@ -494,25 +538,119 @@ fn find_server(allow: &Allow, answer: &sdp::Answer, creds: (&str, &str), shown: 
     Err(Error::new(ErrorCode::Io, format!("no answer to ICE checks from {shown}'s candidates ({}) in {} s", permitted.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", "), ICE_TIMEOUT.as_secs())).hint("the server's UDP port must be reachable, and the answer's credentials are what the checks use"))
 }
 
-/// The DTLS handshake with the server at `peer`, until it has the SRTP keys.
-fn handshake(sock: &UdpSocket, peer: SocketAddr, client: &mut dtls::Client) -> std::result::Result<dtls::SrtpKeys, String> {
+/// The SRTP contexts that protect what this end sends and unprotect what it receives. A DTLS client
+/// protects with the client write keys and a DTLS server with the server's (RFC 5764 §4.2), so the
+/// keys swap with the role the answer's `a=setup` gave.
+fn contexts(dtls: &Dtls, keys: &dtls::SrtpKeys) -> Result<(srtp::Context, srtp::Context)> {
+    let ctx = |key: &[u8], salt: &[u8]| srtp::Context::new(keys.profile, key, salt).map_err(|e| Error::new(ErrorCode::Internal, format!("SRTP keys: {e:?}")));
+    match dtls {
+        Dtls::Client(_) => Ok((ctx(&keys.client_key, &keys.client_salt)?, ctx(&keys.server_key, &keys.server_salt)?)),
+        Dtls::Server(..) => Ok((ctx(&keys.server_key, &keys.server_salt)?, ctx(&keys.client_key, &keys.client_salt)?)),
+    }
+}
+
+/// This end of DTLS: the client when the answer is `passive`, the server when it is `active`.
+enum Dtls {
+    Client(dtls::Client),
+    /// The server, and the peer's address as text (what its cookie is made for).
+    Server(dtls::Server, Vec<u8>),
+}
+
+impl Dtls {
+    /// The datagrams that open the handshake: the client's hello; a server waits for the other end's.
+    fn start(&mut self, now: Instant) -> std::result::Result<Vec<Vec<u8>>, String> {
+        match self {
+            Dtls::Client(c) => c.start(now),
+            Dtls::Server(..) => Ok(Vec::new()),
+        }
+    }
+
+    /// The datagrams to send back; on an error, the alert that goes with it.
+    fn handle(&mut self, d: &[u8], now: Instant) -> std::result::Result<Vec<Vec<u8>>, (String, Vec<Vec<u8>>)> {
+        match self {
+            Dtls::Client(c) => c.handle(d, now).map_err(|e| (e, Vec::new())),
+            Dtls::Server(s, peer) => s.handle(d, peer, now),
+        }
+    }
+
+    fn poll(&mut self, now: Instant) -> std::result::Result<Vec<Vec<u8>>, String> {
+        match self {
+            Dtls::Client(c) => c.poll(now),
+            Dtls::Server(s, _) => s.poll(now),
+        }
+    }
+
+    fn keys(&self) -> Option<&dtls::SrtpKeys> {
+        match self {
+            Dtls::Client(c) => c.keys(),
+            Dtls::Server(s, _) => s.keys(),
+        }
+    }
+
+    fn closed(&self) -> bool {
+        match self {
+            Dtls::Client(c) => c.closed(),
+            Dtls::Server(s, _) => s.closed(),
+        }
+    }
+
+    fn close_notify(&mut self) -> Vec<Vec<u8>> {
+        match self {
+            Dtls::Client(c) => c.close_notify(),
+            Dtls::Server(s, _) => s.close_notify(),
+        }
+    }
+}
+
+/// How long the handshake may take from the first check answered: a server that is to connect (answer
+/// `active`) may take a while to start, and the handshake itself is bounded by [`dtls::HANDSHAKE_TIMEOUT`].
+const HANDSHAKE_WAIT: Duration = Duration::from_secs(15);
+
+/// The DTLS handshake with the other end at `peer`, until it has the SRTP keys. The same socket carries
+/// ICE (RFC 7983): the other end's checks are answered, and consent is asked again when due, while DTLS runs.
+fn handshake(sock: &UdpSocket, peer: SocketAddr, dtls: &mut Dtls, ice: &mut Ice) -> std::result::Result<dtls::SrtpKeys, String> {
     let mut buf = vec![0u8; 4096];
-    let mut out = client.start(Instant::now())?;
+    let end = Instant::now() + HANDSHAKE_WAIT;
+    let mut out = dtls.start(Instant::now())?;
     loop {
         for d in out.drain(..) {
             let _ = sock.send_to(&d, peer);
         }
-        if let Some(k) = client.keys() {
+        if let Some(k) = dtls.keys() {
             return Ok(k.clone());
         }
+        let now = Instant::now();
+        if now >= end {
+            return Err(format!("no DTLS handshake in {} s", HANDSHAKE_WAIT.as_secs()));
+        }
+        if ice.due(now) {
+            let _ = sock.send_to(&ice.request(now), peer);
+        }
         match net::recv_from_within(sock, &mut buf, Duration::from_millis(50)) {
-            // DTLS is told by its first byte (RFC 7983); STUN answers that come late are not for it
-            Ok((n, from)) if from == peer && n > 0 && (20..=63).contains(&buf[0]) => out.extend(client.handle(&buf[..n], Instant::now())?),
+            Ok((n, from)) if from == peer && n > 0 => match buf[0] {
+                // DTLS is told by its first byte (RFC 7983)
+                20..=63 => match dtls.handle(&buf[..n], Instant::now()) {
+                    Ok(o) => out.extend(o),
+                    Err((e, alert)) => {
+                        for a in alert {
+                            let _ = sock.send_to(&a, peer);
+                        }
+                        return Err(e);
+                    }
+                },
+                // an answer to our check counts as consent; anything else is a check of the other end's, answered if it authenticates
+                0..=3 if !ice.answered(&buf[..n], Instant::now()) => {
+                    if let Some(r) = ice.respond(&buf[..n], from) {
+                        let _ = sock.send_to(&r, peer);
+                    }
+                }
+                _ => {}
+            },
             Ok(_) => {}
             Err(e) if transient(&e) => {}
             Err(e) => return Err(e.to_string()),
         }
-        out.extend(client.poll(Instant::now())?);
+        out.extend(dtls.poll(Instant::now())?);
     }
 }
 
@@ -520,7 +658,7 @@ fn handshake(sock: &UdpSocket, peer: SocketAddr, client: &mut dtls::Client) -> s
 struct Session {
     sock: UdpSocket,
     peer: SocketAddr,
-    client: dtls::Client,
+    dtls: Dtls,
     ice: Ice,
     rx: srtp::Context,
     shared: Arc<Shared>,
@@ -566,16 +704,21 @@ impl Session {
                     self.send(&r);
                 }
             }
-            20..=63 => match self.client.handle(d, now) {
+            20..=63 => match self.dtls.handle(d, now) {
                 Ok(out) => {
                     for o in out {
                         self.send(&o);
                     }
-                    if self.client.closed() {
+                    if self.dtls.closed() {
                         self.shared.fail("the server closed the DTLS association");
                     }
                 }
-                Err(e) => self.shared.fail(format!("DTLS: {e}")),
+                Err((e, alert)) => {
+                    for a in alert {
+                        self.send(&a);
+                    }
+                    self.shared.fail(format!("DTLS: {e}"));
+                }
             },
             128..=191 if d.len() >= 8 && (192..=223).contains(&d[1]) => {
                 let Ok(p) = self.rx.unprotect_rtcp(d) else { return };
@@ -658,7 +801,7 @@ impl Session {
         for b in bye {
             self.send(&b);
         }
-        for d in self.client.close_notify() {
+        for d in self.dtls.close_notify() {
             self.send(&d);
         }
     }
@@ -861,7 +1004,7 @@ mod tests {
     use super::*;
 
     fn answer() -> sdp::Answer {
-        sdp::Answer { ufrag: "srvU".into(), pwd: "serverpasswordserverpw1".into(), fingerprint: [0; 32], candidates: vec!["127.0.0.1:9".parse().unwrap()], media: Vec::new() }
+        sdp::Answer { ufrag: "srvU".into(), pwd: "serverpasswordserverpw1".into(), fingerprint: [0; 32], candidates: vec!["127.0.0.1:9".parse().unwrap()], media: Vec::new(), setup: sdp::Setup::Passive }
     }
 
     #[test]
@@ -922,14 +1065,53 @@ mod tests {
 
     #[test]
     fn a_servers_own_check_is_answered_only_if_it_authenticates() {
-        let ice = Ice::new("locU", "localpasswordlocalpw12", &answer(), Instant::now());
+        let mut ice = Ice::new("locU", "localpasswordlocalpw12", &answer(), Instant::now());
         // the server's check carries "local:server" and is signed with the local password
         let from: SocketAddr = "127.0.0.1:9".parse().unwrap();
-        let theirs = stun::request(&[5; 12], "locU:srvU", "localpasswordlocalpw12", false, [1; 8]);
+        let theirs = stun::request_as(&[5; 12], "locU:srvU", "localpasswordlocalpw12", false, false, [1; 8]);
         let r = ice.respond(&theirs, from).expect("answered");
         assert_eq!(stun::check_success(&r, &[5; 12], "localpasswordlocalpw12"), Some(from));
         assert!(ice.respond(&stun::request(&[5; 12], "locU:srvU", "wrong-password-wrong-password", false, [1; 8]), from).is_none());
         assert!(ice.respond(&theirs[..30], from).is_none());
+    }
+
+    #[test]
+    fn a_role_conflict_is_settled_by_the_tiebreakers() {
+        let from: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let pwd = "localpasswordlocalpw12";
+        let small = [0u8; 8];
+        // both claim to be controlling and the other end's tiebreaker is the larger: we give way, and answer
+        let mut ice = Ice::new("locU", pwd, &answer(), Instant::now());
+        ice.tiebreaker = [0x10; 8];
+        let r = ice.respond(&stun::request_as(&[1; 12], "locU:srvU", pwd, false, true, [0x20; 8]), from).unwrap();
+        assert_eq!(stun::check_success(&r, &[1; 12], pwd), Some(from));
+        assert!(!ice.controlling, "gave way to the larger tiebreaker");
+        // controlled now, this end sends no USE-CANDIDATE
+        let req = ice.request(Instant::now());
+        let b = stun::check_request(&req, "srvU", "locU", "serverpasswordserverpw1").unwrap();
+        assert!(!b.use_candidate && b.controlled.is_some() && b.controlling.is_none());
+        // the other end says it is controlled as well, with the smaller tiebreaker: this end takes the controlling role
+        let r = ice.respond(&stun::request_as(&[3; 12], "locU:srvU", pwd, false, false, small), from).unwrap();
+        assert_eq!(stun::check_success(&r, &[3; 12], pwd), Some(from));
+        assert!(ice.controlling);
+        // controlling with the larger tiebreaker: 487, signed with our password, and the role is kept
+        let mut ice = Ice::new("locU", pwd, &answer(), Instant::now());
+        let r = ice.respond(&stun::request_as(&[4; 12], "locU:srvU", pwd, false, true, small), from).unwrap();
+        assert!(stun::is_role_conflict(&r, &[4; 12], pwd) && !stun::is_role_conflict(&r, &[5; 12], pwd) && !stun::is_role_conflict(&r, &[4; 12], "other-password-other-pass"));
+        assert!(ice.controlling);
+        // a 487 to our own check swaps the role and the check is sent again
+        let req = ice.request(Instant::now());
+        let txid: [u8; 12] = req[8..20].try_into().unwrap();
+        assert!(!ice.answered(&stun::role_conflict(&txid, "serverpasswordserverpw1"), Instant::now()));
+        assert!(!ice.controlling);
+        let again = ice.request(Instant::now());
+        assert!(!stun::check_request(&again, "srvU", "locU", "serverpasswordserverpw1").unwrap().use_candidate);
+        // a forged 487 changes nothing
+        let mut ice = Ice::new("locU", pwd, &answer(), Instant::now());
+        let req = ice.request(Instant::now());
+        let txid: [u8; 12] = req[8..20].try_into().unwrap();
+        assert!(!ice.answered(&stun::role_conflict(&txid, "not-the-servers-password!!"), Instant::now()));
+        assert!(ice.controlling);
     }
 
     #[test]
@@ -1026,7 +1208,7 @@ mod tests {
         let session = Session {
             sock: UdpSocket::bind("127.0.0.1:0").unwrap(),
             peer: server.local_addr().unwrap(),
-            client: dtls::Client::new(id, [0; 32]).unwrap(),
+            dtls: Dtls::Client(dtls::Client::new(id, [0; 32]).unwrap()),
             ice: Ice::new("locU", "localpasswordlocalpw12", &answer(), now),
             rx: srtp::Context::new(gcm, &[6; 16], &[7; 12]).unwrap(),
             shared,
@@ -1087,6 +1269,156 @@ mod tests {
         let video = &reports[0];
         assert_eq!(u32::from_be_bytes([video[20], video[21], video[22], video[23]]), 3, "packets sent");
         assert_eq!(u32::from_be_bytes([video[24], video[25], video[26], video[27]]), 30, "octets sent");
+    }
+
+    #[test]
+    fn a_session_answers_a_binding_request_and_ignores_one_that_does_not_authenticate() {
+        let (mut s, server, _) = session();
+        let now = Instant::now();
+        let heard = |wait: u64| {
+            let mut buf = vec![0u8; 2048];
+            net::recv_from_within(&server, &mut buf, Duration::from_millis(wait)).ok().map(|(n, _)| buf[..n].to_vec())
+        };
+        // a check from a full ICE agent: "local:remote" signed with the local password
+        let good = stun::request_as(&[9; 12], "locU:srvU", "localpasswordlocalpw12", false, false, [3; 8]);
+        s.datagram(&good, now);
+        let r = heard(5000).expect("a success response");
+        assert_eq!(stun::check_success(&r, &[9; 12], "localpasswordlocalpw12"), Some(server.local_addr().unwrap()));
+        // bad integrity (the server's password, a bit flipped), the wrong user name, and cut short get nothing
+        let mut flipped = good.clone();
+        flipped[30] ^= 1;
+        for bad in [stun::request_as(&[9; 12], "locU:srvU", "serverpasswordserverpw1", false, false, [3; 8]), flipped, stun::request_as(&[9; 12], "srvU:locU", "localpasswordlocalpw12", false, false, [3; 8]), good[..good.len() - 8].to_vec(), good[..20].to_vec()] {
+            s.datagram(&bad, now);
+        }
+        assert_eq!(heard(300), None);
+        // the answer to our own check is taken, not answered
+        let req = s.ice.request(now);
+        let txid: [u8; 12] = req[8..20].try_into().unwrap();
+        s.datagram(&stun::success(&txid, server.local_addr().unwrap(), "serverpasswordserverpw1"), now);
+        assert_eq!(heard(300), None);
+    }
+
+    /// The other end of a handshake on a socket of its own, in a thread: a DTLS client or server, until it has keys.
+    fn other_end(sock: UdpSocket, to: SocketAddr, mut end: Dtls) -> std::thread::JoinHandle<std::result::Result<dtls::SrtpKeys, String>> {
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let mut buf = vec![0u8; 4096];
+            let mut out = end.start(Instant::now())?;
+            let mut done_at: Option<Instant> = None;
+            while Instant::now() < deadline {
+                for d in out.drain(..) {
+                    let _ = sock.send_to(&d, to);
+                }
+                if end.keys().is_some() && done_at.is_none() {
+                    done_at = Some(Instant::now());
+                }
+                // keep answering for a moment, so that a last flight lost on the way is sent again
+                if done_at.is_some_and(|t| t.elapsed() > Duration::from_millis(300)) {
+                    return Ok(end.keys().unwrap().clone());
+                }
+                if let Ok((n, _)) = net::recv_from_within(&sock, &mut buf, Duration::from_millis(50)) {
+                    if (20..=63).contains(&buf[0]) {
+                        out.extend(end.handle(&buf[..n], Instant::now()).map_err(|e| e.0)?);
+                    }
+                }
+                out.extend(end.poll(Instant::now())?);
+            }
+            Err("the other end timed out".into())
+        })
+    }
+
+    fn pair_of_sockets() -> (UdpSocket, UdpSocket) {
+        (UdpSocket::bind("127.0.0.1:0").unwrap(), UdpSocket::bind("127.0.0.1:0").unwrap())
+    }
+
+    fn some_client() -> Dtls {
+        Dtls::Client(dtls::Client::new(Arc::new(dtls::Identity::generate("x").unwrap()), [0; 32]).unwrap())
+    }
+
+    #[test]
+    fn the_publisher_is_the_dtls_server_when_the_answer_is_active() {
+        let (mine, theirs) = pair_of_sockets();
+        let (mine_addr, their_addr) = (mine.local_addr().unwrap(), theirs.local_addr().unwrap());
+        let (my_id, their_id) = (Arc::new(dtls::Identity::generate("publisher").unwrap()), Arc::new(dtls::Identity::generate("other end").unwrap()));
+        let mut ice = Ice::new("locU", "localpasswordlocalpw12", &answer(), Instant::now());
+        let mut server = Dtls::Server(dtls::Server::new(my_id.clone(), their_id.fingerprint).unwrap(), their_addr.to_string().into_bytes());
+        let peer = other_end(theirs, mine_addr, Dtls::Client(dtls::Client::new(their_id, my_id.fingerprint).unwrap()));
+        let keys = handshake(&mine, their_addr, &mut server, &mut ice).expect("a client with the right certificate connects");
+        let theirs_keys = peer.join().unwrap().unwrap();
+        assert_eq!(keys, theirs_keys);
+        // what the publisher protects, the other end (the DTLS client) unprotects with the server's write keys
+        let (mut tx, mut rx) = contexts(&server, &keys).unwrap();
+        // the other end's contexts, by the client's rule: it sends with the client keys and receives with the server's
+        let (mut peer_tx, mut peer_rx) = contexts(&some_client(), &theirs_keys).unwrap();
+        let mut stream = Stream::new(111, 0x77, 48_000);
+        let sent = stream.packet(&mut tx, true, 960, b"opus-bytes", Instant::now()).unwrap();
+        assert!(peer_rx.unprotect_rtp(&sent).unwrap().ends_with(b"opus-bytes"));
+        // and the other way: what the DTLS client protects, the publisher unprotects
+        let rtcp = [&[0x81u8, 206, 0, 2, 0, 0, 0, 9][..], &0x77u32.to_be_bytes()].concat();
+        assert!(rx.unprotect_rtcp(&peer_tx.protect_rtcp(&rtcp).unwrap()).is_ok());
+        // protecting with the client's keys, as the publisher would if it kept the other role, does not authenticate on the other end
+        let (mut wrong_tx, _) = contexts(&some_client(), &keys).unwrap();
+        let bad = Stream::new(111, 0x77, 48_000).packet(&mut wrong_tx, true, 0, b"x", Instant::now()).unwrap();
+        let (_, mut fresh_rx) = contexts(&some_client(), &keys).unwrap();
+        assert!(fresh_rx.unprotect_rtp(&bad).is_err());
+    }
+
+    #[test]
+    fn a_dtls_client_with_the_wrong_certificate_does_not_connect_to_the_publisher_as_server() {
+        let (mine, theirs) = pair_of_sockets();
+        let (mine_addr, their_addr) = (mine.local_addr().unwrap(), theirs.local_addr().unwrap());
+        let (my_id, their_id) = (Arc::new(dtls::Identity::generate("publisher").unwrap()), Arc::new(dtls::Identity::generate("other end").unwrap()));
+        let mut ice = Ice::new("locU", "localpasswordlocalpw12", &answer(), Instant::now());
+        // the answer's fingerprint is not the certificate this client has
+        let mut server = Dtls::Server(dtls::Server::new(my_id.clone(), [0x42; 32]).unwrap(), their_addr.to_string().into_bytes());
+        let peer = other_end(theirs, mine_addr, Dtls::Client(dtls::Client::new(their_id, my_id.fingerprint).unwrap()));
+        let e = handshake(&mine, their_addr, &mut server, &mut ice).expect_err("a certificate the answer did not name");
+        assert!(!e.is_empty());
+        assert!(server.keys().is_none());
+        drop(mine);
+        let _ = peer.join();
+    }
+
+    #[test]
+    fn a_dtls_server_with_the_wrong_certificate_does_not_connect_to_the_publisher_as_client() {
+        let (mine, theirs) = pair_of_sockets();
+        let (mine_addr, their_addr) = (mine.local_addr().unwrap(), theirs.local_addr().unwrap());
+        let (my_id, their_id) = (Arc::new(dtls::Identity::generate("publisher").unwrap()), Arc::new(dtls::Identity::generate("other end").unwrap()));
+        let mut ice = Ice::new("locU", "localpasswordlocalpw12", &answer(), Instant::now());
+        let mut client = Dtls::Client(dtls::Client::new(my_id.clone(), [0x42; 32]).unwrap());
+        let peer = other_end(theirs, mine_addr, Dtls::Server(dtls::Server::new(their_id, my_id.fingerprint).unwrap(), mine_addr.to_string().into_bytes()));
+        assert!(handshake(&mine, their_addr, &mut client, &mut ice).is_err());
+        let _ = peer.join();
+    }
+
+    #[test]
+    fn the_publisher_is_still_the_dtls_client_when_the_answer_is_passive() {
+        let (mine, theirs) = pair_of_sockets();
+        let (mine_addr, their_addr) = (mine.local_addr().unwrap(), theirs.local_addr().unwrap());
+        let (my_id, their_id) = (Arc::new(dtls::Identity::generate("publisher").unwrap()), Arc::new(dtls::Identity::generate("other end").unwrap()));
+        let mut ice = Ice::new("locU", "localpasswordlocalpw12", &answer(), Instant::now());
+        let mut client = Dtls::Client(dtls::Client::new(my_id.clone(), their_id.fingerprint).unwrap());
+        let peer = other_end(theirs, mine_addr, Dtls::Server(dtls::Server::new(their_id, my_id.fingerprint).unwrap(), mine_addr.to_string().into_bytes()));
+        let keys = handshake(&mine, their_addr, &mut client, &mut ice).expect("connects");
+        assert_eq!(keys, peer.join().unwrap().unwrap());
+        let (mut tx, _) = contexts(&client, &keys).unwrap();
+        let mut server_rx = srtp::Context::new(keys.profile, &keys.client_key, &keys.client_salt).unwrap();
+        let sent = Stream::new(111, 5, 48_000).packet(&mut tx, true, 0, b"hello", Instant::now()).unwrap();
+        assert!(server_rx.unprotect_rtp(&sent).is_ok());
+    }
+
+    #[test]
+    fn a_server_role_handshake_with_nobody_there_ends_in_bounded_time() {
+        // the other end never starts: the wait is bounded
+        let (mine, theirs) = pair_of_sockets();
+        let their_addr = theirs.local_addr().unwrap();
+        let id = Arc::new(dtls::Identity::generate("publisher").unwrap());
+        let mut ice = Ice::new("locU", "localpasswordlocalpw12", &answer(), Instant::now());
+        let mut server = Dtls::Server(dtls::Server::new(id, [1; 32]).unwrap(), their_addr.to_string().into_bytes());
+        // a datagram that is not DTLS, from the right address, is no handshake
+        theirs.send_to(&[0x80; 40], mine.local_addr().unwrap()).unwrap();
+        let e = handshake(&mine, their_addr, &mut server, &mut ice).unwrap_err();
+        assert!(e.contains("no DTLS handshake"), "{e}");
     }
 
     #[test]
