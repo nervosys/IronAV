@@ -72,6 +72,10 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Fixed
 
+- **Opus decoder with malformed packets:** a silent CELT frame smaller than the bits already read took a negative bit
+  count, which the range decoder's bit total could not hold. Release builds wrapped the arithmetic and stayed in
+  bounds, with the same output; builds with overflow checks panicked. The bit count is now set to the frame's size as
+  the reference decoder does it, and the decoder is fuzzed with random packets of every config.
 - **WHIP with OBS Studio:** OBS's DTLS certificate (libdatachannel's) has an empty extensions list, which the strict X.509
   parser refused, so OBS could not publish. The publisher's certificate is vouched for by its offer's fingerprint and only
   its key is used, so the key is now read from it without holding it to RFC 5280. OBS publishes to `whip://`; it offers

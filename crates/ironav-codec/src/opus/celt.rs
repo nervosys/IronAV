@@ -1519,7 +1519,7 @@ impl Celt {
         }
         if silence {
             consumed = self.p.framebits;
-            rc.skip_bits((self.p.framebits - rc.tell()) as u32);
+            rc.set_tell(self.p.framebits);
         }
 
         // post-filter options

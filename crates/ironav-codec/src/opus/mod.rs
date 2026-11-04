@@ -590,6 +590,9 @@ impl Decoder for OpusDecoder {
 mod tests {
     use super::*;
 
+    /// Random packets per config, channel count and frame-count code in the quick sweep.
+    const PACKETS_PER_CASE: usize = 40;
+
     #[test]
     fn toc_decodes_mode_bandwidth_and_length() {
         let t = toc(8 << 3 | 4); // config 8: SILK wideband 10 ms, stereo
@@ -620,6 +623,86 @@ mod tests {
             let mut y = vec![0f32; x.len() * rs.ratio()];
             silk_to_48k(&mut rs, &x, &mut y);
             assert!((y[y.len() - 1] - 0.5).abs() < 1e-3, "{fs} kHz: {}", y[y.len() - 1]);
+        }
+    }
+
+    /// A fixed-seed generator, so a failing packet replays from the seed.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn word(&mut self) -> u32 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (self.0 >> 33) as u32
+        }
+
+        fn below(&mut self, n: u32) -> u32 {
+            self.word() % n
+        }
+    }
+
+    /// A random packet of up to 1275 bytes with the given config byte fields.
+    fn random_packet(rng: &mut Lcg, config: u8, stereo: bool, code: u8) -> Vec<u8> {
+        let len = 1 + rng.below(1275) as usize;
+        let mut p: Vec<u8> = (0..len).map(|_| rng.word() as u8).collect();
+        p[0] = config << 3 | (stereo as u8) << 2 | code;
+        if code == 3 && len > 1 {
+            // a frame count of up to 7 most of the time, so the frames are decoded
+            p[1] = (p[1] & 0xC0) | rng.below(8) as u8;
+        }
+        p
+    }
+
+    /// Random packets through `decode_into` for every config byte (32 configs, mono and stereo,
+    /// each frame-count code), with a decoder that is reset every 16 packets so its state is
+    /// reached too. A malformed packet must decode or fail with an error; a panic (overflow checks
+    /// are on in test builds) fails the test.
+    fn fuzz_all_configs(per_case: usize, seed: u64) {
+        let mut rng = Lcg(seed);
+        for config in 0..32u8 {
+            for stereo in [false, true] {
+                for code in 0..4u8 {
+                    let ch = 1 + stereo as usize;
+                    let mut dec = OpusDecoder::stream(ch);
+                    let mut out = vec![0f32; MAX_PACKET_SAMPLES * ch];
+                    for i in 0..per_case {
+                        if i % 16 == 15 {
+                            dec = OpusDecoder::stream(ch);
+                        }
+                        let p = random_packet(&mut rng, config, stereo, code);
+                        if let Ok(n) = dec.decode_into(&p, &mut out) {
+                            assert!(n <= MAX_PACKET_SAMPLES, "config {config} stereo {stereo} code {code}: {n} samples");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn random_packets_never_panic() {
+        fuzz_all_configs(PACKETS_PER_CASE, 0x0BAD_C0DE);
+    }
+
+    /// The same sweep, longer: `cargo test -p ironav-codec --lib -- --ignored random_packets_long`.
+    #[test]
+    #[ignore = "a longer sweep, a few minutes in debug; run by hand"]
+    fn random_packets_long_never_panic() {
+        fuzz_all_configs(20_000, 0x1234_5678);
+    }
+
+    /// A hybrid packet whose in-band redundancy takes every byte leaves the CELT frame with no
+    /// bytes. Its bit count starts at zero, and the fraction of a bit below it must not overflow.
+    #[test]
+    fn an_empty_celt_frame_decodes_without_overflow() {
+        let mut celt = celt::Celt::new(2, true);
+        let mut out = [vec![0f32; 960], vec![0f32; 960]];
+        for data in [&[][..], &[0xff][..], &[0x5a, 0xc3][..]] {
+            for stereo in [1, 2] {
+                let mut rc = RangeDecoder::new(data);
+                rc.set_raw(data.len(), data.len());
+                let _ = celt.decode_frame(&mut rc, &mut out, stereo, 960, 17, BAND_END[4]);
+                assert!(rc.tell() >= 0);
+            }
         }
     }
 }

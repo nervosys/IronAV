@@ -71,9 +71,12 @@ impl<'a> RangeDecoder<'a> {
         (self.raw_bytes * 8) as i32
     }
 
-    /// Account for `n` bits as consumed without reading them (a silent frame).
-    pub fn skip_bits(&mut self, n: u32) {
-        self.total_bits += n;
+    /// Make [`tell`](Self::tell) read `bits` for the frame, as a silent frame does: the rest of
+    /// the frame counts as consumed without being read. `bits` may be below the count already
+    /// used, and then the count goes back to `bits`. The reference decoder adds the difference
+    /// in unsigned arithmetic, which lands on the same count; here the total is set directly.
+    pub fn set_tell(&mut self, bits: i32) {
+        self.total_bits = bits.max(0) as u32 + log2(self.range) + 1;
     }
 
     pub fn range(&self) -> u32 {
@@ -682,5 +685,22 @@ mod laplace_tests {
                 }
             }
         }
+    }
+
+    /// A silent CELT frame smaller than the bits already read (a short packet, the packet's
+    /// frame size is 8 bits): the count goes back to the frame size, with no wrap and no panic.
+    #[test]
+    fn a_silent_frame_below_the_bits_used_sets_the_count_back() {
+        let data = [0x5au8; 64];
+        let mut rc = RangeDecoder::new(&data);
+        for _ in 0..4 {
+            rc.uint(1 << 20);
+        }
+        assert!(rc.tell() > 8);
+        rc.set_tell(8);
+        assert_eq!(rc.tell(), 8);
+        assert!((57..=64).contains(&rc.tell_frac()), "tell_frac {}", rc.tell_frac());
+        rc.set_tell(40);
+        assert_eq!(rc.tell(), 40);
     }
 }
