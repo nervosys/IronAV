@@ -582,7 +582,8 @@ fn tell_frac_of(total_bits: u32, range: u32) -> i32 {
         rcbuffer = rcbuffer << 1 | bit;
         range >>= bit;
     }
-    (total_bits - rcbuffer) as i32
+    // below zero when a count set to zero has a fraction left in the range
+    total_bits as i32 - rcbuffer as i32
 }
 
 #[cfg(test)]
@@ -685,6 +686,18 @@ mod laplace_tests {
                 }
             }
         }
+    }
+
+    /// A count set to zero, as an empty CELT frame does: the whole bits are zero, so the fraction of
+    /// a range that is not a power of two makes the fine count negative, not an overflow.
+    #[test]
+    fn the_fine_count_can_go_below_zero_without_overflow() {
+        let data = [0x5au8; 64];
+        let mut rc = RangeDecoder::new(&data);
+        rc.range = 0xB504_F334; // the square root of two, as far above a power of two as it matters
+        rc.set_tell(0);
+        assert_eq!(rc.tell(), 0);
+        assert_eq!(rc.tell_frac(), -3);
     }
 
     /// A silent CELT frame smaller than the bits already read (a short packet, the packet's

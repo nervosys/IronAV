@@ -7,6 +7,12 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Fixed
+
+- **Opus decoder, a second overflow on malformed packets:** after an empty CELT frame set the bit count to zero, the
+  fraction left in the range made the fine bit count negative, which was calculated unsigned and panicked in builds with
+  overflow checks on. 0.1.3 still has this. Release builds wrapped to the same value, so their output does not change.
+
 ## [0.1.3] - 2026-11-04
 
 ### Added
