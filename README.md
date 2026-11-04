@@ -352,7 +352,11 @@ each keyframe. The video has to be H.264, so a source with other video needs `--
 audio is not sent, and a `publish_audio_skipped` event says so. The token goes only to the endpoint's host and port and is
 redacted wherever the URL is shown. FIPS mode refuses `whip://` (its signalling is plaintext) and takes `whips://`. A caller
 goes through `IRONAV_NET_ALLOW` as SRT does, and the same events, back-off and status apply. The server's requests for a
-keyframe are counted as `keyframe_requests` in the status; the encoder is not told to make one. Tested end to end against
+keyframe are counted as `keyframe_requests` in the status. With a transcode (`--transcode`, or `transcode` in `stream_open`),
+the transcoder makes an IDR picture for each, with the parameter sets ahead of it and the GOP count starting again from
+it, at most one per half second (`keyframes_forced`); a request that comes while one is waiting, or that is still waiting
+when the session ends, is counted as `keyframes_ignored`. Without a transcode nothing can be forced: the requests are
+counted, and `keyframes_forced` stays 0. Tested end to end against
 IronAV's own WHIP endpoint; not yet against OBS, FFmpeg or a browser as the receiver.
 
 ```sh

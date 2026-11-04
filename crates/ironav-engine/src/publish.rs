@@ -19,7 +19,7 @@ use ironav_live::{open_sink, whip_endpoint, Sink, SinkPlan, WhipOptions, WhipPub
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::io::{Seek, SeekFrom, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -56,18 +56,47 @@ pub struct PublishCell {
     dropped: AtomicU64,
     /// Keyframes the destination asked for (a WHIP server's picture loss indication or full intra request).
     keyframes: AtomicU64,
+    /// A keyframe the destination asked for that the transcoder has not made yet.
+    idr_wanted: AtomicBool,
+    /// The session's output is made by a transcoder, which can make the keyframes asked for.
+    transcoded: AtomicBool,
+    /// Requests answered with a forced IDR picture.
+    keyframes_forced: AtomicU64,
+    /// Requests not answered: nothing transcodes, or the request came while one was already waiting, or the
+    /// session ended before it was made.
+    keyframes_ignored: AtomicU64,
 }
 
 impl PublishCell {
     fn new(url: &str) -> PublishCell {
-        PublishCell { status: Mutex::new(json!({ "url": url, "state": "waiting" })), events: Mutex::new(VecDeque::new()), dropped: AtomicU64::new(0), keyframes: AtomicU64::new(0) }
+        PublishCell {
+            status: Mutex::new(json!({ "url": url, "state": "waiting" })),
+            events: Mutex::new(VecDeque::new()),
+            dropped: AtomicU64::new(0),
+            keyframes: AtomicU64::new(0),
+            idr_wanted: AtomicBool::new(false),
+            transcoded: AtomicBool::new(false),
+            keyframes_forced: AtomicU64::new(0),
+            keyframes_ignored: AtomicU64::new(0),
+        }
     }
 
     pub fn status(&self) -> Value {
         let mut v = lock(&self.status).clone();
         v["dropped_packets"] = json!(self.dropped.load(Ordering::Relaxed));
         v["keyframe_requests"] = json!(self.keyframes.load(Ordering::Relaxed));
+        v["keyframes_forced"] = json!(self.keyframes_forced.load(Ordering::Relaxed));
+        v["keyframes_ignored"] = json!(self.keyframes_ignored.load(Ordering::Relaxed));
         v
+    }
+
+    /// The destination asked for a keyframe. The transcoder is asked to make an IDR picture, unless one is
+    /// already waiting for it; with nothing transcoding, the request is only counted, as ignored.
+    pub(crate) fn keyframe_asked(&self) {
+        self.keyframes.fetch_add(1, Ordering::Relaxed);
+        if !self.transcoded.load(Ordering::Relaxed) || self.idr_wanted.swap(true, Ordering::Relaxed) {
+            self.keyframes_ignored.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// The events since the last call, oldest first.
@@ -163,11 +192,31 @@ impl Publisher {
         }
     }
 
+    /// The session's output is made by a transcoder, which can make the keyframes the destination asks for.
+    pub fn set_transcoded(&self) {
+        self.cell.transcoded.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the destination has asked for a keyframe that the transcoder has not made yet.
+    pub fn keyframe_wanted(&self) -> bool {
+        self.cell.idr_wanted.load(Ordering::Relaxed)
+    }
+
+    /// The transcoder has made the keyframe the destination asked for.
+    pub fn keyframe_made(&self) {
+        self.cell.idr_wanted.store(false, Ordering::Relaxed);
+        self.cell.keyframes_forced.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// The session is over: what is queued is sent, and the destination told goodbye.
     pub fn finish(&mut self) {
         self.tx = None;
         if let Some(t) = self.thread.take() {
             let _ = t.join();
+        }
+        // a request still waiting when the session ends is not answered
+        if self.cell.idr_wanted.swap(false, Ordering::Relaxed) {
+            self.cell.keyframes_ignored.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -532,7 +581,7 @@ impl Work {
             };
             if let Some(c) = conn.as_mut() {
                 if c.keyframe_requested() {
-                    self.cell.keyframes.fetch_add(1, Ordering::Relaxed);
+                    self.cell.keyframe_asked();
                 }
             }
             let Some(c) = conn.as_mut() else {
@@ -749,6 +798,31 @@ mod tests {
         assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
         assert!(cell.status()["dropped_packets"].as_u64().unwrap() > 0);
         drop(p);
+    }
+
+    #[test]
+    fn a_keyframe_request_is_forced_or_ignored_and_the_counts_say_which() {
+        ironav_live::net::allow_loopback_for_tests();
+        let url = "srt://127.0.0.1:9?passphrase=0123456789abcdef";
+        let mut p = Publisher::new(url, check(url).unwrap());
+        let cell = p.cell();
+        // nothing transcodes: a request is counted, and nothing waits for the transcoder
+        cell.keyframe_asked();
+        assert!(!p.keyframe_wanted());
+        // a transcoder: one request waits for it, and one that comes while it waits is ignored
+        p.set_transcoded();
+        cell.keyframe_asked();
+        cell.keyframe_asked();
+        assert!(p.keyframe_wanted());
+        p.keyframe_made();
+        assert!(!p.keyframe_wanted());
+        let st = cell.status();
+        assert_eq!((st["keyframe_requests"].as_u64(), st["keyframes_forced"].as_u64(), st["keyframes_ignored"].as_u64()), (Some(3), Some(1), Some(2)), "{st}");
+        // a request still waiting when the session ends is ignored
+        cell.keyframe_asked();
+        p.finish();
+        let st = cell.status();
+        assert_eq!((st["keyframe_requests"].as_u64(), st["keyframes_forced"].as_u64(), st["keyframes_ignored"].as_u64()), (Some(4), Some(1), Some(3)), "{st}");
     }
 
     #[test]

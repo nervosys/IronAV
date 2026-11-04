@@ -95,6 +95,8 @@ pub struct H264Encoder {
     rc_window: f64,
     /// Display index of the last IDR picture.
     idr_at: u64,
+    /// Set by `force_idr`: the next picture is coded as an IDR picture.
+    force_idr: bool,
     /// The last picture's luma at a quarter of the size, to find scene cuts.
     last_low: Option<LowRes>,
     /// Every picture's reconstruction by its time stamp.
@@ -160,6 +162,7 @@ impl H264Encoder {
             keyint: KEYINT,
             rc_window: 1.0,
             idr_at: 0,
+            force_idr: false,
             last_low: None,
             #[cfg(test)]
             recon: Vec::new(),
@@ -192,6 +195,14 @@ impl H264Encoder {
     pub fn with_keyint(mut self, n: u64) -> Self {
         self.keyint = n.max(1);
         self
+    }
+
+    /// The next picture is coded as an IDR picture, with the parameter sets ahead of it, whatever the
+    /// GOP count says, and the count starts again from it. This is for a viewer that asked for a
+    /// keyframe. With B pictures, the pictures still waiting for their P picture are coded first, as
+    /// they are before any IDR picture.
+    pub fn force_idr(&mut self) {
+        self.force_idr = true;
     }
 
     /// P pictures may predict from up to `n` reference pictures (1 to 16, by default `REFS`), and
@@ -568,7 +579,8 @@ impl Encoder for H264Encoder {
             inter as f64 > SCENE_CUT * intra as f64
         });
         self.last_low = Some(low);
-        let idr = d == 0 || d - self.idr_at >= self.keyint || cut;
+        let forced = std::mem::take(&mut self.force_idr);
+        let idr = forced || d == 0 || d - self.idr_at >= self.keyint || cut;
         let mut out = Vec::new();
         if idr || self.pending.len() == self.b_frames() {
             if idr {
@@ -880,6 +892,58 @@ mod tests {
             let s = enc.mb_w * 16;
             for r in 0..h {
                 assert_eq!(&d.planes[0][r * w..r * w + w], recon[0][r * s..r * s + w].iter().map(|&v| v as u8).collect::<Vec<_>>().as_slice(), "frame {} row {r}", d.pts);
+            }
+        }
+    }
+
+    #[test]
+    fn a_forced_idr_picture_starts_a_new_gop_that_the_pictures_after_it_predict_from() {
+        let (w, h) = (96, 64);
+        let params = StreamParams::Video { width: w as u32, height: h as u32, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational::new(25, 1) };
+        // without B pictures, and with them (the pictures waiting for their P picture are coded first)
+        for bframes in [0, BFRAMES] {
+            // an IDR picture every 5 pictures, and one forced at picture 3: the count starts again from it
+            let mut enc = H264Encoder::new(&params, Some(26), None).unwrap().with_keyint(5);
+            enc.bframes = bframes;
+            let mut pkts = Vec::new();
+            for t in 0..12 {
+                if t == 3 {
+                    enc.force_idr();
+                }
+                pkts.extend(enc.encode(&Frame::Video(scene(w, h, t))).unwrap());
+            }
+            pkts.extend(enc.flush().unwrap());
+            // NAL units of a given type (5 IDR slices, 7 SPS, 8 PPS, 1 P slices)
+            let has = |p: &Packet, want: u8| p.data.windows(4).any(|w| w[..3] == [0, 0, 1] && w[3] & 31 == want);
+            let idrs: Vec<i64> = pkts.iter().filter(|p| has(p, 5)).map(|p| p.pts).collect();
+            assert_eq!(idrs, [0, 3, 8], "bframes {bframes}");
+            for t in [0, 3, 8] {
+                let p = pkts.iter().find(|p| p.pts == t).unwrap();
+                assert!(has(p, 7) && has(p, 8), "bframes {bframes}: the IDR picture at {t} has its parameter sets");
+            }
+            if bframes == 0 {
+                // the pictures after the forced one are P pictures, predicted from it
+                for t in 4..8 {
+                    let p = pkts.iter().find(|p| p.pts == t).unwrap();
+                    assert!(has(p, 1) && !has(p, 5), "picture {t} is a P picture");
+                }
+            }
+            let mut dec = H264Decoder::new();
+            let mut out = Vec::new();
+            for p in &pkts {
+                out.extend(dec.decode(p).unwrap());
+            }
+            out.extend(dec.flush().unwrap());
+            assert_eq!(out.len(), 12, "bframes {bframes}");
+            // each decoded picture is what the encoder reconstructed, so the pictures after the IDR picture
+            // were predicted from the references it kept
+            let s = enc.mb_w * 16;
+            for f in out {
+                let Frame::Video(d) = f else { unreachable!() };
+                let recon = &enc.recon.iter().find(|r| r.0 == d.pts).unwrap().1;
+                for r in 0..h {
+                    assert_eq!(&d.planes[0][r * w..r * w + w], recon[0][r * s..r * s + w].iter().map(|&v| v as u8).collect::<Vec<_>>().as_slice(), "bframes {bframes} frame {} row {r}", d.pts);
+                }
             }
         }
     }

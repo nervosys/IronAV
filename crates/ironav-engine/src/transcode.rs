@@ -14,9 +14,14 @@ use serde_json::{json, Map, Value};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 /// Packets waiting for the transcoder, at most.
 const QUEUE: usize = 256;
+
+/// The least time between two IDR pictures made because a destination asked for a keyframe: a viewer that
+/// keeps asking gets one every half second, not a keyframe for every picture.
+const IDR_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -94,7 +99,8 @@ impl Transcoder {
     }
 
     /// Sends what the transcoder writes to `p` as well: the session's publisher. It is told the
-    /// output's streams when the first picture has been encoded, and finished with the output.
+    /// output's streams when the first picture has been encoded, and finished with the output. A keyframe
+    /// the destination asks for is made as an IDR picture, at most one per half second.
     pub fn publish_to(&mut self, p: crate::publish::Publisher) {
         self.publisher = Some(p);
     }
@@ -120,6 +126,9 @@ impl Transcoder {
         let mut work = Work::new(self.opts.clone(), streams, v, self.status.clone());
         work.late = self.late;
         work.publisher = self.publisher.take();
+        if let Some(p) = &work.publisher {
+            p.set_transcoded();
+        }
         self.tx = Some(tx);
         let status = self.status.clone();
         let output = self.opts.output.clone();
@@ -212,6 +221,27 @@ struct Work {
     late: bool,
     error: Option<Error>,
     publisher: Option<crate::publish::Publisher>,
+    idr: IdrClock,
+}
+
+/// When the last IDR picture made for a destination's request was made, so the next one waits for
+/// [`IDR_INTERVAL`].
+#[derive(Default)]
+struct IdrClock {
+    last: Option<Instant>,
+}
+
+impl IdrClock {
+    /// Whether an IDR picture may be made at `now`; if so, it is recorded as made then.
+    fn allow(&mut self, now: Instant) -> bool {
+        match self.last {
+            Some(t) if now.saturating_duration_since(t) < IDR_INTERVAL => false,
+            _ => {
+                self.last = Some(now);
+                true
+            }
+        }
+    }
 }
 
 impl Work {
@@ -229,7 +259,7 @@ impl Work {
             }
         }
         let rec = Recorder::new(opts.record());
-        Work { opts, streams: streams.to_vec(), video, map, decoder: None, convert: None, scale: None, encoder: None, rec, started: false, status, pictures_in: 0, pictures_out: 0, size: None, late: false, error: None, publisher: None }
+        Work { opts, streams: streams.to_vec(), video, map, decoder: None, convert: None, scale: None, encoder: None, rec, started: false, status, pictures_in: 0, pictures_out: 0, size: None, late: false, error: None, publisher: None, idr: IdrClock::default() }
     }
 
     fn run(mut self, rx: Receiver<(Packet, bool)>) {
@@ -325,6 +355,7 @@ impl Work {
             if let Some(Frame::Video(v)) = cur.iter().find(|fr| !matches!(fr, Frame::Video(v) if v.pix_fmt == PixelFormat::Yuv420p)) {
                 return Err(Error::new(ErrorCode::UnsupportedFormat, format!("{:?} pictures cannot be encoded as H.264", v.pix_fmt)));
             }
+            self.honour_keyframe_request(Instant::now());
             let mut pkts = Vec::new();
             for fr in &cur {
                 pkts.extend(self.encoder.as_mut().unwrap().encode(fr)?);
@@ -369,6 +400,20 @@ impl Work {
         Ok(())
     }
 
+    /// Makes the encoder's next picture an IDR picture when the destination asked for a keyframe and the last
+    /// IDR picture made for a request is at least [`IDR_INTERVAL`] back. A request that has to wait stays
+    /// pending until it can be made.
+    fn honour_keyframe_request(&mut self, now: Instant) {
+        let Some(p) = self.publisher.as_ref() else { return };
+        if !p.keyframe_wanted() || !self.idr.allow(now) {
+            return;
+        }
+        if let Some(e) = self.encoder.as_mut() {
+            e.force_idr();
+        }
+        p.keyframe_made();
+    }
+
     fn write_video(&mut self, pkts: Vec<Packet>) {
         let tb = self.streams[self.video].time_base.as_f64();
         let out = self.map[self.video].unwrap();
@@ -407,5 +452,58 @@ impl Work {
             "record": rec,
             "error": err,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::publish::{check, Publisher};
+    use ironav_core::{Rational, VideoFrame};
+
+    #[test]
+    fn idr_pictures_for_requests_come_at_most_once_per_half_second() {
+        let mut clock = IdrClock::default();
+        let t0 = Instant::now();
+        assert!(clock.allow(t0), "the first request is made at once");
+        assert!(!clock.allow(t0 + Duration::from_millis(1)));
+        assert!(!clock.allow(t0 + Duration::from_millis(499)));
+        assert!(clock.allow(t0 + Duration::from_millis(500)), "half a second after the last one");
+        // measured from the picture made, not from the request that waited
+        assert!(!clock.allow(t0 + Duration::from_millis(900)));
+        assert!(clock.allow(t0 + Duration::from_millis(1000)));
+    }
+
+    #[test]
+    fn a_waiting_keyframe_request_becomes_an_idr_picture_once_the_clock_allows() {
+        ironav_live::net::allow_loopback_for_tests();
+        let url = "srt://127.0.0.1:9?passphrase=0123456789abcdef";
+        let publisher = Publisher::new(url, check(url).unwrap());
+        let cell = publisher.cell();
+        publisher.set_transcoded();
+        let opts: TranscodeOptions = serde_json::from_value(json!({ "output": "unused.ts" })).unwrap();
+        let mut work = Work::new(opts, &[], 0, Arc::new(Mutex::new(Value::Null)));
+        work.publisher = Some(publisher);
+        let params = StreamParams::Video { width: 64, height: 48, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational::new(25, 1) };
+        work.encoder = Some(H264Encoder::new(&params, Some(26), None).unwrap().low_latency());
+        let frame = |t: i64| Frame::Video(VideoFrame { width: 64, height: 48, pix_fmt: PixelFormat::Yuv420p, pts: t, planes: vec![vec![90; 64 * 48], vec![128; 32 * 24], vec![128; 32 * 24]] });
+        // one picture through the encoder as the transcoder does it, and whether it came out as an IDR picture
+        let code = |work: &mut Work, t: i64, now: Instant| -> bool {
+            work.honour_keyframe_request(now);
+            let pkts = work.encoder.as_mut().unwrap().encode(&frame(t)).unwrap();
+            pkts.iter().any(|p| ironav_formats::is_keyframe(CodecId::H264, &p.data) == Some(true))
+        };
+        let t0 = Instant::now();
+        assert!(code(&mut work, 0, t0), "the first picture is an IDR picture anyway");
+        // a request is made into the next picture, as no IDR picture was made for one before
+        cell.keyframe_asked();
+        assert!(code(&mut work, 1, t0), "the request is made at once");
+        // a second request within half a second waits: the picture is coded as P
+        cell.keyframe_asked();
+        assert!(!code(&mut work, 2, t0 + Duration::from_millis(100)));
+        assert!(!code(&mut work, 3, t0 + Duration::from_millis(499)), "still waiting");
+        assert!(code(&mut work, 4, t0 + Duration::from_millis(500)), "made once half a second has passed");
+        let st = cell.status();
+        assert_eq!((st["keyframe_requests"].as_u64(), st["keyframes_forced"].as_u64(), st["keyframes_ignored"].as_u64()), (Some(2), Some(2), Some(0)), "{st}");
     }
 }
