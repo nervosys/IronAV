@@ -30,7 +30,8 @@
 //! keyframe comes) and after a large gap. The source ends when the publisher DELETEs its session or
 //! closes DTLS, or when its media stops for [`MEDIA_TIMEOUT`].
 //!
-//! The other direction is [`WhipPublisher`], a WHIP client over the same STUN, DTLS, SRTP and SDP code.
+//! The other direction is [`WhipPublisher`], a WHIP client over the same STUN, DTLS, SRTP and SDP code,
+//! and [`WhepServer`] is a send-only WHEP endpoint, the same server pieces turned toward viewers.
 
 mod dtls;
 mod http;
@@ -42,8 +43,10 @@ mod stun;
 // not yet served by an endpoint: the caller is a viewer's input channel
 #[allow(dead_code)]
 mod websocket;
+mod whep;
 
 pub use publisher::{WhipOptions, WhipPublisher};
+pub use whep::{WhepOptions, WhepServer};
 #[cfg(test)]
 mod tests;
 
@@ -139,7 +142,7 @@ impl Source for WhipSource {
 
 /// `host:port/path`, the host optional (loopback) and in brackets for IPv6.
 fn parse_target(target: &str, scheme: &str) -> Result<(String, u16, String)> {
-    let bad = || Error::invalid_arg(format!("a WHIP source needs {scheme}://[host]:port[/path], got '{scheme}://{target}'"));
+    let bad = || Error::invalid_arg(format!("a WHIP or WHEP endpoint needs {scheme}://[host]:port[/path], got '{scheme}://{target}'"));
     let (hostport, path) = match target.find('/') {
         Some(i) => (&target[..i], &target[i..]),
         None => (target, "/"),
@@ -354,6 +357,14 @@ fn with_cors(resp: Vec<u8>, origin: &str) -> Vec<u8> {
     out
 }
 
+/// Whether an `Authorization` header holds `Bearer` and `token`.
+fn bearer_matches(header: Option<&str>, token: &str) -> bool {
+    let given = header.and_then(|a| a.strip_prefix("Bearer ").or_else(|| a.strip_prefix("bearer "))).unwrap_or("").trim();
+    // the comparison takes the same time whatever matches; only the lengths may differ
+    let (a, b) = (crate::webrtc::dtls::sha256(given.as_bytes()), crate::webrtc::dtls::sha256(token.as_bytes()));
+    ic_core::ct::verify(&a, &b)
+}
+
 /// Random text from the ICE character set, for credentials and the session's id.
 fn random_text(n: usize) -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
@@ -477,10 +488,7 @@ impl Endpoint {
 
     fn authorized(&self, req: &http::Request) -> bool {
         let Some(token) = &self.token else { return true };
-        let given = req.header("authorization").and_then(|a| a.strip_prefix("Bearer ").or_else(|| a.strip_prefix("bearer "))).unwrap_or("").trim();
-        // the comparison takes the same time whatever matches; only the lengths may differ
-        let (a, b) = (crate::webrtc::dtls::sha256(given.as_bytes()), crate::webrtc::dtls::sha256(token.as_bytes()));
-        ic_core::ct::verify(&a, &b)
+        bearer_matches(req.header("authorization"), token)
     }
 
     fn route(&mut self, req: &http::Request, peer: SocketAddr, now: Instant) -> (Vec<u8>, Flow) {

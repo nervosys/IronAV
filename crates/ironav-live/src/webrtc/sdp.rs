@@ -48,6 +48,15 @@ struct Section {
     fingerprint: Option<String>,
     setup: Option<String>,
     inactive: bool,
+    recvonly: bool,
+    sendonly: bool,
+}
+
+/// Who posted the offer: a publisher, which sends to this end, or a viewer, which receives from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Role {
+    Ingest,
+    Viewer,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -85,8 +94,25 @@ fn parse_fingerprint(v: &str) -> Option<[u8; 32]> {
     bytes.try_into().ok()
 }
 
-/// Reads an offer, choosing what to take. Errors say what is wrong, for the 400 response.
+/// Reads a publisher's offer, choosing what to take. Errors say what is wrong, for the 400 response.
 pub(crate) fn parse_offer(text: &str) -> Result<Offer, String> {
+    parse_offer_as(text, Role::Ingest)
+}
+
+/// The rank of an H.264 `profile-level-id` for a viewer: Constrained Baseline level 3.1 first, then
+/// the other Constrained Baseline levels, then the rest.
+fn profile_rank(fmtp: Option<&String>) -> u8 {
+    let id = fmtp.map(|f| params(f)).and_then(|p| p.get("profile-level-id").cloned()).unwrap_or_default().to_ascii_lowercase();
+    match id.as_str() {
+        "42e01f" => 0,
+        i if i.starts_with("42e0") => 1,
+        _ => 2,
+    }
+}
+
+/// Reads an offer from a publisher or a viewer. A viewer's offer takes H.264 video only, in a section
+/// that is `recvonly` or `sendrecv`; its audio is declined.
+pub(crate) fn parse_offer_as(text: &str, role: Role) -> Result<Offer, String> {
     if text.len() > MAX_OFFER {
         return Err("the offer is too long".into());
     }
@@ -146,7 +172,9 @@ pub(crate) fn parse_offer(text: &str) -> Result<Offer, String> {
                 }
             }
             "setup" => s.setup = Some(value.trim().to_ascii_lowercase()),
-            "inactive" | "recvonly" => s.inactive = true,
+            "inactive" => s.inactive = true,
+            "recvonly" => s.recvonly = true,
+            "sendonly" => s.sendonly = true,
             _ => {}
         }
     }
@@ -164,7 +192,7 @@ pub(crate) fn parse_offer(text: &str) -> Result<Offer, String> {
     let fingerprint = pick(|s| &s.fingerprint).and_then(|f| parse_fingerprint(&f)).ok_or("the offer has no sha-256 a=fingerprint")?;
     match pick(|s| &s.setup).as_deref() {
         Some("actpass") | Some("active") | None => {}
-        Some(other) => return Err(format!("the offer has a=setup:{other}; WHIP clients must be the DTLS client (actpass or active)")),
+        Some(other) => return Err(format!("the offer has a=setup:{other}; {} must be the DTLS client (actpass or active)", if role == Role::Ingest { "WHIP clients" } else { "WHEP clients" })),
     }
     let mut out = Vec::new();
     let (mut video, mut audio) = (false, false);
@@ -173,15 +201,22 @@ pub(crate) fn parse_offer(text: &str) -> Result<Offer, String> {
         if mid.is_empty() || mid.len() > 32 || !mid.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)) {
             return Err("an offer section has a malformed a=mid".into());
         }
-        let usable = !s.port_zero && !s.inactive && s.proto.to_ascii_uppercase().contains("SAVP");
+        // a publisher's section must not be receive-only, a viewer's must not be send-only
+        let direction_ok = !s.inactive && if role == Role::Ingest { !s.recvonly } else { !s.sendonly };
+        let usable = !s.port_zero && direction_ok && s.proto.to_ascii_uppercase().contains("SAVP");
         let track = match s.kind.as_str() {
-            "video" if usable && !video => s.formats.iter().find_map(|&pt| {
-                let map = s.rtpmap.get(&pt)?;
-                let fmtp = s.fmtp.get(&pt);
-                let mode = fmtp.map(|f| params(f)).and_then(|p| p.get("packetization-mode").cloned()).unwrap_or_else(|| "0".into());
-                (map.to_ascii_uppercase().starts_with("H264/90000") && mode == "1").then(|| Track { kind: Kind::Video, mid: mid.clone(), payload: pt, rtpmap: "H264/90000".into(), fmtp: fmtp.cloned(), clock: 90_000 })
-            }),
-            "audio" if usable && !audio => s.formats.iter().find_map(|&pt| {
+            "video" if usable && !video => s
+                .formats
+                .iter()
+                .filter_map(|&pt| {
+                    let map = s.rtpmap.get(&pt)?;
+                    let fmtp = s.fmtp.get(&pt);
+                    let mode = fmtp.map(|f| params(f)).and_then(|p| p.get("packetization-mode").cloned()).unwrap_or_else(|| "0".into());
+                    (map.to_ascii_uppercase().starts_with("H264/90000") && mode == "1").then(|| Track { kind: Kind::Video, mid: mid.clone(), payload: pt, rtpmap: "H264/90000".into(), fmtp: fmtp.cloned(), clock: 90_000 })
+                })
+                // the first of the best rank (a publisher's offer is taken as it comes)
+                .min_by_key(|t| if role == Role::Viewer { profile_rank(t.fmtp.as_ref()) } else { 0 }),
+            "audio" if usable && !audio && role == Role::Ingest => s.formats.iter().find_map(|&pt| {
                 let map = s.rtpmap.get(&pt)?;
                 map.to_ascii_lowercase().starts_with("opus/48000").then(|| Track { kind: Kind::Audio, mid: mid.clone(), payload: pt, rtpmap: "opus/48000/2".into(), fmtp: s.fmtp.get(&pt).cloned(), clock: 48_000 })
             }),
@@ -202,7 +237,11 @@ pub(crate) fn parse_offer(text: &str) -> Result<Offer, String> {
     }
     let offer = Offer { ufrag, pwd, fingerprint, sections: out };
     if offer.tracks().next().is_none() {
-        return Err("the offer has no H.264 (packetization-mode=1) video or Opus audio".into());
+        return Err(match role {
+            Role::Ingest => "the offer has no H.264 (packetization-mode=1) video or Opus audio",
+            Role::Viewer => "the offer has no recvonly or sendrecv H.264 (packetization-mode=1) video",
+        }
+        .into());
     }
     if offer.tracks().any(|t| offer.tracks().filter(|u| u.mid == t.mid).count() > 1) {
         return Err("two offer sections share a mid".into());
@@ -221,12 +260,21 @@ pub(crate) struct Local<'a> {
 
 /// The answer to `offer`: the tracks taken, receive-only, and the rest rejected.
 pub(crate) fn answer(offer: &Offer, l: &Local) -> String {
+    answer_with(offer, l, None)
+}
+
+/// The answer to a viewer's offer: the video taken, send-only with its SSRC, and the rest rejected.
+pub(crate) fn viewer_answer(offer: &Offer, l: &Local, ssrc: u32) -> String {
+    answer_with(offer, l, Some(ssrc))
+}
+
+fn answer_with(offer: &Offer, l: &Local, sending: Option<u32>) -> String {
     let mut s = String::new();
     let ip = l.candidate.ip();
     let family = if ip.is_ipv4() { "IP4" } else { "IP6" };
     let _ = write!(s, "v=0\r\no=- {} 2 IN {family} {ip}\r\ns=-\r\nt=0 0\r\n", l.session_id);
     let bundled: Vec<&str> = offer.tracks().map(|t| t.mid.as_str()).collect();
-    let _ = write!(s, "a=group:BUNDLE {}\r\na=ice-lite\r\na=msid-semantic: WMS\r\n", bundled.join(" "));
+    let _ = write!(s, "a=group:BUNDLE {}\r\na=ice-lite\r\na=msid-semantic: WMS{}\r\n", bundled.join(" "), if sending.is_some() { " ironav" } else { "" });
     for (track, mid, rejected) in &offer.sections {
         let Some(t) = track else {
             let _ = write!(s, "m={rejected}\r\nc=IN {family} {ip}\r\na=mid:{mid}\r\na=inactive\r\n");
@@ -236,7 +284,8 @@ pub(crate) fn answer(offer: &Offer, l: &Local) -> String {
             Kind::Video => "video",
             Kind::Audio => "audio",
         };
-        let _ = write!(s, "m={kind} {} UDP/TLS/RTP/SAVPF {}\r\nc=IN {family} {ip}\r\na=mid:{}\r\na=recvonly\r\na=rtcp-mux\r\n", l.candidate.port(), t.payload, t.mid);
+        let direction = if sending.is_some() { "sendonly" } else { "recvonly" };
+        let _ = write!(s, "m={kind} {} UDP/TLS/RTP/SAVPF {}\r\nc=IN {family} {ip}\r\na=mid:{}\r\na={direction}\r\na=rtcp-mux\r\n", l.candidate.port(), t.payload, t.mid);
         let _ = write!(s, "a=ice-ufrag:{}\r\na=ice-pwd:{}\r\na=fingerprint:sha-256 {}\r\na=setup:passive\r\n", l.ufrag, l.pwd, super::dtls::fingerprint_text(l.fingerprint));
         let _ = write!(s, "a=rtpmap:{} {}\r\n", t.payload, t.rtpmap);
         if let Some(f) = &t.fmtp {
@@ -244,6 +293,9 @@ pub(crate) fn answer(offer: &Offer, l: &Local) -> String {
         }
         if t.kind == Kind::Video {
             let _ = write!(s, "a=rtcp-fb:{0} nack\r\na=rtcp-fb:{0} nack pli\r\n", t.payload);
+        }
+        if let Some(ssrc) = sending {
+            let _ = write!(s, "a=msid:ironav ironav-video\r\na=ssrc:{ssrc} cname:IronAV\r\n");
         }
         let _ = write!(s, "a=candidate:1 1 udp 2130706431 {ip} {} typ host\r\na=end-of-candidates\r\n", l.candidate.port());
     }
@@ -603,6 +655,45 @@ mod tests {
                 let _ = parse_offer(&BROWSER_OFFER[..n]);
             }
         }
+    }
+
+    /// A viewer's offer: the browser's, turned around to `recvonly`.
+    fn viewer_offer() -> String {
+        BROWSER_OFFER.replace("a=sendonly", "a=recvonly")
+    }
+
+    #[test]
+    fn a_viewers_offer_takes_the_video_it_receives_and_declines_audio() {
+        let o = parse_offer_as(&viewer_offer(), Role::Viewer).unwrap();
+        let t = o.tracks().collect::<Vec<_>>();
+        assert_eq!(t.len(), 1);
+        assert_eq!((t[0].kind, t[0].payload), (Kind::Video, 102));
+        // the same offer, from a publisher, is one that cannot be sent to
+        assert!(parse_offer(&viewer_offer()).unwrap_err().contains("H.264"));
+        // a send-only section is not one a viewer can have, and send-receive is
+        assert!(parse_offer_as(BROWSER_OFFER, Role::Viewer).unwrap_err().contains("recvonly"));
+        let both = viewer_offer().replace("a=recvonly", "a=sendrecv");
+        assert!(parse_offer_as(&both, Role::Viewer).is_ok());
+        let a = viewer_answer(&o, &Local { ufrag: "u", pwd: "p", fingerprint: &[1; 32], candidate: "127.0.0.1:9".parse().unwrap(), session_id: 1 }, 77);
+        assert!(a.contains("m=video 9 UDP/TLS/RTP/SAVPF 102\r\n") && a.contains("a=sendonly\r\n") && !a.contains("a=recvonly"), "{a}");
+        assert!(a.contains("a=ssrc:77 cname:IronAV\r\n") && a.contains("a=group:BUNDLE 1\r\n"), "{a}");
+        assert!(a.contains("m=audio 0 UDP/TLS/RTP/SAVPF 111 63 9 0 8\r\nc=IN IP4 127.0.0.1\r\na=mid:0\r\na=inactive\r\n"), "{a}");
+    }
+
+    #[test]
+    fn a_viewer_gets_constrained_baseline_level_3_1_when_the_offer_has_several() {
+        let offer = |ids: &[(&str, &str)]| {
+            let mut s = String::from("v=0\r\na=ice-ufrag:FUZZ\r\na=ice-pwd:aBcDeFgHiJkLmNoPqRsTuVwX\r\na=fingerprint:sha-256 00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF\r\n");
+            s += &format!("m=video 9 UDP/TLS/RTP/SAVPF {}\r\na=mid:v\r\na=recvonly\r\n", ids.iter().map(|i| i.0).collect::<Vec<_>>().join(" "));
+            for (pt, id) in ids {
+                s += &format!("a=rtpmap:{pt} H264/90000\r\na=fmtp:{pt} packetization-mode=1;profile-level-id={id}\r\n");
+            }
+            s
+        };
+        let pt = |ids: &[(&str, &str)]| parse_offer_as(&offer(ids), Role::Viewer).unwrap().tracks().next().unwrap().payload;
+        assert_eq!(pt(&[("96", "640c1f"), ("97", "42e01f"), ("98", "42e01f")]), 97);
+        assert_eq!(pt(&[("96", "640c1f"), ("97", "42e034"), ("98", "42001f")]), 97);
+        assert_eq!(pt(&[("96", "640c1f"), ("97", "42001f")]), 96);
     }
 }
 

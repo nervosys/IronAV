@@ -153,6 +153,7 @@ fn open_once(url: &str) -> Result<Box<dyn Source>> {
         "device" => Box::new(crate::capture::open(&u, shown)?),
         "test" => Box::new(crate::synthetic::open(&u, shown)?),
         "whip" | "whips" => Box::new(crate::webrtc::open(&u, shown)?),
+        "whep" | "wheps" => return Err(Error::invalid_arg(format!("{}:// is an output: a WHEP endpoint sends video to viewers", u.scheme)).hint("open it with ironav_live::WhepServer::open, or give a session whep://host:port/path as its output")),
         _ => unreachable!("SourceUrl::parse accepts only these schemes"),
     })
 }

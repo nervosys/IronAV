@@ -68,12 +68,12 @@ impl SourceUrl {
             ("file".to_string(), base.to_string())
         };
         match scheme.as_str() {
-            "file" | "pipe" | "tcp" | "udp" | "srt" | "rtsp" | "rtsps" | "http" | "https" | "device" | "test" | "whip" | "whips" => {}
+            "file" | "pipe" | "tcp" | "udp" | "srt" | "rtsp" | "rtsps" | "http" | "https" | "device" | "test" | "whip" | "whips" | "whep" | "wheps" => {}
             other => {
-                return Err(Error::invalid_arg(format!("'{other}' sources are not supported")).alternatives(["file", "pipe", "tcp", "udp", "srt", "rtsp", "rtsps", "http", "https", "device", "test", "whip", "whips"]));
+                return Err(Error::invalid_arg(format!("'{other}' sources are not supported")).alternatives(["file", "pipe", "tcp", "udp", "srt", "rtsp", "rtsps", "http", "https", "device", "test", "whip", "whips", "whep", "wheps"]));
             }
         }
-        if matches!(scheme.as_str(), "tcp" | "udp" | "srt" | "whip" | "whips") && !target.contains(':') {
+        if matches!(scheme.as_str(), "tcp" | "udp" | "srt" | "whip" | "whips" | "whep" | "wheps") && !target.contains(':') {
             return Err(Error::invalid_arg(format!("{scheme} sources need host:port (or :port), got '{target}'")));
         }
         Ok(SourceUrl { scheme, target, options: opts })

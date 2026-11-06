@@ -47,7 +47,7 @@ const SCHEMES: [SignatureScheme; 8] = [
 ];
 
 /// The transports that carry no TLS in IronAV.
-const PLAINTEXT: [&str; 6] = ["http", "rtsp", "tcp", "udp", "srt", "whip"];
+const PLAINTEXT: [&str; 7] = ["http", "rtsp", "tcp", "udp", "srt", "whip", "whep"];
 
 /// Whether `IRONAV_FIPS` is set to a true value.
 pub(crate) fn env_flag(name: &str) -> bool {
@@ -104,6 +104,7 @@ fn refuse_plaintext(on: bool, scheme: &str) -> Result<()> {
             "http" => "https://",
             "rtsp" => "rtsps://",
             "whip" => "whips:// with cert= and key= (a TLS certificate chain and private key, both PEM)",
+            "whep" => "wheps:// with cert= and key= (a TLS certificate chain and private key, both PEM)",
             _ => "a TLS source (https:// or rtsps://); this transport has no TLS form in IronAV",
         };
         return Err(Error::invalid_arg(format!("{scheme}:// is a plaintext transport, which FIPS mode refuses")).hint(format!("use {instead}")));

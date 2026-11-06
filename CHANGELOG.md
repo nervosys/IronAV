@@ -12,6 +12,10 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - A server-side WebSocket (RFC 6455) module in the WebRTC HTTP server: upgrade validation with an Origin check, the
   101 response, and a strict framing layer (masking, fragments, control frames, UTF-8 and size limits, idle timeout).
   Not yet served by an endpoint.
+- **`WhepServer`, a send-only WHEP endpoint** (`whep://`, `wheps://`; library API in `ironav-live`): a viewer POSTs an offer with
+  `recvonly` video, gets a `sendonly` answer, and is sent the H.264 access units the caller pushes, over the WHIP endpoint's ICE-lite,
+  DTLS server and SRTP, with NACK retransmission, sender reports, a bearer-token hook and a viewer limit. Tested in process only, not yet
+  against a browser; a session cannot yet publish to it (`publish` and `--publish` take no `whep://`).
 - `Rect::new`, `MoveRect::new`, `ScreenFrame::new` and `ScreenFrame::with_changes`, so that a frame can be
   made outside a capture, as a test or another source needs. `ScreenFrame::new` panics when the pixels or the stride
   are too small for the size given.

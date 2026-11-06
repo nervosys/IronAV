@@ -85,15 +85,15 @@ impl Default for WhipOptions {
 }
 
 /// One stream sent: its RTP state, and the packets kept for NACKs.
-struct Stream {
+pub(crate) struct Stream {
     payload: u8,
-    ssrc: u32,
+    pub(crate) ssrc: u32,
     clock: u32,
     seq: u16,
     /// Added to the caller's timestamps, so they do not start at 0 (RFC 3550 §5.1).
     offset: u32,
-    packets: u32,
-    octets: u32,
+    pub(crate) packets: u32,
+    pub(crate) octets: u32,
     /// The RTP timestamp of the last packet sent, and when.
     last: Option<(u32, Instant)>,
     history: VecDeque<Sent>,
@@ -106,13 +106,13 @@ struct Sent {
 }
 
 impl Stream {
-    fn new(payload: u8, ssrc: u32, clock: u32) -> Stream {
+    pub(crate) fn new(payload: u8, ssrc: u32, clock: u32) -> Stream {
         let r = crate::auth::random_bytes::<6>();
         Stream { payload, ssrc, clock, seq: u16::from_be_bytes([r[0], r[1]]) & 0x7FFF, offset: u32::from_be_bytes([r[2], r[3], r[4], r[5]]), packets: 0, octets: 0, last: None, history: VecDeque::new() }
     }
 
     /// The SRTP packet carrying `payload` at `pts` (in this stream's clock), kept for a NACK.
-    fn packet(&mut self, tx: &mut srtp::Context, marker: bool, pts: u64, payload: &[u8], now: Instant) -> Result<Vec<u8>> {
+    pub(crate) fn packet(&mut self, tx: &mut srtp::Context, marker: bool, pts: u64, payload: &[u8], now: Instant) -> Result<Vec<u8>> {
         let ts = (pts as u32).wrapping_add(self.offset);
         let plain = packetize::rtp_packet(self.payload, marker, self.seq, ts, self.ssrc, payload);
         let protected = tx.protect_rtp(&plain).map_err(|e| Error::new(ErrorCode::Internal, format!("SRTP could not protect a packet: {e:?}")))?;
@@ -128,13 +128,13 @@ impl Stream {
     }
 
     /// The RTP timestamp that `now` stands for, by the clock from the last packet sent.
-    fn timestamp_at(&self, now: Instant) -> Option<u32> {
+    pub(crate) fn timestamp_at(&self, now: Instant) -> Option<u32> {
         let (ts, at) = self.last?;
         Some(ts.wrapping_add((now.saturating_duration_since(at).as_secs_f64() * self.clock as f64) as u32))
     }
 
     /// The packets of `seqs` that are kept and have not been sent again just now.
-    fn resend(&mut self, seqs: &[u16], now: Instant) -> Vec<Vec<u8>> {
+    pub(crate) fn resend(&mut self, seqs: &[u16], now: Instant) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         for s in seqs {
             if let Some(h) = self.history.iter_mut().rev().find(|h| h.seq == *s) {

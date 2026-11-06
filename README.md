@@ -369,6 +369,15 @@ ironav watch rtsp://cam/stream --publish "srt://relay.example:9000?streamid=cam1
 ffmpeg -i "srt://:9000?mode=listener&passphrase=0123456789abcdef" -c copy out.mkv   # the receiving end
 ```
 
+The other way round, `ironav_live::WhepServer` is a send-only WebRTC endpoint ([WHEP](https://datatracker.ietf.org/doc/draft-ietf-wish-whep/)):
+a viewer POSTs an SDP offer with `recvonly` H.264 video (packetization-mode 1; Constrained Baseline 42e01f is preferred) and gets a
+`sendonly` answer and a `Location` to DELETE. `WhepServer::open("whep://127.0.0.1:8080/whep?token=T")` (or `wheps://` with
+`cert=` and `key=`, `WhepServer::bind` with a `WhepOptions` for a bearer-check function, a viewer limit of 4 by default and timeouts) listens
+for HTTP and the media on one port; the caller pushes Annex B access units with `send_h264_access_unit(bytes, pts_90k)` and reads
+`keyframe_requested()`, which a viewer's PLI or FIR, or a new viewer, raises. It reuses the WHIP endpoint's ICE-lite, DTLS server and SRTP (AES-GCM only in
+FIPS mode, which refuses `whep://`), answers NACKs from the last 512 packets and sends sender reports. Audio is declined. It is tested in process
+only, against a scripted viewer, and not yet against a browser; a session's `publish` does not take `whep://` yet.
+
 Code in the same process (a detector, a speech model) can take decoded pictures or sound from a session with a tap,
 rather than as observations or through a sidecar's pipe:
 

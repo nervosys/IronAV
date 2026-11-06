@@ -1017,3 +1017,465 @@ fn fips_publishers_refuse_http() {
     assert!(e.message.contains("plaintext") && e.message.contains("FIPS"), "{e:?}");
     assert!(e.hint.as_deref().is_some_and(|h| h.contains("https")), "{e:?}");
 }
+
+// ---- the WHEP endpoint: a scripted viewer ----
+
+/// A WHEP endpoint on a free port, with `f` setting its options. `tls` serves it over HTTPS, to a
+/// certificate this module issues, which `request` then talks to.
+fn whep_server(tls: bool, f: impl FnOnce(&mut WhepOptions)) -> (WhepServer, u16) {
+    crate::net::allow_loopback_for_tests();
+    let port = free_port();
+    let mut o = WhepOptions::default();
+    if tls {
+        let t = tls_fixture(false);
+        TLS_PORTS.lock().unwrap().push((port, t.client.clone()));
+        o.tls = Some(crate::tls::server_config(&t.cert, &t.key).unwrap());
+    }
+    f(&mut o);
+    (WhepServer::bind(format!("127.0.0.1:{port}").parse().unwrap(), "/whep", o).unwrap(), port)
+}
+
+/// A viewer's offer: `recvonly` video offering VP8, two H.264 (the better one last, to see it taken), and
+/// `recvonly` Opus audio.
+fn viewer_offer(fingerprint: &[u8; 32]) -> String {
+    let fp = dtls::fingerprint_text(fingerprint);
+    format!(
+        "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE v a\r\n\
+         m=video 9 UDP/TLS/RTP/SAVPF 96 97 102 103\r\nc=IN IP4 0.0.0.0\r\na=ice-ufrag:viewU\r\na=ice-pwd:viewerpassword01234567\r\n\
+         a=fingerprint:sha-256 {fp}\r\na=setup:actpass\r\na=mid:v\r\na=recvonly\r\na=rtcp-mux\r\n\
+         a=rtpmap:96 VP8/90000\r\na=rtpmap:97 H264/90000\r\na=fmtp:97 packetization-mode=1;profile-level-id=64001f\r\n\
+         a=rtpmap:102 H264/90000\r\na=fmtp:102 packetization-mode=0;profile-level-id=42e01f\r\n\
+         a=rtpmap:103 H264/90000\r\na=fmtp:103 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\r\n\
+         a=rtcp-fb:103 nack\r\na=rtcp-fb:103 nack pli\r\n\
+         m=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:a\r\na=recvonly\r\na=rtcp-mux\r\na=rtpmap:111 opus/48000/2\r\n"
+    )
+}
+
+/// A viewer that has connected: its socket, SRTP for what it hears, SRTCP for what it says.
+struct Watcher {
+    sock: UdpSocket,
+    to: SocketAddr,
+    rx: srtp::Context,
+    tx: srtp::Context,
+    location: String,
+    answer: String,
+    ssrc: u32,
+    profile: srtp::Profile,
+}
+
+/// POSTs an offer, answers the endpoint's STUN check and runs DTLS as the client.
+fn watch(port: u16, token: Option<&str>, profiles: &[u16]) -> Watcher {
+    let mut client = Client::with_options(Arc::new(dtls::Identity::generate("WHEP test client").unwrap()), [0; 32], profiles.to_vec(), true).unwrap();
+    let (status, headers, answer) = request(port, "POST", "/whep", token, &viewer_offer(&client.id.fingerprint));
+    assert_eq!(status, 201, "{answer}");
+    let location = headers.iter().find(|(k, _)| k == "location").unwrap().1.clone();
+    assert!(headers.iter().any(|(k, v)| k == "content-type" && v == "application/sdp"));
+    let fp = attr(&answer, "fingerprint").strip_prefix("sha-256 ").unwrap();
+    let fp: Vec<u8> = fp.split(':').map(|h| u8::from_str_radix(h, 16).unwrap()).collect();
+    client.server_fingerprint = fp.try_into().unwrap();
+    let (ufrag, pwd) = (attr(&answer, "ice-ufrag").to_string(), attr(&answer, "ice-pwd").to_string());
+    let candidate: Vec<&str> = attr(&answer, "candidate").split(' ').collect();
+    let to: SocketAddr = format!("{}:{}", candidate[4], candidate[5]).parse().unwrap();
+    assert_eq!(to.port(), port);
+    let ssrc: u32 = attr(&answer, "ssrc").split(' ').next().unwrap().parse().unwrap();
+
+    let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let txid = [5u8; 12];
+    sock.send_to(&stun::request(&txid, &format!("{ufrag}:viewU"), &pwd, true, [1, 2, 3, 4, 5, 6, 7, 8]), to).unwrap();
+    let mut buf = vec![0u8; 4096];
+    let (n, _) = sock.recv_from(&mut buf).unwrap();
+    assert_eq!(stun::check_success(&buf[..n], &txid, &pwd), Some(sock.local_addr().unwrap()));
+    let mut pending = client.start(Instant::now()).unwrap();
+    let started = Instant::now();
+    while client.keys.is_none() {
+        assert!(started.elapsed() < Duration::from_secs(10), "the handshake did not finish");
+        for d in pending.drain(..) {
+            sock.send_to(&d, to).unwrap();
+        }
+        let (n, _) = sock.recv_from(&mut buf).unwrap();
+        pending = client.handle(&buf[..n], Instant::now()).unwrap();
+    }
+    let k = client.keys.clone().unwrap();
+    sock.set_read_timeout(None).unwrap();
+    Watcher {
+        sock,
+        to,
+        rx: srtp::Context::new(k.profile, &k.server_key, &k.server_salt).unwrap(),
+        tx: srtp::Context::new(k.profile, &k.client_key, &k.client_salt).unwrap(),
+        location,
+        answer,
+        ssrc,
+        profile: k.profile,
+    }
+}
+
+/// An RTP packet a viewer received.
+#[derive(Clone)]
+struct Got {
+    seq: u16,
+    ts: u32,
+    marker: bool,
+    pt: u8,
+    ssrc: u32,
+    payload: Vec<u8>,
+    /// The datagram as it came, encrypted.
+    raw: Vec<u8>,
+}
+
+/// What a viewer has heard: RTP in order, and the RTCP packets of each compound packet.
+#[derive(Default)]
+struct Heard {
+    rtp: Vec<Got>,
+    /// (packet type, the whole packet) of every RTCP packet.
+    rtcp: Vec<(u8, Vec<u8>)>,
+    /// Every datagram that looks like RTP, as it came, replays included.
+    raw_rtp: Vec<Vec<u8>>,
+    /// Datagrams that were neither (DTLS alerts, STUN).
+    other: usize,
+}
+
+impl Watcher {
+    /// Reads whatever has come, for up to `wait`.
+    fn listen(&mut self, heard: &mut Heard, wait: Duration) {
+        let until = Instant::now() + wait;
+        let mut buf = vec![0u8; 4096];
+        while Instant::now() < until {
+            // (a plain read with a timeout can lose a datagram on Windows, as net::recv_from_within says)
+            let Ok((n, _)) = crate::net::recv_from_within(&self.sock, &mut buf, Duration::from_millis(2)) else { continue };
+            let d = &buf[..n];
+            if d.len() >= 12 && (128..=191).contains(&d[0]) && (192..=223).contains(&d[1]) {
+                let Ok(p) = self.rx.unprotect_rtcp(d) else { continue };
+                let mut at = 0;
+                while let Some(h) = p.get(at..at + 4) {
+                    let len = 4 * (u16::from_be_bytes([h[2], h[3]]) as usize + 1);
+                    heard.rtcp.push((h[1], p[at..(at + len).min(p.len())].to_vec()));
+                    at += len;
+                }
+            } else if d.len() >= 12 && (128..=191).contains(&d[0]) {
+                heard.raw_rtp.push(d.to_vec());
+                let Ok(p) = self.rx.unprotect_rtp(d) else { continue };
+                let h = srtp::rtp_header_len(&p).unwrap();
+                heard.rtp.push(Got {
+                    seq: u16::from_be_bytes([p[2], p[3]]),
+                    ts: u32::from_be_bytes([p[4], p[5], p[6], p[7]]),
+                    marker: p[1] & 0x80 != 0,
+                    pt: p[1] & 0x7F,
+                    ssrc: u32::from_be_bytes([p[8], p[9], p[10], p[11]]),
+                    payload: p[h..].to_vec(),
+                    raw: d.to_vec(),
+                });
+            } else {
+                heard.other += 1;
+            }
+        }
+    }
+
+    /// Sends an RTCP packet to the endpoint, protected.
+    fn say(&mut self, rtcp: &[u8]) {
+        let p = self.tx.protect_rtcp(rtcp).unwrap();
+        self.sock.send_to(&p, self.to).unwrap();
+    }
+
+    fn pli(&mut self, media: u32) {
+        let mut p = vec![0x81, 206, 0, 2];
+        p.extend_from_slice(&0x5555_6666u32.to_be_bytes());
+        p.extend_from_slice(&media.to_be_bytes());
+        self.say(&p);
+    }
+
+    fn fir(&mut self, media: u32) {
+        let mut p = vec![0x84, 206, 0, 4];
+        p.extend_from_slice(&0x5555_6666u32.to_be_bytes());
+        p.extend_from_slice(&0u32.to_be_bytes());
+        p.extend_from_slice(&media.to_be_bytes());
+        p.extend_from_slice(&[1, 0, 0, 0]);
+        self.say(&p);
+    }
+
+    fn nack(&mut self, media: u32, first: u16, blp: u16) {
+        let mut p = vec![0x81, 205, 0, 3];
+        p.extend_from_slice(&0x5555_6666u32.to_be_bytes());
+        p.extend_from_slice(&media.to_be_bytes());
+        p.extend_from_slice(&first.to_be_bytes());
+        p.extend_from_slice(&blp.to_be_bytes());
+        self.say(&p);
+    }
+}
+
+/// The NAL units of each access unit that RFC 6184's receiver makes of the packets (single NAL unit
+/// packets and FU-A fragments), an access unit ending at a marker.
+fn viewer_access_units(rtp: &[Got]) -> Vec<Vec<Vec<u8>>> {
+    let (mut out, mut au, mut open) = (Vec::new(), Vec::new(), None::<Vec<u8>>);
+    for g in rtp {
+        let p = &g.payload;
+        match p[0] & 31 {
+            28 => {
+                if p[1] & 0x80 != 0 {
+                    assert!(open.is_none(), "a fragment starts inside another NAL unit");
+                    open = Some(vec![(p[0] & 0xE0) | (p[1] & 31)]);
+                }
+                open.as_mut().expect("a fragment with no start").extend_from_slice(&p[2..]);
+                if p[1] & 0x40 != 0 {
+                    au.push(open.take().unwrap());
+                }
+            }
+            t => {
+                assert!((1..=23).contains(&t) && open.is_none());
+                au.push(p.clone());
+            }
+        }
+        if g.marker {
+            out.push(std::mem::take(&mut au));
+        }
+    }
+    assert!(au.is_empty() && open.is_none(), "the last access unit is whole");
+    out
+}
+
+/// Waits, for up to `wait`, for `done`.
+fn until(wait: Duration, mut done: impl FnMut() -> bool) -> bool {
+    let end = Instant::now() + wait;
+    while Instant::now() < end {
+        if done() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    done()
+}
+
+fn whep_watching(profiles: &[u16], tls: bool, with_token: bool) {
+    let (url_token, authorize): (Option<&str>, Option<Arc<whep::Authorize>>) = if with_token { (Some("s3cret"), Some(Arc::new(|h: Option<&str>| h == Some("Bearer s3cret")))) } else { (None, None) };
+    let (server, port) = whep_server(tls, |o| o.authorize = authorize);
+    let tok = url_token;
+    if with_token {
+        // without the token, or with another, nothing happens, and the refusal says nothing
+        for t in [None, Some("wrong")] {
+            let (status, headers, body) = request(port, "POST", "/whep", t, &viewer_offer(&[1; 32]));
+            assert_eq!((status, body.as_str()), (401, ""));
+            assert!(headers.iter().any(|(k, v)| k == "www-authenticate" && v == "Bearer"));
+        }
+        assert_eq!(request(port, "DELETE", "/whep/session/x", None, "").0, 401);
+    }
+    assert_eq!(request(port, "OPTIONS", "/whep", None, "").0, 204);
+    assert_eq!(request(port, "POST", "/elsewhere", tok, &viewer_offer(&[1; 32])).0, 404);
+    assert_eq!(request(port, "GET", "/whep", tok, "").0, 405);
+    assert_eq!(server.viewers(), 0);
+    let mut w = watch(port, tok, profiles);
+    let want = if profiles.contains(&0x0007) { srtp::Profile::AeadAes128Gcm } else { srtp::Profile::Aes128CmHmacSha1_80 };
+    assert_eq!(w.profile, want);
+
+    // the answer: ICE-lite, passive, send-only video with the better H.264, audio declined
+    let a = w.answer.clone();
+    assert!(a.contains("a=ice-lite") && a.contains("a=setup:passive") && a.contains("a=group:BUNDLE v\r\n"), "{a}");
+    assert!(a.contains("m=video ") && a.contains("UDP/TLS/RTP/SAVPF 103\r\n") && a.contains("a=sendonly") && !a.contains("a=recvonly"), "{a}");
+    assert!(a.contains("a=rtpmap:103 H264/90000") && a.contains("profile-level-id=42e01f") && !a.contains("VP8"), "{a}");
+    assert!(a.contains("m=audio 0 UDP/TLS/RTP/SAVPF 111") && a.contains("a=inactive"), "{a}");
+    assert_eq!(request(port, "PATCH", &w.location, tok, "").0, 405);
+
+    // the viewer is connected, and a keyframe is wanted for it
+    assert!(until(Duration::from_secs(3), || server.viewers() == 1));
+    assert!(until(Duration::from_secs(3), || server.keyframe_requested()), "a new viewer raises a keyframe request");
+    // nothing is sent to it before a keyframe
+    let mut heard = Heard::default();
+    let p_frame = [0u8, 0, 0, 1, 0x41, 0x9A, 1, 2, 3, 4];
+    server.send_h264_access_unit(&p_frame, 0).unwrap();
+    assert!(server.send_h264_access_unit(b"junk", 0).is_err());
+    w.listen(&mut heard, Duration::from_millis(200));
+    assert!(heard.rtp.is_empty(), "a viewer is sent nothing before the first keyframe");
+
+    let aus: Vec<(Vec<u8>, u64)> = access_units().into_iter().take(150).collect();
+    assert!(aus.iter().any(|(a, _)| a.len() > 1200), "the fixture has access units that need FU-A");
+    for (au, pts) in &aus {
+        server.send_h264_access_unit(au, 1000 + pts).unwrap();
+        w.listen(&mut heard, Duration::from_millis(3));
+    }
+    // sender reports come each second: wait for one that counts everything sent
+    let sr_counts = |h: &Heard| h.rtcp.iter().filter(|(t, _)| *t == 200).any(|(_, p)| u32::from_be_bytes([p[20], p[21], p[22], p[23]]) as usize == h.rtp.len());
+    let end = Instant::now() + Duration::from_secs(4);
+    while !sr_counts(&heard) && Instant::now() < end {
+        w.listen(&mut heard, Duration::from_millis(100));
+    }
+
+    // every access unit came, whole and unchanged, once and in order
+    assert!(heard.rtp.iter().all(|g| g.pt == 103 && g.ssrc == w.ssrc), "the payload type and SSRC are the answer's");
+    assert!(heard.rtp.windows(2).all(|p| p[1].seq == p[0].seq.wrapping_add(1)), "sequence numbers run on");
+    let got = viewer_access_units(&heard.rtp);
+    assert_eq!(got.len(), aus.len());
+    for (i, ((au, _), g)) in aus.iter().zip(&got).enumerate() {
+        assert_eq!(g, &sent_nals(au), "access unit {i}");
+    }
+    // timestamps keep the caller's spacing
+    let marked: Vec<&Got> = heard.rtp.iter().filter(|g| g.marker).collect();
+    for (m, (_, pts)) in marked.iter().zip(&aus) {
+        assert_eq!(m.ts.wrapping_sub(marked[0].ts) as u64, pts - aus[0].1);
+    }
+    // a sender report, naming the stream and counting what was sent
+    let sr = heard.rtcp.iter().rfind(|(t, _)| *t == 200).expect("a sender report");
+    assert!(sr_counts(&heard), "a sender report counts the packets sent");
+    assert_eq!(u32::from_be_bytes([sr.1[4], sr.1[5], sr.1[6], sr.1[7]]), w.ssrc);
+    let count = |at: usize| u32::from_be_bytes([sr.1[at], sr.1[at + 1], sr.1[at + 2], sr.1[at + 3]]);
+    assert_eq!(count(20) as usize, heard.rtp.len());
+    assert_eq!(count(24) as usize, heard.rtp.iter().map(|g| g.payload.len()).sum::<usize>());
+    assert!(heard.rtcp.iter().any(|(t, _)| *t == 202), "with an SDES");
+
+    // a NACK is answered from the history: the same packets again, and no others
+    let have: Vec<Got> = heard.rtp.clone();
+    let (a, b) = (have[10].seq, have[20].seq);
+    let mut again = Heard::default();
+    w.nack(w.ssrc, a, 0b11); // a, a+1, a+2
+    w.nack(w.ssrc, b, 0);
+    w.nack(w.ssrc ^ 1, have[30].seq, 0); // not this stream
+    w.listen(&mut again, Duration::from_millis(500));
+    // (the replay window refuses the copies, so it is the datagrams that count)
+    let sent_again: Vec<u16> = again.raw_rtp.iter().map(|d| u16::from_be_bytes([d[2], d[3]])).collect();
+    assert_eq!(sent_again.len(), 4, "{sent_again:?}");
+    for s in [a, a.wrapping_add(1), a.wrapping_add(2), b] {
+        let was = have.iter().find(|g| g.seq == s).unwrap();
+        assert!(again.raw_rtp.contains(&was.raw), "{s} was sent again, as it was sent");
+    }
+
+    // picture loss and full intra requests raise the flag; a request for another stream does not
+    server.keyframe_requested();
+    w.pli(w.ssrc ^ 1);
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(!server.keyframe_requested(), "a request for another SSRC asks for nothing");
+    w.pli(w.ssrc);
+    assert!(until(Duration::from_secs(2), || server.keyframe_requested()), "a PLI raises the flag");
+    assert!(!server.keyframe_requested(), "the flag is read once");
+    w.fir(w.ssrc);
+    assert!(until(Duration::from_secs(2), || server.keyframe_requested()), "a FIR raises the flag");
+
+    // DELETE ends the session: goodbye, and the session is gone
+    let mut bye = Heard::default();
+    assert_eq!(request(port, "DELETE", &w.location, tok, "").0, 200);
+    w.listen(&mut bye, Duration::from_millis(300));
+    assert!(bye.rtcp.iter().any(|(t, _)| *t == 203), "an RTCP BYE");
+    assert!(bye.other > 0, "and a DTLS close_notify");
+    assert_eq!(server.viewers(), 0);
+    assert_eq!(request(port, "DELETE", &w.location, tok, "").0, 404);
+    // what is sent now goes nowhere, and does not fail
+    server.send_h264_access_unit(&aus[0].0, 0).unwrap();
+}
+
+#[test]
+fn a_viewer_watches_over_srtp_aes_gcm_with_a_token() {
+    // FIPS mode refuses plaintext signalling, so that build serves through TLS
+    whep_watching(&[0x0001, 0x0007], crate::fips::enabled(), true);
+}
+
+#[test]
+fn a_viewer_watches_through_wheps_signalling_over_tls() {
+    whep_watching(&[0x0001, 0x0007], true, false);
+}
+
+#[test]
+#[cfg_attr(feature = "fips", ignore = "FIPS build: AES128_CM_HMAC_SHA1_80 is not offered (dtls tests cover the refusal)")]
+fn a_viewer_watches_over_srtp_aes_cm_hmac_sha1() {
+    if crate::fips::enabled() {
+        return;
+    }
+    whep_watching(&[0x0001], false, false);
+}
+
+#[test]
+fn an_offer_a_viewer_cannot_make_is_refused_with_a_400_that_says_why() {
+    let (server, port) = whep_server(crate::fips::enabled(), |_| {});
+    let good = viewer_offer(&[7; 32]);
+    let refused = |offer: &str, why: &str| {
+        let (status, _, body) = request(port, "POST", "/whep", None, offer);
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains(why), "{body}");
+    };
+    // no H.264 with packetization-mode=1
+    refused(&good.replace("packetization-mode=1", "packetization-mode=0"), "H.264");
+    refused(&good.replace("H264/90000", "VP9/90000"), "H.264");
+    // a section that only sends is not one to send to, and neither is one that is off
+    refused(&good.replace("a=mid:v\r\na=recvonly", "a=mid:v\r\na=sendonly"), "recvonly or sendrecv");
+    refused(&good.replace("a=mid:v\r\na=recvonly", "a=mid:v\r\na=inactive"), "recvonly or sendrecv");
+    refused(&good.replace("m=video 9", "m=video 0"), "recvonly or sendrecv");
+    // audio alone is not taken
+    refused(&good.replace("m=video", "m=audio").replace("96 97 102 103", "111"), "video");
+    // not a DTLS client
+    refused(&good.replace("a=setup:actpass", "a=setup:passive"), "DTLS client");
+    refused("v=0\r\n", "media");
+    // sendrecv is fine
+    let (status, _, answer) = request(port, "POST", "/whep", None, &good.replace("a=mid:v\r\na=recvonly", "a=mid:v\r\na=sendrecv"));
+    assert_eq!(status, 201, "{answer}");
+    assert!(answer.contains("a=sendonly"), "{answer}");
+    let (status, _, _) = request(port, "POST", "/whep", None, "x");
+    assert_eq!(status, 400);
+    drop(server);
+}
+
+#[test]
+fn the_viewer_limit_holds_and_a_viewer_that_never_connects_or_goes_quiet_is_dropped() {
+    let (server, port) = whep_server(crate::fips::enabled(), |o| {
+        o.max_viewers = 2;
+        o.setup_timeout = Duration::from_millis(1500);
+        o.consent_timeout = Duration::from_millis(700);
+    });
+    let post = |offer: &str| request(port, "POST", "/whep", None, offer);
+    let (s1, h1, _) = post(&viewer_offer(&[1; 32]));
+    let (s2, _, _) = post(&viewer_offer(&[2; 32]));
+    assert_eq!((s1, s2), (201, 201));
+    let (s3, headers, body) = post(&viewer_offer(&[3; 32]));
+    assert_eq!(s3, 503, "{body}");
+    assert!(headers.iter().any(|(k, _)| k == "retry-after"));
+    // a DELETE frees a place at once
+    let loc = h1.iter().find(|(k, _)| k == "location").unwrap().1.clone();
+    assert_eq!(request(port, "DELETE", &loc, None, "").0, 200);
+    assert_eq!(post(&viewer_offer(&[4; 32])).0, 201);
+    assert_eq!(post(&viewer_offer(&[5; 32])).0, 503);
+    // the two that never connect are dropped after the setup timeout
+    std::thread::sleep(Duration::from_millis(1800));
+    assert_eq!(post(&viewer_offer(&[6; 32])).0, 201);
+    assert_eq!(server.viewers(), 0);
+    // a viewer that connects and then says nothing loses consent
+    let mut w = watch(port, None, &[0x0001, 0x0007]);
+    assert!(until(Duration::from_secs(3), || server.viewers() == 1));
+    let mut heard = Heard::default();
+    w.listen(&mut heard, Duration::from_millis(1200));
+    assert_eq!(server.viewers(), 0, "a viewer with no consent checks is dropped");
+    assert_eq!(request(port, "DELETE", &w.location, None, "").0, 404);
+}
+
+#[test]
+fn a_whep_url_opens_an_endpoint_with_its_token() {
+    crate::net::allow_loopback_for_tests();
+    if crate::fips::enabled() {
+        return;
+    }
+    let port = free_port();
+    let server = WhepServer::open(&format!("whep://127.0.0.1:{port}/w?token=t%2Bk&cors=http://localhost:3000")).unwrap();
+    assert_eq!(server.local_addr().port(), port);
+    let offer = viewer_offer(&[9; 32]);
+    assert_eq!(request(port, "POST", "/w", None, &offer).0, 401);
+    assert_eq!(request(port, "POST", "/w", Some("t"), &offer).0, 401);
+    let (status, headers, _) = request(port, "POST", "/w", Some("t+k"), &offer);
+    assert_eq!(status, 201);
+    assert!(headers.iter().any(|(k, v)| k == "access-control-allow-origin" && v == "http://localhost:3000"));
+    assert!(headers.iter().any(|(k, v)| k == "location" && v.starts_with("/w/session/")));
+    assert!(WhepServer::open("whep://127.0.0.1:0/w?cert=a&key=b").is_err());
+    assert!(WhepServer::open("wheps://127.0.0.1:0/w").is_err());
+    assert!(WhepServer::open("whep://127.0.0.1:0/w?token=").is_err());
+    // port 0 picks a port free for TCP and UDP
+    let s = WhepServer::open("whep://127.0.0.1:0").unwrap();
+    assert!(s.local_addr().port() != 0);
+    assert!(WhepServer::bind("127.0.0.1:0".parse().unwrap(), "no-slash", WhepOptions::default()).is_err());
+    let o = WhepOptions { max_viewers: 0, ..WhepOptions::default() };
+    assert!(WhepServer::bind("127.0.0.1:0".parse().unwrap(), "/", o).is_err());
+}
+
+#[test]
+fn a_whep_endpoint_over_tls_is_opened_from_a_url_and_fips_refuses_plain_whep() {
+    crate::net::allow_loopback_for_tests();
+    let t = tls_fixture(false);
+    let s = WhepServer::open(&format!("wheps://127.0.0.1:0/whep?cert={}&key={}", t.cert, t.key)).expect("wheps:// is accepted");
+    assert!(s.local_addr().port() != 0);
+    if crate::fips::enabled() {
+        let e = WhepServer::open("whep://127.0.0.1:0/whep").err().expect("whep:// opened in FIPS mode");
+        assert!(e.message.contains("plaintext") && e.hint.as_deref().is_some_and(|h| h.contains("wheps://")), "{e:?}");
+    }
+}
