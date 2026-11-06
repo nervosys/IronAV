@@ -237,6 +237,12 @@ pub struct Rect {
     pub height: u32,
 }
 
+impl Rect {
+    pub fn new(x: u32, y: u32, width: u32, height: u32) -> Rect {
+        Rect { x, y, width, height }
+    }
+}
+
 /// A rectangle the display moved, as scrolling does: the pixels of `to` are those of the same size
 /// whose top-left pixel was at `from` in the previous frame. `to` is clipped to the frame, and `from`
 /// moves with its top-left pixel.
@@ -245,6 +251,12 @@ pub struct Rect {
 pub struct MoveRect {
     pub from: (u32, u32),
     pub to: Rect,
+}
+
+impl MoveRect {
+    pub fn new(from: (u32, u32), to: Rect) -> MoveRect {
+        MoveRect { from, to }
+    }
 }
 
 /// A display, as [`list_screens`] lists it.
@@ -294,6 +306,33 @@ pub struct ScreenFrame<'a> {
     pub whole: bool,
     /// When the picture was taken.
     pub at: Instant,
+}
+
+impl<'a> ScreenFrame<'a> {
+    /// A frame made outside a capture, such as a test's or another source's. `whole` starts true and
+    /// `dirty` and `moved` empty; set them with [`ScreenFrame::with_changes`].
+    ///
+    /// # Panics
+    ///
+    /// If `stride` is less than `width * 4`, or `bgra` holds fewer than `stride * height` bytes.
+    pub fn new(width: u32, height: u32, stride: usize, bgra: &'a [u8], at: Instant) -> ScreenFrame<'a> {
+        let row = width as usize * 4;
+        assert!(stride >= row, "stride {stride} is less than {row} bytes for width {width}");
+        let need = stride.checked_mul(height as usize).expect("frame size overflows");
+        assert!(bgra.len() >= need, "{} bytes given, {need} needed", bgra.len());
+        ScreenFrame { width, height, stride, bgra, dirty: &[], moved: &[], whole: true, at }
+    }
+
+    /// The same frame with what changed since the previous one. With `whole` true, `dirty` and
+    /// `moved` must be empty, as a capture gives them.
+    ///
+    /// # Panics
+    ///
+    /// If `whole` is true and `dirty` or `moved` is not empty.
+    pub fn with_changes(self, whole: bool, dirty: &'a [Rect], moved: &'a [MoveRect]) -> ScreenFrame<'a> {
+        assert!(!whole || (dirty.is_empty() && moved.is_empty()), "a whole frame lists no changes");
+        ScreenFrame { dirty, moved, whole, ..self }
+    }
 }
 
 /// What changed since the previous frame, as a backend reports it.
@@ -705,5 +744,42 @@ mod tests {
         assert_eq!(rx.recv().unwrap().unwrap(), black(4, 2));
         drop(rx);
         assert!(t.join().unwrap());
+    }
+
+    #[test]
+    fn a_frame_can_be_made_outside_a_capture() {
+        let px = vec![0u8; 16 * 2];
+        let at = Instant::now();
+        let f = ScreenFrame::new(3, 2, 16, &px, at);
+        assert!(f.whole && f.dirty.is_empty() && f.moved.is_empty());
+        let dirty = [Rect::new(1, 0, 2, 1)];
+        let moved = [MoveRect::new((0, 1), Rect::new(0, 0, 3, 1))];
+        let f = f.with_changes(false, &dirty, &moved);
+        assert_eq!((f.width, f.height, f.stride, f.at), (3, 2, 16, at));
+        assert!(!f.whole);
+        assert_eq!(f.dirty, &dirty);
+        assert_eq!(f.moved[0].from, (0, 1));
+    }
+
+    #[test]
+    #[should_panic(expected = "needed")]
+    fn a_frame_refuses_too_few_pixels() {
+        let px = vec![0u8; 16 * 2 - 1];
+        ScreenFrame::new(3, 2, 16, &px, Instant::now());
+    }
+
+    #[test]
+    #[should_panic(expected = "stride")]
+    fn a_frame_refuses_a_short_stride() {
+        let px = vec![0u8; 64];
+        ScreenFrame::new(5, 2, 16, &px, Instant::now());
+    }
+
+    #[test]
+    #[should_panic(expected = "no changes")]
+    fn a_whole_frame_lists_no_changes() {
+        let px = vec![0u8; 16];
+        let dirty = [Rect::new(0, 0, 1, 1)];
+        ScreenFrame::new(4, 1, 16, &px, Instant::now()).with_changes(true, &dirty, &[]);
     }
 }

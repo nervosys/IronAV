@@ -5,6 +5,14 @@ All notable changes to IronAV are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `Rect::new`, `MoveRect::new`, `ScreenFrame::new` and `ScreenFrame::with_changes`, so that a frame can be
+  made outside a capture, as a test or another source needs. `ScreenFrame::new` panics when the pixels or the stride
+  are too small for the size given.
+
 ## [0.1.4] - 2026-11-04
 
 ### Fixed
