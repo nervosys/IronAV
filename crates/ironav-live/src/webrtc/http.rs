@@ -32,6 +32,8 @@ const READ_SLICE: Duration = Duration::from_millis(250);
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Request {
     pub method: String,
+    /// The version from the request line, such as `HTTP/1.1`.
+    pub version: String,
     /// The path, without any query.
     pub path: String,
     pub headers: Vec<(String, String)>,
@@ -76,7 +78,7 @@ pub(crate) fn parse(buf: &[u8], max_body: usize) -> Parsed {
         }
         headers.push((k.trim().to_string(), v.trim().to_string()));
     }
-    let mut r = Request { method: method.to_string(), path: target.split('?').next().unwrap_or("/").to_string(), headers, body: Vec::new() };
+    let mut r = Request { method: method.to_string(), version: version.to_string(), path: target.split('?').next().unwrap_or("/").to_string(), headers, body: Vec::new() };
     if let Some(te) = r.header("transfer-encoding") {
         // a client may send even an empty body chunked
         if !te.eq_ignore_ascii_case("chunked") || r.header("content-length").is_some() {
@@ -153,6 +155,7 @@ pub(crate) fn response(status: u16, headers: &[(&str, &str)], body: &[u8]) -> Ve
         411 => "Length Required",
         413 => "Content Too Large",
         415 => "Unsupported Media Type",
+        426 => "Upgrade Required",
         431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
         _ => "Error",
@@ -323,6 +326,26 @@ pub(crate) enum Responder {
 }
 
 impl Responder {
+    /// The connection itself, for a protocol that takes it over (a WebSocket after its 101). It
+    /// is made blocking, with reads that give up every `slice` so a caller can look at its clock.
+    #[allow(dead_code)] // for the WebSocket upgrade, which no endpoint serves yet
+    pub(crate) fn into_stream(self, slice: Duration) -> Option<super::websocket::Stream> {
+        use super::websocket::Stream;
+        match self {
+            Responder::Plain(Some(s)) => {
+                s.set_nonblocking(false).ok()?;
+                s.set_read_timeout(Some(slice)).ok()?;
+                s.set_write_timeout(Some(WRITE_TIMEOUT)).ok()?;
+                Some(Stream::Plain(s))
+            }
+            Responder::Plain(None) => None,
+            Responder::Tls(mut t) => {
+                t.set_timeouts(Timeouts::new(HANDSHAKE_TIMEOUT, slice));
+                Some(Stream::Tls(t))
+            }
+        }
+    }
+
     pub(crate) fn send(self, bytes: &[u8]) {
         match self {
             Responder::Plain(Some(mut s)) => {

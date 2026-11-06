@@ -9,6 +9,9 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Added
 
+- A server-side WebSocket (RFC 6455) module in the WebRTC HTTP server: upgrade validation with an Origin check, the
+  101 response, and a strict framing layer (masking, fragments, control frames, UTF-8 and size limits, idle timeout).
+  Not yet served by an endpoint.
 - `Rect::new`, `MoveRect::new`, `ScreenFrame::new` and `ScreenFrame::with_changes`, so that a frame can be
   made outside a capture, as a test or another source needs. `ScreenFrame::new` panics when the pixels or the stride
   are too small for the size given.
