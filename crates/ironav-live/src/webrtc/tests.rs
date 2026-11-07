@@ -1246,7 +1246,7 @@ fn until(wait: Duration, mut done: impl FnMut() -> bool) -> bool {
 }
 
 fn whep_watching(profiles: &[u16], tls: bool, with_token: bool) {
-    let (url_token, authorize): (Option<&str>, Option<Arc<whep::Authorize>>) = if with_token { (Some("s3cret"), Some(Arc::new(|h: Option<&str>| h == Some("Bearer s3cret")))) } else { (None, None) };
+    let (url_token, authorize): (Option<&str>, Option<Arc<whep::Authorize>>) = if with_token { (Some("s3cret"), Some(Arc::new(|r: &AuthRequest| r.header() == Some("Bearer s3cret")))) } else { (None, None) };
     let (server, port) = whep_server(tls, |o| o.authorize = authorize);
     let tok = url_token;
     if with_token {
@@ -1533,7 +1533,7 @@ fn the_fallback_serves_a_page_with_security_headers_and_sees_the_request() {
             continue;
         }
         // authorize refuses everything: it covers the WHEP paths only
-        let (server, port) = site_server(tls, |o| o.authorize = Some(Arc::new(|_| false)));
+        let (server, port) = site_server(tls, |o| o.authorize = Some(Arc::new(|_: &AuthRequest| false)));
         let (status, h, body) = request(port, "GET", "/", None, "");
         assert_eq!((status, body.as_str()), (200, "<h1>viewer</h1>"));
         let get = |k: &str| h.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
@@ -1752,7 +1752,7 @@ fn pem_site() -> (WhepServer, u16, String, String) {
     crate::net::allow_loopback_for_tests();
     let (cert, key) = crate::tls::self_signed_pem(&["127.0.0.1", "localhost"], 1).unwrap();
     let mut o = WhepOptions::default();
-    o.authorize = Some(Arc::new(|h: Option<&str>| h == Some("Bearer s3cret")));
+    o.authorize = Some(Arc::new(|r: &AuthRequest| r.header() == Some("Bearer s3cret")));
     o.fallback = Some(site(websocket::Config::default()));
     o.tls_from_pem(cert.as_bytes(), key.as_bytes()).unwrap();
     let fp = o.tls_fingerprint().unwrap();
@@ -1801,4 +1801,40 @@ fn tls_from_pem_refuses_what_is_not_a_certificate_and_key() {
     assert!(crate::tls::self_signed_pem(&[], 1).is_err());
     assert!(crate::tls::self_signed_pem(&["a b"], 1).is_err());
     assert!(crate::tls::self_signed_pem(&["localhost"], 0).is_err());
+}
+
+#[test]
+fn authorize_is_shown_the_peer_address_over_plain_tcp_and_over_tls() {
+    for tls in [false, true] {
+        if !tls && crate::fips::enabled() {
+            continue;
+        }
+        let seen: Arc<Mutex<Vec<(Option<String>, SocketAddr)>>> = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let (server, port) = whep_server(tls, |o| {
+            o.authorize = Some(Arc::new(move |r: &AuthRequest| {
+                log.lock().unwrap().push((r.header().map(str::to_string), r.peer_addr()));
+                // only a bearer token from loopback, on a port that is not the server's
+                r.header() == Some("Bearer t") && r.peer_addr().ip().is_loopback() && r.peer_addr().port() != 0
+            }))
+        });
+        assert_eq!(request(port, "DELETE", "/whep/session/x", Some("wrong"), "").0, 401);
+        assert_eq!(request(port, "DELETE", "/whep/session/x", Some("t"), "").0, 404);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[1].0.as_deref(), Some("Bearer t"));
+        assert!(seen.iter().all(|(_, p)| p.ip().is_loopback() && p.port() != port));
+        drop(server);
+    }
+}
+
+#[test]
+fn a_whep_url_token_is_checked_through_the_hook() {
+    crate::net::allow_loopback_for_tests();
+    let port = free_port();
+    let server = WhepServer::open(&format!("whep://127.0.0.1:{port}/whep?token=abc")).unwrap();
+    assert_eq!(request(port, "DELETE", "/whep/session/x", None, "").0, 401);
+    assert_eq!(request(port, "DELETE", "/whep/session/x", Some("abd"), "").0, 401);
+    assert_eq!(request(port, "DELETE", "/whep/session/x", Some("abc"), "").0, 404);
+    drop(server);
 }

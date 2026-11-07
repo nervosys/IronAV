@@ -22,7 +22,7 @@
 //! apart from the HTTP server's small pool, [`WhepOptions::max_websockets`] at most.
 //!
 //! What it trusts: nothing from the network. The caller's `authorize` function sees each request's
-//! `Authorization` header and nothing is logged of it; a refusal is a `401` with no body. It covers
+//! `Authorization` header and peer address (an [`AuthRequest`]) and nothing is logged of them; a refusal is a `401` with no body. It covers
 //! the WHEP path and its sessions only: the paths of the fallback are the caller's to protect. HTTP and
 //! media are taken only from loopback or from addresses `IRONAV_NET_ALLOW` admits; media only from an
 //! address that has passed a STUN check with the viewer's credentials, and only once it authenticates.
@@ -74,9 +74,28 @@ const MAX_WEBSOCKETS: usize = 1024;
 const UPGRADED_SLICE: Duration = Duration::from_millis(250);
 const CNAME: &str = "IronAV";
 
-/// The check a request's `Authorization` header must pass: it gets the header's value, if there is one,
-/// and says whether to go on.
-pub type Authorize = dyn Fn(Option<&str>) -> bool + Send + Sync;
+/// The check a request must pass: it gets the request's `Authorization` header and the address it came
+/// from (an [`AuthRequest`]), and says whether to go on.
+pub type Authorize = dyn Fn(&AuthRequest<'_>) -> bool + Send + Sync;
+
+/// What an [`Authorize`] check is shown of a request: the `Authorization` header and the peer's address.
+/// The address is the TCP peer's, so behind a proxy it is the proxy's.
+pub struct AuthRequest<'a> {
+    header: Option<&'a str>,
+    peer: SocketAddr,
+}
+
+impl AuthRequest<'_> {
+    /// The whole value of the `Authorization` header (such as `Bearer abc`), if there is one.
+    pub fn header(&self) -> Option<&str> {
+        self.header
+    }
+
+    /// The address the request came from.
+    pub fn peer_addr(&self) -> SocketAddr {
+        self.peer
+    }
+}
 
 /// What serves the requests that are not WHEP's, see [`WhepOptions::fallback`].
 pub type Fallback = dyn Fn(HttpRequest, HttpReply) + Send + Sync;
@@ -87,7 +106,8 @@ pub type Fallback = dyn Fn(HttpRequest, HttpReply) + Send + Sync;
 pub struct WhepOptions {
     /// The most viewers at once, 1 to 64 (4 by default). A POST past it is answered `503`.
     pub max_viewers: usize,
-    /// Checks every POST and DELETE's `Authorization` header (the whole value, such as `Bearer abc`).
+    /// Checks every POST and DELETE: it is shown the `Authorization` header (the whole value, such as
+    /// `Bearer abc`) and the peer's address, over TLS too.
     /// Without one anyone who can reach the port may watch, which is why the endpoint binds loopback
     /// unless told otherwise.
     ///
@@ -386,7 +406,7 @@ pub(crate) fn open_whep(u: &SourceUrl) -> Result<WhepServer> {
         opts.tls_fingerprint = Some(dtls::sha256(&leaf));
     }
     if let Some(token) = t.token {
-        opts.authorize = Some(Arc::new(move |h| super::bearer_matches(h, &token)));
+        opts.authorize = Some(Arc::new(move |r| super::bearer_matches(r.header(), &token)));
     }
     opts.cors = t.cors;
     WhepServer::bind(t.addr, &t.path, opts)
@@ -444,8 +464,8 @@ impl Endpoint {
         }
     }
 
-    fn authorized(&self, req: &http::Request) -> bool {
-        self.opts.authorize.as_ref().is_none_or(|f| f(req.header("authorization")))
+    fn authorized(&self, req: &http::Request, peer: SocketAddr) -> bool {
+        self.opts.authorize.as_ref().is_none_or(|f| f(&AuthRequest { header: req.header("authorization"), peer }))
     }
 
     /// Whether a request is for the WHEP path or one of its session resources.
@@ -462,7 +482,7 @@ impl Endpoint {
         if req.method == "OPTIONS" {
             return http::response(204, &[("Accept-Post", "application/sdp"), ("Allow", "OPTIONS, POST, DELETE, PATCH")], b"");
         }
-        if !self.authorized(req) {
+        if !self.authorized(req, peer) {
             return http::response(401, &[("WWW-Authenticate", "Bearer")], b"");
         }
         let sessions = self.session_path("");
