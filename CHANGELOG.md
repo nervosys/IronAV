@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-11-07
+
 ### Added
 
 - A server-side WebSocket (RFC 6455), public as `ironav_live::websocket` (`Connection`, `Message`, `Config`, `Error`,
