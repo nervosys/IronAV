@@ -1745,3 +1745,60 @@ fn a_whep_server_takes_at_most_1024_websockets() {
     assert!(WhepServer::bind("127.0.0.1:0".parse().unwrap(), "/whep", with(1025)).is_err());
     assert!(WhepServer::bind("127.0.0.1:0".parse().unwrap(), "/whep", with(1024)).is_ok());
 }
+
+/// A site served over TLS with a certificate `self_signed_pem` made and `tls_from_pem` was given, with an
+/// `authorize` hook and the fallback set.
+fn pem_site() -> (WhepServer, u16, String, String) {
+    crate::net::allow_loopback_for_tests();
+    let (cert, key) = crate::tls::self_signed_pem(&["127.0.0.1", "localhost"], 1).unwrap();
+    let mut o = WhepOptions::default();
+    o.authorize = Some(Arc::new(|h: Option<&str>| h == Some("Bearer s3cret")));
+    o.fallback = Some(site(websocket::Config::default()));
+    o.tls_from_pem(cert.as_bytes(), key.as_bytes()).unwrap();
+    let fp = o.tls_fingerprint().unwrap();
+    // the certificate is its own trust anchor for the client
+    let mut roots = RootStore::new();
+    roots.add_pem_bundle(&cert).unwrap();
+    let client = if crate::fips::enabled() { crate::fips::client_config(roots).unwrap() } else { ClientConfig::new(Profile::Default, roots).unwrap() };
+    let port = free_port();
+    TLS_PORTS.lock().unwrap().push((port, Arc::new(client)));
+    let server = WhepServer::bind(format!("127.0.0.1:{port}").parse().unwrap(), "/whep", o).unwrap();
+    assert_eq!(server.tls_fingerprint(), Some(fp.clone()));
+    (server, port, cert, fp)
+}
+
+#[test]
+fn tls_from_pem_serves_the_fallback_and_websockets_with_the_hooks_set() {
+    let (server, port, cert, fp) = pem_site();
+    // the fingerprint is the SHA-256 of the certificate in the PEM, which the client's handshake
+    // (it trusts that certificate alone) shows is the one served
+    let der: String = cert.lines().filter(|l| !l.starts_with("-----")).collect();
+    assert_eq!(fp, dtls::fingerprint_text(&dtls::sha256(&crate::tls::unbase64(&der).unwrap())));
+    assert_eq!(fp.len(), 32 * 3 - 1);
+    // the page is the caller's, the WHEP path has its check
+    let (status, _, body) = request(port, "GET", "/", None, "");
+    assert_eq!((status, body.as_str()), (200, "<h1>viewer</h1>"));
+    assert_eq!(request(port, "POST", "/whep", None, &viewer_offer(&[1; 32])).0, 401);
+    assert_eq!(request(port, "POST", "/whep", Some("s3cret"), &viewer_offer(&[1; 32])).0, 201);
+    // and a WebSocket upgrades over it
+    let mut c = ws_connect(port);
+    assert_eq!(c.recv(), (1, b"hello".to_vec()));
+    drop(server);
+}
+
+#[test]
+fn tls_from_pem_refuses_what_is_not_a_certificate_and_key() {
+    let (cert, key) = crate::tls::self_signed_pem(&["localhost"], 1).unwrap();
+    let (other, _) = crate::tls::self_signed_pem(&["localhost"], 1).unwrap();
+    let mut o = WhepOptions::default();
+    assert!(o.tls_from_pem(b"", key.as_bytes()).is_err());
+    assert!(o.tls_from_pem(cert.as_bytes(), b"").is_err());
+    assert!(o.tls_from_pem(&[0xff, 0xfe], key.as_bytes()).is_err());
+    // a key that is not the certificate's
+    assert!(o.tls_from_pem(other.as_bytes(), key.as_bytes()).is_err());
+    assert!(o.tls.is_none() && o.tls_fingerprint().is_none());
+    // and the names and the lifetime of a made certificate are checked
+    assert!(crate::tls::self_signed_pem(&[], 1).is_err());
+    assert!(crate::tls::self_signed_pem(&["a b"], 1).is_err());
+    assert!(crate::tls::self_signed_pem(&["localhost"], 0).is_err());
+}

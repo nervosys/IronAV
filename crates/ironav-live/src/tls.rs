@@ -226,21 +226,87 @@ pub(crate) fn connect_with(sock: TcpStream, host: &str, config: Arc<ClientConfig
 /// `cert_path` and the private key in `key_path`, with IronSocketLayer's default profile, or FIPS
 /// mode's when it is on. Read once, when the endpoint opens.
 pub(crate) fn server_config(cert_path: &str, key_path: &str) -> Result<Arc<ServerConfig>> {
+    server_config_files(cert_path, key_path).map(|c| c.0)
+}
+
+/// [`server_config`], and the leaf certificate's DER too.
+pub(crate) fn server_config_files(cert_path: &str, key_path: &str) -> Result<(Arc<ServerConfig>, Vec<u8>)> {
     let bad = |what: &str, path: &str, why: String| Error::invalid_arg(format!("whips://: {what} {path}: {why}"));
-    let text = std::fs::read_to_string(cert_path).map_err(|e| bad("cannot read cert", cert_path, e.to_string()))?;
-    let chain: Vec<Vec<u8>> = pem_blocks(&text).map_err(|e| bad("cert", cert_path, e))?.into_iter().filter(|(l, _)| l == "CERTIFICATE").map(|(_, d)| d).collect();
+    let cert = std::fs::read_to_string(cert_path).map_err(|e| bad("cannot read cert", cert_path, e.to_string()))?;
+    let key = std::fs::read_to_string(key_path).map_err(|e| bad("cannot read key", key_path, e.to_string()))?;
+    server_config_text(&cert, &key, cert_path, key_path, "whips://")
+}
+
+/// The server configuration for a certificate chain (leaf first) and a private key given as PEM
+/// text, and the leaf's DER, for its fingerprint. `cert_name` and `key_name` say where the text came
+/// from, for errors.
+pub(crate) fn server_config_text(cert: &str, key: &str, cert_name: &str, key_name: &str, who: &str) -> Result<(Arc<ServerConfig>, Vec<u8>)> {
+    let bad = |what: &str, path: &str, why: String| Error::invalid_arg(format!("{who}: {what} {path}: {why}"));
+    let chain: Vec<Vec<u8>> = pem_blocks(cert).map_err(|e| bad("cert", cert_name, e))?.into_iter().filter(|(l, _)| l == "CERTIFICATE").map(|(_, d)| d).collect();
     if chain.is_empty() {
-        return Err(bad("cert", cert_path, "no CERTIFICATE block (a PEM chain, the server's certificate first, is expected)".into()));
+        return Err(bad("cert", cert_name, "no CERTIFICATE block (a PEM chain, the server's certificate first, is expected)".into()));
     }
-    let text = std::fs::read_to_string(key_path).map_err(|e| bad("cannot read key", key_path, e.to_string()))?;
-    let key = private_key(&text).map_err(|e| bad("key", key_path, e))?;
-    let identity = Identity::new(chain, key).map_err(|e| bad("cert and key", cert_path, format!("{e} (does the key belong to the first certificate?)")))?;
+    let leaf = chain[0].clone();
+    let key = private_key(key).map_err(|e| bad("key", key_name, e))?;
+    let identity = Identity::new(chain, key).map_err(|e| bad("cert and key", cert_name, format!("{e} (does the key belong to the first certificate?)")))?;
     let config = if crate::fips::enabled() {
         crate::fips::server_config(identity)?
     } else {
         ServerConfig::new(Profile::Default, identity).map_err(|e| Error::new(ErrorCode::Io, format!("TLS configuration: {e}")))?
     };
-    Ok(Arc::new(config))
+    Ok((Arc::new(config), leaf))
+}
+
+/// Makes a self-signed TLS server certificate and its private key, as PEM text (certificate, then key
+/// in PKCS#8), valid for `valid_days` (1 to 3650) from now. `names` are what it is for, each an IP
+/// address or a DNS name; at least one. The key is P-256, and nothing is written anywhere. A client has
+/// to be told to trust it, for example by its SHA-256 fingerprint (see [`crate::WhepOptions::tls_fingerprint`]).
+pub fn self_signed_pem(names: &[&str], valid_days: u32) -> Result<(String, String)> {
+    use ironsocketlayer::x509::{self, CertificateParams, Purpose};
+    crate::fips::activate()?;
+    if names.is_empty() || names.iter().any(|n| n.is_empty() || n.len() > 253 || !n.bytes().all(|b| b.is_ascii_alphanumeric() || b".-:_*".contains(&b))) {
+        return Err(Error::invalid_arg("a self-signed certificate is for one or more DNS names or IP addresses"));
+    }
+    if !(1..=3650).contains(&valid_days) {
+        return Err(Error::invalid_arg("a self-signed certificate is valid for 1 to 3650 days"));
+    }
+    let internal = |e: &dyn std::fmt::Display| Error::new(ErrorCode::Internal, format!("could not make a certificate: {e}"));
+    let mut rng = ic_drbg::Rng::from_os().map_err(|e| internal(&e))?;
+    // a random scalar is below the group order but for a chance of 2^-32; asking again settles it
+    let (key, scalar) = (0..8)
+        .find_map(|_| {
+            let scalar: [u8; 32] = rng.random_array().ok()?;
+            SigningKey::ecdsa_p256(&scalar).ok().map(|k| (k, scalar))
+        })
+        .ok_or_else(|| internal(&"no usable key"))?;
+    let mut ips = Vec::new();
+    let mut dns = Vec::new();
+    for n in names {
+        match n.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V4(a)) => ips.push(x509::IpAddr::V4(a.octets())),
+            Ok(std::net::IpAddr::V6(a)) => ips.push(x509::IpAddr::V6(a.octets())),
+            Err(_) => dns.push(*n),
+        }
+    }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let mut serial: [u8; 16] = rng.random_array().map_err(|e| internal(&e))?;
+    serial[0] &= 0x7F;
+    let mut p = CertificateParams::new(names[0], now.saturating_sub(3600), now + u64::from(valid_days) * 86_400, serial);
+    p.dns_names = &dns;
+    p.ip_addresses = &ips;
+    p.usage = &[Purpose::TlsServer];
+    let cert = x509::self_signed(&p, &key, &mut rng).map_err(|e| internal(&e))?;
+    // PKCS#8: version 0, id-ecPublicKey with prime256v1, and the SEC1 key in an OCTET STRING
+    let mut der = vec![0x30, 0x41, 0x02, 0x01, 0x00, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x04, 0x27];
+    der.extend_from_slice(&[0x30, 0x25, 0x02, 0x01, 0x01, 0x04, 0x20]);
+    der.extend_from_slice(&scalar);
+    Ok((pem("CERTIFICATE", &cert), pem("PRIVATE KEY", &der)))
+}
+
+fn pem(label: &str, der: &[u8]) -> String {
+    let b64 = crate::http::base64(der);
+    let lines: Vec<&str> = b64.as_bytes().chunks(64).filter_map(|l| std::str::from_utf8(l).ok()).collect();
+    format!("-----BEGIN {label}-----\n{}\n-----END {label}-----\n", lines.join("\n"))
 }
 
 /// The blocks of a PEM text, each as its label and decoded bytes.

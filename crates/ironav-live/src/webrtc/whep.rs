@@ -114,11 +114,34 @@ pub struct WhepOptions {
     pub consent_timeout: Duration,
     /// Serve the signalling over TLS with this configuration.
     pub(crate) tls: Option<Arc<ServerConfig>>,
+    /// The SHA-256 of the first certificate of `tls`.
+    pub(crate) tls_fingerprint: Option<[u8; 32]>,
 }
 
 impl Default for WhepOptions {
     fn default() -> Self {
-        WhepOptions { max_viewers: 4, authorize: None, fallback: None, max_websockets: 8, cors: None, setup_timeout: SETUP_TIMEOUT, consent_timeout: CONSENT_TIMEOUT, tls: None }
+        WhepOptions { max_viewers: 4, authorize: None, fallback: None, max_websockets: 8, cors: None, setup_timeout: SETUP_TIMEOUT, consent_timeout: CONSENT_TIMEOUT, tls: None, tls_fingerprint: None }
+    }
+}
+
+impl WhepOptions {
+    /// Serves the signalling, the `fallback` pages and the WebSockets over TLS, with the certificate
+    /// chain (the server's certificate first) and private key given as PEM text; the key is PKCS#8 or
+    /// SEC1 EC (P-256, P-384 or P-521). It is the library form of `wheps://`: the same TLS profile, FIPS
+    /// mode's when that is on, and the `authorize` and `fallback` hooks too. [`tls_fingerprint`](Self::tls_fingerprint)
+    /// then names the certificate. See [`crate::tls::self_signed_pem`] for making one.
+    pub fn tls_from_pem(&mut self, cert_pem: &[u8], key_pem: &[u8]) -> Result<()> {
+        let text = |b: &[u8], what: &str| String::from_utf8(b.to_vec()).map_err(|_| Error::invalid_arg(format!("the TLS {what} is not PEM text")));
+        let (config, leaf) = crate::tls::server_config_text(&text(cert_pem, "certificate")?, &text(key_pem, "key")?, "given", "given", "WHEP TLS")?;
+        self.tls = Some(config);
+        self.tls_fingerprint = Some(dtls::sha256(&leaf));
+        Ok(())
+    }
+
+    /// The SHA-256 fingerprint of the TLS certificate that is served, as `AB:CD:...` (the form of an
+    /// SDP `a=fingerprint` line), once [`tls_from_pem`](Self::tls_from_pem) has set one.
+    pub fn tls_fingerprint(&self) -> Option<String> {
+        self.tls_fingerprint.map(|f| dtls::fingerprint_text(&f))
     }
 }
 
@@ -186,6 +209,7 @@ impl Shared {
 pub struct WhepServer {
     shared: Arc<Shared>,
     addr: SocketAddr,
+    tls_fingerprint: Option<[u8; 32]>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -213,11 +237,12 @@ impl WhepServer {
         let local = listener.local_addr()?;
         super::grow_receive_buffer(&udp);
         let id = dtls::Identity::generate("IronAV WHEP").map_err(|e| Error::new(ErrorCode::Internal, format!("could not make the WHEP endpoint's DTLS certificate: {e}")))?;
+        let tls_fingerprint = opts.tls_fingerprint;
         let http = http::Server::new(listener, allow.clone(), sdp::MAX_OFFER, opts.tls.clone())?;
         let shared = Arc::new(Shared { state: Mutex::new(State { viewers: Vec::new(), packetizer: H264Packetizer::default() }), keyframe: AtomicBool::new(false), stop: AtomicBool::new(false), udp: udp.try_clone()? });
         let mut endpoint = Endpoint { path: path.to_string(), opts, upgraded: Arc::new(AtomicUsize::new(0)), http, udp, id: Arc::new(id), allow, shared: shared.clone() };
         let worker = std::thread::Builder::new().name("ironav-whep".into()).spawn(move || endpoint.run()).map_err(|e| Error::new(ErrorCode::Internal, format!("could not start the WHEP endpoint: {e}")))?;
-        Ok(WhepServer { shared, addr: local, worker: Some(worker) })
+        Ok(WhepServer { shared, addr: local, tls_fingerprint, worker: Some(worker) })
     }
 
     /// Opens the endpoint a `whep://[host]:port[/path][?token=T]` or `wheps://...` URL names (see
@@ -230,6 +255,13 @@ impl WhepServer {
     /// The address it listens on, for HTTP over TCP and for the media over UDP.
     pub fn local_addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// The SHA-256 fingerprint, as `AB:CD:...`, of the TLS certificate the signalling is served with, if it
+    /// is served over TLS and the endpoint knows the certificate (`wheps://` and
+    /// [`WhepOptions::tls_from_pem`] both give it).
+    pub fn tls_fingerprint(&self) -> Option<String> {
+        self.tls_fingerprint.map(|f| dtls::fingerprint_text(&f))
     }
 
     /// How many viewers have finished ICE and DTLS and are being sent video.
@@ -349,7 +381,9 @@ pub(crate) fn open_whep(u: &SourceUrl) -> Result<WhepServer> {
     let t = target(u)?;
     let mut opts = WhepOptions::default();
     if let Some((cert, key)) = &t.tls {
-        opts.tls = Some(crate::tls::server_config(cert, key)?);
+        let (config, leaf) = crate::tls::server_config_files(cert, key)?;
+        opts.tls = Some(config);
+        opts.tls_fingerprint = Some(dtls::sha256(&leaf));
     }
     if let Some(token) = t.token {
         opts.authorize = Some(Arc::new(move |h| super::bearer_matches(h, &token)));
