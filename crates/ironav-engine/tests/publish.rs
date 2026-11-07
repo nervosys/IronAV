@@ -7,13 +7,21 @@ use ironav_engine::live::{close, open, OpenArgs};
 use ironav_live::{open_source, Chunk};
 use serde_json::{json, Value};
 use std::io::Cursor;
-use std::net::UdpSocket;
+use std::net::{TcpListener, UdpSocket};
 use std::time::{Duration, Instant};
 
 const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../ironav-formats/tests/data/h264_aac.ts");
 
+/// A port free for UDP and TCP both: a WHIP endpoint listens on each. Windows reserves ranges of TCP ports, so a
+/// port free for UDP alone can be refused for TCP (os error 10013).
 fn free_port() -> u16 {
-    UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    loop {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        if UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
 }
 
 fn args(v: Value) -> OpenArgs {
