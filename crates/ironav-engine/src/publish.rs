@@ -683,7 +683,17 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
         let t = std::thread::spawn(move || {
-            let mut rx = open_source(&format!("srt://127.0.0.1:{port}?mode=listener&reconnect=0&{PASS}")).unwrap();
+            // A receiver that comes back takes the port the last one left. Its socket can still be closing, or
+            // another test can hold the port for a moment, so try for a little while before failing.
+            let url = format!("srt://127.0.0.1:{port}?mode=listener&reconnect=0&{PASS}");
+            let until = Instant::now() + Duration::from_secs(2);
+            let mut rx = loop {
+                match open_source(&url) {
+                    Ok(rx) => break rx,
+                    Err(e) if Instant::now() >= until => panic!("{e:?}"),
+                    Err(_) => std::thread::sleep(Duration::from_millis(50)),
+                }
+            };
             let (mut out, mut buf) = (Vec::new(), vec![0u8; 64 << 10]);
             while !flag.load(Ordering::Relaxed) {
                 match rx.read(&mut buf, Duration::from_millis(20)).unwrap() {
