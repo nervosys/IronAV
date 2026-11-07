@@ -1479,3 +1479,269 @@ fn a_whep_endpoint_over_tls_is_opened_from_a_url_and_fips_refuses_plain_whep() {
         assert!(e.message.contains("plaintext") && e.hint.as_deref().is_some_and(|h| h.contains("wheps://")), "{e:?}");
     }
 }
+
+// ---- the WHEP server's other paths: a page and WebSockets on the same origin ----
+
+const SITE_ORIGIN: &str = "https://viewer.example";
+
+/// What serves the site's paths: a page, a path that tells what it was asked, a WebSocket that echoes,
+/// and three that fail to answer well.
+fn site(config: websocket::Config) -> Arc<whep::Fallback> {
+    Arc::new(move |req: HttpRequest, reply: HttpReply| match req.path() {
+        "/" => reply.send(200, &[("Content-Type", "text/html; charset=utf-8"), ("Content-Security-Policy", "default-src 'self'")], b"<h1>viewer</h1>"),
+        "/info" => {
+            let ua = req.header("USER-AGENT").unwrap_or("-");
+            let text = format!("{} {} q={} ua={ua} body={} peer={}", req.method(), req.path(), req.query(), req.body().len(), req.peer_addr().ip());
+            reply.send(200, &[("Content-Type", "text/plain"), ("Cache-Control", "max-age=60")], text.as_bytes());
+        }
+        "/ws" => {
+            let Ok(mut c) = reply.upgrade_websocket(&[SITE_ORIGIN], config) else { return };
+            // the connection runs on a thread of its own
+            std::thread::spawn(move || {
+                let _ = c.send_text("hello");
+                loop {
+                    match c.recv() {
+                        Ok(Some(websocket::Message::Text(t))) => {
+                            let _ = c.send_text(&format!("echo:{t}"));
+                        }
+                        Ok(Some(websocket::Message::Binary(b))) => {
+                            let _ = c.send_binary(&b.iter().rev().copied().collect::<Vec<u8>>());
+                        }
+                        _ => break,
+                    }
+                }
+            });
+        }
+        "/silent" => drop(reply),
+        "/panic" => panic!("a fallback that fails"),
+        "/badheader" => reply.send(200, &[("X-A", "b\r\nSet-Cookie: x=1")], b""),
+        _ => reply.send(404, &[("Content-Type", "text/plain")], b"no such page"),
+    })
+}
+
+fn site_server(tls: bool, f: impl FnOnce(&mut WhepOptions)) -> (WhepServer, u16) {
+    whep_server(tls, |o| {
+        o.fallback = Some(site(websocket::Config::default()));
+        f(o)
+    })
+}
+
+#[test]
+fn the_fallback_serves_a_page_with_security_headers_and_sees_the_request() {
+    for tls in [false, true] {
+        if !tls && crate::fips::enabled() {
+            continue;
+        }
+        // authorize refuses everything: it covers the WHEP paths only
+        let (server, port) = site_server(tls, |o| o.authorize = Some(Arc::new(|_| false)));
+        let (status, h, body) = request(port, "GET", "/", None, "");
+        assert_eq!((status, body.as_str()), (200, "<h1>viewer</h1>"));
+        let get = |k: &str| h.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("content-type"), Some("text/html; charset=utf-8"));
+        assert_eq!(get("content-security-policy"), Some("default-src 'self'"));
+        assert_eq!(get("x-content-type-options"), Some("nosniff"));
+        assert_eq!(get("cache-control"), Some("no-store"));
+        assert_eq!(get("content-length"), Some("15"));
+        // the caller's own Cache-Control is kept, and the request's parts are as sent
+        let (status, h, body) = request(port, "POST", "/info?a=1&b=%20", None, "xyz");
+        assert_eq!(status, 200);
+        assert!(body.starts_with("POST /info q=a=1&b=%20 ua=- body=3 peer=127.0.0.1"), "{body}");
+        assert_eq!(h.iter().filter(|(k, _)| k == "cache-control").map(|(_, v)| v.as_str()).collect::<Vec<_>>(), ["max-age=60"]);
+        assert_eq!(request(port, "GET", "/nothing/here", None, "").0, 404);
+        // the WHEP path and its sessions stay the endpoint's, with their check
+        assert_eq!(request(port, "POST", "/whep", None, &viewer_offer(&[1; 32])).0, 401);
+        assert_eq!(request(port, "DELETE", "/whep/session/abc", None, "").0, 401);
+        drop(server);
+    }
+}
+
+#[test]
+fn without_a_fallback_other_paths_are_404() {
+    let (server, port) = whep_server(crate::fips::enabled(), |_| {});
+    for path in ["/", "/ws", "/info?x=1"] {
+        assert_eq!(request(port, "GET", path, None, "").0, 404, "{path}");
+    }
+    drop(server);
+}
+
+#[test]
+fn a_fallback_that_fails_to_answer_gives_a_500_and_the_endpoint_goes_on() {
+    let (server, port) = site_server(crate::fips::enabled(), |_| {});
+    for path in ["/silent", "/panic", "/badheader"] {
+        assert_eq!(request(port, "GET", path, None, "").0, 500, "{path}");
+    }
+    assert_eq!(request(port, "GET", "/", None, "").0, 200);
+    assert_eq!(request(port, "POST", "/whep", None, &viewer_offer(&[1; 32])).0, 201);
+    drop(server);
+}
+
+/// A byte stream the test client reads and writes, plain or TLS.
+trait Io: Read + Write {}
+impl<T: Read + Write> Io for T {}
+
+/// A WebSocket client written by hand: the upgrade request, then masked frames out and plain frames in.
+struct WsClient {
+    io: Box<dyn Io>,
+}
+
+/// Sends an upgrade request for `/ws` with `origin` (if any) and reads the response's head: its
+/// status, its headers (names in lower case) and the client, positioned after the head.
+fn ws_request(port: u16, origin: Option<&str>) -> (u16, Vec<(String, String)>, WsClient) {
+    let c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let tls = TLS_PORTS.lock().unwrap().iter().find(|(p, _)| *p == port).map(|(_, c)| c.clone());
+    let mut io: Box<dyn Io> = match tls {
+        None => Box::new(c),
+        Some(config) => Box::new(TlsStream::connect(c, config, "localhost").unwrap()),
+    };
+    let origin = origin.map(|o| format!("Origin: {o}\r\n")).unwrap_or_default();
+    let req = format!("GET /ws HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\n{origin}Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n");
+    io.write_all(req.as_bytes()).unwrap();
+    io.flush().unwrap();
+    // byte by byte: frames the server sends at once must stay unread
+    let mut head = Vec::new();
+    let mut b = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        match io.read(&mut b) {
+            Ok(1) => head.push(b[0]),
+            Ok(_) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => panic!("{e}"),
+        }
+    }
+    let text = String::from_utf8(head).unwrap();
+    let mut lines = text.trim_end().split("\r\n");
+    let status = lines.next().unwrap().split(' ').nth(1).unwrap().parse().unwrap();
+    let headers = lines.filter_map(|l| l.split_once(':')).map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string())).collect();
+    (status, headers, WsClient { io })
+}
+
+/// An upgraded connection: the 101 is checked (its accept value is the RFC's example).
+fn ws_connect(port: u16) -> WsClient {
+    let (status, headers, c) = ws_request(port, Some(SITE_ORIGIN));
+    assert_eq!(status, 101);
+    assert!(headers.iter().any(|(k, v)| k == "sec-websocket-accept" && v == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="), "{headers:?}");
+    c
+}
+
+impl WsClient {
+    fn send(&mut self, opcode: u8, payload: &[u8]) {
+        assert!(payload.len() < 126);
+        let mask = [9u8, 8, 7, 6];
+        let mut f = vec![0x80 | opcode, 0x80 | payload.len() as u8];
+        f.extend_from_slice(&mask);
+        f.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+        self.io.write_all(&f).unwrap();
+        self.io.flush().unwrap();
+    }
+
+    /// The next frame: its opcode and payload.
+    fn recv(&mut self) -> (u8, Vec<u8>) {
+        let mut h = [0u8; 2];
+        self.io.read_exact(&mut h).unwrap();
+        assert_eq!(h[1] & 0x80, 0, "a server's frames are not masked");
+        let len = match h[1] & 0x7f {
+            126 => {
+                let mut l = [0u8; 2];
+                self.io.read_exact(&mut l).unwrap();
+                u16::from_be_bytes(l) as usize
+            }
+            n => n as usize,
+        };
+        let mut p = vec![0u8; len];
+        self.io.read_exact(&mut p).unwrap();
+        (h[0] & 0x0f, p)
+    }
+}
+
+fn websocket_exchange(tls: bool) {
+    let (server, port) = site_server(tls, |_| {});
+    let mut c = ws_connect(port);
+    assert_eq!(c.recv(), (1, b"hello".to_vec()));
+    c.send(1, b"move 10 20");
+    assert_eq!(c.recv(), (1, b"echo:move 10 20".to_vec()));
+    c.send(2, &[1, 2, 3]);
+    assert_eq!(c.recv(), (2, vec![3, 2, 1]));
+    // a ping is answered with a pong, and the connection goes on
+    c.send(9, b"p");
+    assert_eq!(c.recv(), (10, b"p".to_vec()));
+    c.send(1, b"again");
+    assert_eq!(c.recv(), (1, b"echo:again".to_vec()));
+    // a close is answered with a close
+    c.send(8, &1000u16.to_be_bytes());
+    assert_eq!(c.recv(), (8, 1000u16.to_be_bytes().to_vec()));
+    // the page is served meanwhile
+    assert_eq!(request(port, "GET", "/", None, "").0, 200);
+    drop(server);
+}
+
+#[test]
+fn a_websocket_upgrades_through_the_fallback_over_plain_tcp() {
+    if crate::fips::enabled() {
+        return; // FIPS mode serves TLS only
+    }
+    websocket_exchange(false);
+}
+
+#[test]
+fn a_websocket_upgrades_through_the_fallback_over_tls() {
+    websocket_exchange(true);
+}
+
+#[test]
+fn an_upgrade_from_another_origin_or_without_one_is_refused_with_a_403() {
+    let (server, port) = site_server(crate::fips::enabled(), |_| {});
+    for origin in [Some("https://evil.example"), Some("https://viewer.example:8443"), None] {
+        let (status, _, _) = ws_request(port, origin);
+        assert_eq!(status, 403, "{origin:?}");
+    }
+    // an origin is compared ignoring case
+    let (status, _, _) = ws_request(port, Some("HTTPS://VIEWER.EXAMPLE"));
+    assert_eq!(status, 101);
+    // a plain GET of the path is no upgrade
+    assert_eq!(request(port, "GET", "/ws", None, "").0, 400);
+    drop(server);
+}
+
+#[test]
+fn upgraded_connections_have_a_limit_of_their_own_and_closing_one_frees_its_place() {
+    let (server, port) = site_server(crate::fips::enabled(), |o| o.max_websockets = 2);
+    let mut a = ws_connect(port);
+    let b = ws_connect(port);
+    let (status, headers, _) = ws_request(port, Some(SITE_ORIGIN));
+    assert_eq!(status, 503);
+    assert!(headers.iter().any(|(k, _)| k == "retry-after"));
+    // the pages and the signalling do not wait on them
+    assert_eq!(request(port, "GET", "/", None, "").0, 200);
+    drop(b);
+    // its thread sees the end, drops the connection, and the place is free
+    assert!(until(Duration::from_secs(5), || ws_request(port, Some(SITE_ORIGIN)).0 == 101));
+    assert_eq!(a.recv(), (1, b"hello".to_vec()));
+    drop(server);
+}
+
+#[test]
+fn whep_signalling_works_while_eight_websockets_are_open() {
+    let (server, port) = site_server(crate::fips::enabled(), |_| {});
+    let mut open: Vec<WsClient> = (0..8).map(|_| ws_connect(port)).collect();
+    // the ninth is refused: the default is 8
+    assert_eq!(ws_request(port, Some(SITE_ORIGIN)).0, 503);
+    // the HTTP server's own eight connections are free for the viewers
+    let w = watch(port, None, &[0x0001, 0x0007]);
+    assert!(until(Duration::from_secs(3), || server.viewers() == 1));
+    assert_eq!(request(port, "DELETE", &w.location, None, "").0, 200);
+    for c in open.iter_mut() {
+        assert_eq!(c.recv(), (1, b"hello".to_vec()));
+        c.send(1, b"x");
+        assert_eq!(c.recv(), (1, b"echo:x".to_vec()));
+    }
+    drop(server);
+}
+
+#[test]
+fn a_whep_server_takes_at_most_1024_websockets() {
+    crate::net::allow_loopback_for_tests();
+    let with = |n| WhepOptions { max_websockets: n, ..WhepOptions::default() };
+    assert!(WhepServer::bind("127.0.0.1:0".parse().unwrap(), "/whep", with(1025)).is_err());
+    assert!(WhepServer::bind("127.0.0.1:0".parse().unwrap(), "/whep", with(1024)).is_ok());
+}

@@ -1,6 +1,10 @@
 //! A server-side WebSocket (RFC 6455) over the HTTP server's connections: the upgrade request's
 //! checks and its 101 response, then framing over the same stream, plain or TLS.
 //!
+//! A caller gets a [`Connection`] from `HttpReply::upgrade_websocket` (see [`crate::WhepOptions::fallback`]),
+//! already past the handshake, and runs it on a thread of its own: [`Connection::recv`] for what
+//! the client sends, `send_text` and `send_binary` for what it is sent.
+//!
 //! The input is untrusted, so the reader is strict. A client's frames must be masked, no
 //! extension is negotiated (so the RSV bits must be zero), reserved opcodes and malformed control
 //! frames are refused, and a text message must be UTF-8 once it is whole. A length field is
@@ -8,11 +12,11 @@
 //! close frame with its code (1002, 1007 or 1009) and ends the connection. Frames the server
 //! sends are never masked.
 //!
-//! [`handshake`] checks a request and gives the key to answer with; [`upgrade_response`] is the
-//! 101. After sending it, `Responder::into_stream` gives the stream, and [`Connection::new`] runs
+//! `handshake` checks a request and gives the key to answer with; `upgrade_response` is the
+//! 101. After sending it, `Responder::into_stream` gives the stream, and `Connection::new` runs
 //! the framing over it.
 
-use super::http::{response, Request};
+use super::http::{response, Request, Slot};
 use crate::http::base64;
 use crate::sha1::sha1;
 use crate::tls::unbase64;
@@ -28,33 +32,55 @@ const MAX_CONTROL: usize = 125;
 /// How much of a payload is read into memory at a time.
 const CHUNK: usize = 8 << 10;
 
-/// The stream of an upgraded connection.
-pub(crate) enum Stream {
+enum Inner {
     Plain(TcpStream),
     Tls(Box<TlsStream<TcpStream>>),
 }
 
+/// The stream of an upgraded connection, plain or TLS. It holds one of the server's places for
+/// upgraded connections until it is dropped.
+pub struct Stream {
+    inner: Inner,
+    _slot: Option<Slot>,
+}
+
+impl Stream {
+    pub(crate) fn plain(s: TcpStream) -> Stream {
+        Stream { inner: Inner::Plain(s), _slot: None }
+    }
+
+    pub(crate) fn tls(t: Box<TlsStream<TcpStream>>) -> Stream {
+        Stream { inner: Inner::Tls(t), _slot: None }
+    }
+
+    /// Has this stream give back `slot` when it is dropped.
+    pub(crate) fn holding(mut self, slot: Slot) -> Stream {
+        self._slot = Some(slot);
+        self
+    }
+}
+
 impl Read for Stream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            Stream::Plain(s) => s.read(buf),
-            Stream::Tls(t) => t.read(buf),
+        match &mut self.inner {
+            Inner::Plain(s) => s.read(buf),
+            Inner::Tls(t) => t.read(buf),
         }
     }
 }
 
 impl Write for Stream {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        match self {
-            Stream::Plain(s) => s.write(buf),
-            Stream::Tls(t) => t.write(buf),
+        match &mut self.inner {
+            Inner::Plain(s) => s.write(buf),
+            Inner::Tls(t) => t.write(buf),
         }
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        match self {
-            Stream::Plain(s) => s.flush(),
-            Stream::Tls(t) => t.flush(),
+        match &mut self.inner {
+            Inner::Plain(s) => s.flush(),
+            Inner::Tls(t) => t.flush(),
         }
     }
 }
@@ -66,19 +92,34 @@ pub(crate) fn accept_key(key: &str) -> String {
     base64(&sha1(&data))
 }
 
-/// Why an upgrade request is refused: the status to answer with, and why.
+/// Why an upgrade was refused. Unless `status` is 0 the refusal has been sent to the client
+/// already, as an HTTP response with that status.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Refusal {
+pub struct Refused {
+    /// The status answered with: 400, 403 (the `Origin` is not allowed), 405, 426, or 503 (the
+    /// server has all the upgraded connections it takes). 0 if the connection failed before
+    /// anything could be sent.
     pub status: u16,
+    /// Why, as the client was told.
     pub why: &'static str,
 }
 
-impl Refusal {
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "WebSocket upgrade refused ({}): {}", self.status, self.why)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+impl Refused {
     /// The refusal as an HTTP response.
     pub(crate) fn response(&self) -> Vec<u8> {
         let mut headers = vec![("Content-Type", "text/plain")];
-        if self.status == 426 {
-            headers.push(("Sec-WebSocket-Version", "13"));
+        match self.status {
+            426 => headers.push(("Sec-WebSocket-Version", "13")),
+            503 => headers.push(("Retry-After", "5")),
+            _ => {}
         }
         response(self.status, &headers, self.why.as_bytes())
     }
@@ -92,8 +133,8 @@ fn has_token(value: &str, token: &str) -> bool {
 /// Checks an upgrade request, and gives the `Sec-WebSocket-Accept` value to answer it with.
 /// Its `Origin` must be one of `allowed_origins` (compared ignoring case); with no `Origin`, or
 /// none allowed, it is refused with 403.
-pub(crate) fn handshake(req: &Request, allowed_origins: &[&str]) -> std::result::Result<String, Refusal> {
-    let no = |status, why| Err(Refusal { status, why });
+pub(crate) fn handshake(req: &Request, allowed_origins: &[&str]) -> std::result::Result<String, Refused> {
+    let no = |status, why| Err(Refused { status, why });
     if req.method != "GET" {
         return no(405, "a WebSocket upgrade is a GET");
     }
@@ -126,14 +167,17 @@ pub(crate) fn upgrade_response(accept: &str) -> Vec<u8> {
 
 /// A message, whole.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Message {
+pub enum Message {
+    /// A text message, valid UTF-8.
     Text(String),
+    /// A binary message.
     Binary(Vec<u8>),
 }
 
 /// Limits for a connection.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Config {
+#[non_exhaustive]
+pub struct Config {
     /// The longest message accepted, over all its fragments. Longer is closed with 1009.
     pub max_message: usize,
     /// How long [`Connection::recv`] waits for the client to send anything.
@@ -148,7 +192,7 @@ impl Default for Config {
 
 /// Why a connection gave no message.
 #[derive(Debug)]
-pub(crate) enum Error {
+pub enum Error {
     /// The client broke the protocol; a close frame with this code has been sent.
     Protocol(u16, &'static str),
     /// Nothing came in [`Config::idle`]. If it was between frames the connection is usable still
@@ -158,7 +202,20 @@ pub(crate) enum Error {
     Io(std::io::Error),
 }
 
-type Result<T> = std::result::Result<T, Error>;
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::Protocol(code, why) => write!(f, "WebSocket protocol error {code}: {why}"),
+            Error::Idle => f.write_str("the WebSocket client sent nothing in time"),
+            Error::Io(e) => write!(f, "WebSocket I/O error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+/// What a connection's calls give.
+pub type Result<T> = std::result::Result<T, Error>;
 
 fn closed() -> Error {
     Error::Io(ErrorKind::NotConnected.into())
@@ -173,8 +230,9 @@ mod op {
     pub const PONG: u8 = 10;
 }
 
-/// A WebSocket over `S`, after the 101 has been sent.
-pub(crate) struct Connection<S> {
+/// A WebSocket over `S`, after the 101 has been sent. Messages are whole: the reader joins
+/// fragments and answers pings itself.
+pub struct Connection<S> {
     stream: S,
     config: Config,
     /// A message in pieces so far: its opcode and what has come.
@@ -193,39 +251,40 @@ fn valid_close_code(c: u16) -> bool {
 }
 
 impl<S: Read + Write> Connection<S> {
-    /// A connection over `stream`. Its reads should give up every so often (`WouldBlock` or
-    /// `TimedOut`), as `Responder::into_stream`'s do, so the idle limit can be kept.
-    pub(crate) fn new(stream: S, config: Config) -> Connection<S> {
+    /// A connection over `stream`, which is past the handshake. Its reads should give up every so
+    /// often (`WouldBlock` or `TimedOut`), as a [`Stream`]'s do, so the idle limit can be kept.
+    pub fn new(stream: S, config: Config) -> Connection<S> {
         Connection { stream, config, partial: None, sent_close: false, dead: false, peer_close: None }
     }
 
     /// The code and reason of the close frame the client sent, if one has come. A close with no
     /// code is 1005.
-    pub(crate) fn peer_close(&self) -> Option<&(u16, String)> {
+    pub fn peer_close(&self) -> Option<&(u16, String)> {
         self.peer_close.as_ref()
     }
 
     /// Whether nothing more can be sent.
-    pub(crate) fn is_closed(&self) -> bool {
+    pub fn is_closed(&self) -> bool {
         self.sent_close || self.dead
     }
 
-    pub(crate) fn into_inner(self) -> S {
+    /// The stream, ending the framing. Nothing is sent: close first if the client should be told.
+    pub fn into_inner(self) -> S {
         self.stream
     }
 
     /// Sends a text message.
-    pub(crate) fn send_text(&mut self, text: &str) -> Result<()> {
+    pub fn send_text(&mut self, text: &str) -> Result<()> {
         self.send_frame(op::TEXT, text.as_bytes())
     }
 
     /// Sends a binary message.
-    pub(crate) fn send_binary(&mut self, data: &[u8]) -> Result<()> {
+    pub fn send_binary(&mut self, data: &[u8]) -> Result<()> {
         self.send_frame(op::BINARY, data)
     }
 
     /// Sends a ping with up to 125 bytes of payload.
-    pub(crate) fn send_ping(&mut self, payload: &[u8]) -> Result<()> {
+    pub fn send_ping(&mut self, payload: &[u8]) -> Result<()> {
         if payload.len() > MAX_CONTROL {
             return Err(Error::Io(ErrorKind::InvalidInput.into()));
         }
@@ -235,7 +294,7 @@ impl<S: Read + Write> Connection<S> {
     /// Sends a close frame; nothing more can be sent after it, but [`recv`](Self::recv) goes on
     /// to the client's reply. The reason is cut to fit (123 bytes). A code that may not be on the
     /// wire (1005, say) is sent as 1000.
-    pub(crate) fn close(&mut self, code: u16, reason: &str) -> Result<()> {
+    pub fn close(&mut self, code: u16, reason: &str) -> Result<()> {
         if self.is_closed() {
             return Ok(());
         }
@@ -316,7 +375,7 @@ impl<S: Read + Write> Connection<S> {
 
     /// The next message, with pings answered and pongs ignored on the way. `Ok(None)` once the
     /// client has closed (the close is answered, unless one was sent already).
-    pub(crate) fn recv(&mut self) -> Result<Option<Message>> {
+    pub fn recv(&mut self) -> Result<Option<Message>> {
         loop {
             if self.peer_close.is_some() {
                 return Ok(None);
@@ -525,6 +584,7 @@ mod tests {
             method: "GET".into(),
             version: "HTTP/1.1".into(),
             path: "/ws".into(),
+            query: String::new(),
             headers: headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
             body: Vec::new(),
         }

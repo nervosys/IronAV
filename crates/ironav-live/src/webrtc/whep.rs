@@ -15,8 +15,15 @@
 //! numbers, SRTP keys and history for NACKs. A viewer that has not finished ICE and DTLS within
 //! [`WhepOptions::setup_timeout`], or that sends nothing authentic for [`WhepOptions::consent_timeout`], is dropped.
 //!
+//! One origin can serve more than the signalling. With [`WhepOptions::fallback`] set, a request whose
+//! path is not the WHEP path or one of its session resources is handed to the caller as an
+//! [`HttpRequest`] and an [`HttpReply`]: the caller answers with a page, or upgrades the connection to a
+//! [WebSocket](super::websocket) and runs it on a thread of its own. Upgraded connections are counted
+//! apart from the HTTP server's small pool, [`WhepOptions::max_websockets`] at most.
+//!
 //! What it trusts: nothing from the network. The caller's `authorize` function sees each request's
-//! `Authorization` header and nothing is logged of it; a refusal is a `401` with no body. HTTP and
+//! `Authorization` header and nothing is logged of it; a refusal is a `401` with no body. It covers
+//! the WHEP path and its sessions only: the paths of the fallback are the caller's to protect. HTTP and
 //! media are taken only from loopback or from addresses `IRONAV_NET_ALLOW` admits; media only from an
 //! address that has passed a STUN check with the viewer's credentials, and only once it authenticates.
 //!
@@ -32,13 +39,14 @@ use super::publisher::Stream;
 use super::sdp;
 use super::srtp;
 use super::stun;
+use super::websocket::{self, Refused};
 use crate::net::Allow;
 use crate::url::SourceUrl;
 use ironav_core::{Error, ErrorCode, Result};
 use ironsocketlayer::config::ServerConfig;
 use std::collections::VecDeque;
 use std::net::{IpAddr, SocketAddr, TcpListener, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -59,11 +67,19 @@ const POLL: Duration = Duration::from_millis(5);
 const MAX_PEERS: usize = 4;
 /// The most viewers a server may be set to take.
 const MAX_VIEWERS: usize = 64;
+/// The most upgraded connections a server may be set to take.
+const MAX_WEBSOCKETS: usize = 1024;
+/// How long a read from an upgraded connection waits before giving up, so its owner can look at
+/// the clock.
+const UPGRADED_SLICE: Duration = Duration::from_millis(250);
 const CNAME: &str = "IronAV";
 
 /// The check a request's `Authorization` header must pass: it gets the header's value, if there is one,
 /// and says whether to go on.
 pub type Authorize = dyn Fn(Option<&str>) -> bool + Send + Sync;
+
+/// What serves the requests that are not WHEP's, see [`WhepOptions::fallback`].
+pub type Fallback = dyn Fn(HttpRequest, HttpReply) + Send + Sync;
 
 /// How a WHEP endpoint is set up.
 #[non_exhaustive]
@@ -74,7 +90,21 @@ pub struct WhepOptions {
     /// Checks every POST and DELETE's `Authorization` header (the whole value, such as `Bearer abc`).
     /// Without one anyone who can reach the port may watch, which is why the endpoint binds loopback
     /// unless told otherwise.
+    ///
+    /// It does not cover the requests the `fallback` gets: that code authenticates its own.
     pub authorize: Option<Arc<Authorize>>,
+    /// Serves every request whose path is not the WHEP path or one of its session resources, such as
+    /// the page of a viewer and its WebSocket. Without it those paths are answered `404`.
+    ///
+    /// It is called on the endpoint's thread, which also carries the signalling, so it should answer
+    /// at once; code that waits or runs long (a WebSocket's loop) must take the [`HttpReply`] or the
+    /// [`websocket::Connection`] onto a thread of its own. It runs before `authorize` is looked at and
+    /// the CORS headers are not added to its answers. A request's body is at most 64 KiB. If the
+    /// function panics, or drops its reply unanswered, the client gets a `500`.
+    pub fallback: Option<Arc<Fallback>>,
+    /// The most upgraded connections (WebSockets) open at once, 0 to 1024 (8 by default). They do not
+    /// use up the HTTP server's connections: a past-the-limit upgrade is answered `503`.
+    pub max_websockets: usize,
     /// The web origin (or `*`) a page that watches from another origin has, for the CORS headers.
     pub cors: Option<String>,
     /// How long a viewer has to finish ICE and DTLS (5 s by default).
@@ -88,7 +118,7 @@ pub struct WhepOptions {
 
 impl Default for WhepOptions {
     fn default() -> Self {
-        WhepOptions { max_viewers: 4, authorize: None, cors: None, setup_timeout: SETUP_TIMEOUT, consent_timeout: CONSENT_TIMEOUT, tls: None }
+        WhepOptions { max_viewers: 4, authorize: None, fallback: None, max_websockets: 8, cors: None, setup_timeout: SETUP_TIMEOUT, consent_timeout: CONSENT_TIMEOUT, tls: None }
     }
 }
 
@@ -167,6 +197,9 @@ impl WhepServer {
         if !(1..=MAX_VIEWERS).contains(&opts.max_viewers) {
             return Err(Error::invalid_arg(format!("a WHEP endpoint takes 1 to {MAX_VIEWERS} viewers, not {}", opts.max_viewers)));
         }
+        if opts.max_websockets > MAX_WEBSOCKETS {
+            return Err(Error::invalid_arg(format!("a WHEP endpoint takes at most {MAX_WEBSOCKETS} WebSockets, not {}", opts.max_websockets)));
+        }
         if path.is_empty() || !path.starts_with('/') || path.len() > 256 || !path.bytes().all(|b| b.is_ascii_graphic() && b != b'?' && b != b'%') {
             return Err(Error::invalid_arg(format!("a WHEP path starts with / and holds printable characters, without ? or %, got '{path}'")));
         }
@@ -182,7 +215,7 @@ impl WhepServer {
         let id = dtls::Identity::generate("IronAV WHEP").map_err(|e| Error::new(ErrorCode::Internal, format!("could not make the WHEP endpoint's DTLS certificate: {e}")))?;
         let http = http::Server::new(listener, allow.clone(), sdp::MAX_OFFER, opts.tls.clone())?;
         let shared = Arc::new(Shared { state: Mutex::new(State { viewers: Vec::new(), packetizer: H264Packetizer::default() }), keyframe: AtomicBool::new(false), stop: AtomicBool::new(false), udp: udp.try_clone()? });
-        let mut endpoint = Endpoint { path: path.to_string(), opts, http, udp, id: Arc::new(id), allow, shared: shared.clone() };
+        let mut endpoint = Endpoint { path: path.to_string(), opts, upgraded: Arc::new(AtomicUsize::new(0)), http, udp, id: Arc::new(id), allow, shared: shared.clone() };
         let worker = std::thread::Builder::new().name("ironav-whep".into()).spawn(move || endpoint.run()).map_err(|e| Error::new(ErrorCode::Internal, format!("could not start the WHEP endpoint: {e}")))?;
         Ok(WhepServer { shared, addr: local, worker: Some(worker) })
     }
@@ -329,6 +362,8 @@ pub(crate) fn open_whep(u: &SourceUrl) -> Result<WhepServer> {
 struct Endpoint {
     path: String,
     opts: WhepOptions,
+    /// The upgraded connections open.
+    upgraded: Arc<AtomicUsize>,
     http: http::Server,
     udp: UdpSocket,
     id: Arc<dtls::Identity>,
@@ -342,6 +377,13 @@ impl Endpoint {
         while !self.shared.stop.load(Ordering::Relaxed) {
             let now = Instant::now();
             for (req, peer, responder) in self.http.poll(now) {
+                if let Some(f) = self.opts.fallback.as_ref().filter(|_| !self.is_whep(&req)) {
+                    let reply = HttpReply { responder: Some(responder), request: req.clone(), upgraded: self.upgraded.clone(), max_upgraded: self.opts.max_websockets };
+                    let request = HttpRequest { inner: req, peer };
+                    // a panic drops the reply, which answers 500, and the endpoint goes on
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(request, reply)));
+                    continue;
+                }
                 let resp = self.route(&req, peer, now);
                 responder.send(&self.cors(resp));
             }
@@ -370,6 +412,11 @@ impl Endpoint {
 
     fn authorized(&self, req: &http::Request) -> bool {
         self.opts.authorize.as_ref().is_none_or(|f| f(req.header("authorization")))
+    }
+
+    /// Whether a request is for the WHEP path or one of its session resources.
+    fn is_whep(&self, req: &http::Request) -> bool {
+        req.path == self.path || req.path.starts_with(&self.session_path(""))
     }
 
     fn session_path(&self, id: &str) -> String {
@@ -606,4 +653,117 @@ impl Endpoint {
             true
         });
     }
+}
+
+/// A request the [`WhepOptions::fallback`] is given: a read-only view of what the client sent.
+#[derive(Debug, Clone)]
+pub struct HttpRequest {
+    inner: http::Request,
+    peer: SocketAddr,
+}
+
+impl HttpRequest {
+    /// The method, such as `GET`.
+    pub fn method(&self) -> &str {
+        &self.inner.method
+    }
+
+    /// The path, as sent: without the query, and not percent-decoded.
+    pub fn path(&self) -> &str {
+        &self.inner.path
+    }
+
+    /// The query, without the `?`; empty if there is none. Not percent-decoded.
+    pub fn query(&self) -> &str {
+        &self.inner.query
+    }
+
+    /// The value of a header, by name, ignoring case. The first, if it is sent more than once.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.inner.header(name)
+    }
+
+    /// The body, at most 64 KiB.
+    pub fn body(&self) -> &[u8] {
+        &self.inner.body
+    }
+
+    /// The address the request came from.
+    pub fn peer_addr(&self) -> SocketAddr {
+        self.peer
+    }
+}
+
+/// Where the answer to a request goes. It answers once, and the connection ends with the answer, or
+/// becomes a WebSocket. Dropped unanswered it sends a `500`.
+pub struct HttpReply {
+    responder: Option<http::Responder>,
+    request: http::Request,
+    upgraded: Arc<AtomicUsize>,
+    max_upgraded: usize,
+}
+
+impl HttpReply {
+    /// Answers with `status`, `headers` and `body`. The server adds `Content-Length` and
+    /// `Connection: close`, and `X-Content-Type-Options: nosniff` and `Cache-Control: no-store` unless
+    /// the headers have them; the caller gives `Content-Type`, and `Content-Security-Policy` for a page.
+    /// A header with a line break in it, or named `Content-Length` or `Connection`, is not sent: the
+    /// answer is a `500` instead, so that the mistake shows.
+    pub fn send(mut self, status: u16, headers: &[(&str, &str)], body: &[u8]) {
+        let Some(responder) = self.responder.take() else { return };
+        responder.send(&page_response(status, headers, body));
+    }
+
+    /// Takes the request as a WebSocket upgrade. It checks the request (a `GET` with the upgrade
+    /// headers, version 13, a well-formed key, and an `Origin` that is one of `allowed_origins`,
+    /// compared ignoring case: a request with no `Origin` is refused), takes one of the server's
+    /// places for upgraded connections, and answers `101`. The connection it returns is the caller's
+    /// to run on a thread of its own; dropping it gives its place back.
+    ///
+    /// When it refuses it has answered the client already (`400`, `403`, `405`, `426`, or `503` when
+    /// [`WhepOptions::max_websockets`] are open) and the error says what was sent.
+    pub fn upgrade_websocket(mut self, allowed_origins: &[&str], config: websocket::Config) -> std::result::Result<websocket::Connection<websocket::Stream>, Refused> {
+        let Some(responder) = self.responder.take() else { return Err(Refused { status: 0, why: "already answered" }) };
+        let refuse = |responder: http::Responder, r: Refused| {
+            responder.send(&r.response());
+            Err(r)
+        };
+        let accept = match websocket::handshake(&self.request, allowed_origins) {
+            Ok(a) => a,
+            Err(r) => return refuse(responder, r),
+        };
+        let Some(slot) = http::Slot::acquire(&self.upgraded, self.max_upgraded) else {
+            return refuse(responder, Refused { status: 503, why: "this endpoint has all the WebSockets it takes" });
+        };
+        let lost = Refused { status: 0, why: "the connection failed" };
+        let Some(stream) = responder.into_stream(UPGRADED_SLICE) else { return Err(lost) };
+        let mut stream = stream.holding(slot);
+        std::io::Write::write_all(&mut stream, &websocket::upgrade_response(&accept)).and_then(|()| std::io::Write::flush(&mut stream)).map_err(|_| lost)?;
+        Ok(websocket::Connection::new(stream, config))
+    }
+}
+
+impl Drop for HttpReply {
+    fn drop(&mut self) {
+        if let Some(r) = self.responder.take() {
+            r.send(&http::response(500, &[("Content-Type", "text/plain")], b"no answer"));
+        }
+    }
+}
+
+/// A page's response: the caller's headers and the security headers that suit a page.
+fn page_response(status: u16, headers: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
+    let bad = |(k, v): &(&str, &str)| {
+        k.is_empty() || !k.bytes().all(|b| b.is_ascii_graphic() && b != b':') || v.bytes().any(|b| (b < b' ' && b != b'\t') || b == 0x7f) || k.eq_ignore_ascii_case("content-length") || k.eq_ignore_ascii_case("connection")
+    };
+    if headers.iter().any(bad) || !(200..=599).contains(&status) {
+        return http::response(500, &[("Content-Type", "text/plain")], b"the page's response was malformed");
+    }
+    let mut all = headers.to_vec();
+    for (k, v) in [("X-Content-Type-Options", "nosniff"), ("Cache-Control", "no-store")] {
+        if !headers.iter().any(|(h, _)| h.eq_ignore_ascii_case(k)) {
+            all.push((k, v));
+        }
+    }
+    http::response(status, &all, body)
 }

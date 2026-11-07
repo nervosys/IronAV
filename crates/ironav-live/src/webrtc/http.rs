@@ -36,6 +36,8 @@ pub(crate) struct Request {
     pub version: String,
     /// The path, without any query.
     pub path: String,
+    /// The query, without the `?`; empty if there is none.
+    pub query: String,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
 }
@@ -78,7 +80,8 @@ pub(crate) fn parse(buf: &[u8], max_body: usize) -> Parsed {
         }
         headers.push((k.trim().to_string(), v.trim().to_string()));
     }
-    let mut r = Request { method: method.to_string(), version: version.to_string(), path: target.split('?').next().unwrap_or("/").to_string(), headers, body: Vec::new() };
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    let mut r = Request { method: method.to_string(), version: version.to_string(), path: path.to_string(), query: query.to_string(), headers, body: Vec::new() };
     if let Some(te) = r.header("transfer-encoding") {
         // a client may send even an empty body chunked
         if !te.eq_ignore_ascii_case("chunked") || r.header("content-length").is_some() {
@@ -149,6 +152,8 @@ pub(crate) fn response(status: u16, headers: &[(&str, &str)], body: &[u8]) -> Ve
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
+        301 => "Moved Permanently",
+        302 => "Found",
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",
@@ -156,8 +161,10 @@ pub(crate) fn response(status: u16, headers: &[(&str, &str)], body: &[u8]) -> Ve
         413 => "Content Too Large",
         415 => "Unsupported Media Type",
         426 => "Upgrade Required",
+        429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
+        503 => "Service Unavailable",
         _ => "Error",
     };
     let mut out = format!("HTTP/1.1 {status} {reason}\r\nConnection: close\r\nContent-Length: {}\r\n", body.len());
@@ -186,8 +193,25 @@ struct Tls {
     rx: Receiver<(Request, SocketAddr, Responder)>,
 }
 
-/// One connection's place among those in progress, given back when its thread ends.
-struct Slot(Arc<AtomicUsize>);
+/// One connection's place among those in progress, given back when it is dropped. The pool of
+/// connections in progress and the server's upgraded connections each count theirs this way.
+pub(crate) struct Slot(Arc<AtomicUsize>);
+
+impl Slot {
+    /// A place, if fewer than `max` are taken of those `counter` counts.
+    pub(crate) fn acquire(counter: &Arc<AtomicUsize>, max: usize) -> Option<Slot> {
+        let mut n = counter.load(Ordering::Acquire);
+        loop {
+            if n >= max {
+                return None;
+            }
+            match counter.compare_exchange_weak(n, n + 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Some(Slot(counter.clone())),
+                Err(now) => n = now,
+            }
+        }
+    }
+}
 
 impl Drop for Slot {
     fn drop(&mut self) {
@@ -328,20 +352,21 @@ pub(crate) enum Responder {
 impl Responder {
     /// The connection itself, for a protocol that takes it over (a WebSocket after its 101). It
     /// is made blocking, with reads that give up every `slice` so a caller can look at its clock.
-    #[allow(dead_code)] // for the WebSocket upgrade, which no endpoint serves yet
     pub(crate) fn into_stream(self, slice: Duration) -> Option<super::websocket::Stream> {
         use super::websocket::Stream;
+        // The request's connection leaves the pool here: a plain one was taken out of `conns`
+        // when the request came whole, and a TLS one's `Slot` went with its thread.
         match self {
             Responder::Plain(Some(s)) => {
                 s.set_nonblocking(false).ok()?;
                 s.set_read_timeout(Some(slice)).ok()?;
                 s.set_write_timeout(Some(WRITE_TIMEOUT)).ok()?;
-                Some(Stream::Plain(s))
+                Some(Stream::plain(s))
             }
             Responder::Plain(None) => None,
             Responder::Tls(mut t) => {
                 t.set_timeouts(Timeouts::new(HANDSHAKE_TIMEOUT, slice));
-                Some(Stream::Tls(t))
+                Some(Stream::tls(t))
             }
         }
     }

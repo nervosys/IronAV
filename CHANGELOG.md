@@ -9,13 +9,19 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Added
 
-- A server-side WebSocket (RFC 6455) module in the WebRTC HTTP server: upgrade validation with an Origin check, the
-  101 response, and a strict framing layer (masking, fragments, control frames, UTF-8 and size limits, idle timeout).
-  Not yet served by an endpoint.
+- A server-side WebSocket (RFC 6455), public as `ironav_live::websocket` (`Connection`, `Message`, `Config`, `Error`,
+  `Stream`, `Refused`): upgrade validation with an Origin check, the 101 response, and a strict framing layer (masking,
+  fragments, control frames, UTF-8 and size limits, idle timeout). A caller gets a connection from
+  `HttpReply::upgrade_websocket` and runs it on its own thread.
 - **`WhepServer`, a send-only WHEP endpoint** (`whep://`, `wheps://`; library API in `ironav-live`): a viewer POSTs an offer with
   `recvonly` video, gets a `sendonly` answer, and is sent the H.264 access units the caller pushes, over the WHIP endpoint's ICE-lite,
   DTLS server and SRTP, with NACK retransmission, sender reports, a bearer-token hook and a viewer limit. Tested in process only, not yet
-  against a browser; a session cannot yet publish to it (`publish` and `--publish` take no `whep://`).
+  against a browser; a session cannot yet publish to it (`publish` and `--publish` take no `whep://`). One origin can serve
+  more than the signalling: `WhepOptions::fallback` gets every request whose path is not the WHEP path or one of its
+  sessions (as an `HttpRequest` and an `HttpReply`), to answer with a page (the server adds `nosniff` and `no-store`; the caller
+  gives the content type and CSP) or to upgrade to a WebSocket, over TLS too. Upgraded connections leave the HTTP server's
+  small pool and have their own limit, `WhepOptions::max_websockets` (8; the 9th is answered `503`). The `authorize` hook
+  covers the WHEP paths only.
 - `Rect::new`, `MoveRect::new`, `ScreenFrame::new` and `ScreenFrame::with_changes`, so that a frame can be
   made outside a capture, as a test or another source needs. `ScreenFrame::new` panics when the pixels or the stride
   are too small for the size given.

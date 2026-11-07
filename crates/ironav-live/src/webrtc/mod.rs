@@ -40,13 +40,11 @@ mod publisher;
 mod sdp;
 mod srtp;
 mod stun;
-// not yet served by an endpoint: the caller is a viewer's input channel
-#[allow(dead_code)]
-mod websocket;
+pub mod websocket;
 mod whep;
 
 pub use publisher::{WhipOptions, WhipPublisher};
-pub use whep::{WhepOptions, WhepServer};
+pub use whep::{Fallback, HttpReply, HttpRequest, WhepOptions, WhepServer};
 #[cfg(test)]
 mod tests;
 
