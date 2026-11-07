@@ -96,23 +96,79 @@ fn parse_fingerprint(v: &str) -> Option<[u8; 32]> {
 
 /// Reads a publisher's offer, choosing what to take. Errors say what is wrong, for the 400 response.
 pub(crate) fn parse_offer(text: &str) -> Result<Offer, String> {
-    parse_offer_as(text, Role::Ingest)
+    parse_offer_as(text, Role::Ingest, None)
 }
 
-/// The rank of an H.264 `profile-level-id` for a viewer: Constrained Baseline level 3.1 first, then
-/// the other Constrained Baseline levels, then the rest.
-fn profile_rank(fmtp: Option<&String>) -> u8 {
-    let id = fmtp.map(|f| params(f)).and_then(|p| p.get("profile-level-id").cloned()).unwrap_or_default().to_ascii_lowercase();
-    match id.as_str() {
-        "42e01f" => 0,
-        i if i.starts_with("42e0") => 1,
-        _ => 2,
+/// The H.264 profile of the stream a WHEP endpoint sends, which decides what offer it can answer.
+/// A profile is taken to decode a stream of the profiles below it that its decoders also accept: a
+/// Constrained Baseline stream is valid Baseline, Main and High, a Main stream is valid High.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum H264Profile {
+    /// Baseline with the Constrained Baseline limits (CAVLC, no B pictures, no 8x8 transform): offers
+    /// of `42e0xx` and `4200xx`, then Main and High.
+    ConstrainedBaseline,
+    /// Main (CABAC, perhaps B pictures): offers of `4dxxxx`, then High.
+    Main,
+    /// High, which is what `ironav-codec`'s encoder emits unless told otherwise: offers of `64xxxx`,
+    /// the Constrained High `640cxx` included.
+    #[default]
+    High,
+}
+
+impl H264Profile {
+    /// The `profile_idc` of a stream of this profile, as its SPS has it.
+    pub fn profile_idc(self) -> u8 {
+        match self {
+            H264Profile::ConstrainedBaseline => 66,
+            H264Profile::Main => 77,
+            H264Profile::High => 100,
+        }
+    }
+
+    /// How well an offered `profile-level-id` suits a stream of this profile: 0 for the same profile,
+    /// more for one that takes it as a superset, `None` for one that cannot decode it. RFC 6184 §8.1:
+    /// `profile_idc` and the constraint flags (the id's second byte) say the profile.
+    fn rank(self, id: &str) -> Option<u8> {
+        let b = u32::from_str_radix(id, 16).ok().filter(|_| id.len() == 6)?;
+        let (idc, iop) = ((b >> 16) as u8, (b >> 8) as u8);
+        match (self, idc) {
+            (H264Profile::ConstrainedBaseline, 66) => Some(if iop & 0x40 != 0 { 0 } else { 1 }),
+            (H264Profile::ConstrainedBaseline, 77) => Some(2),
+            (H264Profile::ConstrainedBaseline, 100) => Some(3),
+            (H264Profile::Main, 77) => Some(0),
+            (H264Profile::Main, 100) => Some(1),
+            (H264Profile::High, 100) => Some(0),
+            _ => None,
+        }
+    }
+}
+
+/// What the stream a viewer is sent is, for choosing among the H.264 an offer lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct H264Want {
+    pub profile: H264Profile,
+    /// The stream's `level_idc`, if known: an offer without `level-asymmetry-allowed=1` must be for
+    /// this level or a higher one.
+    pub level: Option<u8>,
+}
+
+impl H264Want {
+    /// The rank of an offered H.264 format, `None` if the stream cannot be sent as it. With no
+    /// `profile-level-id` the format is Baseline at level 1 (RFC 6184 §8.1).
+    fn rank(&self, fmtp: Option<&String>) -> Option<u8> {
+        let p = fmtp.map(|f| params(f)).unwrap_or_default();
+        let id = p.get("profile-level-id").map_or_else(|| "42000a".to_string(), |s| s.to_ascii_lowercase());
+        let rank = self.profile.rank(&id)?;
+        let asymmetric = p.get("level-asymmetry-allowed").is_some_and(|v| v == "1");
+        let offered = u8::from_str_radix(&id[4..], 16).ok()?;
+        (asymmetric || self.level.is_none_or(|l| offered >= l)).then_some(rank)
     }
 }
 
 /// Reads an offer from a publisher or a viewer. A viewer's offer takes H.264 video only, in a section
-/// that is `recvonly` or `sendrecv`; its audio is declined.
-pub(crate) fn parse_offer_as(text: &str, role: Role) -> Result<Offer, String> {
+/// that is `recvonly` or `sendrecv`; its audio is declined. With `want`, only H.264 that the stream can be sent as
+/// is taken, the closest profile first.
+pub(crate) fn parse_offer_as(text: &str, role: Role, want: Option<H264Want>) -> Result<Offer, String> {
     if text.len() > MAX_OFFER {
         return Err("the offer is too long".into());
     }
@@ -195,7 +251,7 @@ pub(crate) fn parse_offer_as(text: &str, role: Role) -> Result<Offer, String> {
         Some(other) => return Err(format!("the offer has a=setup:{other}; {} must be the DTLS client (actpass or active)", if role == Role::Ingest { "WHIP clients" } else { "WHEP clients" })),
     }
     let mut out = Vec::new();
-    let (mut video, mut audio) = (false, false);
+    let (mut video, mut audio, mut mismatch) = (false, false, false);
     for (i, s) in sections.iter().enumerate() {
         let mid = s.mid.clone().unwrap_or_else(|| i.to_string());
         if mid.is_empty() || mid.len() > 32 || !mid.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)) {
@@ -214,14 +270,23 @@ pub(crate) fn parse_offer_as(text: &str, role: Role) -> Result<Offer, String> {
                     let mode = fmtp.map(|f| params(f)).and_then(|p| p.get("packetization-mode").cloned()).unwrap_or_else(|| "0".into());
                     (map.to_ascii_uppercase().starts_with("H264/90000") && mode == "1").then(|| Track { kind: Kind::Video, mid: mid.clone(), payload: pt, rtpmap: "H264/90000".into(), fmtp: fmtp.cloned(), clock: 90_000 })
                 })
-                // the first of the best rank (a publisher's offer is taken as it comes)
-                .min_by_key(|t| if role == Role::Viewer { profile_rank(t.fmtp.as_ref()) } else { 0 }),
+                // the first of the closest profile (a publisher's offer is taken as it comes)
+                .filter_map(|t| match want {
+                    Some(w) => w.rank(t.fmtp.as_ref()).map(|r| (r, t)),
+                    None => Some((0, t)),
+                })
+                .min_by_key(|(r, _)| *r)
+                .map(|(_, t)| t),
             "audio" if usable && !audio && role == Role::Ingest => s.formats.iter().find_map(|&pt| {
                 let map = s.rtpmap.get(&pt)?;
                 map.to_ascii_lowercase().starts_with("opus/48000").then(|| Track { kind: Kind::Audio, mid: mid.clone(), payload: pt, rtpmap: "opus/48000/2".into(), fmtp: s.fmtp.get(&pt).cloned(), clock: 48_000 })
             }),
             _ => None,
         };
+        // H.264 was offered, but not a profile the stream can be sent as
+        if track.is_none() && want.is_some() && s.kind == "video" && usable && !video {
+            mismatch |= s.formats.iter().any(|pt| s.rtpmap.get(pt).is_some_and(|m| m.to_ascii_uppercase().starts_with("H264/90000")) && s.fmtp.get(pt).is_some_and(|f| params(f).get("packetization-mode").is_some_and(|m| m == "1")));
+        }
         match track.as_ref().map(|t| t.kind) {
             Some(Kind::Video) => video = true,
             Some(Kind::Audio) => audio = true,
@@ -237,6 +302,9 @@ pub(crate) fn parse_offer_as(text: &str, role: Role) -> Result<Offer, String> {
     }
     let offer = Offer { ufrag, pwd, fingerprint, sections: out };
     if offer.tracks().next().is_none() {
+        if let Some(w) = want.filter(|_| mismatch) {
+            return Err(format!("the offer's H.264 (packetization-mode=1) has no profile-level-id that suits this stream ({:?}, profile_idc {}): it needs 42e0xx or 4200xx, 4dxxxx or 64xxxx, as the stream's profile allows", w.profile, w.profile.profile_idc()));
+        }
         return Err(match role {
             Role::Ingest => "the offer has no H.264 (packetization-mode=1) video or Opus audio",
             Role::Viewer => "the offer has no recvonly or sendrecv H.264 (packetization-mode=1) video",
@@ -664,36 +732,84 @@ mod tests {
 
     #[test]
     fn a_viewers_offer_takes_the_video_it_receives_and_declines_audio() {
-        let o = parse_offer_as(&viewer_offer(), Role::Viewer).unwrap();
+        let o = parse_offer_as(&viewer_offer(), Role::Viewer, Some(CB)).unwrap();
         let t = o.tracks().collect::<Vec<_>>();
         assert_eq!(t.len(), 1);
         assert_eq!((t[0].kind, t[0].payload), (Kind::Video, 102));
         // the same offer, from a publisher, is one that cannot be sent to
         assert!(parse_offer(&viewer_offer()).unwrap_err().contains("H.264"));
         // a send-only section is not one a viewer can have, and send-receive is
-        assert!(parse_offer_as(BROWSER_OFFER, Role::Viewer).unwrap_err().contains("recvonly"));
+        assert!(parse_offer_as(BROWSER_OFFER, Role::Viewer, Some(CB)).unwrap_err().contains("recvonly"));
         let both = viewer_offer().replace("a=recvonly", "a=sendrecv");
-        assert!(parse_offer_as(&both, Role::Viewer).is_ok());
+        assert!(parse_offer_as(&both, Role::Viewer, Some(CB)).is_ok());
         let a = viewer_answer(&o, &Local { ufrag: "u", pwd: "p", fingerprint: &[1; 32], candidate: "127.0.0.1:9".parse().unwrap(), session_id: 1 }, 77);
         assert!(a.contains("m=video 9 UDP/TLS/RTP/SAVPF 102\r\n") && a.contains("a=sendonly\r\n") && !a.contains("a=recvonly"), "{a}");
         assert!(a.contains("a=ssrc:77 cname:IronAV\r\n") && a.contains("a=group:BUNDLE 1\r\n"), "{a}");
         assert!(a.contains("m=audio 0 UDP/TLS/RTP/SAVPF 111 63 9 0 8\r\nc=IN IP4 127.0.0.1\r\na=mid:0\r\na=inactive\r\n"), "{a}");
     }
 
+    const CB: H264Want = H264Want { profile: H264Profile::ConstrainedBaseline, level: None };
+
+    fn want(profile: H264Profile, level: Option<u8>) -> H264Want {
+        H264Want { profile, level }
+    }
+
+    /// An offer with H.264 formats `(payload type, fmtp)`, in this order.
+    fn h264_offer(formats: &[(&str, &str)]) -> String {
+        let mut s = String::from("v=0\r\na=ice-ufrag:FUZZ\r\na=ice-pwd:aBcDeFgHiJkLmNoPqRsTuVwX\r\na=fingerprint:sha-256 00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF\r\n");
+        s += &format!("m=video 9 UDP/TLS/RTP/SAVPF {}\r\na=mid:v\r\na=recvonly\r\n", formats.iter().map(|i| i.0).collect::<Vec<_>>().join(" "));
+        for (pt, fmtp) in formats {
+            s += &format!("a=rtpmap:{pt} H264/90000\r\na=fmtp:{pt} {fmtp}\r\n");
+        }
+        s
+    }
+
+    fn pick(formats: &[(&str, &str)], w: H264Want) -> Result<(u8, Option<String>), String> {
+        let o = parse_offer_as(&h264_offer(formats), Role::Viewer, Some(w))?;
+        let t = o.tracks().next().unwrap();
+        Ok((t.payload, t.fmtp.clone()))
+    }
+
     #[test]
-    fn a_viewer_gets_constrained_baseline_level_3_1_when_the_offer_has_several() {
-        let offer = |ids: &[(&str, &str)]| {
-            let mut s = String::from("v=0\r\na=ice-ufrag:FUZZ\r\na=ice-pwd:aBcDeFgHiJkLmNoPqRsTuVwX\r\na=fingerprint:sha-256 00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF\r\n");
-            s += &format!("m=video 9 UDP/TLS/RTP/SAVPF {}\r\na=mid:v\r\na=recvonly\r\n", ids.iter().map(|i| i.0).collect::<Vec<_>>().join(" "));
-            for (pt, id) in ids {
-                s += &format!("a=rtpmap:{pt} H264/90000\r\na=fmtp:{pt} packetization-mode=1;profile-level-id={id}\r\n");
-            }
-            s
-        };
-        let pt = |ids: &[(&str, &str)]| parse_offer_as(&offer(ids), Role::Viewer).unwrap().tracks().next().unwrap().payload;
-        assert_eq!(pt(&[("96", "640c1f"), ("97", "42e01f"), ("98", "42e01f")]), 97);
-        assert_eq!(pt(&[("96", "640c1f"), ("97", "42e034"), ("98", "42001f")]), 97);
-        assert_eq!(pt(&[("96", "640c1f"), ("97", "42001f")]), 96);
+    fn the_offered_profile_must_be_one_the_stream_can_be_sent_as() {
+        let id = |x: &str| format!("packetization-mode=1;profile-level-id={x}");
+        let browser = [("96", id("640c1f")), ("97", id("42e01f")), ("98", id("64001f")), ("99", id("42001f"))];
+        let f: Vec<(&str, &str)> = browser.iter().map(|(p, s)| (*p, s.as_str())).collect();
+        // High takes the High formats, the first of them
+        assert_eq!(pick(&f, want(H264Profile::High, None)).unwrap().0, 96);
+        // Constrained Baseline takes 42e01f over the plainer 42001f and over High
+        assert_eq!(pick(&f, want(H264Profile::ConstrainedBaseline, None)).unwrap(), (97, Some(id("42e01f"))));
+        // only baseline offered: refused for a High stream, with the reason
+        let e = pick(&f[1..2], want(H264Profile::High, None)).unwrap_err();
+        assert!(e.contains("profile") && e.contains("High"), "{e}");
+        assert!(pick(&f[3..], want(H264Profile::High, None)).is_err());
+        assert!(pick(&f[3..], want(H264Profile::Main, None)).is_err());
+        // plain baseline (42001f) takes a Constrained Baseline stream
+        assert_eq!(pick(&f[3..], want(H264Profile::ConstrainedBaseline, None)).unwrap().0, 99);
+        // only High offered: a Constrained Baseline or Main stream is valid High
+        assert_eq!(pick(&f[..1], want(H264Profile::ConstrainedBaseline, None)).unwrap().0, 96);
+        assert_eq!(pick(&f[..1], want(H264Profile::Main, None)).unwrap().0, 96);
+        // Main, offered Main and High: its own profile
+        let m = [("1", "packetization-mode=1;profile-level-id=64001f"), ("2", "packetization-mode=1;profile-level-id=4d001f")];
+        assert_eq!(pick(&m, want(H264Profile::Main, None)).unwrap().0, 2);
+        // a format without a profile-level-id is Baseline level 1: no stream of ours but Constrained Baseline
+        assert!(pick(&[("5", "packetization-mode=1")], want(H264Profile::High, None)).is_err());
+        assert_eq!(pick(&[("5", "packetization-mode=1")], want(H264Profile::ConstrainedBaseline, None)).unwrap().0, 5);
+        // packetization-mode 0 is never taken, and other H.264 does not turn the answer into a profile refusal
+        let e = parse_offer_as(&h264_offer(&[("7", "packetization-mode=0;profile-level-id=64001f")]), Role::Viewer, Some(want(H264Profile::High, None))).unwrap_err();
+        assert!(e.contains("no recvonly or sendrecv H.264"), "{e}");
+    }
+
+    #[test]
+    fn without_level_asymmetry_the_offered_level_must_reach_the_streams() {
+        let (low, high) = ("packetization-mode=1;profile-level-id=64001f", "packetization-mode=1;profile-level-id=640028");
+        let asym = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=64001f";
+        let w = want(H264Profile::High, Some(0x28));
+        assert!(pick(&[("1", low)], w).is_err());
+        assert_eq!(pick(&[("1", low), ("2", high)], w).unwrap().0, 2);
+        // level 3.1 offered, level 4.0 sent: fine when either side may differ
+        assert_eq!(pick(&[("1", asym)], w).unwrap().0, 1);
+        assert_eq!(pick(&[("1", low)], want(H264Profile::High, Some(0x1f))).unwrap().0, 1);
     }
 }
 

@@ -21,7 +21,10 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   sessions (as an `HttpRequest` and an `HttpReply`), to answer with a page (the server adds `nosniff` and `no-store`; the caller
   gives the content type and CSP) or to upgrade to a WebSocket, over TLS too. Upgraded connections leave the HTTP server's
   small pool and have their own limit, `WhepOptions::max_websockets` (8; the 9th is answered `503`). The `authorize` hook
-  covers the WHEP paths only.
+  covers the WHEP paths only and is shown an `AuthRequest` (`header()`, `peer_addr()`). `WhepOptions::tls_from_pem` serves
+  TLS from PEM text with the hooks set, `tls_fingerprint()` gives the certificate's SHA-256, and `tls::self_signed_pem` makes
+  a certificate. `WhepOptions::h264_profile` (`H264Profile`, High by default) says what the stream is: the answer takes only an
+  offered format it can be sent as, else `400`. `H264Encoder::constrained_baseline` makes a stream for baseline-only viewers.
 - `Rect::new`, `MoveRect::new`, `ScreenFrame::new` and `ScreenFrame::with_changes`, so that a frame can be
   made outside a capture, as a test or another source needs. `ScreenFrame::new` panics when the pixels or the stride
   are too small for the size given.

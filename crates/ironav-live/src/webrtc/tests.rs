@@ -1266,11 +1266,11 @@ fn whep_watching(profiles: &[u16], tls: bool, with_token: bool) {
     let want = if profiles.contains(&0x0007) { srtp::Profile::AeadAes128Gcm } else { srtp::Profile::Aes128CmHmacSha1_80 };
     assert_eq!(w.profile, want);
 
-    // the answer: ICE-lite, passive, send-only video with the better H.264, audio declined
+    // the answer: ICE-lite, passive, send-only video with the H.264 that is the stream's profile (High), audio declined
     let a = w.answer.clone();
     assert!(a.contains("a=ice-lite") && a.contains("a=setup:passive") && a.contains("a=group:BUNDLE v\r\n"), "{a}");
-    assert!(a.contains("m=video ") && a.contains("UDP/TLS/RTP/SAVPF 103\r\n") && a.contains("a=sendonly") && !a.contains("a=recvonly"), "{a}");
-    assert!(a.contains("a=rtpmap:103 H264/90000") && a.contains("profile-level-id=42e01f") && !a.contains("VP8"), "{a}");
+    assert!(a.contains("m=video ") && a.contains("UDP/TLS/RTP/SAVPF 97\r\n") && a.contains("a=sendonly") && !a.contains("a=recvonly"), "{a}");
+    assert!(a.contains("a=rtpmap:97 H264/90000") && a.contains("profile-level-id=64001f") && !a.contains("VP8"), "{a}");
     assert!(a.contains("m=audio 0 UDP/TLS/RTP/SAVPF 111") && a.contains("a=inactive"), "{a}");
     assert_eq!(request(port, "PATCH", &w.location, tok, "").0, 405);
 
@@ -1299,7 +1299,7 @@ fn whep_watching(profiles: &[u16], tls: bool, with_token: bool) {
     }
 
     // every access unit came, whole and unchanged, once and in order
-    assert!(heard.rtp.iter().all(|g| g.pt == 103 && g.ssrc == w.ssrc), "the payload type and SSRC are the answer's");
+    assert!(heard.rtp.iter().all(|g| g.pt == 97 && g.ssrc == w.ssrc), "the payload type and SSRC are the answer's");
     assert!(heard.rtp.windows(2).all(|p| p[1].seq == p[0].seq.wrapping_add(1)), "sequence numbers run on");
     let got = viewer_access_units(&heard.rtp);
     assert_eq!(got.len(), aus.len());
@@ -1751,9 +1751,7 @@ fn a_whep_server_takes_at_most_1024_websockets() {
 fn pem_site() -> (WhepServer, u16, String, String) {
     crate::net::allow_loopback_for_tests();
     let (cert, key) = crate::tls::self_signed_pem(&["127.0.0.1", "localhost"], 1).unwrap();
-    let mut o = WhepOptions::default();
-    o.authorize = Some(Arc::new(|r: &AuthRequest| r.header() == Some("Bearer s3cret")));
-    o.fallback = Some(site(websocket::Config::default()));
+    let mut o = WhepOptions { authorize: Some(Arc::new(|r: &AuthRequest| r.header() == Some("Bearer s3cret"))), fallback: Some(site(websocket::Config::default())), ..WhepOptions::default() };
     o.tls_from_pem(cert.as_bytes(), key.as_bytes()).unwrap();
     let fp = o.tls_fingerprint().unwrap();
     // the certificate is its own trust anchor for the client
@@ -1830,6 +1828,9 @@ fn authorize_is_shown_the_peer_address_over_plain_tcp_and_over_tls() {
 
 #[test]
 fn a_whep_url_token_is_checked_through_the_hook() {
+    if crate::fips::enabled() {
+        return; // FIPS mode refuses whep://
+    }
     crate::net::allow_loopback_for_tests();
     let port = free_port();
     let server = WhepServer::open(&format!("whep://127.0.0.1:{port}/whep?token=abc")).unwrap();
@@ -1837,4 +1838,62 @@ fn a_whep_url_token_is_checked_through_the_hook() {
     assert_eq!(request(port, "DELETE", "/whep/session/x", Some("abd"), "").0, 401);
     assert_eq!(request(port, "DELETE", "/whep/session/x", Some("abc"), "").0, 404);
     drop(server);
+}
+
+/// A viewer's offer with only these H.264 formats, `(payload type, fmtp)`.
+fn h264_viewer_offer(formats: &[(u8, &str)]) -> String {
+    let fp = dtls::fingerprint_text(&[3; 32]);
+    let pts: Vec<String> = formats.iter().map(|f| f.0.to_string()).collect();
+    let mut s = format!(
+        "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE v\r\nm=video 9 UDP/TLS/RTP/SAVPF {}\r\nc=IN IP4 0.0.0.0\r\na=ice-ufrag:viewU\r\na=ice-pwd:viewerpassword01234567\r\n\
+         a=fingerprint:sha-256 {fp}\r\na=setup:actpass\r\na=mid:v\r\na=recvonly\r\na=rtcp-mux\r\n",
+        pts.join(" ")
+    );
+    for (pt, fmtp) in formats {
+        s += &format!("a=rtpmap:{pt} H264/90000\r\na=fmtp:{pt} {fmtp}\r\n");
+    }
+    s
+}
+
+#[test]
+fn the_answer_takes_the_h264_profile_the_stream_has() {
+    const HIGH: &str = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640c1f";
+    const BASE: &str = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f";
+    const MAIN: &str = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=4d001f";
+    let post = |profile: H264Profile, level: Option<u8>, formats: &[(u8, &str)]| {
+        let (server, port) = whep_server(crate::fips::enabled(), |o| {
+            o.h264_profile = profile;
+            o.h264_level = level;
+        });
+        let r = request(port, "POST", "/whep", None, &h264_viewer_offer(formats));
+        drop(server);
+        (r.0, r.2)
+    };
+    let both = [(96, BASE), (97, HIGH)];
+    // only High offered, a High stream
+    let (status, a) = post(H264Profile::High, None, &[(97, HIGH)]);
+    assert_eq!(status, 201, "{a}");
+    assert!(a.contains("SAVPF 97\r\n") && a.contains(&format!("a=fmtp:97 {HIGH}\r\n")), "{a}");
+    // only baseline offered, a High stream: refused, and the reason says why
+    let (status, why) = post(H264Profile::High, None, &[(96, BASE)]);
+    assert_eq!(status, 400);
+    assert!(why.contains("profile") && why.contains("High"), "{why}");
+    // both offered: each stream gets its own
+    let (status, a) = post(H264Profile::High, None, &both);
+    assert!(status == 201 && a.contains("SAVPF 97\r\n") && a.contains("profile-level-id=640c1f") && !a.contains("42e01f"), "{a}");
+    let (status, a) = post(H264Profile::ConstrainedBaseline, None, &both);
+    assert!(status == 201 && a.contains("SAVPF 96\r\n") && a.contains("a=fmtp:96 ") && a.contains("profile-level-id=42e01f") && !a.contains("640c1f"), "{a}");
+    // Main: the Main format if offered, High's otherwise, never baseline's
+    let (status, a) = post(H264Profile::Main, None, &[(96, BASE), (97, HIGH), (98, MAIN)]);
+    assert!(status == 201 && a.contains("SAVPF 98\r\n") && a.contains("profile-level-id=4d001f"), "{a}");
+    let (status, a) = post(H264Profile::Main, None, &both);
+    assert!(status == 201 && a.contains("SAVPF 97\r\n"), "{a}");
+    assert_eq!(post(H264Profile::Main, None, &[(96, BASE)]).0, 400);
+    // a Constrained Baseline stream is accepted by a High-only offer
+    assert_eq!(post(H264Profile::ConstrainedBaseline, None, &[(97, HIGH)]).0, 201);
+    // without level asymmetry the level must reach the stream's
+    let strict = "packetization-mode=1;profile-level-id=64001f";
+    assert_eq!(post(H264Profile::High, Some(40), &[(97, strict)]).0, 400);
+    assert_eq!(post(H264Profile::High, Some(31), &[(97, strict)]).0, 201);
+    assert_eq!(post(H264Profile::High, Some(40), &[(97, HIGH)]).0, 201);
 }

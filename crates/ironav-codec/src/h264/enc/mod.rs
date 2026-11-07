@@ -191,6 +191,16 @@ impl H264Encoder {
         self
     }
 
+    /// Codes Constrained Baseline: CAVLC, no B pictures and no 8x8 transform, with an SPS of profile 66 and
+    /// constraint_set0 and 1 (`42c0xx`), which every WebRTC browser decodes. Costs bitrate against the default
+    /// High. 8-bit input only (10-bit is always High 10).
+    pub fn constrained_baseline(mut self) -> Self {
+        self.cabac = false;
+        self.transform8 = false;
+        self.bframes = 0;
+        self
+    }
+
     /// IDR pictures every `n` frames (1 for IDR pictures only), in place of the default.
     pub fn with_keyint(mut self, n: u64) -> Self {
         self.keyint = n.max(1);
@@ -856,6 +866,50 @@ mod tests {
         }
         assert!(enc.flush().unwrap().is_empty());
         assert!([0, 25, 50].iter().all(|i| idrs.contains(i)), "an IDR picture each second: {idrs:?}");
+    }
+
+    /// The profile_idc, constraint flags and level_idc of the first SPS in an Annex B stream.
+    fn sps_head(data: &[u8]) -> [u8; 3] {
+        let at = data.windows(4).position(|w| w[..3] == [0, 0, 1] && w[3] & 31 == 7).unwrap();
+        [data[at + 4], data[at + 5], data[at + 6]]
+    }
+
+    #[test]
+    fn constrained_baseline_live_streams_declare_it_and_decode() {
+        let (w, h) = (64, 48);
+        let params = StreamParams::Video { width: w as u32, height: h as u32, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational::new(25, 1) };
+        let mut enc = H264Encoder::new(&params, None, Some(300_000)).unwrap().low_latency().constrained_baseline();
+        let mut dec = H264Decoder::with_threads(1);
+        let (mut first, mut out) = (None, 0);
+        for t in 0..30 {
+            for p in enc.encode(&Frame::Video(scene(w, h, t))).unwrap() {
+                first.get_or_insert_with(|| p.data.clone());
+                out += dec.decode(&p).unwrap().len();
+            }
+        }
+        assert_eq!(out, 30);
+        let head = sps_head(&first.unwrap());
+        // Baseline with constraint_set0 and 1, the id a browser offers as 42e01f / 42c01f
+        assert_eq!((head[0], head[1] & 0xC0), (66, 0xC0));
+        // the default is High
+        let mut enc = H264Encoder::new(&params, None, Some(300_000)).unwrap().low_latency();
+        let p = enc.encode(&Frame::Video(scene(w, h, 0))).unwrap();
+        assert_eq!(sps_head(&p[0].data)[0], 100);
+    }
+
+    #[test]
+    fn the_sps_level_follows_the_picture_size_and_rate() {
+        let level = |w: u32, h: u32, fps: i64| {
+            let params = StreamParams::Video { width: w, height: h, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational::new(fps, 1) };
+            let mut enc = H264Encoder::new(&params, Some(40), None).unwrap().low_latency();
+            let f = Frame::Video(scene(w as usize, h as usize, 0));
+            sps_head(&enc.encode(&f).unwrap()[0].data)[2]
+        };
+        assert_eq!(level(1280, 720, 30), 31);
+        assert_eq!(level(1920, 1080, 30), 40);
+        assert_eq!(level(1920, 1080, 60), 42);
+        assert_eq!(level(2560, 1440, 30), 50);
+        assert_eq!(level(3840, 2160, 30), 51);
     }
 
     #[test]

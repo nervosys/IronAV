@@ -7,9 +7,10 @@
 //! with one host candidate (`stun`), DTLS 1.2 server whose peer certificate must match the offer's
 //! fingerprint (`dtls`) and SRTP (`srtp`), and the publisher's packetizer, RTP stream and NACK history
 //! (`packetize`, `publisher::Stream`). Video only: audio sections of an offer are declined. The offer's
-//! H.264 must be `packetization-mode=1`; of several, Constrained Baseline 42e01f is taken.
+//! H.264 must be `packetization-mode=1` and of a profile the stream can be sent as ([`WhepOptions::h264_profile`],
+//! High unless set), the closest to it of several; no such format is a `400`.
 //!
-//! `whep://[host]:port[/path][?token=SECRET]` is the URL form, `wheps://` serves the signalling over
+//! `whep://[host]:port[/path][?token=SECRET]` is the URL form (its stream is High), `wheps://` serves the signalling over
 //! TLS with `cert=` and `key=` as `whips://` does, and FIPS mode refuses `whep://`. Several viewers may
 //! watch at once, [`WhepOptions::max_viewers`] at most (4 by default); each has its own SSRC, sequence
 //! numbers, SRTP keys and history for NACKs. A viewer that has not finished ICE and DTLS within
@@ -36,7 +37,7 @@ use super::dtls;
 use super::http;
 use super::packetize::{self, H264Packetizer};
 use super::publisher::Stream;
-use super::sdp;
+use super::sdp::{self, H264Profile};
 use super::srtp;
 use super::stun;
 use super::websocket::{self, Refused};
@@ -127,6 +128,15 @@ pub struct WhepOptions {
     pub max_websockets: usize,
     /// The web origin (or `*`) a page that watches from another origin has, for the CORS headers.
     pub cors: Option<String>,
+    /// The H.264 profile of the stream the owner sends (High by default, which is what `ironav-codec`'s
+    /// encoder emits; `H264Encoder::constrained_baseline` makes the other kind). The answer takes only an
+    /// offered `packetization-mode=1` format whose `profile-level-id` this stream can be sent as, the
+    /// closest first; an offer with none is refused with a `400`.
+    pub h264_profile: H264Profile,
+    /// The `level_idc` of the stream (such as 40 for level 4.0), if known. An offered format that does
+    /// not say `level-asymmetry-allowed=1` is then taken only at this level or a higher one. Browsers do
+    /// say it, so it matters for other clients. Not checked by default.
+    pub h264_level: Option<u8>,
     /// How long a viewer has to finish ICE and DTLS (5 s by default).
     pub setup_timeout: Duration,
     /// How long a connected viewer may send nothing authentic (its consent checks and RTCP) before it is
@@ -140,7 +150,7 @@ pub struct WhepOptions {
 
 impl Default for WhepOptions {
     fn default() -> Self {
-        WhepOptions { max_viewers: 4, authorize: None, fallback: None, max_websockets: 8, cors: None, setup_timeout: SETUP_TIMEOUT, consent_timeout: CONSENT_TIMEOUT, tls: None, tls_fingerprint: None }
+        WhepOptions { max_viewers: 4, authorize: None, fallback: None, max_websockets: 8, cors: None, h264_profile: H264Profile::High, h264_level: None, setup_timeout: SETUP_TIMEOUT, consent_timeout: CONSENT_TIMEOUT, tls: None, tls_fingerprint: None }
     }
 }
 
@@ -512,7 +522,7 @@ impl Endpoint {
             return http::response(503, &[("Content-Type", "text/plain"), ("Retry-After", "5")], b"this endpoint has all the viewers it takes");
         }
         let Ok(body) = std::str::from_utf8(&req.body) else { return text(400, "the offer is not text") };
-        let offer = match sdp::parse_offer_as(body, sdp::Role::Viewer) {
+        let offer = match sdp::parse_offer_as(body, sdp::Role::Viewer, Some(sdp::H264Want { profile: self.opts.h264_profile, level: self.opts.h264_level })) {
             Ok(o) => o,
             Err(why) => return text(400, &why),
         };

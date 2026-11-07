@@ -44,6 +44,7 @@ pub mod websocket;
 mod whep;
 
 pub use publisher::{WhipOptions, WhipPublisher};
+pub use sdp::H264Profile;
 pub use whep::{AuthRequest, Authorize, Fallback, HttpReply, HttpRequest, WhepOptions, WhepServer};
 #[cfg(test)]
 mod tests;
