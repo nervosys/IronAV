@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-11-08
+
 ### Added
 
 - `H264Encoder::realtime()`, an opt-in speed setting for live video (no change to any other setting's output): more slices,
