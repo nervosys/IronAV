@@ -7,6 +7,7 @@
 
 use super::mb::{chroma_qp, Kind, MbInfo, Picture};
 use super::tables::{ALPHA, BETA, TC0};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn clip1(v: i32, bd: u32) -> u16 {
     v.clamp(0, (1 << bd) - 1) as u16
@@ -191,86 +192,130 @@ pub fn deblock_rows(pic: &mut Picture, bd: u32, rows: std::ops::Range<usize>) {
         deblock_mbaff(pic, bd, rows.start / 2..rows.end.div_ceil(2));
         return;
     }
+    for mby in rows {
+        for mbx in 0..pic.mb_w {
+            deblock_mb(pic, bd, mbx, mby);
+        }
+    }
+}
+
+/// `deblock_picture` for live coding: each macroblock row is a task, and a macroblock waits only
+/// for the row above to have finished the macroblock after it, so the rows are filtered in a
+/// staggered wave, to the very samples the raster order gives (the filtering of a macroblock reads
+/// and changes only samples of itself, of the macroblocks left of and above it, and of the one
+/// above and to the right, through that one's left edge).
+pub fn deblock_picture_par(pic: &mut Picture, bd: u32) {
+    if pic.mbaff || pic.mb_h < 2 {
+        return deblock_picture(pic, bd);
+    }
+    struct Shared(*mut Picture);
+    // SAFETY: see below.
+    unsafe impl Sync for Shared {}
+    let (w, h) = (pic.mb_w, pic.mb_h);
+    let done: Vec<AtomicUsize> = (0..h).map(|_| AtomicUsize::new(0)).collect();
+    let shared = Shared(pic);
+    let shared = &shared;
+    crate::pool::run(h, |mby| {
+        for mbx in 0..w {
+            if mby > 0 {
+                let need = (mbx + 2).min(w);
+                let mut spins = 0u32;
+                while done[mby - 1].load(Ordering::Acquire) < need {
+                    spins += 1;
+                    if spins < 200 {
+                        std::hint::spin_loop();
+                    } else {
+                        std::thread::yield_now();
+                    }
+                }
+            }
+            // SAFETY: tasks are taken in row order and each waits as above, so no two macroblocks being
+            // filtered at once are neighbours: they touch different samples, and none writes the
+            // macroblock records or the slice parameters, which are only read.
+            deblock_mb(unsafe { &mut *shared.0 }, bd, mbx, mby);
+            done[mby].store(mbx + 1, Ordering::Release);
+        }
+    });
+}
+
+/// Filters macroblock (`mbx`, `mby`) of a picture that is not MBAFF.
+fn deblock_mb(pic: &mut Picture, bd: u32, mbx: usize, mby: usize) {
     let w = pic.mb_w;
     let ls = w * 16;
     let cs = w * 8;
-    for mby in rows {
-        for mbx in 0..w {
-            let idx = mby * w + mbx;
-            let m = &pic.mbs[idx];
-            if m.slice == 0 {
-                continue;
-            }
-            let sp = pic.slices[m.slice as usize - 1];
-            if sp.disable_deblocking == 1 {
-                continue;
-            }
-            let usable = |o: &MbInfo| o.slice != 0 && (sp.disable_deblocking == 0 || o.slice == m.slice);
-            let left_ok = mbx > 0 && usable(&pic.mbs[idx - 1]);
-            let top_ok = mby > 0 && usable(&pic.mbs[idx - w]);
-            // the macroblocks on the far side of the left and top edges (`m` itself at the picture edge)
-            let edge_mb = [if mbx > 0 { &pic.mbs[idx - 1] } else { m }, if mby > 0 { &pic.mbs[idx - w] } else { m }];
-            // boundary strengths depend on the macroblocks only, so all planes and chroma share them
-            let mut bs = [[[0u8; 4]; 4]; 2];
-            for dir in 0..2 {
-                for e in 0..4usize {
-                    let other = if e == 0 { edge_mb[dir] } else { m };
-                    bs[dir][e] = strength(m, other, dir, e, 4);
+    let idx = mby * w + mbx;
+    let m = &pic.mbs[idx];
+    if m.slice == 0 {
+        return;
+    }
+    let sp = pic.slices[m.slice as usize - 1];
+    if sp.disable_deblocking == 1 {
+        return;
+    }
+    let usable = |o: &MbInfo| o.slice != 0 && (sp.disable_deblocking == 0 || o.slice == m.slice);
+    let left_ok = mbx > 0 && usable(&pic.mbs[idx - 1]);
+    let top_ok = mby > 0 && usable(&pic.mbs[idx - w]);
+    // the macroblocks on the far side of the left and top edges (`m` itself at the picture edge)
+    let edge_mb = [if mbx > 0 { &pic.mbs[idx - 1] } else { m }, if mby > 0 { &pic.mbs[idx - w] } else { m }];
+    // boundary strengths depend on the macroblocks only, so all planes and chroma share them
+    let mut bs = [[[0u8; 4]; 4]; 2];
+    for dir in 0..2 {
+        for e in 0..4usize {
+            let other = if e == 0 { edge_mb[dir] } else { m };
+            bs[dir][e] = strength(m, other, dir, e, 4);
+        }
+    }
+    // luma, and Cb and Cr filtered the same way in 4:4:4
+    for pl in 0..if pic.cf == 3 { 3 } else { 1 } {
+        let off = if pl > 0 { sp.chroma_qp_offset[pl - 1] } else { 0 };
+        for dir in 0..2 {
+            for e in 0..4usize {
+                if e == 0 && !(if dir == 0 { left_ok } else { top_ok }) {
+                    continue;
+                }
+                if m.t8x8 && e & 1 == 1 {
+                    continue;
+                }
+                let other = if e == 0 { edge_mb[dir] } else { m };
+                let qpav = if pl == 0 { (other.qp as i32 + m.qp as i32 + 1) >> 1 } else { (chroma_qp(other.qp as i32, off, bd) + chroma_qp(m.qp as i32, off, bd) + 1) >> 1 };
+                let ia = (qpav + sp.alpha_offset).clamp(0, 51) as usize;
+                let ib = (qpav + sp.beta_offset).clamp(0, 51) as usize;
+                let (alpha, beta) = ((ALPHA[ia] as i32) << (bd - 8), (BETA[ib] as i32) << (bd - 8));
+                let (x0, y0) = (mbx * 16, mby * 16);
+                if dir == 0 {
+                    filter_edge(&mut pic.planes[pl], y0 * ls + x0 + e * 4, 1, ls, 4, &bs[dir][e], alpha, beta, ia, false, bd, (other.keep, m.keep));
+                } else {
+                    filter_edge(&mut pic.planes[pl], (y0 + e * 4) * ls + x0, ls, 1, 4, &bs[dir][e], alpha, beta, ia, false, bd, (other.keep, m.keep));
                 }
             }
-            // luma, and Cb and Cr filtered the same way in 4:4:4
-            for pl in 0..if pic.cf == 3 { 3 } else { 1 } {
-                let off = if pl > 0 { sp.chroma_qp_offset[pl - 1] } else { 0 };
-                for dir in 0..2 {
-                    for e in 0..4usize {
-                        if e == 0 && !(if dir == 0 { left_ok } else { top_ok }) {
-                            continue;
-                        }
-                        if m.t8x8 && e & 1 == 1 {
-                            continue;
-                        }
-                        let other = if e == 0 { edge_mb[dir] } else { m };
-                        let qpav = if pl == 0 { (other.qp as i32 + m.qp as i32 + 1) >> 1 } else { (chroma_qp(other.qp as i32, off, bd) + chroma_qp(m.qp as i32, off, bd) + 1) >> 1 };
-                        let ia = (qpav + sp.alpha_offset).clamp(0, 51) as usize;
-                        let ib = (qpav + sp.beta_offset).clamp(0, 51) as usize;
-                        let (alpha, beta) = ((ALPHA[ia] as i32) << (bd - 8), (BETA[ib] as i32) << (bd - 8));
-                        let (x0, y0) = (mbx * 16, mby * 16);
-                        if dir == 0 {
-                            filter_edge(&mut pic.planes[pl], y0 * ls + x0 + e * 4, 1, ls, 4, &bs[dir][e], alpha, beta, ia, false, bd, (other.keep, m.keep));
-                        } else {
-                            filter_edge(&mut pic.planes[pl], (y0 + e * 4) * ls + x0, ls, 1, 4, &bs[dir][e], alpha, beta, ia, false, bd, (other.keep, m.keep));
-                        }
-                    }
+        }
+    }
+    // chroma: vertical edges at 0 and 4, horizontal edges every 4 rows (every 4 chroma rows of
+    // 4:2:2, every 8 luma rows of 4:2:0); each takes the strength of the luma edge it lines up with
+    if matches!(pic.cf, 0 | 3) {
+        return;
+    }
+    let chh = pic.ch;
+    for comp in 0..2usize {
+        let off = sp.chroma_qp_offset[comp];
+        for dir in 0..2 {
+            let edges: &[usize] = if dir == 1 && chh == 16 { &[0, 1, 2, 3] } else { &[0, 2] };
+            for &e in edges {
+                if e == 0 && !(if dir == 0 { left_ok } else { top_ok }) {
+                    continue;
                 }
-            }
-            // chroma: vertical edges at 0 and 4, horizontal edges every 4 rows (every 4 chroma rows of
-            // 4:2:2, every 8 luma rows of 4:2:0); each takes the strength of the luma edge it lines up with
-            if matches!(pic.cf, 0 | 3) {
-                continue;
-            }
-            let chh = pic.ch;
-            for comp in 0..2usize {
-                let off = sp.chroma_qp_offset[comp];
-                for dir in 0..2 {
-                    let edges: &[usize] = if dir == 1 && chh == 16 { &[0, 1, 2, 3] } else { &[0, 2] };
-                    for &e in edges {
-                        if e == 0 && !(if dir == 0 { left_ok } else { top_ok }) {
-                            continue;
-                        }
-                        let other = if e == 0 { edge_mb[dir] } else { m };
-                        let qpav = (chroma_qp(other.qp as i32, off, bd) + chroma_qp(m.qp as i32, off, bd) + 1) >> 1;
-                        let ia = (qpav + sp.alpha_offset).clamp(0, 51) as usize;
-                        let ib = (qpav + sp.beta_offset).clamp(0, 51) as usize;
-                        let (alpha, beta) = ((ALPHA[ia] as i32) << (bd - 8), (BETA[ib] as i32) << (bd - 8));
-                        let (x0, y0) = (mbx * 8, mby * chh);
-                        if dir == 0 {
-                            filter_edge(&mut pic.planes[1 + comp], y0 * cs + x0 + e * 2, 1, cs, chh / 4, &bs[dir][e], alpha, beta, ia, true, bd, (other.keep, m.keep));
-                        } else if chh == 16 {
-                            filter_edge(&mut pic.planes[1 + comp], (y0 + e * 4) * cs + x0, cs, 1, 2, &bs[dir][e], alpha, beta, ia, true, bd, (other.keep, m.keep));
-                        } else {
-                            filter_edge(&mut pic.planes[1 + comp], (y0 + e * 2) * cs + x0, cs, 1, 2, &bs[dir][e], alpha, beta, ia, true, bd, (other.keep, m.keep));
-                        }
-                    }
+                let other = if e == 0 { edge_mb[dir] } else { m };
+                let qpav = (chroma_qp(other.qp as i32, off, bd) + chroma_qp(m.qp as i32, off, bd) + 1) >> 1;
+                let ia = (qpav + sp.alpha_offset).clamp(0, 51) as usize;
+                let ib = (qpav + sp.beta_offset).clamp(0, 51) as usize;
+                let (alpha, beta) = ((ALPHA[ia] as i32) << (bd - 8), (BETA[ib] as i32) << (bd - 8));
+                let (x0, y0) = (mbx * 8, mby * chh);
+                if dir == 0 {
+                    filter_edge(&mut pic.planes[1 + comp], y0 * cs + x0 + e * 2, 1, cs, chh / 4, &bs[dir][e], alpha, beta, ia, true, bd, (other.keep, m.keep));
+                } else if chh == 16 {
+                    filter_edge(&mut pic.planes[1 + comp], (y0 + e * 4) * cs + x0, cs, 1, 2, &bs[dir][e], alpha, beta, ia, true, bd, (other.keep, m.keep));
+                } else {
+                    filter_edge(&mut pic.planes[1 + comp], (y0 + e * 2) * cs + x0, cs, 1, 2, &bs[dir][e], alpha, beta, ia, true, bd, (other.keep, m.keep));
                 }
             }
         }

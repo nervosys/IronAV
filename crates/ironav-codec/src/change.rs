@@ -50,13 +50,19 @@ impl LowRes {
 /// 8x8 blocks, each moved up to 4 samples, from `prev` (inter), and from their own means (intra).
 /// `inter` well above a fraction of `intra` means the picture starts a new scene.
 pub fn change(prev: &LowRes, cur: &LowRes) -> (i64, i64) {
+    change_threads(prev, cur, 1)
+}
+
+/// [`change`] with the rows of blocks shared among up to `threads` threads: the same numbers.
+pub fn change_threads(prev: &LowRes, cur: &LowRes, threads: usize) -> (i64, i64) {
     let (lw, lh) = (cur.w, cur.h);
     let (cur, prev) = (&cur.data, &prev.data);
-    let (mut inter, mut intra) = (0i64, 0i64);
     if prev.len() != cur.len() {
         return (1, 0);
     }
-    for by in (0..lh.saturating_sub(7)).step_by(8) {
+    let rows: Vec<usize> = (0..lh.saturating_sub(7)).step_by(8).collect();
+    let block_row = |by: usize| -> (i64, i64) {
+        let (mut inter, mut intra) = (0i64, 0i64);
         for bx in (0..lw.saturating_sub(7)).step_by(8) {
             let at = |x: usize, y: usize| cur[(by + y) * lw + bx + x];
             let mean = (0..64).map(|k| at(k % 8, k / 8)).sum::<i32>() / 64;
@@ -74,8 +80,15 @@ pub fn change(prev: &LowRes, cur: &LowRes) -> (i64, i64) {
             }
             inter += best;
         }
+        (inter, intra)
+    };
+    let sum = |rows: &[usize]| rows.iter().map(|&by| block_row(by)).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+    let t = threads.clamp(1, rows.len().max(1));
+    if t == 1 {
+        return sum(&rows);
     }
-    (inter, intra)
+    let per = rows.len().div_ceil(t);
+    crate::pool::map(rows.chunks(per).count(), |k| sum(&rows[k * per..((k + 1) * per).min(rows.len())])).into_iter().fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
 }
 
 /// [`change`] as one number: inter over intra, so 0 is a still picture and above [`SCENE_CUT`] a cut.

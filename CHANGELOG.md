@@ -7,6 +7,14 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+
+- `H264Encoder::realtime()`, an opt-in speed setting for live video (no change to any other setting's output): more slices,
+  a pooled thread set for the loop filter, half-sample planes and input conversion, reused picture buffers, one
+  reference, a cheaper motion search and early P_Skip. With `low_latency().constrained_baseline()` a 1920x1080 picture
+  of screen content codes in about 15 ms and one of gradient plus noise in about 25 ms (was 55 and 105 ms on a 24-thread
+  machine), at about the same PSNR for the bytes. New example `h264_realtime_bench` in `ironav-codec`.
+
 ## [0.1.5] - 2026-11-07
 
 ### Added

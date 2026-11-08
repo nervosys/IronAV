@@ -17,6 +17,8 @@ pub mod change;
 pub mod flac;
 #[cfg(feature = "h264")]
 pub mod h264;
+#[cfg(feature = "h264")]
+mod pool;
 #[cfg(feature = "hevc")]
 pub mod hevc;
 #[cfg(feature = "vp9")]

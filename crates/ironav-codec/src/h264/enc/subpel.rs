@@ -14,6 +14,8 @@ pub struct HalfPel {
     /// Integer samples (with the picture's edges repeated), and the half samples to the right (b),
     /// below (h) and diagonally between (j), each at the integer sample's index.
     planes: [Vec<u16>; 4],
+    /// The unrounded horizontal sums, kept between pictures when a picture's buffers are reused.
+    scratch: Vec<i32>,
 }
 
 fn tap6(a: i32, b: i32, c: i32, d: i32, e: i32, f: i32) -> i32 {
@@ -38,38 +40,78 @@ const MIX: [[(usize, usize, usize, usize, usize, usize); 4]; 4] = {
 impl HalfPel {
     /// Builds the planes from a `pw` x `ph` luma plane of `bd`-bit samples.
     pub fn new(luma: &[u16], pw: usize, ph: usize, bd: u32) -> Self {
+        Self::with_threads(luma, pw, ph, bd, 1)
+    }
+
+    /// `new`, with the planes' rows worked out on up to `threads` threads at once (the same planes).
+    pub fn with_threads(luma: &[u16], pw: usize, ph: usize, bd: u32, threads: usize) -> Self {
+        Self::build(luma, pw, ph, bd, threads, None, false)
+    }
+
+    /// `with_threads`, in the buffers of `spare` (a picture of the same size that is no longer needed) when
+    /// it has them, and keeping its scratch space for the next picture.
+    pub fn rebuild(spare: Option<HalfPel>, luma: &[u16], pw: usize, ph: usize, bd: u32, threads: usize) -> Self {
+        Self::build(luma, pw, ph, bd, threads, spare, true)
+    }
+
+    fn build(luma: &[u16], pw: usize, ph: usize, bd: u32, threads: usize, spare: Option<HalfPel>, keep: bool) -> Self {
         let maxv = (1i32 << bd) - 1;
         let (sw, sh) = (pw + 2 * PAD, ph + 2 * PAD);
-        let mut g = vec![0u16; sw * sh];
-        for y in 0..sh {
-            let sy = y.saturating_sub(PAD).min(ph - 1);
-            for x in 0..sw {
-                g[y * sw + x] = luma[sy * pw + x.saturating_sub(PAD).min(pw - 1)];
-            }
-        }
-        let mut b = vec![0u16; sw * sh];
-        let mut h = vec![0u16; sw * sh];
-        let mut j = vec![0u16; sw * sh];
+        let n = sw * sh;
+        // the planes of a picture of the same size, when given, are written over
+        let (mut planes, mut b1) = match spare {
+            Some(s) if s.stride == sw && s.ph == ph && s.scratch.len() == n => (s.planes, s.scratch),
+            _ => ([vec![0u16; n], vec![0u16; n], vec![0u16; n], vec![0u16; n]], vec![0i32; n]),
+        };
+        let [g, b, h, j] = &mut planes;
         // unrounded horizontal sums, which the diagonal half samples filter again vertically
-        let mut b1 = vec![0i32; sw * sh];
-        let at = |x: usize, y: usize| g[y * sw + x] as i32;
-        for y in 0..sh {
-            for x in 2..sw - 3 {
-                let v = tap6(at(x - 2, y), at(x - 1, y), at(x, y), at(x + 1, y), at(x + 2, y), at(x + 3, y));
-                b1[y * sw + x] = v;
-                b[y * sw + x] = ((v + 16) >> 5).clamp(0, maxv) as u16;
+        let t = threads.clamp(1, (sh / 16).max(1));
+        let per = sh.div_ceil(t);
+        // the integer samples with the picture's edges repeated, and the horizontal half samples, row by row
+        let round1 = |k: usize, g: &mut [u16], b: &mut [u16], b1: &mut [i32]| {
+            for r in 0..g.len() / sw {
+                let y = k * per + r;
+                let sy = y.saturating_sub(PAD).min(ph - 1);
+                let (gr, br, b1r) = (&mut g[r * sw..(r + 1) * sw], &mut b[r * sw..(r + 1) * sw], &mut b1[r * sw..(r + 1) * sw]);
+                for (x, v) in gr.iter_mut().enumerate() {
+                    *v = luma[sy * pw + x.saturating_sub(PAD).min(pw - 1)];
+                }
+                for x in 2..sw - 3 {
+                    let v = tap6(gr[x - 2] as i32, gr[x - 1] as i32, gr[x] as i32, gr[x + 1] as i32, gr[x + 2] as i32, gr[x + 3] as i32);
+                    b1r[x] = v;
+                    br[x] = ((v + 16) >> 5).clamp(0, maxv) as u16;
+                }
             }
+        };
+        if t == 1 {
+            round1(0, g, b, &mut b1);
+        } else {
+            crate::pool::each(g.chunks_mut(per * sw).zip(b.chunks_mut(per * sw)).zip(b1.chunks_mut(per * sw)).collect(), |k, ((g, b), b1)| round1(k, g, b, b1));
         }
-        for y in 2..sh - 3 {
-            for x in 0..sw {
-                let v = tap6(at(x, y - 2), at(x, y - 1), at(x, y), at(x, y + 1), at(x, y + 2), at(x, y + 3));
-                h[y * sw + x] = ((v + 16) >> 5).clamp(0, maxv) as u16;
-                let c = |yy: usize| b1[yy * sw + x];
-                let v = tap6(c(y - 2), c(y - 1), c(y), c(y + 1), c(y + 2), c(y + 3));
-                j[y * sw + x] = ((v + 512) >> 10).clamp(0, maxv) as u16;
+        // the vertical half samples and the diagonal ones, which need the rows above and below
+        let (gref, b1ref) = (&*g, &b1);
+        let round2 = |k: usize, h: &mut [u16], j: &mut [u16]| {
+            for r in 0..h.len() / sw {
+                let y = k * per + r;
+                if !(2..sh - 3).contains(&y) {
+                    continue;
+                }
+                for x in 0..sw {
+                    let at = |yy: usize| gref[yy * sw + x] as i32;
+                    let v = tap6(at(y - 2), at(y - 1), at(y), at(y + 1), at(y + 2), at(y + 3));
+                    h[r * sw + x] = ((v + 16) >> 5).clamp(0, maxv) as u16;
+                    let c = |yy: usize| b1ref[yy * sw + x];
+                    let v = tap6(c(y - 2), c(y - 1), c(y), c(y + 1), c(y + 2), c(y + 3));
+                    j[r * sw + x] = ((v + 512) >> 10).clamp(0, maxv) as u16;
+                }
             }
+        };
+        if t == 1 {
+            round2(0, h, j);
+        } else {
+            crate::pool::each(h.chunks_mut(per * sw).zip(j.chunks_mut(per * sw)).collect(), |k, (h, j)| round2(k, h, j));
         }
-        HalfPel { stride: sw, pw, ph, planes: [g, b, h, j] }
+        HalfPel { stride: sw, pw, ph, planes, scratch: if keep { b1 } else { Vec::new() } }
     }
 
     fn offset(&self, x: i32, y: i32) -> usize {

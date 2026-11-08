@@ -344,6 +344,8 @@ pub struct FrameCoder<'a> {
     /// Whether P_8x8 macroblocks may use sub-partitions (8x4, 4x8, 4x4): when the encoder's option is on
     /// (`with_sub8x8`), at QP up to `SUB8_MAX_QP`.
     sub8: bool,
+    /// Live coding (see `H264Encoder::realtime`): macroblocks decided with fewer, cheaper tests.
+    fast: bool,
     /// For a B slice: the list 1 reference with its half samples.
     refp1: Option<&'a Picture>,
     half1: Option<&'a HalfPel>,
@@ -377,17 +379,20 @@ impl<'a> FrameCoder<'a> {
     /// whose half samples are `half`.
     #[allow(clippy::too_many_arguments)]
     pub fn new(src: &'a Source, refp: Option<(&'a Picture, &'a HalfPel)>, mb_w: usize, mb_h: usize, qp: i32, rows: Range<usize>, slice_id: u16, use_cabac: bool, transform8: bool) -> Self {
+        let nrows = rows.len();
         FrameCoder {
             src,
             refp: refp.map(|r| r.0),
             half: refp.map(|r| r.1),
             plist: refp.into_iter().collect(),
             sub8: false,
+            fast: false,
             refp1: None,
             half1: None,
             dist: (1, 2),
             b_slice: false,
-            pic: Picture::new(mb_w, mb_h, 1, src.bd),
+            // allocated when the slice is coded, or given by `with_pic`
+            pic: Picture { mb_w, mb_h, cf: 1, cw: 8, ch: 8, planes: [Vec::new(), Vec::new(), Vec::new()], mbs: Vec::new(), slices: Vec::new(), mbaff: false },
             rows,
             slice_id,
             mb_w,
@@ -396,7 +401,7 @@ impl<'a> FrameCoder<'a> {
             qpc: chroma_qp(qp, 0, src.bd),
             lambda: lambda(qp + src.qp_offset()),
             p_slice: refp.is_some(),
-            state: vec![MbState::default(); mb_w * mb_h],
+            state: vec![MbState::default(); nrows * mb_w],
             w: BitWriter::new(),
             cabac: None,
             use_cabac,
@@ -410,6 +415,19 @@ impl<'a> FrameCoder<'a> {
     /// index order: `ref_idx` in the macroblocks picks among them.
     pub fn with_refs(mut self, list: Vec<(&'a Picture, &'a HalfPel)>) -> Self {
         self.plist = list;
+        self
+    }
+
+    /// Codes into the buffers of `pic`, a slice's picture from an earlier picture of the same size, in place of
+    /// new ones: every sample and macroblock record the slice reads it writes first.
+    pub fn with_pic(mut self, pic: Picture) -> Self {
+        self.pic = pic;
+        self
+    }
+
+    /// Decides macroblocks with fewer, cheaper tests (see `H264Encoder::realtime`).
+    pub fn with_fast(mut self, on: bool) -> Self {
+        self.fast = on;
         self
     }
 
@@ -433,6 +451,14 @@ impl<'a> FrameCoder<'a> {
     /// holding the slice's reconstruction (not yet loop filtered) and macroblocks.
     pub fn encode(mut self, header: impl FnOnce(&mut BitWriter)) -> (Vec<u8>, Picture, [usize; 3]) {
         header(&mut self.w);
+        let (ylen, clen) = (self.mb_w * self.mb_h * 256, self.mb_w * self.mb_h * 64);
+        if self.pic.planes[0].len() != ylen || self.pic.planes[1].len() != clen {
+            // zeroed, so its pages are only touched where the slice writes; the macroblock records are the slice's rows alone
+            self.pic.planes = [vec![0; ylen], vec![0; clen], vec![0; clen]];
+        }
+        if self.pic.mbs.len() != self.rows.len() * self.mb_w {
+            self.pic.mbs = vec![MbInfo::default(); self.rows.len() * self.mb_w];
+        }
         if self.use_cabac {
             self.w.align_ones();
             let w = std::mem::take(&mut self.w);
@@ -485,7 +511,7 @@ impl<'a> FrameCoder<'a> {
         if mbx < 0 || mby < self.rows.start as i32 || mbx as usize >= self.mb_w || mby as usize >= self.mb_h {
             return None;
         }
-        Some(&self.state[mby as usize * self.mb_w + mbx as usize])
+        Some(&self.state[(mby as usize - self.rows.start) * self.mb_w + mbx as usize])
     }
 
     /// Reference index in list `l` (0, or -1 for intra or an unused list) and vector of the 4x4 block at (x, y) relative to
@@ -701,7 +727,21 @@ impl<'a> FrameCoder<'a> {
             self.luma_pred(0, 0, x0, y0, 16, 16, skip_mv, &mut pred);
             let ls = self.ls();
             let sad: i32 = (0..256).map(|i| (self.src.planes[0][(y0 + i / 16) * ls + x0 + i % 16] as i32 - pred[i] as i32).abs()).sum();
-            if (sad as f64) < 256.0 * 0.625 * 2f64.powf(self.qpp() as f64 / 6.0) {
+            let step = 2f64.powf(self.qpp() as f64 / 6.0);
+            if self.fast && (sad as f64) < 256.0 * 0.05 * step {
+                // close to the reference: P_Skip when the chroma is too, without transforming anything
+                let (_, cpred) = self.inter_pred(mbx, mby, 0, &[0; 4], &[skip_mv; 16], &[0; 4]);
+                let cs = self.cs();
+                let csad: i32 = (0..2).map(|c| (0..64).map(|i| (self.src.planes[1 + c][(mby * 8 + i / 8) * cs + mbx * 8 + i % 8] as i32 - cpred[c][i] as i32).abs()).sum::<i32>()).sum();
+                if (csad as f64) < 128.0 * 0.05 * step {
+                    let mut code = MbCode::new(Kind::Inter);
+                    code.skip = true;
+                    code.mvs = [skip_mv; 16];
+                    self.put_pred(mbx, mby, &pred, &cpred);
+                    return code;
+                }
+            }
+            if (sad as f64) < 256.0 * 0.625 * step {
                 let mut code = self.code_inter(mbx, mby, 0, [skip_mv; 16], [0; 4], [0; 4], false);
                 if code.cbp == 0 {
                     code.skip = true;
@@ -718,7 +758,11 @@ impl<'a> FrameCoder<'a> {
             return self.decide_rd(mbx, mby, i16.0, inter);
         }
         // Intra4x4 is tried by coding it, which leaves its reconstruction in place; it is kept only if it wins
-        let try_i4 = inter.is_none_or(|(_, _, _, _, c)| best_intra < c);
+        let mut try_i4 = inter.is_none_or(|(_, _, _, _, c)| best_intra < c);
+        // live coding leaves flat intra macroblocks to Intra16x16
+        if self.fast && inter.is_none() && (i16.1 as f64) < 256.0 * 0.8 * 2f64.powf(self.qpp() as f64 / 6.0) {
+            try_i4 = false;
+        }
         let mut i4 = None;
         if try_i4 {
             let code = self.code_i4(mbx, mby);
@@ -814,6 +858,9 @@ impl<'a> FrameCoder<'a> {
         let (mv, cost) = self.motion_search(0, r as usize, mbx, mby, PARTS[0][0], mvp, &col);
         // costs carry the mb_type and sub_mb_type bits (as CAVLC codes them)
         let mut best = (0u8, [mv; 16], [0u8; 4], cost + lam * (mvd_bits(mv, mvp) + 1) + rb);
+        if self.fast {
+            return (best.0, best.1, best.2, best.3);
+        }
         // P_8x8: the 8x8 blocks in turn, each with the sub-partitioning that costs least
         let mut st = ([[0i16; 2]; 16], [0i8; 16], 0u32);
         let mut sub = [0u8; 4];
@@ -923,7 +970,8 @@ impl<'a> FrameCoder<'a> {
             }
         }
         // large diamond steps, then the small diamond
-        for step in [16i32, 8, 4] {
+        let steps: &[i32] = if self.fast { &[8, 4] } else { &[16, 8, 4] };
+        for &step in steps {
             for _ in 0..if step == 4 { 32 } else { 4 } {
                 let mut moved = false;
                 for (dx, dy) in [(-step, 0), (step, 0), (0, -step), (0, step)] {
@@ -938,6 +986,10 @@ impl<'a> FrameCoder<'a> {
                 }
             }
         }
+        // live coding stops at the integer vector when it is already as good as the reference gets
+        if self.fast && best_cost < (w * h) as i32 / 8 + lam {
+            return (best, best_cost - lam * mvd_bits(best, mvp));
+        }
         // sub-sample refinement by SATD
         let mut buf = [0u16; 256];
         let pred = &mut buf[..w * h];
@@ -951,6 +1003,9 @@ impl<'a> FrameCoder<'a> {
         let square: &[(i32, i32)] = &[(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)];
         let diamond: &[(i32, i32)] = &[(0, -1), (-1, 0), (1, 0), (0, 1)];
         for (step, pts) in [(2i32, square), (1, diamond)] {
+            if self.fast && step == 1 {
+                break;
+            }
             let centre = best;
             for &(dx, dy) in pts {
                 let c = clamp([centre[0] as i32 + dx * step, centre[1] as i32 + dy * step]);
@@ -2224,7 +2279,7 @@ impl<'a> FrameCoder<'a> {
     }
 
     fn finish_mb(&mut self, code: &MbCode, mbx: usize, mby: usize) {
-        let idx = mby * self.mb_w + mbx;
+        let idx = (mby - self.rows.start) * self.mb_w + mbx;
         let inter = code.kind == Kind::Inter;
         let none = [[0; 2]; 16];
         let b = inter && self.b_slice;

@@ -15,12 +15,12 @@ mod cavlc;
 mod frame;
 mod subpel;
 
-use super::deblock::deblock_picture;
+use super::deblock::{deblock_picture, deblock_picture_par};
 use super::mb::{Picture, SliceParams};
 use bitw::{put_nal, BitWriter};
 use frame::{FrameCoder, Source};
 use subpel::HalfPel;
-use crate::change::{change, LowRes, SCENE_CUT};
+use crate::change::{change_threads, LowRes, SCENE_CUT};
 use ironav_core::{Encoder, Error, ErrorCode, Frame, Packet, PixelFormat, Rational, Result, StreamParams};
 
 /// Pictures between IDR pictures.
@@ -110,6 +110,12 @@ pub struct H264Encoder {
     transform8: bool,
     /// P_8x8 macroblocks may use sub-partitions (see `with_sub8x8`).
     sub8x8: bool,
+    /// Live coding (see `realtime`).
+    fast: bool,
+    /// The last picture's padded samples, written over by the next in live coding.
+    spare_src: Option<Source>,
+    /// The slices' pictures of the last picture, written over by the next in live coding.
+    slice_pics: Vec<Picture>,
     count: u64,
     frame_num: u32,
     idr_id: u32,
@@ -173,6 +179,9 @@ impl H264Encoder {
             cabac: true,
             transform8: true,
             sub8x8: false,
+            fast: false,
+            spare_src: None,
+            slice_pics: Vec::new(),
             count: 0,
             frame_num: 0,
             idr_id: 0,
@@ -198,6 +207,24 @@ impl H264Encoder {
         self.cabac = false;
         self.transform8 = false;
         self.bframes = 0;
+        self
+    }
+
+    /// Speeds coding up for live use, where a picture must be coded in a fraction of a frame time (the
+    /// default is unchanged without it). Typically 4 to 5 times faster on a many-core machine, at
+    /// about the same PSNR for the bytes: it codes in more slices (two macroblock rows or more each,
+    /// up to one per thread), shares the loop filter, the reference's half samples, the input
+    /// conversion and the scene-cut test among a pool of threads, reuses its picture buffers, predicts
+    /// from one reference picture, searches 16x16 partitions only, with a shorter diamond, half
+    /// samples only, and stopping at an integer vector that already matches, codes a macroblock that
+    /// is within a twentieth of a quantiser step of the reference as P_Skip without transforming it,
+    /// and gives flat intra macroblocks Intra16x16 alone. More slices cost a few bytes in headers and
+    /// prediction across their edges. The stream is what the other settings make it: with
+    /// `constrained_baseline` it is Constrained Baseline. Call `with_refs` after it to have more references.
+    pub fn realtime(mut self) -> Self {
+        self.fast = true;
+        self.nrefs = 1;
+        self.slices = std::thread::available_parallelism().map_or(1, |n| n.get()).min((self.mb_h / 2).max(1));
         self
     }
 
@@ -387,36 +414,54 @@ impl H264Encoder {
         self.rc_qp = next.clamp(self.rc_qp - 4.0, self.rc_qp + 4.0).clamp(1.0, 51.0);
     }
 
-    fn source(&self, v: &ironav_core::VideoFrame) -> Result<Source> {
+    fn source(&mut self, v: &ironav_core::VideoFrame) -> Result<Source> {
         let want = if self.bd == 8 { PixelFormat::Yuv420p } else { PixelFormat::Yuv420p10 };
         if v.pix_fmt != want || v.width as usize != self.width || v.height as usize != self.height || v.planes.len() < 3 {
             return Err(Error::invalid_input(format!("the H.264 encoder was set up for {}x{} {} frames", self.width, self.height, want.name())));
         }
-        // samples as u16 whatever the depth: two bytes each, little-endian, at 10 bits
-        let unpack = |p: &[u8]| -> Vec<u16> {
-            if self.bd == 8 {
-                p.iter().map(|&b| b as u16).collect()
-            } else {
-                p.as_chunks::<2>().0.iter().map(|&c| u16::from_le_bytes(c)).collect()
-            }
-        };
-        let pad = |p: &[u16], w: usize, h: usize, pw: usize, ph: usize| -> Result<Vec<u16>> {
-            if p.len() < w * h {
-                return Err(Error::invalid_input("a video frame plane is shorter than its dimensions"));
-            }
-            let mut out = vec![0u16; pw * ph];
-            for y in 0..ph {
-                let row = &p[y.min(h - 1) * w..y.min(h - 1) * w + w];
-                for x in 0..pw {
-                    out[y * pw + x] = row[x.min(w - 1)];
-                }
-            }
-            Ok(out)
-        };
+        // samples as u16 whatever the depth (two bytes each, little-endian, at 10 bits), padded to whole
+        // macroblocks by repeating the edges
+        let bytes = if self.bd == 8 { 1 } else { 2 };
         let (pw, ph) = (self.mb_w * 16, self.mb_h * 16);
         let (cw, ch) = (self.width / 2, self.height / 2);
-        let (y, u, v2) = (unpack(&v.planes[0]), unpack(&v.planes[1]), unpack(&v.planes[2]));
-        Ok(Source { planes: [pad(&y, self.width, self.height, pw, ph)?, pad(&u, cw, ch, pw / 2, ph / 2)?, pad(&v2, cw, ch, pw / 2, ph / 2)?], bd: self.bd })
+        let dims = [(self.width, self.height, pw, ph), (cw, ch, pw / 2, ph / 2), (cw, ch, pw / 2, ph / 2)];
+        for (p, d) in v.planes.iter().zip(&dims) {
+            if p.len() < d.0 * d.1 * bytes {
+                return Err(Error::invalid_input("a video frame plane is shorter than its dimensions"));
+            }
+        }
+        let mut planes = match self.spare_src.take() {
+            Some(s) if s.bd == self.bd && s.planes.iter().zip(&dims).all(|(p, d)| p.len() == d.2 * d.3) => s.planes,
+            _ => dims.map(|d| vec![0u16; d.2 * d.3]),
+        };
+        let threads = if self.fast { std::thread::available_parallelism().map_or(1, |n| n.get()) } else { 1 };
+        for ((out, inp), &(w, h, pw, ph)) in planes.iter_mut().zip(&v.planes).zip(&dims) {
+            let fill = |first: usize, rows: &mut [u16]| {
+                for (r, o) in rows.chunks_mut(pw).enumerate() {
+                    let sy = (first + r).min(h - 1);
+                    let row = &inp[sy * w * bytes..(sy + 1) * w * bytes];
+                    if bytes == 1 {
+                        for (d, &s) in o.iter_mut().zip(row) {
+                            *d = s as u16;
+                        }
+                    } else {
+                        for (d, c) in o.iter_mut().zip(row.as_chunks::<2>().0) {
+                            *d = u16::from_le_bytes(*c);
+                        }
+                    }
+                    let last = o[w - 1];
+                    o[w..].fill(last);
+                }
+            };
+            let t = threads.clamp(1, (ph / 64).max(1));
+            if t == 1 {
+                fill(0, out);
+            } else {
+                let per = ph.div_ceil(t);
+                crate::pool::each(out.chunks_mut(per * pw).collect(), |k, rows| fill(k * per, rows));
+            }
+        }
+        Ok(Source { planes, bd: self.bd })
     }
 }
 
@@ -437,7 +482,7 @@ impl H264Encoder {
         let poc = (2 * (d - self.idr_at)) as i32;
         let qp = self.next_qp(kind);
         let (frame_num, idr_id, poc_type0) = (self.frame_num, self.idr_id, self.b_frames() > 0);
-        let (mb_w, mb_h, n, use_cabac, t8, sub8) = (self.mb_w, self.mb_h, self.slices.clamp(1, self.mb_h), self.cabac, self.transform8, self.sub8x8);
+        let (mb_w, mb_h, n, use_cabac, t8, sub8, fast) = (self.mb_w, self.mb_h, self.slices.clamp(1, self.mb_h), self.cabac, self.transform8, self.sub8x8, self.fast);
         // P: the last reference; B: the references before and after it
         let (l0, l1) = match kind {
             0 => (None, None),
@@ -493,28 +538,36 @@ impl H264Encoder {
         };
         let bands: Vec<_> = (0..n).map(|i| i * mb_h / n..(i + 1) * mb_h / n).collect();
         let plist = &plist;
-        let coded: Vec<_> = std::thread::scope(|s| {
-            let jobs: Vec<_> = bands
-                .iter()
-                .enumerate()
-                .map(|(i, rows)| {
-                    let (src, rows) = (src, rows.clone());
-                    s.spawn(move || {
-                        let mut coder = FrameCoder::new(src, refp, mb_w, mb_h, qp, rows.clone(), i as u16 + 1, use_cabac, t8).with_sub8x8(sub8);
-                        if kind == 1 {
-                            coder = coder.with_refs(plist.clone());
-                        }
-                        if let Some(r1) = refp1 {
-                            coder = coder.with_b(r1, dist);
-                        }
-                        coder.encode(|w| header(w, rows.start * mb_w))
-                    })
-                })
-                .collect();
-            jobs.into_iter().map(|j| j.join().expect("an H.264 slice thread panicked")).collect()
-        });
-        // the slices' rows and macroblocks make up the picture, which is then loop filtered across them
-        let mut pic = Picture::new(mb_w, mb_h, 1, self.bd);
+        let spares: Vec<std::sync::Mutex<Option<Picture>>> = std::mem::take(&mut self.slice_pics).into_iter().map(|p| std::sync::Mutex::new(Some(p))).collect();
+        let slice = |i: usize| {
+            let rows = bands[i].clone();
+            let mut coder = FrameCoder::new(src, refp, mb_w, mb_h, qp, rows.clone(), i as u16 + 1, use_cabac, t8).with_sub8x8(sub8).with_fast(fast);
+            if let Some(p) = spares.get(i).and_then(|s| s.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()) {
+                coder = coder.with_pic(p);
+            }
+            if kind == 1 {
+                coder = coder.with_refs(plist.clone());
+            }
+            if let Some(r1) = refp1 {
+                coder = coder.with_b(r1, dist);
+            }
+            coder.encode(|w| header(w, rows.start * mb_w))
+        };
+        let coded: Vec<_> = if fast {
+            crate::pool::map(n, slice)
+        } else {
+            std::thread::scope(|s| {
+                let slice = &slice;
+                let jobs: Vec<_> = (0..n).map(|i| s.spawn(move || slice(i))).collect();
+                jobs.into_iter().map(|j| j.join().expect("an H.264 slice thread panicked")).collect()
+            })
+        };
+        // live coding writes the oldest reference's buffers over, which nothing needs again
+        let spare = if fast && !b && self.refs.len() == self.ref_count() { Some(self.refs.remove(0)) } else { None };
+        let (mut pic, spare_half) = match spare {
+            Some((p, h, _)) => (p, Some(h)),
+            None => (Picture::new(mb_w, mb_h, 1, self.bd), None),
+        };
         let mut data = Vec::new();
         if idr {
             put_nal(&mut data, 3, 7, &self.sps());
@@ -528,15 +581,19 @@ impl H264Encoder {
                 let span = rows.start * unit..rows.end * unit;
                 pic.planes[c][span.clone()].copy_from_slice(&part.planes[c][span]);
             }
-            pic.mbs[rows.start * mb_w..rows.end * mb_w].copy_from_slice(&part.mbs[rows.start * mb_w..rows.end * mb_w]);
+            pic.mbs[rows.start * mb_w..rows.end * mb_w].copy_from_slice(&part.mbs);
+            if fast {
+                self.slice_pics.push(part);
+            }
         }
         pic.slices = vec![SliceParams { disable_deblocking: 0, alpha_offset: 0, beta_offset: 0, chroma_qp_offset: [0, 0] }; n];
-        deblock_picture(&mut pic, self.bd);
+        if fast { deblock_picture_par(&mut pic, self.bd) } else { deblock_picture(&mut pic, self.bd) }
         self.rate_update(data.len() * 8, qp, kind);
         #[cfg(test)]
         self.recon.push((pts, pic.planes.clone()));
         if !b {
-            let half = HalfPel::new(&pic.planes[0], mb_w * 16, mb_h * 16, self.bd);
+            let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+            let half = if fast { HalfPel::rebuild(spare_half, &pic.planes[0], mb_w * 16, mb_h * 16, self.bd, threads) } else { HalfPel::new(&pic.planes[0], mb_w * 16, mb_h * 16, self.bd) };
             // the references kept: the pictures either side of the B pictures, and as many more as
             // P pictures may use
             if self.refs.len() == self.ref_count() {
@@ -585,7 +642,7 @@ impl Encoder for H264Encoder {
         self.count += 1;
         let low = self.low_res(&src);
         let cut = self.last_low.as_ref().is_some_and(|prev| {
-            let (inter, intra) = change(prev, &low);
+            let (inter, intra) = change_threads(prev, &low, if self.fast { std::thread::available_parallelism().map_or(1, |n| n.get()) } else { 1 });
             inter as f64 > SCENE_CUT * intra as f64
         });
         self.last_low = Some(low);
@@ -597,6 +654,9 @@ impl Encoder for H264Encoder {
                 out = self.code_pending();
             }
             out.push(self.code_picture(&src, v.pts, if idr { 0 } else { 1 }, d));
+            if self.fast {
+                self.spare_src = Some(src);
+            }
             for (s, pts, pd) in std::mem::take(&mut self.pending) {
                 out.push(self.code_picture(&s, pts, 2, pd));
             }
@@ -1008,5 +1068,168 @@ mod tests {
         let (_, _, bytes) = run(160, 96, 75, None, Some(target), 2);
         let rate = bytes as f64 * 8.0 / 3.0;
         assert!((rate / target as f64 - 1.0).abs() < 0.25, "{rate:.0} bit/s against {target}");
+    }
+
+    /// Codes `frames` of `scene` with the live settings and `realtime`, decodes the packets, and checks
+    /// each picture is what the encoder reconstructed. Returns the packets, the source pictures and the
+    /// decoded ones.
+    fn run_realtime(w: usize, h: usize, frames: usize, qp: Option<u8>, bitrate: Option<u32>) -> (Vec<Packet>, Vec<VideoFrame>, Vec<VideoFrame>) {
+        let params = StreamParams::Video { width: w as u32, height: h as u32, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational::new(30, 1) };
+        let mut enc = H264Encoder::new(&params, qp, bitrate).unwrap().low_latency().constrained_baseline().realtime();
+        let (mut src, mut pkts) = (Vec::new(), Vec::new());
+        for t in 0..frames {
+            let f = scene(w, h, t);
+            pkts.extend(enc.encode(&Frame::Video(f.clone())).unwrap());
+            src.push(f);
+        }
+        pkts.extend(enc.flush().unwrap());
+        assert_eq!(pkts.len(), frames, "{w}x{h}: one packet per picture, none held back");
+        let mut dec = H264Decoder::new();
+        let mut out = Vec::new();
+        for p in &pkts {
+            out.extend(dec.decode(p).unwrap());
+        }
+        out.extend(dec.flush().unwrap());
+        let out: Vec<VideoFrame> = out.into_iter().map(|f| match f { Frame::Video(v) => v, _ => unreachable!() }).collect();
+        assert_eq!(out.len(), frames, "{w}x{h}");
+        let s = enc.mb_w * 16;
+        for (t, d) in out.iter().enumerate() {
+            assert_eq!(d.pts, t as i64);
+            let recon = &enc.recon.iter().find(|r| r.0 == d.pts).unwrap().1;
+            for r in 0..h {
+                assert_eq!(&d.planes[0][r * w..r * w + w], recon[0][r * s..r * s + w].iter().map(|&v| v as u8).collect::<Vec<_>>().as_slice(), "{w}x{h} frame {t} luma row {r}");
+            }
+            for c in 1..3 {
+                for r in 0..h / 2 {
+                    assert_eq!(&d.planes[c][r * w / 2..r * w / 2 + w / 2], recon[c][r * s / 2..r * s / 2 + w / 2].iter().map(|&v| v as u8).collect::<Vec<_>>().as_slice(), "{w}x{h} frame {t} plane {c} row {r}");
+                }
+            }
+        }
+        (pkts, src, out)
+    }
+
+    /// The NAL units of an Annex B packet: (nal_unit_type, the bytes after the header).
+    fn nals(data: &[u8]) -> Vec<(u8, Vec<u8>)> {
+        let mut starts = Vec::new();
+        let mut i = 0;
+        while i + 3 < data.len() {
+            if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+                starts.push(i + 3);
+                i += 3;
+            } else {
+                i += 1;
+            }
+        }
+        starts.iter().enumerate().map(|(k, &s)| (data[s] & 31, data[s + 1..starts.get(k + 1).map_or(data.len(), |&n| n - 3)].to_vec())).collect()
+    }
+
+    #[test]
+    fn realtime_pictures_decode_to_what_was_reconstructed_at_a_sensible_quality() {
+        // several slices (three rows or more each), a size that is not whole macroblocks, one slice, and
+        // enough rows for the loop filter's wave to run several rows at once
+        for (w, h) in [(176, 144), (100, 68), (64, 16), (320, 240)] {
+            let (_, src, out) = run_realtime(w, h, 8, Some(26), None);
+            for (s, d) in src.iter().zip(&out) {
+                let p = psnr(&s.planes[0], &d.planes[0]);
+                assert!(p > 30.0, "{w}x{h}: {p:.1} dB at picture {}", s.pts);
+            }
+        }
+    }
+
+    #[test]
+    fn realtime_follows_a_bit_rate() {
+        let target = 400_000u32;
+        let (pkts, _, _) = run_realtime(176, 144, 60, None, Some(target));
+        let bytes: usize = pkts.iter().map(|p| p.data.len()).sum();
+        let rate = bytes as f64 * 8.0 / 2.0;
+        assert!(rate < target as f64 * 1.6, "{rate:.0} bit/s against {target}");
+    }
+
+    #[test]
+    fn realtime_streams_stay_constrained_baseline() {
+        let (pkts, _, _) = run_realtime(176, 144, 4, Some(26), None);
+        let n = nals(&pkts[0].data);
+        let sps = n.iter().find(|n| n.0 == 7).expect("an SPS ahead of the IDR picture");
+        assert_eq!(sps.1[0], 66, "profile_idc");
+        assert_eq!(sps.1[1] & 0b1100_0000, 0b1100_0000, "constraint_set0 and 1");
+        let pps = n.iter().find(|n| n.0 == 8).expect("a PPS");
+        // pic_parameter_set_id and seq_parameter_set_id are ue(0), one bit each; then entropy_coding_mode_flag
+        assert_eq!(pps.1[0] & 0b0010_0000, 0, "CAVLC: entropy_coding_mode_flag is 0");
+        assert!(n.iter().any(|n| n.0 == 5));
+        for p in &pkts[1..] {
+            assert!(nals(&p.data).iter().all(|n| n.0 == 1), "P pictures only: no B pictures, no parameter sets");
+        }
+    }
+
+    #[test]
+    fn realtime_codes_a_keyframe_when_asked() {
+        let params = StreamParams::Video { width: 96, height: 64, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational::new(30, 1) };
+        let mut enc = H264Encoder::new(&params, Some(26), None).unwrap().low_latency().constrained_baseline().realtime().with_keyint(1000);
+        let mut kinds = Vec::new();
+        for t in 0..9 {
+            if t == 5 {
+                enc.force_idr();
+            }
+            let pkts = enc.encode(&Frame::Video(scene(96, 64, t))).unwrap();
+            assert_eq!(pkts.len(), 1);
+            let n = nals(&pkts[0].data);
+            kinds.push(n.iter().any(|n| n.0 == 5));
+            if t == 5 {
+                assert!(n.iter().any(|n| n.0 == 7) && n.iter().any(|n| n.0 == 8), "parameter sets ahead of a forced IDR picture");
+            }
+        }
+        assert_eq!(kinds, [true, false, false, false, false, true, false, false, false]);
+    }
+
+    #[test]
+    fn realtime_skips_a_still_picture_and_codes_a_change() {
+        let (w, h) = (176, 144);
+        let params = StreamParams::Video { width: w as u32, height: h as u32, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational::new(30, 1) };
+        let mut enc = H264Encoder::new(&params, Some(26), None).unwrap().low_latency().constrained_baseline().realtime();
+        let still = scene(w, h, 0);
+        let mut sizes = Vec::new();
+        for t in 0..6 {
+            let mut f = still.clone();
+            f.pts = t;
+            if t == 5 {
+                // a small change: a bright block at the top left
+                for r in 0..16 {
+                    f.planes[0][r * w..r * w + 16].fill(250);
+                }
+            }
+            sizes.push(enc.encode(&Frame::Video(f)).unwrap()[0].data.len());
+        }
+        assert!(sizes[2..5].iter().all(|&s| s < 60), "a still picture costs little: {sizes:?}");
+        assert!(sizes[5] > sizes[4] && sizes[5] < sizes[0] / 2, "a small change costs a little more: {sizes:?}");
+    }
+
+    #[test]
+    fn the_threaded_half_sample_planes_equal_the_single_threaded_ones() {
+        let (pw, ph) = (80usize, 112usize);
+        let mut seed = 5u32;
+        let luma: Vec<u16> = (0..pw * ph)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                ((seed >> 16) % 256) as u16
+            })
+            .collect();
+        let one = HalfPel::new(&luma, pw, ph, 8);
+        let spare = HalfPel::rebuild(None, &luma, pw, ph, 8, 5);
+        // a second picture written over the first's buffers
+        let luma2: Vec<u16> = luma.iter().map(|&v| 255 - v).collect();
+        let two = HalfPel::rebuild(Some(spare), &luma2, pw, ph, 8, 7);
+        let ref2 = HalfPel::new(&luma2, pw, ph, 8);
+        let three = HalfPel::rebuild(None, &luma, pw, ph, 8, 3);
+        for (x, y) in [(0, 0), (16, 16), (64, 96)] {
+            for mv in [[0i16, 0], [1, 0], [2, 2], [3, -3], [-9, 14], [26, 31]] {
+                let (mut a, mut b, mut c) = ([0u16; 256], [0u16; 256], [0u16; 256]);
+                one.predict(x, y, mv, 16, 16, &mut a);
+                three.predict(x, y, mv, 16, 16, &mut b);
+                assert_eq!(a, b);
+                two.predict(x, y, mv, 16, 16, &mut b);
+                ref2.predict(x, y, mv, 16, 16, &mut c);
+                assert_eq!(b, c);
+            }
+        }
     }
 }
