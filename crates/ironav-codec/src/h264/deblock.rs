@@ -5,7 +5,7 @@
 //! of the current macroblock, and when its first strength is 4 every line of the group is filtered
 //! strongly while otherwise lines of strength 4 are left as they are.
 
-use super::mb::{chroma_qp, Kind, MbInfo, Picture};
+use super::mb::{chroma_qp, Kind, MbInfo, Picture, SliceParams};
 use super::tables::{ALPHA, BETA, TC0};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -17,7 +17,7 @@ fn clip1(v: i32, bd: u32) -> u16 {
 /// boundary strength in `bs`. `pos` is the first q0 sample, `xs` the step across the edge and `ys`
 /// the step along it.
 #[allow(clippy::too_many_arguments)]
-fn filter_edge(pl: &mut [u16], pos: usize, xs: usize, ys: usize, per_bs: usize, bs: &[u8; 4], alpha: i32, beta: i32, index_a: usize, chroma: bool, bd: u32, keep: (bool, bool)) {
+fn filter_edge<P: Px + ?Sized>(pl: &mut P, pos: usize, xs: usize, ys: usize, per_bs: usize, bs: &[u8; 4], alpha: i32, beta: i32, index_a: usize, chroma: bool, bd: u32, keep: (bool, bool)) {
     if alpha == 0 || beta == 0 {
         return;
     }
@@ -34,18 +34,18 @@ fn filter_edge(pl: &mut [u16], pos: usize, xs: usize, ys: usize, per_bs: usize, 
             let (mut sp, mut sq) = ([0u16; 3], [0u16; 3]);
             if restore {
                 for i in 0..n {
-                    sp[i] = pl[q - (i + 1) * xs];
-                    sq[i] = pl[q + i * xs];
+                    sp[i] = pl.px(q - (i + 1) * xs);
+                    sq[i] = pl.px(q + i * xs);
                 }
             }
             filter_line(pl, q, xs, b, tc0, alpha, beta, chroma, bd);
             if restore {
                 for i in 0..n {
                     if keep.0 {
-                        pl[q - (i + 1) * xs] = sp[i];
+                        pl.set(q - (i + 1) * xs, sp[i]);
                     }
                     if keep.1 {
-                        pl[q + i * xs] = sq[i];
+                        pl.set(q + i * xs, sq[i]);
                     }
                 }
             }
@@ -56,11 +56,11 @@ fn filter_edge(pl: &mut [u16], pos: usize, xs: usize, ys: usize, per_bs: usize, 
 /// Filters the sample line through `q`, the first sample past the edge, with boundary strength `b`;
 /// `tc0` is the clipping threshold for `b` below 4.
 #[allow(clippy::too_many_arguments)]
-fn filter_line(pl: &mut [u16], q: usize, xs: usize, b: u8, tc0: i32, alpha: i32, beta: i32, chroma: bool, bd: u32) {
-    let p0 = pl[q - xs] as i32;
-    let q0 = pl[q] as i32;
-    let p1 = pl[q - 2 * xs] as i32;
-    let q1 = pl[q + xs] as i32;
+fn filter_line<P: Px + ?Sized>(pl: &mut P, q: usize, xs: usize, b: u8, tc0: i32, alpha: i32, beta: i32, chroma: bool, bd: u32) {
+    let p0 = pl.px(q - xs) as i32;
+    let q0 = pl.px(q) as i32;
+    let p1 = pl.px(q - 2 * xs) as i32;
+    let q1 = pl.px(q + xs) as i32;
     if (p0 - q0).abs() >= alpha || (p1 - p0).abs() >= beta || (q1 - q0).abs() >= beta {
         return;
     }
@@ -68,46 +68,46 @@ fn filter_line(pl: &mut [u16], q: usize, xs: usize, b: u8, tc0: i32, alpha: i32,
         if b < 4 {
             let tc = tc0 + 1;
             let delta = ((((q0 - p0) << 2) + (p1 - q1) + 4) >> 3).clamp(-tc, tc);
-            pl[q - xs] = clip1(p0 + delta, bd);
-            pl[q] = clip1(q0 - delta, bd);
+            pl.set(q - xs, clip1(p0 + delta, bd));
+            pl.set(q, clip1(q0 - delta, bd));
         } else {
-            pl[q - xs] = ((2 * p1 + p0 + q1 + 2) >> 2) as u16;
-            pl[q] = ((2 * q1 + q0 + p1 + 2) >> 2) as u16;
+            pl.set(q - xs, ((2 * p1 + p0 + q1 + 2) >> 2) as u16);
+            pl.set(q, ((2 * q1 + q0 + p1 + 2) >> 2) as u16);
         }
         return;
     }
-    let p2 = pl[q - 3 * xs] as i32;
-    let q2 = pl[q + 2 * xs] as i32;
+    let p2 = pl.px(q - 3 * xs) as i32;
+    let q2 = pl.px(q + 2 * xs) as i32;
     let ap = (p2 - p0).abs();
     let aq = (q2 - q0).abs();
     if b < 4 {
         let tc = tc0 + (ap < beta) as i32 + (aq < beta) as i32;
         let delta = ((((q0 - p0) << 2) + (p1 - q1) + 4) >> 3).clamp(-tc, tc);
-        pl[q - xs] = clip1(p0 + delta, bd);
-        pl[q] = clip1(q0 - delta, bd);
+        pl.set(q - xs, clip1(p0 + delta, bd));
+        pl.set(q, clip1(q0 - delta, bd));
         if ap < beta {
-            pl[q - 2 * xs] = (p1 + ((p2 + ((p0 + q0 + 1) >> 1) - (p1 << 1)) >> 1).clamp(-tc0, tc0)) as u16;
+            pl.set(q - 2 * xs, (p1 + ((p2 + ((p0 + q0 + 1) >> 1) - (p1 << 1)) >> 1).clamp(-tc0, tc0)) as u16);
         }
         if aq < beta {
-            pl[q + xs] = (q1 + ((q2 + ((p0 + q0 + 1) >> 1) - (q1 << 1)) >> 1).clamp(-tc0, tc0)) as u16;
+            pl.set(q + xs, (q1 + ((q2 + ((p0 + q0 + 1) >> 1) - (q1 << 1)) >> 1).clamp(-tc0, tc0)) as u16);
         }
     } else {
         let small = (p0 - q0).abs() < (alpha >> 2) + 2;
         if ap < beta && small {
-            let p3 = pl[q - 4 * xs] as i32;
-            pl[q - xs] = ((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3) as u16;
-            pl[q - 2 * xs] = ((p2 + p1 + p0 + q0 + 2) >> 2) as u16;
-            pl[q - 3 * xs] = ((2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3) as u16;
+            let p3 = pl.px(q - 4 * xs) as i32;
+            pl.set(q - xs, ((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3) as u16);
+            pl.set(q - 2 * xs, ((p2 + p1 + p0 + q0 + 2) >> 2) as u16);
+            pl.set(q - 3 * xs, ((2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3) as u16);
         } else {
-            pl[q - xs] = ((2 * p1 + p0 + q1 + 2) >> 2) as u16;
+            pl.set(q - xs, ((2 * p1 + p0 + q1 + 2) >> 2) as u16);
         }
         if aq < beta && small {
-            let q3 = pl[q + 3 * xs] as i32;
-            pl[q] = ((p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3) as u16;
-            pl[q + xs] = ((p0 + q0 + q1 + q2 + 2) >> 2) as u16;
-            pl[q + 2 * xs] = ((2 * q3 + 3 * q2 + q1 + q0 + p0 + 4) >> 3) as u16;
+            let q3 = pl.px(q + 3 * xs) as i32;
+            pl.set(q, ((p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3) as u16);
+            pl.set(q + xs, ((p0 + q0 + q1 + q2 + 2) >> 2) as u16);
+            pl.set(q + 2 * xs, ((2 * q3 + 3 * q2 + q1 + q0 + p0 + 4) >> 3) as u16);
         } else {
-            pl[q] = ((2 * q1 + q0 + p1 + 2) >> 2) as u16;
+            pl.set(q, ((2 * q1 + q0 + p1 + 2) >> 2) as u16);
         }
     }
 }
@@ -192,30 +192,116 @@ pub fn deblock_rows(pic: &mut Picture, bd: u32, rows: std::ops::Range<usize>) {
         deblock_mbaff(pic, bd, rows.start / 2..rows.end.div_ceil(2));
         return;
     }
+    let Picture { mb_w, cf, ch, planes, mbs, slices, .. } = pic;
     for mby in rows {
-        for mbx in 0..pic.mb_w {
-            deblock_mb(pic, bd, mbx, mby);
+        for mbx in 0..*mb_w {
+            deblock_mb(planes, mbs, slices, (*mb_w, *cf, *ch), bd, mbx, mby);
         }
     }
 }
 
-/// `deblock_picture` for live coding: each macroblock row is a task, and a macroblock waits only
-/// for the row above to have finished the macroblock after it, so the rows are filtered in a
-/// staggered wave, to the very samples the raster order gives (the filtering of a macroblock reads
-/// and changes only samples of itself, of the macroblocks left of and above it, and of the one
-/// above and to the right, through that one's left edge).
+/// A sample plane the loop filter reads and writes by index. Besides slices, the planes that
+/// `deblock_picture_par` shares among threads are one (see `SharedPlane`).
+trait Px {
+    fn px(&self, i: usize) -> u16;
+    fn set(&mut self, i: usize, v: u16);
+}
+
+impl Px for [u16] {
+    #[inline]
+    fn px(&self, i: usize) -> u16 {
+        self[i]
+    }
+
+    #[inline]
+    fn set(&mut self, i: usize, v: u16) {
+        self[i] = v;
+    }
+}
+
+impl Px for Vec<u16> {
+    #[inline]
+    fn px(&self, i: usize) -> u16 {
+        self[i]
+    }
+
+    #[inline]
+    fn set(&mut self, i: usize, v: u16) {
+        self[i] = v;
+    }
+}
+
+/// A plane that several loop-filter threads read and write at once, through a raw pointer: no thread
+/// ever holds a reference to the plane (or to any part of it), only this pointer, and each access is
+/// of one sample.
+///
+/// Macroblock rows are filtered as a wave: macroblock (x, r) starts only once row r - 1 has finished
+/// macroblock x + 1. Filtering a macroblock reads and writes only samples of itself, of the macroblock
+/// to its left (up to three columns), and of the one above it (up to three rows, with a fourth read);
+/// the macroblock above and to the right changes the above one's right-hand columns through its own
+/// left edge, which is why it must be done first. So macroblocks filtered at the same time (those of
+/// different rows, at least two columns apart) never touch the same sample, and the progress
+/// counters, set with Release after a macroblock and read with Acquire before the one that follows
+/// it, make every write to a sample happen before any later read of it by another thread.
+#[derive(Clone, Copy)]
+struct SharedPlane<'a> {
+    ptr: *mut u16,
+    len: usize,
+    _plane: std::marker::PhantomData<&'a mut [u16]>,
+}
+
+// SAFETY: concurrent use is limited to the disjoint macroblocks described above; the pointer is into
+// a plane that outlives `'a` and is not otherwise used meanwhile (it is borrowed mutably for `'a`).
+unsafe impl Send for SharedPlane<'_> {}
+unsafe impl Sync for SharedPlane<'_> {}
+
+impl<'a> SharedPlane<'a> {
+    fn new(plane: &'a mut [u16]) -> Self {
+        SharedPlane { ptr: plane.as_mut_ptr(), len: plane.len(), _plane: std::marker::PhantomData }
+    }
+}
+
+impl Px for SharedPlane<'_> {
+    #[inline]
+    fn px(&self, i: usize) -> u16 {
+        assert!(i < self.len);
+        // SAFETY: in bounds, and no other thread is writing this sample (see above).
+        unsafe { *self.ptr.add(i) }
+    }
+
+    #[inline]
+    fn set(&mut self, i: usize, v: u16) {
+        assert!(i < self.len);
+        // SAFETY: in bounds, and no other thread is using this sample (see above).
+        unsafe { *self.ptr.add(i) = v }
+    }
+}
+
+/// Marks a macroblock row finished when dropped, also when filtering it panicked, so that the rows
+/// waiting on it do not wait for ever.
+struct RowDone<'a>(&'a AtomicUsize);
+
+impl Drop for RowDone<'_> {
+    fn drop(&mut self) {
+        self.0.store(usize::MAX, Ordering::Release);
+    }
+}
+
+/// `deblock_picture` for live coding: each macroblock row is a task, filtered in a staggered wave
+/// (see `SharedPlane`), to the very samples the raster order gives.
 pub fn deblock_picture_par(pic: &mut Picture, bd: u32) {
     if pic.mbaff || pic.mb_h < 2 {
         return deblock_picture(pic, bd);
     }
-    struct Shared(*mut Picture);
-    // SAFETY: see below.
-    unsafe impl Sync for Shared {}
-    let (w, h) = (pic.mb_w, pic.mb_h);
+    let Picture { mb_w, mb_h, cf, ch, planes, mbs, slices, .. } = pic;
+    let (w, h, dims) = (*mb_w, *mb_h, (*mb_w, *cf, *ch));
+    let [a, b, c] = planes;
+    let shared = [SharedPlane::new(a), SharedPlane::new(b), SharedPlane::new(c)];
+    let (mbs, slices) = (&*mbs, &*slices);
     let done: Vec<AtomicUsize> = (0..h).map(|_| AtomicUsize::new(0)).collect();
-    let shared = Shared(pic);
-    let shared = &shared;
     crate::pool::run(h, |mby| {
+        let _row = RowDone(&done[mby]);
+        let mut planes = shared;
         for mbx in 0..w {
             if mby > 0 {
                 let need = (mbx + 2).min(w);
@@ -229,34 +315,32 @@ pub fn deblock_picture_par(pic: &mut Picture, bd: u32) {
                     }
                 }
             }
-            // SAFETY: tasks are taken in row order and each waits as above, so no two macroblocks being
-            // filtered at once are neighbours: they touch different samples, and none writes the
-            // macroblock records or the slice parameters, which are only read.
-            deblock_mb(unsafe { &mut *shared.0 }, bd, mbx, mby);
+            deblock_mb(&mut planes, mbs, slices, dims, bd, mbx, mby);
             done[mby].store(mbx + 1, Ordering::Release);
         }
     });
 }
 
-/// Filters macroblock (`mbx`, `mby`) of a picture that is not MBAFF.
-fn deblock_mb(pic: &mut Picture, bd: u32, mbx: usize, mby: usize) {
-    let w = pic.mb_w;
+/// Filters macroblock (`mbx`, `mby`) of a picture that is not MBAFF; `dims` is its width in
+/// macroblocks, chroma_format_idc and the height of a macroblock's chroma.
+fn deblock_mb<P: Px>(planes: &mut [P; 3], mbs: &[MbInfo], slices: &[SliceParams], (mb_w, cf, chh): (usize, u8, usize), bd: u32, mbx: usize, mby: usize) {
+    let w = mb_w;
     let ls = w * 16;
     let cs = w * 8;
     let idx = mby * w + mbx;
-    let m = &pic.mbs[idx];
+    let m = &mbs[idx];
     if m.slice == 0 {
         return;
     }
-    let sp = pic.slices[m.slice as usize - 1];
+    let sp = slices[m.slice as usize - 1];
     if sp.disable_deblocking == 1 {
         return;
     }
     let usable = |o: &MbInfo| o.slice != 0 && (sp.disable_deblocking == 0 || o.slice == m.slice);
-    let left_ok = mbx > 0 && usable(&pic.mbs[idx - 1]);
-    let top_ok = mby > 0 && usable(&pic.mbs[idx - w]);
+    let left_ok = mbx > 0 && usable(&mbs[idx - 1]);
+    let top_ok = mby > 0 && usable(&mbs[idx - w]);
     // the macroblocks on the far side of the left and top edges (`m` itself at the picture edge)
-    let edge_mb = [if mbx > 0 { &pic.mbs[idx - 1] } else { m }, if mby > 0 { &pic.mbs[idx - w] } else { m }];
+    let edge_mb = [if mbx > 0 { &mbs[idx - 1] } else { m }, if mby > 0 { &mbs[idx - w] } else { m }];
     // boundary strengths depend on the macroblocks only, so all planes and chroma share them
     let mut bs = [[[0u8; 4]; 4]; 2];
     for dir in 0..2 {
@@ -266,7 +350,7 @@ fn deblock_mb(pic: &mut Picture, bd: u32, mbx: usize, mby: usize) {
         }
     }
     // luma, and Cb and Cr filtered the same way in 4:4:4
-    for pl in 0..if pic.cf == 3 { 3 } else { 1 } {
+    for pl in 0..if cf == 3 { 3 } else { 1 } {
         let off = if pl > 0 { sp.chroma_qp_offset[pl - 1] } else { 0 };
         for dir in 0..2 {
             for e in 0..4usize {
@@ -283,19 +367,18 @@ fn deblock_mb(pic: &mut Picture, bd: u32, mbx: usize, mby: usize) {
                 let (alpha, beta) = ((ALPHA[ia] as i32) << (bd - 8), (BETA[ib] as i32) << (bd - 8));
                 let (x0, y0) = (mbx * 16, mby * 16);
                 if dir == 0 {
-                    filter_edge(&mut pic.planes[pl], y0 * ls + x0 + e * 4, 1, ls, 4, &bs[dir][e], alpha, beta, ia, false, bd, (other.keep, m.keep));
+                    filter_edge(&mut planes[pl], y0 * ls + x0 + e * 4, 1, ls, 4, &bs[dir][e], alpha, beta, ia, false, bd, (other.keep, m.keep));
                 } else {
-                    filter_edge(&mut pic.planes[pl], (y0 + e * 4) * ls + x0, ls, 1, 4, &bs[dir][e], alpha, beta, ia, false, bd, (other.keep, m.keep));
+                    filter_edge(&mut planes[pl], (y0 + e * 4) * ls + x0, ls, 1, 4, &bs[dir][e], alpha, beta, ia, false, bd, (other.keep, m.keep));
                 }
             }
         }
     }
     // chroma: vertical edges at 0 and 4, horizontal edges every 4 rows (every 4 chroma rows of
     // 4:2:2, every 8 luma rows of 4:2:0); each takes the strength of the luma edge it lines up with
-    if matches!(pic.cf, 0 | 3) {
+    if matches!(cf, 0 | 3) {
         return;
     }
-    let chh = pic.ch;
     for comp in 0..2usize {
         let off = sp.chroma_qp_offset[comp];
         for dir in 0..2 {
@@ -311,11 +394,11 @@ fn deblock_mb(pic: &mut Picture, bd: u32, mbx: usize, mby: usize) {
                 let (alpha, beta) = ((ALPHA[ia] as i32) << (bd - 8), (BETA[ib] as i32) << (bd - 8));
                 let (x0, y0) = (mbx * 8, mby * chh);
                 if dir == 0 {
-                    filter_edge(&mut pic.planes[1 + comp], y0 * cs + x0 + e * 2, 1, cs, chh / 4, &bs[dir][e], alpha, beta, ia, true, bd, (other.keep, m.keep));
+                    filter_edge(&mut planes[1 + comp], y0 * cs + x0 + e * 2, 1, cs, chh / 4, &bs[dir][e], alpha, beta, ia, true, bd, (other.keep, m.keep));
                 } else if chh == 16 {
-                    filter_edge(&mut pic.planes[1 + comp], (y0 + e * 4) * cs + x0, cs, 1, 2, &bs[dir][e], alpha, beta, ia, true, bd, (other.keep, m.keep));
+                    filter_edge(&mut planes[1 + comp], (y0 + e * 4) * cs + x0, cs, 1, 2, &bs[dir][e], alpha, beta, ia, true, bd, (other.keep, m.keep));
                 } else {
-                    filter_edge(&mut pic.planes[1 + comp], (y0 + e * 2) * cs + x0, cs, 1, 2, &bs[dir][e], alpha, beta, ia, true, bd, (other.keep, m.keep));
+                    filter_edge(&mut planes[1 + comp], (y0 + e * 2) * cs + x0, cs, 1, 2, &bs[dir][e], alpha, beta, ia, true, bd, (other.keep, m.keep));
                 }
             }
         }
@@ -324,7 +407,7 @@ fn deblock_mb(pic: &mut Picture, bd: u32, mbx: usize, mby: usize) {
 
 /// Filters one sample line across an edge, putting back I_PCM and lossless samples after.
 #[allow(clippy::too_many_arguments)]
-fn filter_one(pl: &mut [u16], q: usize, xs: usize, b: u8, index_a: usize, alpha: i32, beta: i32, chroma: bool, bd: u32, keep: (bool, bool)) {
+fn filter_one<P: Px + ?Sized>(pl: &mut P, q: usize, xs: usize, b: u8, index_a: usize, alpha: i32, beta: i32, chroma: bool, bd: u32, keep: (bool, bool)) {
     if b == 0 || alpha == 0 || beta == 0 {
         return;
     }
@@ -332,16 +415,16 @@ fn filter_one(pl: &mut [u16], q: usize, xs: usize, b: u8, index_a: usize, alpha:
     let n = if chroma { 1 } else { 3 };
     let (mut sp, mut sq) = ([0u16; 3], [0u16; 3]);
     for i in 0..n {
-        sp[i] = pl[q - (i + 1) * xs];
-        sq[i] = pl[q + i * xs];
+        sp[i] = pl.px(q - (i + 1) * xs);
+        sq[i] = pl.px(q + i * xs);
     }
     filter_line(pl, q, xs, b, tc0, alpha, beta, chroma, bd);
     for i in 0..n {
         if keep.0 {
-            pl[q - (i + 1) * xs] = sp[i];
+            pl.set(q - (i + 1) * xs, sp[i]);
         }
         if keep.1 {
-            pl[q + i * xs] = sq[i];
+            pl.set(q + i * xs, sq[i]);
         }
     }
 }

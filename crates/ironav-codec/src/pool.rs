@@ -30,7 +30,8 @@ struct Job {
     panic: Mutex<Option<Box<dyn Any + Send>>>,
 }
 
-// SAFETY: `f` is only called through a shared reference to a `Sync` closure, and see above.
+// SAFETY: the only non-thread-safe field is `f`, a pointer to a closure that `run` requires to be `Sync`, so
+// calling it through a shared reference from several threads is fine; and see above for its lifetime.
 unsafe impl Send for Job {}
 unsafe impl Sync for Job {}
 
@@ -92,6 +93,23 @@ fn pool() -> &'static Pool {
     })
 }
 
+/// Waits, when dropped, for every share of a job to finish, and takes the job out of the pool.
+struct WaitForJob<'a> {
+    job: &'a Job,
+    pool: &'static Pool,
+}
+
+impl Drop for WaitForJob<'_> {
+    fn drop(&mut self) {
+        let mut fin = lock(&self.job.finished);
+        while !*fin {
+            fin = self.job.finish.wait(fin).unwrap_or_else(PoisonError::into_inner);
+        }
+        drop(fin);
+        lock(&self.pool.state).1 = None;
+    }
+}
+
 /// Calls `f(0)` to `f(n - 1)`, on up to `threads()` threads at once, and returns when all are done.
 /// A panic in `f` is raised here once the others have finished.
 pub fn run(n: usize, f: impl Fn(usize) + Sync) {
@@ -120,14 +138,11 @@ pub fn run(n: usize, f: impl Fn(usize) + Sync) {
         st.1 = Some(job.clone());
     }
     pool.wake.notify_all();
+    // from here the closure is borrowed by other threads: whatever happens next, including a panic in this
+    // thread, `run` does not return or unwind until every share is done and the job is out of the pool
+    let wait = WaitForJob { job: &job, pool };
     job.work();
-    {
-        let mut fin = lock(&job.finished);
-        while !*fin {
-            fin = job.finish.wait(fin).unwrap_or_else(PoisonError::into_inner);
-        }
-    }
-    lock(&pool.state).1 = None;
+    drop(wait);
     let panicked = lock(&job.panic).take();
     if let Some(p) = panicked {
         resume_unwind(p);
@@ -174,6 +189,28 @@ mod tests {
         let r = catch_unwind(|| run(8, |i| assert_ne!(i, 5)));
         assert!(r.is_err());
         assert_eq!(map(4, |i| i), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn panics_in_any_share_leave_the_pool_usable_and_no_share_outlives_the_call() {
+        // every share panics, or only the first, or only the last: the caller always gets the panic, and only
+        // after the other shares have finished
+        for bad in [None, Some(0), Some(7)] {
+            for _ in 0..20 {
+                let live = AtomicUsize::new(0);
+                let r = catch_unwind(AssertUnwindSafe(|| {
+                    run(8, |i| {
+                        live.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_micros(200));
+                        live.fetch_sub(1, Ordering::SeqCst);
+                        assert!(bad.is_some_and(|b| b != i), "share {i}");
+                    })
+                }));
+                assert!(r.is_err());
+                assert_eq!(live.load(Ordering::SeqCst), 0, "a share was still running when `run` unwound");
+                assert_eq!(map(5, |i| i + 1), vec![1, 2, 3, 4, 5]);
+            }
+        }
     }
 
     #[test]
