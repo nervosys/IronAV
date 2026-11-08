@@ -145,6 +145,12 @@ fn run(name: &str, mode: &str, w: usize, h: usize, frames: usize, qp: Option<u8>
         }
     }
     assert_eq!(out.len(), frames);
+    if std::env::var("PSNRS").is_ok() {
+        for (s, d) in src.iter().zip(&out) {
+            eprint!("{:.1} ", psnr(&s.planes[0], &d.planes[0]));
+        }
+        eprintln!();
+    }
     for (s, d) in src.iter().zip(&out) {
         psnrs.push(psnr(&s.planes[0], &d.planes[0]));
     }
