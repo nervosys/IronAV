@@ -151,7 +151,7 @@ impl Grabber for Cg {
                 return Err(Error::new(ErrorCode::UnsupportedFormat, "the display's picture is not in 32-bit BGRA pixels"));
             }
             self.size = (w as u32, h as u32);
-            Ok(Some(Shot { data: &self.pixels, stride: w * 4, width: w as u32, height: h as u32 }))
+            Ok(Some(Shot::new(&self.pixels, w * 4, w as u32, h as u32)))
         }
     }
 }

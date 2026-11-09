@@ -7,6 +7,14 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+
+- `ScreenCapture::set_region(Option<Rect>)`: ask for only a rectangle of the display, which may move between frames. Frames carry
+  `origin` (where the picture lies on the display) and `display` (its full size); `dirty` and `moved` are the region's own. On
+  Windows only the region is copied from the GPU (`CopySubresourceRegion` into a region-sized staging texture), mapped and moved
+  on the CPU, and the cursor is drawn only where it lies inside it, so the cost scales with the region, not the display; X11 and
+  macOS crop the whole picture in software. Without a region, behaviour is unchanged.
+
 ### Fixed
 
 - Live H.264 encoding no longer stalls for hundreds of milliseconds when other programs compete for the cores: the parallel loop

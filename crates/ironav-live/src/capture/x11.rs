@@ -301,7 +301,7 @@ impl Grabber for X11 {
         if self.cursor {
             self.draw_cursor();
         }
-        Ok(Some(Shot { data: &self.pixels, stride: w as usize * 4, width: w, height: h }))
+        Ok(Some(Shot::new(&self.pixels, w as usize * 4, w, h)))
     }
 }
 

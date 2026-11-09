@@ -50,6 +50,23 @@ pub(crate) struct Shot<'a> {
     pub stride: usize,
     pub width: u32,
     pub height: u32,
+    /// Where the picture's top-left pixel lies on the display (0, 0 for the whole display).
+    pub origin: (u32, u32),
+    /// The display's size.
+    pub display: (u32, u32),
+}
+
+impl<'a> Shot<'a> {
+    /// A picture of the whole display.
+    pub fn new(data: &'a [u8], stride: usize, width: u32, height: u32) -> Shot<'a> {
+        Shot { data, stride, width, height, origin: (0, 0), display: (width, height) }
+    }
+
+    /// The same picture, taken to be the part of a `display`-sized display whose top-left pixel is at `origin`.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn at(self, origin: (u32, u32), display: (u32, u32)) -> Shot<'a> {
+        Shot { origin, display, ..self }
+    }
 }
 
 /// What a backend gives: the display's latest picture.
@@ -59,6 +76,14 @@ pub(crate) trait Grabber {
     /// The latest picture, or `None` when the display has not changed since the last call (or has
     /// shown nothing yet).
     fn grab(&mut self) -> Result<Option<Shot<'_>>>;
+    /// Asks for only `region` (display coordinates, not clipped) from the next picture on, or the whole
+    /// display for `None`; true when the backend does that itself (its pictures then carry their
+    /// `origin` and `display`, and its changes are the region's). The default says no, and the caller
+    /// crops the whole display's pictures.
+    fn set_region(&mut self, region: Option<Rect>) -> bool {
+        let _ = region;
+        false
+    }
     /// Waits up to `wait` for the display to change, then gives its latest picture, and writes what
     /// changed since the last call into `changes`. A backend that cannot tell what changed (the
     /// default) takes a picture after `wait` and reports the frame as whole.
@@ -295,6 +320,12 @@ impl Default for ScreenOptions {
 /// `stride` bytes apart. `dirty` and `moved` list what changed since the previous frame; when `whole`
 /// is true they are empty and the whole frame must be taken as changed. This type has no `Debug`
 /// output, so that pixels are not printed by accident.
+///
+/// `width` and `height` are the picture's own size. For the whole display (the default) it is the display's
+/// size and `origin` is (0, 0); after [`ScreenCapture::set_region`] it is the region's, `origin` is where
+/// the picture's top-left pixel lies on the display, and `dirty`, `moved` and `stride` are the picture's
+/// own (so a display point (x, y) in the region is the pixel (x - origin.0, y - origin.1)). `display` is
+/// always the display's full size.
 #[non_exhaustive]
 pub struct ScreenFrame<'a> {
     pub width: u32,
@@ -306,6 +337,10 @@ pub struct ScreenFrame<'a> {
     pub whole: bool,
     /// When the picture was taken.
     pub at: Instant,
+    /// Where the picture's top-left pixel lies on the display: (0, 0) unless a region was asked for.
+    pub origin: (u32, u32),
+    /// The display's full size in pixels.
+    pub display: (u32, u32),
 }
 
 impl<'a> ScreenFrame<'a> {
@@ -320,7 +355,12 @@ impl<'a> ScreenFrame<'a> {
         assert!(stride >= row, "stride {stride} is less than {row} bytes for width {width}");
         let need = stride.checked_mul(height as usize).expect("frame size overflows");
         assert!(bgra.len() >= need, "{} bytes given, {need} needed", bgra.len());
-        ScreenFrame { width, height, stride, bgra, dirty: &[], moved: &[], whole: true, at }
+        ScreenFrame { width, height, stride, bgra, dirty: &[], moved: &[], whole: true, at, origin: (0, 0), display: (width, height) }
+    }
+
+    /// The same frame as the part of a `display`-sized display whose top-left pixel is at `origin`.
+    pub fn with_region(self, origin: (u32, u32), display: (u32, u32)) -> ScreenFrame<'a> {
+        ScreenFrame { origin, display, ..self }
     }
 
     /// The same frame with what changed since the previous one. With `whole` true, `dirty` and
@@ -351,6 +391,14 @@ pub(crate) struct Changes {
 pub struct ScreenCapture {
     grabber: Box<dyn Grabber>,
     changes: Changes,
+    /// The part of the display asked for.
+    region: Option<Rect>,
+    /// The backend crops to `region` itself.
+    native: bool,
+    /// What the software crop last gave, to tell when the region moved.
+    last_view: Option<Rect>,
+    crop: Vec<u8>,
+    crop_changes: Changes,
 }
 
 /// The displays present, the primary one first. A display's index is what
@@ -382,7 +430,7 @@ impl ScreenCapture {
         #[cfg(any(windows, target_os = "macos", all(target_os = "linux", target_pointer_width = "64")))]
         {
             let grabber = imp::open(index, options.cursor)?;
-            Ok(ScreenCapture { grabber: Box::new(grabber), changes: Changes::default() })
+            Ok(ScreenCapture { grabber: Box::new(grabber), changes: Changes::default(), region: None, native: false, last_view: None, crop: Vec::new(), crop_changes: Changes::default() })
         }
         #[cfg(not(any(windows, target_os = "macos", all(target_os = "linux", target_pointer_width = "64"))))]
         {
@@ -402,13 +450,73 @@ impl ScreenCapture {
     ///
     /// On X11 and macOS no rectangles are available, so every frame is `whole`. The call waits `wait`
     /// and then takes a picture, so it never returns `None` there; pass a `wait` to pace the loop.
+    ///
+    /// With a region set ([`ScreenCapture::set_region`]) the frame is only that part of the display.
     pub fn next_frame(&mut self, wait: Duration) -> Result<Option<ScreenFrame<'_>>> {
         let wait = wait.min(MAX_WAIT);
+        if let Some(r) = self.region {
+            if clamp_region(r, self.grabber.size()).is_none() {
+                // wholly off the display: keep the pace, and say so
+                if !wait.is_zero() {
+                    std::thread::sleep(wait);
+                }
+                self.last_view = None;
+                return Ok(Some(empty_frame(self.grabber.size())));
+            }
+        }
         let Some(shot) = self.grabber.grab_within(wait, &mut self.changes)? else {
             return Ok(None);
         };
-        let c = &self.changes;
-        Ok(Some(ScreenFrame { width: shot.width, height: shot.height, stride: shot.stride, bgra: shot.data, dirty: &c.dirty, moved: &c.moved, whole: c.whole, at: Instant::now() }))
+        let at = Instant::now();
+        let Some(want) = self.region.filter(|_| !self.native) else {
+            let c = &self.changes;
+            return Ok(Some(ScreenFrame { width: shot.width, height: shot.height, stride: shot.stride, bgra: shot.data, dirty: &c.dirty, moved: &c.moved, whole: c.whole, at, origin: shot.origin, display: shot.display }));
+        };
+        // the backend gives the whole display: crop its picture here
+        let Some(view) = clamp_region(want, shot.display) else {
+            self.last_view = None;
+            return Ok(Some(empty_frame(shot.display)));
+        };
+        if !crop_bgra(shot.data, shot.stride, view, &mut self.crop) {
+            return Err(Error::new(ErrorCode::InvalidInput, format!("the screen gave a picture of {} bytes, too short for {}x{}", shot.data.len(), shot.width, shot.height)));
+        }
+        let whole = self.changes.whole || self.last_view != Some(view);
+        self.last_view = Some(view);
+        if whole {
+            self.crop_changes.dirty.clear();
+            self.crop_changes.moved.clear();
+        } else {
+            crop_changes(view, &self.changes.dirty, &self.changes.moved, &mut self.crop_changes);
+        }
+        let c = &self.crop_changes;
+        Ok(Some(ScreenFrame { width: view.width, height: view.height, stride: view.width as usize * 4, bgra: &self.crop, dirty: &c.dirty, moved: &c.moved, whole, at, origin: (view.x, view.y), display: shot.display }))
+    }
+
+    /// Asks for only `region` of the display, from the next [`ScreenCapture::next_frame`] on; `None`
+    /// goes back to the whole display. The region is in display pixels (the top-left pixel is 0, 0)
+    /// and may be changed between any two calls, to follow a window, say.
+    ///
+    /// The region is clipped to the display, to any size and position (no rounding, so odd sizes and
+    /// origins are exact). The frame is exactly the display's pixels in that rectangle, plus the cursor
+    /// where it lies inside it, and carries its `origin`, its own size and the `display`'s size. Its
+    /// `dirty` and `moved` are the region's own (intersected with it and moved to its origin; a move
+    /// whose source is outside the region is given as dirty instead). The first frame after the
+    /// region's origin or size changed is `whole`.
+    ///
+    /// A region wholly off the display gives, after waiting `wait` (to keep the pace), a frame of
+    /// size 0 by 0 with no pixels, `whole` set and `origin` (0, 0).
+    ///
+    /// On Windows only the region is copied from the GPU, mapped and moved on the CPU, so the cost
+    /// scales with its area; changes elsewhere on the display do not produce frames. X11 and macOS
+    /// crop the whole display's picture in software: the same frames, at the whole display's cost.
+    pub fn set_region(&mut self, region: Option<Rect>) {
+        self.region = region;
+        self.native = self.grabber.set_region(region);
+    }
+
+    /// The region last given to [`ScreenCapture::set_region`].
+    pub fn region(&self) -> Option<Rect> {
+        self.region
     }
 }
 
@@ -432,6 +540,74 @@ pub(crate) fn fill_buffer<T: Default + Clone, E>(buf: &mut Vec<T>, mut call: imp
         }
     }
     Ok(None)
+}
+
+/// A frame of no pixels, for a region that lies off the `display`.
+fn empty_frame(display: (u32, u32)) -> ScreenFrame<'static> {
+    ScreenFrame { width: 0, height: 0, stride: 0, bgra: &[], dirty: &[], moved: &[], whole: true, at: Instant::now(), origin: (0, 0), display }
+}
+
+/// The part of a `display`-sized display that `region` covers; `None` when none of it does.
+pub(crate) fn clamp_region(region: Rect, display: (u32, u32)) -> Option<Rect> {
+    clipped(region.x as i64, region.y as i64, region.x as i64 + region.width as i64, region.y as i64 + region.height as i64, display.0, display.1)
+}
+
+/// Copies `rows` rows of `row` bytes, `pitch` bytes apart in `src`, into `dst` (replacing it). The last
+/// row need not be followed by padding. False, leaving `dst` empty, when `src` is too short.
+pub(crate) fn copy_rows(src: &[u8], pitch: usize, row: usize, rows: usize, dst: &mut Vec<u8>) -> bool {
+    dst.clear();
+    if rows == 0 || row == 0 {
+        return true;
+    }
+    let need = pitch.checked_mul(rows - 1).and_then(|n| n.checked_add(row));
+    if (rows > 1 && pitch < row) || need.is_none_or(|n| src.len() < n) {
+        return false;
+    }
+    dst.reserve(row * rows);
+    for y in 0..rows {
+        dst.extend_from_slice(&src[y * pitch..y * pitch + row]);
+    }
+    true
+}
+
+/// Copies `view` out of a BGRA picture whose rows are `stride` bytes apart into `dst`, tightly packed.
+/// False when the picture does not hold it.
+pub(crate) fn crop_bgra(data: &[u8], stride: usize, view: Rect, dst: &mut Vec<u8>) -> bool {
+    let (x, y, w) = (view.x as usize, view.y as usize, view.width as usize);
+    let start = y.checked_mul(stride).and_then(|n| n.checked_add(x * 4));
+    let ok = (x + w) * 4 <= stride;
+    match start.and_then(|s| data.get(s..)) {
+        Some(src) if ok => copy_rows(src, stride, w * 4, view.height as usize, dst),
+        _ => {
+            dst.clear();
+            false
+        }
+    }
+}
+
+/// Writes into `out` the changes of the display (`dirty` and `moved`, in display coordinates) as they
+/// are in `view`, in the view's own coordinates: rectangles are intersected with the view; a move
+/// keeps its source when that lies inside the view too, and is a dirty rectangle otherwise. `out.whole`
+/// is not touched.
+pub(crate) fn crop_changes(view: Rect, dirty: &[Rect], moved: &[MoveRect], out: &mut Changes) {
+    out.dirty.clear();
+    out.moved.clear();
+    let (vx, vy) = (view.x as i64, view.y as i64);
+    let inside = |r: &Rect| clipped(r.x as i64 - vx, r.y as i64 - vy, r.x as i64 + r.width as i64 - vx, r.y as i64 + r.height as i64 - vy, view.width, view.height);
+    for d in dirty {
+        out.dirty.extend(inside(d));
+    }
+    for m in moved {
+        let Some(to) = inside(&m.to) else { continue };
+        // the clipped destination's source: the move's own, shifted as the destination was clipped
+        let fx = m.from.0 as i64 + (to.x as i64 + vx - m.to.x as i64) - vx;
+        let fy = m.from.1 as i64 + (to.y as i64 + vy - m.to.y as i64) - vy;
+        if fx >= 0 && fy >= 0 && fx + to.width as i64 <= view.width as i64 && fy + to.height as i64 <= view.height as i64 {
+            out.moved.push(MoveRect { from: (fx as u32, fy as u32), to });
+        } else {
+            out.dirty.push(to);
+        }
+    }
 }
 
 /// The rectangle with the given edges (right and bottom exclusive) clipped to a `w` by `h` picture;
@@ -564,7 +740,7 @@ mod tests {
 
     fn convert(px: &[[u8; 4]], w: u32, h: u32, dw: usize, dh: usize) -> Vec<u8> {
         let d = shot(px, w, h);
-        let f = bgra_to_y4m(&Shot { data: &d, stride: w as usize * 4, width: w, height: h }, dw, dh).unwrap();
+        let f = bgra_to_y4m(&Shot::new(&d, w as usize * 4, w, h), dw, dh).unwrap();
         assert_eq!(&f[..6], b"FRAME\n");
         f[6..].to_vec()
     }
@@ -610,13 +786,13 @@ mod tests {
             padded.extend_from_slice(row);
             padded.extend_from_slice(&[9; 4]);
         }
-        let f = bgra_to_y4m(&Shot { data: &padded, stride: 12, width: 2, height: 2 }, 2, 2).unwrap();
+        let f = bgra_to_y4m(&Shot::new(&padded, 12, 2, 2), 2, 2).unwrap();
         assert_eq!(&f[6..], &out[..]);
         // too short, or a stride narrower than the picture
         d.truncate(11);
-        assert!(bgra_to_y4m(&Shot { data: &d, stride: 8, width: 2, height: 2 }, 2, 2).is_none());
-        assert!(bgra_to_y4m(&Shot { data: &padded, stride: 4, width: 2, height: 2 }, 2, 2).is_none());
-        assert!(bgra_to_y4m(&Shot { data: &padded, stride: 12, width: 2, height: 2 }, 3, 2).is_none(), "an odd size");
+        assert!(bgra_to_y4m(&Shot::new(&d, 8, 2, 2), 2, 2).is_none());
+        assert!(bgra_to_y4m(&Shot::new(&padded, 4, 2, 2), 2, 2).is_none());
+        assert!(bgra_to_y4m(&Shot::new(&padded, 12, 2, 2), 3, 2).is_none(), "an odd size");
     }
 
     #[test]
@@ -633,7 +809,7 @@ mod tests {
         let d = vec![200u8; 8 * 6 * 4];
         let mut y = y4m_header(8, 6, rational(30.0));
         for _ in 0..2 {
-            y.extend(bgra_to_y4m(&Shot { data: &d, stride: 32, width: 8, height: 6 }, 8, 6).unwrap());
+            y.extend(bgra_to_y4m(&Shot::new(&d, 32, 8, 6), 8, 6).unwrap());
         }
         let mut s = ironav_formats::stream::stream_demuxer(&y, &Default::default()).unwrap();
         s.feed(&y).unwrap();
@@ -703,7 +879,7 @@ mod tests {
             (4, 2)
         }
         fn grab(&mut self) -> Result<Option<Shot<'_>>> {
-            Ok(if std::mem::replace(&mut self.sent, true) { None } else { Some(Shot { data: &self.data, stride: 16, width: 4, height: 2 }) })
+            Ok(if std::mem::replace(&mut self.sent, true) { None } else { Some(Shot::new(&self.data, 16, 4, 2)) })
         }
     }
 
@@ -746,6 +922,187 @@ mod tests {
         assert!(t.join().unwrap());
     }
 
+    /// A `w` by `h` display of which pixel (x, y) is [x, y, 7, 255], rows `pitch` bytes apart (the padding is 0xEE).
+    fn pattern(w: u32, h: u32, pitch: usize) -> Vec<u8> {
+        let mut d = vec![0xEE; pitch * h as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let i = y as usize * pitch + x as usize * 4;
+                d[i..i + 4].copy_from_slice(&[x as u8, y as u8, 7, 255]);
+            }
+        }
+        d
+    }
+
+    /// Whether `data` (rows `stride` apart) holds, at `origin`, the pattern's pixels for `w` by `h`.
+    fn is_pattern(data: &[u8], stride: usize, origin: (u32, u32), w: u32, h: u32) -> bool {
+        (0..h).all(|y| (0..w).all(|x| data[y as usize * stride + x as usize * 4..][..4] == [(origin.0 + x) as u8, (origin.1 + y) as u8, 7, 255]))
+    }
+
+    #[test]
+    fn a_region_is_clamped_to_the_display() {
+        let r = |x, y, width, height| Some(Rect { x, y, width, height });
+        let c = |x, y, w, h| clamp_region(Rect::new(x, y, w, h), (100, 50));
+        assert_eq!(c(0, 0, 100, 50), r(0, 0, 100, 50), "the whole display");
+        assert_eq!(c(10, 20, 30, 10), r(10, 20, 30, 10), "inside");
+        assert_eq!(c(90, 40, 30, 30), r(90, 40, 10, 10), "past the lower right corner");
+        assert_eq!(c(99, 49, 1, 1), r(99, 49, 1, 1), "the last pixel");
+        assert_eq!(c(100, 0, 10, 10), None, "just right of the display");
+        assert_eq!(c(0, 50, 10, 10), None, "just below the display");
+        assert_eq!(c(5, 5, 0, 10), None, "no width");
+        assert_eq!(c(5, 5, 10, 0), None, "no height");
+        assert_eq!(c(u32::MAX, u32::MAX, u32::MAX, u32::MAX), None, "far off, and no overflow");
+        assert_eq!(c(1, 1, u32::MAX, u32::MAX), r(1, 1, 99, 49), "huge");
+        assert_eq!(c(3, 3, 7, 5), r(3, 3, 7, 5), "odd sizes and origins are kept");
+    }
+
+    #[test]
+    fn rows_are_copied_from_a_buffer_with_padding() {
+        // 3 rows of 2 pixels (8 bytes) a 12-byte pitch apart; the last row has no padding after it
+        let src: Vec<u8> = (0..3).flat_map(|y| (0..12).map(move |i| if i < 8 { (y * 10 + i) as u8 } else { 0xEE })).collect();
+        let mut dst = vec![9u8; 100];
+        assert!(copy_rows(&src[..12 * 2 + 8], 12, 8, 3, &mut dst));
+        assert_eq!(dst, [0, 1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 14, 15, 16, 17, 20, 21, 22, 23, 24, 25, 26, 27]);
+        // too short for the last row, a pitch narrower than a row, and nothing to copy
+        assert!(!copy_rows(&src[..12 * 2 + 7], 12, 8, 3, &mut dst));
+        assert!(dst.is_empty());
+        assert!(!copy_rows(&src, 4, 8, 3, &mut dst));
+        assert!(copy_rows(&src, 12, 8, 0, &mut dst) && dst.is_empty());
+        assert!(copy_rows(&src[..8], 4, 8, 1, &mut dst), "a single row needs no pitch");
+        assert_eq!(dst, &src[..8]);
+    }
+
+    #[test]
+    fn a_region_is_cropped_from_a_picture_exactly() {
+        // 10x6 display, rows padded to 48 bytes
+        let d = pattern(10, 6, 48);
+        let mut out = Vec::new();
+        for (x, y, w, h) in [(0, 0, 10, 6), (3, 2, 4, 3), (9, 5, 1, 1), (0, 5, 10, 1), (7, 0, 3, 6), (1, 1, 3, 2)] {
+            assert!(crop_bgra(&d, 48, Rect::new(x, y, w, h), &mut out), "{x},{y} {w}x{h}");
+            assert_eq!(out.len(), (w * h * 4) as usize);
+            assert!(is_pattern(&out, w as usize * 4, (x, y), w, h), "{x},{y} {w}x{h}");
+        }
+        // a region that does not fit the stride or the data is refused
+        assert!(!crop_bgra(&d, 48, Rect::new(8, 0, 5, 1), &mut out));
+        assert!(!crop_bgra(&d[..48 * 5], 48, Rect::new(0, 5, 2, 1), &mut out));
+        assert!(out.is_empty());
+    }
+
+    fn changes(view: Rect, dirty: &[Rect], moved: &[MoveRect]) -> (Vec<Rect>, Vec<MoveRect>) {
+        let mut out = Changes { whole: false, dirty: vec![Rect::new(9, 9, 9, 9)], moved: vec![MoveRect::new((1, 1), Rect::new(1, 1, 1, 1))] };
+        crop_changes(view, dirty, moved, &mut out);
+        (out.dirty, out.moved)
+    }
+
+    #[test]
+    fn changes_are_intersected_with_a_region_and_moved_to_its_origin() {
+        let view = Rect::new(100, 50, 40, 30);
+        let (dirty, moved) = changes(view, &[Rect::new(110, 60, 5, 5), Rect::new(90, 40, 20, 20), Rect::new(0, 0, 50, 50), Rect::new(130, 70, 50, 50), Rect::new(140, 50, 5, 5), Rect::new(100, 80, 5, 5)], &[]);
+        assert_eq!(dirty, [Rect::new(10, 10, 5, 5), Rect::new(0, 0, 10, 10), Rect::new(30, 20, 10, 10)], "outside, and just outside, are dropped; the old contents are replaced");
+        assert!(moved.is_empty());
+        // a move inside the region keeps its source, translated
+        let (dirty, moved) = changes(view, &[], &[MoveRect::new((105, 55), Rect::new(110, 60, 10, 10))]);
+        assert!(dirty.is_empty());
+        assert_eq!(moved, [MoveRect::new((5, 5), Rect::new(10, 10, 10, 10))]);
+        // a destination cut by the region's edge moves its source with it
+        let (dirty, moved) = changes(view, &[], &[MoveRect::new((120, 70), Rect::new(95, 60, 10, 5))]);
+        assert!(dirty.is_empty());
+        assert_eq!(moved, [MoveRect::new((25, 20), Rect::new(0, 10, 5, 5))]);
+        // a source outside the region becomes dirty; a destination outside it is nothing
+        let (dirty, moved) = changes(view, &[], &[MoveRect::new((10, 10), Rect::new(110, 60, 10, 10)), MoveRect::new((110, 60), Rect::new(10, 10, 10, 10))]);
+        assert_eq!(dirty, [Rect::new(10, 10, 10, 10)]);
+        assert!(moved.is_empty());
+        // a source that sticks out of the region below makes the move dirty too
+        let (dirty, moved) = changes(view, &[], &[MoveRect::new((130, 70), Rect::new(100, 50, 20, 20))]);
+        assert_eq!((dirty, moved), (vec![Rect::new(0, 0, 20, 20)], vec![]));
+    }
+
+    /// A display that shows `data` (a whole picture) each time, and changes `all` of it.
+    struct Pic {
+        data: Vec<u8>,
+        pitch: usize,
+        size: (u32, u32),
+        dirty: Vec<Rect>,
+    }
+
+    impl Grabber for Pic {
+        fn size(&self) -> (u32, u32) {
+            self.size
+        }
+        fn grab(&mut self) -> Result<Option<Shot<'_>>> {
+            Ok(Some(Shot::new(&self.data, self.pitch, self.size.0, self.size.1)))
+        }
+        fn grab_within(&mut self, _: Duration, changes: &mut Changes) -> Result<Option<Shot<'_>>> {
+            changes.whole = self.dirty.is_empty();
+            changes.dirty = self.dirty.clone();
+            changes.moved.clear();
+            self.grab()
+        }
+    }
+
+    fn capture_of(w: u32, h: u32, pitch: usize, dirty: Vec<Rect>) -> ScreenCapture {
+        ScreenCapture { grabber: Box::new(Pic { data: pattern(w, h, pitch), pitch, size: (w, h), dirty }), changes: Changes::default(), region: None, native: false, last_view: None, crop: Vec::new(), crop_changes: Changes::default() }
+    }
+
+    #[test]
+    fn without_a_region_the_frame_is_the_whole_display() {
+        let mut cap = capture_of(10, 6, 48, Vec::new());
+        let f = cap.next_frame(Duration::ZERO).unwrap().unwrap();
+        assert_eq!((f.width, f.height, f.stride, f.origin, f.display), (10, 6, 48, (0, 0), (10, 6)));
+        assert!(f.whole && is_pattern(f.bgra, f.stride, (0, 0), 10, 6));
+    }
+
+    #[test]
+    fn a_region_frame_holds_exactly_the_regions_pixels() {
+        let mut cap = capture_of(10, 6, 48, Vec::new());
+        for (x, y, w, h) in [(3, 2, 4, 3), (1, 1, 3, 1), (0, 0, 10, 6), (9, 5, 1, 1), (2, 4, 5, 2)] {
+            cap.set_region(Some(Rect::new(x, y, w, h)));
+            assert_eq!(cap.region(), Some(Rect::new(x, y, w, h)));
+            let f = cap.next_frame(Duration::ZERO).unwrap().unwrap();
+            assert_eq!((f.width, f.height, f.stride, f.origin, f.display), (w, h, w as usize * 4, (x, y), (10, 6)));
+            assert_eq!(f.bgra.len(), (w * h * 4) as usize);
+            assert!(f.whole, "the region moved");
+            assert!(is_pattern(f.bgra, f.stride, (x, y), w, h), "{x},{y} {w}x{h}");
+        }
+        // a region partly off the display is cut to it, and says where it starts
+        cap.set_region(Some(Rect::new(7, 4, 20, 20)));
+        let f = cap.next_frame(Duration::ZERO).unwrap().unwrap();
+        assert_eq!((f.width, f.height, f.origin), (3, 2, (7, 4)));
+        assert!(is_pattern(f.bgra, f.stride, (7, 4), 3, 2));
+        // back to the whole display
+        cap.set_region(None);
+        let f = cap.next_frame(Duration::ZERO).unwrap().unwrap();
+        assert_eq!((f.width, f.height, f.origin), (10, 6, (0, 0)));
+    }
+
+    #[test]
+    fn a_region_off_the_display_gives_a_frame_of_no_size() {
+        let mut cap = capture_of(10, 6, 40, Vec::new());
+        for r in [Rect::new(10, 0, 4, 4), Rect::new(0, 6, 4, 4), Rect::new(2, 2, 0, 3), Rect::new(u32::MAX, 0, 5, 5)] {
+            cap.set_region(Some(r));
+            let f = cap.next_frame(Duration::ZERO).unwrap().unwrap();
+            assert_eq!((f.width, f.height, f.stride, f.bgra.len(), f.display, f.origin, f.whole), (0, 0, 0, 0, (10, 6), (0, 0), true), "{r:?}");
+        }
+    }
+
+    #[test]
+    fn a_region_frames_changes_are_the_regions_own() {
+        let mut cap = capture_of(10, 6, 40, vec![Rect::new(0, 0, 2, 2), Rect::new(4, 3, 3, 2), Rect::new(8, 0, 2, 6)]);
+        cap.set_region(Some(Rect::new(3, 2, 4, 3)));
+        // the first frame at a region is whole, with no rectangles
+        let f = cap.next_frame(Duration::ZERO).unwrap().unwrap();
+        assert!(f.whole && f.dirty.is_empty());
+        // then only what touches the region, in its coordinates
+        let f = cap.next_frame(Duration::ZERO).unwrap().unwrap();
+        assert!(!f.whole);
+        assert_eq!(f.dirty, [Rect::new(1, 1, 3, 2)]);
+        // moving the region makes the next frame whole again; keeping it does not
+        cap.set_region(Some(Rect::new(4, 2, 4, 3)));
+        assert!(cap.next_frame(Duration::ZERO).unwrap().unwrap().whole);
+        cap.set_region(Some(Rect::new(4, 2, 4, 3)));
+        assert!(!cap.next_frame(Duration::ZERO).unwrap().unwrap().whole);
+    }
+
     #[test]
     fn a_frame_can_be_made_outside_a_capture() {
         let px = vec![0u8; 16 * 2];
@@ -756,6 +1113,9 @@ mod tests {
         let moved = [MoveRect::new((0, 1), Rect::new(0, 0, 3, 1))];
         let f = f.with_changes(false, &dirty, &moved);
         assert_eq!((f.width, f.height, f.stride, f.at), (3, 2, 16, at));
+        assert_eq!((f.origin, f.display), ((0, 0), (3, 2)));
+        let f = f.with_region((5, 6), (10, 10));
+        assert_eq!((f.origin, f.display), ((5, 6), (10, 10)));
         assert!(!f.whole);
         assert_eq!(f.dirty, &dirty);
         assert_eq!(f.moved[0].from, (0, 1));

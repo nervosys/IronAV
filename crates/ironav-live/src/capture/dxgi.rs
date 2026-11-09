@@ -6,14 +6,14 @@
 //! lost (a mode change, or the secure desktop of a UAC prompt or the lock screen), it is made again
 //! on the following pictures, and the last picture is repeated meanwhile.
 
-use super::screen::{clipped, display_name, fill_buffer, Changes, Fill, Grabber, Listed, MoveRect, Rect, Shot};
+use super::screen::{clamp_region, clipped, copy_rows, crop_bgra, crop_changes, display_name, fill_buffer, Changes, Fill, Grabber, Listed, MoveRect, Rect, Shot};
 use ironav_core::{Error, ErrorCode, Result};
 use std::time::{Duration, Instant};
 use windows::core::Interface;
 use windows::Win32::Foundation::{HMODULE, RECT};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_FLAG, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_FLAG, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
@@ -98,26 +98,33 @@ struct Pointer {
 }
 
 impl Pointer {
-    /// The rectangle the cursor covers on a `w` by `h` picture.
+    /// The rectangle the cursor covers on a `w` by `h` picture of the whole display.
     fn rect(&self, w: u32, h: u32) -> Option<Rect> {
+        self.rect_in(Rect::new(0, 0, w, h))
+    }
+
+    /// The rectangle the cursor covers in `view`, a part of the display, in the view's own coordinates;
+    /// `None` when it does not touch the view.
+    fn rect_in(&self, view: Rect) -> Option<Rect> {
         let rows = if self.kind == 1 { self.height / 2 } else { self.height };
-        clipped(self.x as i64, self.y as i64, self.x as i64 + self.width as i64, self.y as i64 + rows as i64, w, h)
+        let (vx, vy) = (view.x as i64, view.y as i64);
+        clipped(self.x as i64 - vx, self.y as i64 - vy, self.x as i64 + self.width as i64 - vx, self.y as i64 + rows as i64 - vy, view.width, view.height)
     }
 }
 
-/// Draws the cursor into 32-bit BGRA pixels `stride` bytes apart (`w` by `h`), clipping at the
-/// edges. Colour cursors blend by their alpha; masked colour cursors replace the picture where
+/// Draws the cursor into 32-bit BGRA pixels `stride` bytes apart (`w` by `h`) that are the part of the
+/// display whose top-left pixel is at `origin`, clipping at the edges. Colour cursors blend by their alpha; masked colour cursors replace the picture where
 /// their alpha is 0 and exclusive-or it where it is 255; monochrome ones are an AND mask over an
 /// XOR mask (stacked, so their height is twice the cursor's).
-fn draw_pointer(canvas: &mut [u8], stride: usize, w: usize, h: usize, p: &Pointer) {
+fn draw_pointer(canvas: &mut [u8], stride: usize, w: usize, h: usize, origin: (i32, i32), p: &Pointer) {
     let rows = if p.kind == 1 { p.height / 2 } else { p.height };
     for cy in 0..rows {
-        let y = p.y + cy as i32;
+        let y = p.y - origin.1 + cy as i32;
         if y < 0 || y as usize >= h {
             continue;
         }
         for cx in 0..p.width {
-            let x = p.x + cx as i32;
+            let x = p.x - origin.0 + cx as i32;
             if x < 0 || x as usize >= w {
                 continue;
             }
@@ -169,10 +176,18 @@ pub(super) struct Dxgi {
     output: IDXGIOutput1,
     dup: Option<IDXGIOutputDuplication>,
     staging: Option<(ID3D11Texture2D, u32, u32)>,
-    /// The latest desktop, without the cursor.
+    /// With a region asked for: a copy of the whole desktop kept on the GPU, so that the region can
+    /// move without waiting for the desktop to change.
+    shadow: Option<(ID3D11Texture2D, u32, u32)>,
+    /// The part of the display asked for, as given (not clipped).
+    want: Option<Rect>,
+    /// The part of the display that `desktop` holds: all of it, or the clipped region.
+    view: Rect,
+    /// The latest desktop (or its region), without the cursor.
     desktop: Vec<u8>,
-    /// The desktop with the cursor drawn, when it is asked for and visible.
+    /// The desktop (or region) with the cursor drawn, when it is asked for and visible.
     shown: Vec<u8>,
+    /// The display's size.
     size: (u32, u32),
     cursor: bool,
     pointer: Option<Pointer>,
@@ -181,6 +196,8 @@ pub(super) struct Dxgi {
     move_buf: Vec<DXGI_OUTDUPL_MOVE_RECT>,
     /// The changes of a `grab` that has no caller to write them to.
     scratch: Changes,
+    /// The display-wide rectangles of a frame while they are cropped to the region.
+    tmp: Changes,
     /// The next frame is whole: the first, and the first after the duplication was lost.
     whole_pending: bool,
     /// The picture taken at open has not been given yet.
@@ -200,7 +217,7 @@ pub(super) fn open(index: usize, cursor: bool) -> Result<Dxgi> {
         return Err(Error::new(ErrorCode::HardwareUnavailable, "the display adapter gave no Direct3D device"));
     };
     let output = f.output.cast::<IDXGIOutput1>().map_err(|e| fail("Desktop Duplication needs DXGI 1.2", e))?;
-    let mut d = Dxgi { device, ctx, output, dup: None, staging: None, desktop: Vec::new(), shown: Vec::new(), size: (f.width, f.height), cursor, pointer: None, dirty_buf: Vec::new(), move_buf: Vec::new(), scratch: Changes::default(), whole_pending: true, first_ready: false, lost_since: None };
+    let mut d = Dxgi { device, ctx, output, dup: None, staging: None, shadow: None, want: None, view: Rect::new(0, 0, 0, 0), desktop: Vec::new(), shown: Vec::new(), size: (f.width, f.height), cursor, pointer: None, dirty_buf: Vec::new(), move_buf: Vec::new(), scratch: Changes::default(), tmp: Changes::default(), whole_pending: true, first_ready: false, lost_since: None };
     d.dup = Some(d.duplicate()?);
     // a still desktop may not have a picture ready at once: give the first one a moment
     d.first_ready = matches!(d.acquire(500, &mut Changes::default())?, Outcome::Desktop);
@@ -284,7 +301,73 @@ impl Dxgi {
             // the cursor's old and new places are both changed
             out.dirty.extend([before, self.cursor_rect()].into_iter().flatten());
         }
+        if self.want.is_some() {
+            // only the region is wanted: what changed elsewhere is not a frame
+            let Some(view) = self.target() else {
+                self.clear_view();
+                return Ok(Outcome::Nothing);
+            };
+            let moved_view = view != self.view || self.desktop.is_empty();
+            if moved_view {
+                out.whole = true;
+            }
+            if out.whole {
+                out.dirty.clear();
+                out.moved.clear();
+            } else {
+                std::mem::swap(&mut out.dirty, &mut self.tmp.dirty);
+                std::mem::swap(&mut out.moved, &mut self.tmp.moved);
+                crop_changes(view, &self.tmp.dirty, &self.tmp.moved, out);
+                if out.dirty.is_empty() && out.moved.is_empty() {
+                    return Ok(Outcome::Nothing);
+                }
+            }
+            if picture || moved_view {
+                let Some((shadow, ..)) = self.shadow.clone() else {
+                    return Ok(Outcome::Nothing);
+                };
+                self.extract(&shadow, view)?;
+            }
+        }
         Ok(if picture { Outcome::Desktop } else { Outcome::Cursor })
+    }
+
+    /// The part of the display that is wanted, clipped to it; `None` when nothing of it is on the display.
+    fn target(&self) -> Option<Rect> {
+        clamp_region(self.want.unwrap_or_else(|| Rect::new(0, 0, self.size.0, self.size.1)), self.size)
+    }
+
+    /// Forgets the picture: a region that is off the display shows nothing.
+    fn clear_view(&mut self) {
+        self.desktop.clear();
+        self.view = Rect::new(0, 0, 0, 0);
+    }
+
+    /// Makes `desktop` hold what is wanted now when it holds something else, from what is at hand (the
+    /// GPU's copy of the desktop, or the whole picture read before the region was asked for), without
+    /// waiting for the display to change. True when it did: the picture is then whole.
+    fn retarget(&mut self) -> Result<bool> {
+        let Some(view) = self.target() else {
+            self.clear_view();
+            return Ok(false);
+        };
+        if view == self.view && !self.desktop.is_empty() {
+            return Ok(false);
+        }
+        if let Some((shadow, ..)) = self.shadow.clone() {
+            self.extract(&shadow, view)?;
+            if self.want.is_none() {
+                self.shadow = None;
+            }
+            return Ok(true);
+        }
+        let (w, h) = self.size;
+        if !self.desktop.is_empty() && self.view == Rect::new(0, 0, w, h) && crop_bgra(&self.desktop, w as usize * 4, view, &mut self.shown) {
+            std::mem::swap(&mut self.desktop, &mut self.shown);
+            self.view = view;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// Reads the frame's dirty and move rectangles into `out`, clipped to the picture; false when the
@@ -344,21 +427,23 @@ impl Dxgi {
         if self.desktop.is_empty() {
             return None;
         }
-        let (w, h) = self.size;
-        let stride = w as usize * 4;
+        let v = self.view;
+        let stride = v.width as usize * 4;
         let data = match &self.pointer {
-            Some(p) if self.cursor && p.visible => {
+            // the copy to draw into is only made when the cursor is over the picture
+            Some(p) if self.cursor && p.visible && p.rect_in(v).is_some() => {
                 self.shown.clear();
                 self.shown.extend_from_slice(&self.desktop);
-                draw_pointer(&mut self.shown, stride, w as usize, h as usize, p);
+                draw_pointer(&mut self.shown, stride, v.width as usize, v.height as usize, (v.x as i32, v.y as i32), p);
                 &self.shown
             }
             _ => &self.desktop,
         };
-        Some(Shot { data, stride, width: w, height: h })
+        Some(Shot::new(data, stride, v.width, v.height).at((v.x, v.y), self.size))
     }
 
-    /// Copies the desktop texture into `desktop`.
+    /// Takes the desktop texture: into `desktop` when the whole display is wanted; otherwise into the
+    /// GPU's own copy of it, from which `extract` takes the region.
     fn copy(&mut self, res: &IDXGIResource) -> Result<()> {
         let tex: ID3D11Texture2D = res.cast().map_err(|e| fail("reading the screen", e))?;
         let mut desc = D3D11_TEXTURE2D_DESC::default();
@@ -367,19 +452,46 @@ impl Dxgi {
             return Err(Error::new(ErrorCode::UnsupportedFormat, format!("the display's pictures are in DXGI format {}, not 8-bit BGRA", desc.Format.0)).hint("turn off HDR for this display in Windows Settings > System > Display"));
         }
         let (w, h) = (desc.Width, desc.Height);
-        if self.staging.as_ref().is_none_or(|s| (s.1, s.2) != (w, h)) {
-            let sd = D3D11_TEXTURE2D_DESC {
-                Width: w,
-                Height: h,
-                MipLevels: 1,
-                ArraySize: 1,
-                Format: desc.Format,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                Usage: D3D11_USAGE_STAGING,
-                BindFlags: 0,
-                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
-                MiscFlags: 0,
-            };
+        if self.want.is_none() {
+            self.shadow = None;
+            self.size = (w, h);
+            return self.extract(&tex, Rect::new(0, 0, w, h));
+        }
+        if self.shadow.as_ref().is_none_or(|s| (s.1, s.2) != (w, h)) {
+            let sd = D3D11_TEXTURE2D_DESC { Usage: D3D11_USAGE_DEFAULT, CPUAccessFlags: 0, ..self.texture_desc(w, h) };
+            let mut t = None;
+            unsafe { self.device.CreateTexture2D(&sd, None, Some(&mut t)) }.map_err(|e| fail("reading the screen", e))?;
+            self.shadow = t.map(|t| (t, w, h));
+        }
+        let Some((shadow, ..)) = &self.shadow else {
+            return Err(Error::new(ErrorCode::HardwareUnavailable, "the display adapter made no texture"));
+        };
+        unsafe { self.ctx.CopyResource(shadow, &tex) };
+        self.size = (w, h);
+        Ok(())
+    }
+
+    fn texture_desc(&self, w: u32, h: u32) -> D3D11_TEXTURE2D_DESC {
+        D3D11_TEXTURE2D_DESC {
+            Width: w,
+            Height: h,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_STAGING,
+            BindFlags: 0,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+            MiscFlags: 0,
+        }
+    }
+
+    /// Copies `r` (inside the display) of `src`, a texture of the display's size, into `desktop`, through
+    /// a staging texture of the rectangle's size, which is kept while that size stays.
+    fn extract(&mut self, src: &ID3D11Texture2D, r: Rect) -> Result<()> {
+        let (w, h) = (r.width, r.height);
+        if needs_staging(self.staging.as_ref().map(|s| (s.1, s.2)), (w, h)) {
+            let sd = self.texture_desc(w, h);
             let mut t = None;
             unsafe { self.device.CreateTexture2D(&sd, None, Some(&mut t)) }.map_err(|e| fail("reading the screen", e))?;
             self.staging = t.map(|t| (t, w, h));
@@ -387,20 +499,31 @@ impl Dxgi {
         let Some((staging, ..)) = &self.staging else {
             return Err(Error::new(ErrorCode::HardwareUnavailable, "the display adapter made no staging texture"));
         };
-        unsafe { self.ctx.CopyResource(staging, &tex) };
+        if (r.x, r.y, w, h) == (0, 0, self.size.0, self.size.1) {
+            unsafe { self.ctx.CopyResource(staging, src) };
+        } else {
+            let region = D3D11_BOX { left: r.x, top: r.y, front: 0, right: r.x + w, bottom: r.y + h, back: 1 };
+            unsafe { self.ctx.CopySubresourceRegion(staging, 0, 0, 0, 0, src, 0, Some(&region)) };
+        }
         let mut m = D3D11_MAPPED_SUBRESOURCE::default();
         unsafe { self.ctx.Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut m)) }.map_err(|e| fail("reading the screen", e))?;
-        let (row, pitch) = (w as usize * 4, m.RowPitch as usize);
-        self.desktop.resize(row * h as usize, 0);
-        for y in 0..h as usize {
-            // SAFETY: the mapped texture holds `h` rows of `pitch` bytes, each with `row` bytes of pixels
-            let src = unsafe { std::slice::from_raw_parts((m.pData as *const u8).add(y * pitch), row) };
-            self.desktop[y * row..(y + 1) * row].copy_from_slice(src);
-        }
+        let (row, pitch, rows) = (w as usize * 4, m.RowPitch as usize, h as usize);
+        // SAFETY: the mapped texture holds `h` rows of `pitch` bytes, each with `row` bytes of pixels
+        let mapped = unsafe { std::slice::from_raw_parts(m.pData as *const u8, if rows == 0 { 0 } else { pitch * (rows - 1) + row }) };
+        let ok = copy_rows(mapped, pitch, row, rows, &mut self.desktop);
         unsafe { self.ctx.Unmap(staging, 0) };
-        self.size = (w, h);
+        if !ok {
+            return Err(Error::new(ErrorCode::Internal, "the mapped picture is shorter than its size"));
+        }
+        self.view = r;
         Ok(())
     }
+}
+
+/// Whether the staging texture (of the size it has, if any) must be made again for a picture of `want`:
+/// when the size changes, not when only the origin does.
+fn needs_staging(have: Option<(u32, u32)>, want: (u32, u32)) -> bool {
+    have != Some(want)
 }
 
 impl Grabber for Dxgi {
@@ -408,7 +531,17 @@ impl Grabber for Dxgi {
         self.size
     }
 
+    fn set_region(&mut self, region: Option<Rect>) -> bool {
+        self.want = region;
+        true
+    }
+
     fn grab(&mut self) -> Result<Option<Shot<'_>>> {
+        if self.retarget()? {
+            self.first_ready = false;
+            self.whole_pending = false;
+            return Ok(self.shot());
+        }
         // the device's own loop takes whatever is ready, and does not say what changed
         let mut scratch = std::mem::take(&mut self.scratch);
         let fresh = if std::mem::take(&mut self.first_ready) { Ok(true) } else { self.acquire(0, &mut scratch).map(|o| o != Outcome::Nothing) };
@@ -421,7 +554,8 @@ impl Grabber for Dxgi {
     }
 
     fn grab_within(&mut self, wait: Duration, changes: &mut Changes) -> Result<Option<Shot<'_>>> {
-        if std::mem::take(&mut self.first_ready) {
+        let retargeted = self.retarget()?;
+        if std::mem::take(&mut self.first_ready) || retargeted {
             changes.whole = true;
             changes.dirty.clear();
             changes.moved.clear();
@@ -526,7 +660,7 @@ mod tests {
         // a 2x1 cursor: opaque white, then half-transparent white, on black
         let p = pointer(2, 2, 1, 8, vec![255, 255, 255, 255, 255, 255, 255, 128], 1, 0);
         let mut c = vec![0u8; 4 * 4 * 2];
-        draw_pointer(&mut c, 16, 4, 2, &p);
+        draw_pointer(&mut c, 16, 4, 2, (0, 0), &p);
         assert_eq!(&c[4..8], &[255, 255, 255, 0]);
         assert_eq!(&c[8..12], &[128, 128, 128, 0]);
         assert_eq!(&c[..4], &[0, 0, 0, 0]);
@@ -534,9 +668,9 @@ mod tests {
         assert!(c[16..].iter().all(|&b| b == 0));
         // partly off the right edge and off the top: only what lies inside is drawn
         let mut c = vec![0u8; 4 * 4 * 2];
-        draw_pointer(&mut c, 16, 4, 2, &pointer(2, 2, 1, 8, vec![255; 8], 3, 0));
+        draw_pointer(&mut c, 16, 4, 2, (0, 0), &pointer(2, 2, 1, 8, vec![255; 8], 3, 0));
         assert_eq!(&c[12..16], &[255, 255, 255, 0]);
-        draw_pointer(&mut c, 16, 4, 2, &pointer(2, 2, 1, 8, vec![255; 8], 0, -1));
+        draw_pointer(&mut c, 16, 4, 2, (0, 0), &pointer(2, 2, 1, 8, vec![255; 8], 0, -1));
         assert_eq!(c.iter().filter(|&&b| b == 255).count(), 3);
     }
 
@@ -546,15 +680,63 @@ mod tests {
         // masked colour: alpha 0 replaces, alpha 255 exclusive-ors
         let p = pointer(4, 2, 1, 8, vec![1, 2, 3, 0, 0xFF, 0xFF, 0xFF, 255], 0, 0);
         let mut c = [screen, screen].concat();
-        draw_pointer(&mut c, 8, 2, 1, &p);
+        draw_pointer(&mut c, 8, 2, 1, (0, 0), &p);
         assert_eq!(&c[..4], &[1, 2, 3, 255]);
         assert_eq!(&c[4..], &[10 ^ 0xFF, 20 ^ 0xFF, 30 ^ 0xFF, 255]);
         // monochrome 2x1 (the masks stacked: height 2): AND 0 / XOR 0 gives black, AND 1 / XOR 1 inverts
         let p = pointer(1, 2, 2, 1, vec![0b0100_0000, 0b0100_0000], 0, 0);
         let mut c = [screen, screen].concat();
-        draw_pointer(&mut c, 8, 2, 1, &p);
+        draw_pointer(&mut c, 8, 2, 1, (0, 0), &p);
         assert_eq!(&c[..3], &[0, 0, 0]);
         assert_eq!(&c[4..7], &[!10, !20, !30]);
+    }
+
+    #[test]
+    fn the_cursor_is_found_in_a_region_in_the_regions_coordinates() {
+        // a 3x4 colour cursor at (10, 20) on the display
+        let p = pointer(2, 3, 4, 12, vec![0; 48], 10, 20);
+        let r = |x, y, width, height| Some(Rect { x, y, width, height });
+        // the region's top-left corner is the cursor's
+        assert_eq!(p.rect_in(Rect::new(10, 20, 100, 100)), r(0, 0, 3, 4));
+        // the region starts inside the cursor: only the cursor's lower right part is in it
+        assert_eq!(p.rect_in(Rect::new(11, 21, 100, 100)), r(0, 0, 2, 3));
+        // the region ends inside the cursor
+        assert_eq!(p.rect_in(Rect::new(0, 0, 12, 22)), r(10, 20, 2, 2));
+        // the cursor lies in the region, which is not at the display's corner
+        assert_eq!(p.rect_in(Rect::new(5, 15, 50, 50)), r(5, 5, 3, 4));
+        // outside on each side, and touching: the edges are exclusive
+        assert_eq!(p.rect_in(Rect::new(0, 0, 10, 100)), None);
+        assert_eq!(p.rect_in(Rect::new(13, 0, 10, 100)), None);
+        assert_eq!(p.rect_in(Rect::new(0, 0, 100, 20)), None);
+        assert_eq!(p.rect_in(Rect::new(0, 24, 100, 10)), None);
+        // a cursor with its hot spot off the display's corner (negative position)
+        let n = pointer(2, 3, 4, 12, vec![0; 48], -2, -1);
+        assert_eq!(n.rect_in(Rect::new(0, 0, 50, 50)), r(0, 0, 1, 3));
+        assert_eq!(n.rect(50, 50), r(0, 0, 1, 3));
+        assert_eq!(n.rect_in(Rect::new(1, 1, 50, 50)), None);
+    }
+
+    #[test]
+    fn the_cursor_is_drawn_into_a_region_at_its_translated_place() {
+        // a 2x2 opaque white cursor at display (5, 3); the region starts at (4, 2) and is 3x3
+        let p = pointer(2, 2, 2, 8, vec![255; 16], 5, 3);
+        let mut c = vec![0u8; 3 * 3 * 4];
+        draw_pointer(&mut c, 12, 3, 3, (4, 2), &p);
+        let white: Vec<(usize, usize)> = (0..3).flat_map(|y| (0..3).map(move |x| (x, y))).filter(|&(x, y)| c[y * 12 + x * 4] == 255).collect();
+        assert_eq!(white, [(1, 1), (2, 1), (1, 2), (2, 2)]);
+        // a region whose right edge cuts the cursor: nothing is written outside it, even into the next row
+        let mut c = vec![0u8; 2 * 3 * 4];
+        draw_pointer(&mut c, 8, 2, 3, (4, 2), &p);
+        assert_eq!(c.iter().filter(|&&b| b == 255).count(), 2 * 3, "one column of two rows: {c:?}");
+    }
+
+    #[test]
+    fn the_staging_texture_is_made_again_only_when_the_size_changes() {
+        assert!(needs_staging(None, (100, 50)));
+        assert!(!needs_staging(Some((100, 50)), (100, 50)), "a moved region keeps it");
+        assert!(needs_staging(Some((100, 50)), (101, 50)));
+        assert!(needs_staging(Some((100, 50)), (100, 49)));
+        assert!(needs_staging(Some((100, 50)), (50, 100)));
     }
 
     #[test]
