@@ -7,7 +7,8 @@
 
 use super::mb::{chroma_qp, Kind, MbInfo, Picture, SliceParams};
 use super::tables::{ALPHA, BETA, TC0};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{fence, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex, PoisonError};
 
 fn clip1(v: i32, bd: u32) -> u16 {
     v.clamp(0, (1 << bd) - 1) as u16
@@ -277,13 +278,66 @@ impl Px for SharedPlane<'_> {
     }
 }
 
+/// The progress of each macroblock row of a wave (see `SharedPlane`), with a blocking wait for it.
+///
+/// A row that has to wait for the one above spins briefly, then sleeps on a condition variable. It does
+/// not spin or yield for long, because on a machine busy with other work the thread filtering the row
+/// above may be descheduled for many milliseconds, and the waiters spinning would take the very cores
+/// it needs to come back.
+struct Wave {
+    /// Per row: macroblocks finished, or `usize::MAX` once the row is over (also by a panic).
+    done: Vec<AtomicUsize>,
+    /// Threads asleep or about to sleep in `wait`.
+    waiters: AtomicUsize,
+    lock: Mutex<()>,
+    wake: Condvar,
+}
+
+impl Wave {
+    fn new(rows: usize) -> Self {
+        Wave { done: (0..rows).map(|_| AtomicUsize::new(0)).collect(), waiters: AtomicUsize::new(0), lock: Mutex::new(()), wake: Condvar::new() }
+    }
+
+    /// Records that row `row` has finished `n` macroblocks, and wakes the sleepers when there are any.
+    fn set(&self, row: usize, n: usize) {
+        self.done[row].store(n, Ordering::Release);
+        // pairs with the fence in `wait`: either the sleeper-to-be sees the new count, or we see it
+        fence(Ordering::SeqCst);
+        if self.waiters.load(Ordering::Relaxed) > 0 {
+            // taking the lock makes a waiter that has checked the count but not yet gone to sleep
+            // reach `Condvar::wait` (which releases the lock) before we notify
+            drop(self.lock.lock().unwrap_or_else(PoisonError::into_inner));
+            self.wake.notify_all();
+        }
+    }
+
+    /// Returns once row `row` has finished at least `need` macroblocks.
+    fn wait(&self, row: usize, need: usize) {
+        let ready = || self.done[row].load(Ordering::Acquire) >= need;
+        for _ in 0..200 {
+            if ready() {
+                return;
+            }
+            std::hint::spin_loop();
+        }
+        self.waiters.fetch_add(1, Ordering::SeqCst);
+        fence(Ordering::SeqCst);
+        let mut guard = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        while !ready() {
+            guard = self.wake.wait(guard).unwrap_or_else(PoisonError::into_inner);
+        }
+        drop(guard);
+        self.waiters.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Marks a macroblock row finished when dropped, also when filtering it panicked, so that the rows
 /// waiting on it do not wait for ever.
-struct RowDone<'a>(&'a AtomicUsize);
+struct RowDone<'a>(&'a Wave, usize);
 
 impl Drop for RowDone<'_> {
     fn drop(&mut self) {
-        self.0.store(usize::MAX, Ordering::Release);
+        self.0.set(self.1, usize::MAX);
     }
 }
 
@@ -298,25 +352,16 @@ pub fn deblock_picture_par(pic: &mut Picture, bd: u32) {
     let [a, b, c] = planes;
     let shared = [SharedPlane::new(a), SharedPlane::new(b), SharedPlane::new(c)];
     let (mbs, slices) = (&*mbs, &*slices);
-    let done: Vec<AtomicUsize> = (0..h).map(|_| AtomicUsize::new(0)).collect();
+    let wave = Wave::new(h);
     crate::pool::run(h, |mby| {
-        let _row = RowDone(&done[mby]);
+        let _row = RowDone(&wave, mby);
         let mut planes = shared;
         for mbx in 0..w {
             if mby > 0 {
-                let need = (mbx + 2).min(w);
-                let mut spins = 0u32;
-                while done[mby - 1].load(Ordering::Acquire) < need {
-                    spins += 1;
-                    if spins < 200 {
-                        std::hint::spin_loop();
-                    } else {
-                        std::thread::yield_now();
-                    }
-                }
+                wave.wait(mby - 1, (mbx + 2).min(w));
             }
             deblock_mb(&mut planes, mbs, slices, dims, bd, mbx, mby);
-            done[mby].store(mbx + 1, Ordering::Release);
+            wave.set(mby, mbx + 1);
         }
     });
 }
@@ -617,6 +662,46 @@ fn deblock_mbaff(pic: &mut Picture, bd: u32, pairs: std::ops::Range<usize>) {
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod wave_tests {
+    use super::*;
+
+    /// Rows that wait for the one above, with far more threads than cores and a row that panics: nobody hangs
+    /// and every row sees the whole row above it.
+    #[test]
+    fn waiting_rows_wake_up_also_when_a_row_panics() {
+        for panic_row in [None, Some(3)] {
+            for _ in 0..20 {
+                let (rows, w) = (40, 50);
+                let wave = Wave::new(rows);
+                let seen = AtomicUsize::new(0);
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    std::thread::scope(|s| {
+                        for row in 0..rows {
+                            let (wave, seen) = (&wave, &seen);
+                            s.spawn(move || {
+                                let _done = RowDone(wave, row);
+                                for x in 0..w {
+                                    if row > 0 {
+                                        wave.wait(row - 1, (x + 2).min(w));
+                                    }
+                                    assert!(panic_row != Some(row) || x < 7, "row {row}");
+                                    wave.set(row, x + 1);
+                                    seen.fetch_add(1, Ordering::Relaxed);
+                                }
+                            });
+                        }
+                    })
+                }));
+                assert_eq!(r.is_err(), panic_row.is_some());
+                if panic_row.is_none() {
+                    assert_eq!(seen.load(Ordering::Relaxed), rows * w);
                 }
             }
         }

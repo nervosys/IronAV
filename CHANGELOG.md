@@ -7,6 +7,12 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Fixed
+
+- Live H.264 encoding no longer stalls for hundreds of milliseconds when other programs compete for the cores: the parallel loop
+  filter's rows waited for the row above by spinning and yielding for ever, so a preempted thread left every later row burning
+  cores; they now spin briefly, then sleep on a condition variable. Output is byte-identical.
+
 ## [0.1.6] - 2026-11-08
 
 ### Added
