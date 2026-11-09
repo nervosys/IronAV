@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-11-09
+
 ### Added
 
 - `ScreenCapture::set_region(Option<Rect>)`: ask for only a rectangle of the display, which may move between frames. Frames carry
@@ -14,6 +16,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   Windows only the region is copied from the GPU (`CopySubresourceRegion` into a region-sized staging texture), mapped and moved
   on the CPU, and the cursor is drawn only where it lies inside it, so the cost scales with the region, not the display; X11 and
   macOS crop the whole picture in software. Without a region, behaviour is unchanged.
+- New example `region_check` in `ironav-live`, an owner-run check of region capture on a real GPU: each test rectangle is
+  compared with a crop of the whole display, and it prints no screen content.
 
 ### Fixed
 
