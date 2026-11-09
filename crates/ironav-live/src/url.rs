@@ -109,16 +109,33 @@ pub(crate) fn percent_decode(s: &str) -> String {
 }
 
 /// What follows `scheme://`, split into user information, host and port, and the rest (path and
-/// query). The user information ends at the last `@` before any `?`, so a password holding an
-/// unescaped `/` is still taken whole (and redacted whole) rather than read as a path.
+/// query). The authority ends at the first `/`, `?` or `#`, and an `@` after that belongs to the
+/// path, not to user information. Within the authority the user information ends at the last `@`,
+/// so a password holding a literal `@` is taken whole. A password holding an unescaped `/` is
+/// still read as user information (and redacted whole) when the part before the first `/` looks
+/// like `user:password` rather than a host, port or bracketed IPv6 literal.
 pub(crate) fn split_authority(rest: &str) -> (Option<&str>, &str, &str) {
     let query = rest.find('?').unwrap_or(rest.len());
-    let (cred, after) = match rest[..query].rfind('@') {
+    let segment = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    let at = if segment.contains('@') {
+        segment.rfind('@')
+    } else if looks_like_user_and_password(segment) {
+        rest[..query].rfind('@')
+    } else {
+        None
+    };
+    let (cred, after) = match at {
         Some(at) => (Some(&rest[..at]), &rest[at + 1..]),
         None => (None, rest),
     };
-    let end = after.find(['/', '?']).unwrap_or(after.len());
+    let end = after.find(['/', '?', '#']).unwrap_or(after.len());
     (cred, &after[..end], &after[end..])
+}
+
+/// Whether the authority segment (text before the first `/`, `?` or `#`) reads as `user:password`:
+/// a `:` followed by something that is not a port number. A bracketed IPv6 literal is never one.
+fn looks_like_user_and_password(segment: &str) -> bool {
+    !segment.starts_with('[') && segment.rsplit_once(':').is_some_and(|(_, tail)| !tail.is_empty() && !tail.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// `url` with the value of an SRT `passphrase` option replaced by `***`.
@@ -201,5 +218,41 @@ mod tests {
         let u = SourceUrl::parse("whips://:8443/live?cert=C:/tls/chain.pem&key=C:/tls/key.pem&token=abc").unwrap();
         assert_eq!((u.scheme.as_str(), u.option("cert"), u.option("key")), ("whips", Some("C:/tls/chain.pem"), Some("C:/tls/key.pem")));
         assert_eq!(redact("whips://:8443/live?cert=a.pem&key=k.pem&token=s3cret"), "whips://:8443/live?cert=a.pem&key=k.pem&token=***");
+    }
+
+    #[test]
+    fn at_sign_in_the_path_is_not_userinfo() {
+        assert_eq!(split_authority("192.168.1.10/stream@hd"), (None, "192.168.1.10", "/stream@hd"));
+        assert_eq!(split_authority("192.168.1.10:554/live/ch@1"), (None, "192.168.1.10:554", "/live/ch@1"));
+        let u = SourceUrl::parse("rtsp://192.168.1.10/stream@hd").unwrap();
+        assert_eq!((u.scheme.as_str(), u.target.as_str()), ("rtsp", "192.168.1.10/stream@hd"));
+        assert_eq!(redact("rtsp://192.168.1.10/stream@hd"), "rtsp://192.168.1.10/stream@hd");
+        assert_eq!(redact("rtsp://192.168.1.10:554/live/ch@1"), "rtsp://192.168.1.10:554/live/ch@1");
+    }
+
+    #[test]
+    fn at_sign_in_the_path_next_to_real_userinfo() {
+        assert_eq!(split_authority("user:pass@192.168.1.10/path@x"), (Some("user:pass"), "192.168.1.10", "/path@x"));
+        assert_eq!(redact("rtsp://user:pass@192.168.1.10/path@x"), "rtsp://user:***@192.168.1.10/path@x");
+    }
+
+    #[test]
+    fn at_sign_in_the_query_only_is_not_userinfo() {
+        assert_eq!(split_authority("cam:554/live?x=a@b"), (None, "cam:554", "/live?x=a@b"));
+        assert_eq!(redact("rtsp://cam:554/live?x=a@b"), "rtsp://cam:554/live?x=a@b");
+    }
+
+    #[test]
+    fn password_with_a_literal_at_sign_in_the_authority() {
+        assert_eq!(split_authority("user:p@ss@cam:554/live"), (Some("user:p@ss"), "cam:554", "/live"));
+        assert_eq!(redact("rtsp://user:p@ss@cam:554/live"), "rtsp://user:***@cam:554/live");
+    }
+
+    #[test]
+    fn bracketed_ipv6_host_with_at_sign_in_the_path() {
+        assert_eq!(split_authority("[fe80::1]:554/live@x"), (None, "[fe80::1]:554", "/live@x"));
+        assert_eq!(split_authority("[fe80::1]/a:b@x"), (None, "[fe80::1]", "/a:b@x"));
+        assert_eq!(redact("rtsp://[fe80::1]/a:b@x"), "rtsp://[fe80::1]/a:b@x");
+        assert_eq!(split_authority("u:p@[fe80::1]:554/live@x"), (Some("u:p"), "[fe80::1]:554", "/live@x"));
     }
 }
