@@ -9,6 +9,16 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Fixed
 
+- `ironav-codec`: the H.264 encoder's bit rate control no longer swings the quantiser when pictures come only on change. The
+  surplus or deficit is now a leaky bucket that drains at the rate in time and holds at most a window of credit or debt, and it
+  nudges the next picture's quantiser instead of being added into the controller's state each picture. Before, the running total of
+  bits spent against bits allowed fed back through that state (so it behaved like an integral of an integral), and every picture
+  counted as one frame period whatever the time since the last, so a debt from an IDR picture was never repaid and a quiet screen
+  left most of the rate unused. New `H264Encoder::with_time_base` says what unit the picture timestamps are in; with it the rate is
+  followed in real time. Without it each picture still counts as one frame period, as before. The quantiser also keeps a floor
+  (never above 26) at which a picture as costly as the last IDR picture stays within one window of bits, so a scroll after a quiet
+  spell cannot burst. On a synthetic 640x480 typing run at 4 Mbit/s the quantiser's direction reversals fall from 15 to 0 and the
+  largest non-IDR picture from 403 ms of rate to 316 ms.
 - `ironav-live`: an `@` in the URL path or query is no longer taken for user information, so `rtsp://192.168.1.10:554/live/ch@1`
   connects to the host it names and is logged unchanged; an unescaped `/` in a password is still read as part of it when the text
   before the first `/` looks like `user:password`.

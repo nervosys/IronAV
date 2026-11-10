@@ -73,10 +73,20 @@ pub struct H264Encoder {
     /// A fixed quantiser, or a bit rate in bits per second to average.
     qp: Option<u8>,
     bitrate: Option<u32>,
-    /// Rate control state: the quantiser for the next picture, and bits spent against bits allowed.
+    /// Rate control state: the quantiser the content alone calls for, before the bucket's pull.
     rc_qp: f64,
-    spent: f64,
-    allowed: f64,
+    /// Bits in the leaky bucket the rate drains: above zero, spending has run ahead of the rate;
+    /// below, behind it. Held within the window either way.
+    fullness: f64,
+    /// What the bucket adds to `rc_qp` for the next picture, and the quantiser and bits of the last
+    /// IDR picture, which says what a picture of all-new content costs.
+    rc_adj: f64,
+    idr_cost: Option<(f64, f64)>,
+    /// The unit of picture timestamps, when the caller says (`with_time_base`), the last picture's
+    /// timestamp, and a running average of the seconds between pictures.
+    time_base: Option<Rational>,
+    last_pts: Option<i64>,
+    avg_dt: f64,
     /// The reference pictures as decoders reconstruct them, with their half samples and picture
     /// order counts, oldest first.
     refs: Vec<(Picture, HalfPel, i32)>,
@@ -158,8 +168,12 @@ impl H264Encoder {
             // a first guess from the bits per pixel the rate allows: about a tenth at 26, half as
             // many for every 7 added (it varies a lot with the content)
             rc_qp: bitrate.map_or(26.0, |r| (26.0 - 7.0 * (r as f64 / (fps * width as f64 * height as f64) / BPP).log2()).clamp(10.0, 45.0)),
-            spent: 0.0,
-            allowed: 0.0,
+            fullness: 0.0,
+            rc_adj: 0.0,
+            idr_cost: None,
+            time_base: None,
+            last_pts: None,
+            avg_dt: 1.0 / fps,
             refs: Vec::new(),
             bframes: BFRAMES,
             nrefs: REFS,
@@ -197,6 +211,17 @@ impl H264Encoder {
         self.bframes = 0;
         self.keyint = self.fps().round().max(1.0) as u64;
         self.rc_window = 0.25;
+        self
+    }
+
+    /// Says that picture timestamps count in `time_base` seconds (1/1000 for milliseconds). With it, the
+    /// bit rate is followed in real time: a picture that comes after a gap is allowed the bits the gap
+    /// earned, so a source that sends a picture only when the screen changes still gets the rate it asks
+    /// for. Without it, each picture counts as one frame period (1/frame rate) whatever its timestamp, as
+    /// before, which suits a constant frame rate whatever the timestamp unit. B pictures also count
+    /// as a frame period each.
+    pub fn with_time_base(mut self, time_base: Rational) -> Self {
+        self.time_base = (time_base.num > 0 && time_base.den > 0).then_some(time_base);
         self
     }
 
@@ -380,37 +405,76 @@ impl H264Encoder {
         let off = QP_OFFSET[kind as usize];
         match self.qp {
             Some(q) => (q as i32 + off).clamp(0, 51),
-            None => (self.rc_qp.round() as i32 + off).clamp(1, 51),
+            None => {
+                let mut q = self.rc_qp + self.rc_adj;
+                if kind != 0 {
+                    q = q.max(self.burst_floor());
+                }
+                (q.round() as i32 + off).clamp(1, 51)
+            }
         }
+    }
+
+    /// The lowest quantiser (before the picture kind's offset) at which a picture of all-new content,
+    /// which costs about what the last IDR picture did, stays within a window of bits, so a scroll
+    /// after a quiet spell cannot burst past what a small receive buffer holds. It never asks for
+    /// worse than 26: where even that is over a window, the burst is left to the picture.
+    fn burst_floor(&self) -> f64 {
+        let (Some(rate), Some((qp, bits))) = (self.bitrate, self.idr_cost) else {
+            return 1.0;
+        };
+        (qp - QP_OFFSET[0] as f64 + 6.0 * (bits / (rate as f64 * self.rc_window)).max(1e-3).log2()).clamp(1.0, 26.0)
+    }
+
+    /// The seconds from the last picture to this one at `pts`: the timestamps' difference when the time
+    /// base is known, there are no B pictures and the timestamps rise, else one frame period.
+    fn picture_dt(&mut self, pts: i64) -> f64 {
+        let nominal = 1.0 / self.fps();
+        let (Some(tb), 0) = (self.time_base, self.b_frames()) else {
+            return nominal;
+        };
+        let dt = match self.last_pts {
+            Some(last) if pts > last => (pts - last) as f64 * tb.num as f64 / tb.den as f64,
+            _ => nominal,
+        };
+        self.last_pts = Some(self.last_pts.map_or(pts, |l| l.max(pts)));
+        dt
     }
 
     /// Steers the quantiser so the bits spent follow the bits the rate allows. A picture's size
     /// roughly halves for every 6 added to the quantiser, which says what quantiser the last
-    /// picture would have needed; the running surplus or deficit, against a second's worth of
-    /// bits (a quarter of one at low latency), pulls the next one further.
-    fn rate_update(&mut self, bits: usize, qp: i32, kind: u8) {
+    /// picture would have needed to cost its share of the rate (the average time between pictures
+    /// times the rate). The bucket of unspent or overspent bits, against a second's worth of bits
+    /// (a quarter of one at low latency), scales that share: a surplus shrinks it, a deficit grows it.
+    /// The bucket drains at the rate in real time, and idle time banks at most one window of credit.
+    fn rate_update(&mut self, bits: usize, qp: i32, kind: u8, pts: i64) {
         let Some(rate) = self.bitrate else {
             return;
         };
-        let per_frame = rate as f64 / self.fps();
-        self.spent += bits as f64;
-        self.allowed += per_frame;
+        let window = rate as f64 * self.rc_window;
+        let dt = self.picture_dt(pts);
+        self.fullness = (self.fullness + bits as f64 - rate as f64 * dt).clamp(-window, 2.0 * window);
+        self.avg_dt += 0.125 * (dt.min(self.rc_window) - self.avg_dt);
+        if kind == 0 {
+            self.idr_cost = Some((qp as f64, bits as f64));
+        }
+        let pressure = ((self.fullness + window) / window).clamp(0.25, 3.0);
+        // the bucket's pull eases in: at most 1.5 steps a picture, so one large picture does not jolt the next
+        self.rc_adj += (6.0 * pressure.log2() - self.rc_adj).clamp(-1.5, 1.5);
         // a B picture's size relative to its P pictures varies too much with the content to say
         // what quantiser it wanted; it only counts towards the bits spent and follows the P pictures
         if kind == 2 {
             return;
         }
-        let window = rate as f64 * self.rc_window;
-        let budget = 6.0 * ((self.spent + window) / (self.allowed + window).max(1.0)).log2();
         // an IDR picture is expected to cost several P pictures, and a P picture more than one
         // picture's worth when B pictures, which cost much less, lie between them
         let share = match kind {
             0 => 4.0,
             _ => 1.0 + 0.25 * self.b_frames() as f64,
         };
-        let expected = per_frame * share;
+        let expected = rate as f64 * self.avg_dt * share;
         let wanted = (qp - QP_OFFSET[kind as usize]) as f64 + 6.0 * (bits as f64 / expected).max(1e-3).log2();
-        let next = 0.5 * self.rc_qp + 0.5 * wanted + budget;
+        let next = 0.5 * self.rc_qp + 0.5 * wanted;
         self.rc_qp = next.clamp(self.rc_qp - 4.0, self.rc_qp + 4.0).clamp(1.0, 51.0);
     }
 
@@ -588,7 +652,7 @@ impl H264Encoder {
         }
         pic.slices = vec![SliceParams { disable_deblocking: 0, alpha_offset: 0, beta_offset: 0, chroma_qp_offset: [0, 0] }; n];
         if fast { deblock_picture_par(&mut pic, self.bd) } else { deblock_picture(&mut pic, self.bd) }
-        self.rate_update(data.len() * 8, qp, kind);
+        self.rate_update(data.len() * 8, qp, kind, pts);
         #[cfg(test)]
         self.recon.push((pts, pic.planes.clone()));
         if !b {
@@ -1231,5 +1295,177 @@ mod tests {
                 assert_eq!(b, c);
             }
         }
+    }
+
+    // ---- live remote-desktop rate control: variable frame rate, text-like content ----
+
+    /// A text-like page: a grid of 8x16 glyph cells, each drawn from its id.
+    struct Page {
+        cells: Vec<Vec<u32>>,
+        seed: u32,
+    }
+
+    impl Page {
+        fn rnd(&mut self) -> u32 {
+            self.seed = self.seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            self.seed >> 8
+        }
+        fn new(w: usize, h: usize) -> Self {
+            let mut p = Page { cells: Vec::new(), seed: 99 };
+            for _ in 0..h / 16 {
+                let line = (0..w / 8).map(|c| if c < 60 { p.rnd() | 1 } else { 0 }).collect();
+                p.cells.push(line);
+            }
+            p
+        }
+        /// Re-rolls `n` glyphs in the text area.
+        fn type_chars(&mut self, n: usize) {
+            for _ in 0..n {
+                let (r, c) = (self.rnd() as usize % self.cells.len(), self.rnd() as usize % 60);
+                self.cells[r][c] = self.rnd() | 1;
+            }
+        }
+        fn scroll(&mut self, lines: usize) {
+            for _ in 0..lines {
+                self.cells.remove(0);
+                let line = (0..self.cells[0].len()).map(|c| if c < 60 { self.rnd() | 1 } else { 0 }).collect();
+                self.cells.push(line);
+            }
+        }
+        fn frame(&self, w: usize, h: usize, pts: i64) -> VideoFrame {
+            let mut y = vec![240u8; w * h];
+            for (r, line) in self.cells.iter().enumerate() {
+                for (c, &id) in line.iter().enumerate() {
+                    if id == 0 {
+                        continue;
+                    }
+                    // a 5x9 dot matrix, the glyph's bits picking the dots
+                    for gy in 0..9 {
+                        for gx in 0..5 {
+                            if (id.wrapping_mul(2_654_435_761).rotate_left((gy * 5 + gx) as u32) >> 3) & 3 == 0 {
+                                y[(r * 16 + 3 + gy) * w + c * 8 + 1 + gx] = 40;
+                            }
+                        }
+                    }
+                }
+            }
+            let (cw, ch) = (w / 2, h / 2);
+            VideoFrame { width: w as u32, height: h as u32, pix_fmt: PixelFormat::Yuv420p, pts, planes: vec![y, vec![128; cw * ch], vec![128; cw * ch]] }
+        }
+    }
+
+    fn frame_noise(px: &mut u8, v: u32) {
+        *px = 60 + v as u8 + (v as u8 ^ 0x2a) % 40;
+    }
+
+    struct LivePic {
+        qp: i32,
+        bits: usize,
+        idr: bool,
+        /// The picture follows a scroll (within a few pictures) rather than steady typing.
+        busy: bool,
+        pts: i64,
+    }
+
+    /// Drives the encoder as the remote-desktop viewer does: 640x480 at 4 Mbit/s, 30 fps, live settings, a
+    /// picture only when the screen changes (typing at 5 to 30 pictures a second with gaps up to a second),
+    /// two scrolls and one asked-for keyframe. Gaps come from a fixed sequence, in 1/30 s pts ticks.
+    fn live_run(rate: u32, noise: u32) -> Vec<LivePic> {
+        let (w, h) = (640usize, 480usize);
+        let params = StreamParams::Video { width: w as u32, height: h as u32, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational::new(30, 1) };
+        let mut enc = H264Encoder::new(&params, None, Some(rate)).unwrap().low_latency().constrained_baseline().realtime().with_time_base(Rational::new(1, 30));
+        let mut page = Page::new(w, h);
+        let mut seed = 12345u32;
+        let mut rnd = move |n: u32| {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            (seed >> 8) % n
+        };
+        let (mut pts, mut out, mut last_scroll) = (0i64, Vec::new(), -100i64);
+        for i in 0..260i64 {
+            let gap = match rnd(100) {
+                0..=69 => 2 + rnd(3),
+                70..=89 => 5 + rnd(6),
+                90..=97 => 11 + rnd(10),
+                _ => 30,
+            } as i64;
+            pts += gap;
+            if i == 90 || i == 170 {
+                page.scroll(1 + rnd(3) as usize);
+                last_scroll = i;
+            } else {
+                page.type_chars(2 + rnd(3) as usize);
+            }
+            if i == 130 {
+                enc.force_idr();
+            }
+            let mut frame = page.frame(w, h, pts);
+            // a busy region, as a playing video or an animation is: up to `noise` macroblocks refilled with noise
+            for _ in 0..if noise > 0 { rnd(noise + 1) } else { 0 } {
+                let (mx, my) = (rnd(40) as usize, 20 + rnd(10) as usize);
+                for r in 0..16 {
+                    for c in 0..16 {
+                        frame_noise(&mut frame.planes[0][(my * 16 + r) * w + mx * 16 + c], rnd(100));
+                    }
+                }
+            }
+            let qp = enc.next_qp(1);
+            let pkts = enc.encode(&Frame::Video(frame)).unwrap();
+            assert_eq!(pkts.len(), 1);
+            let idr = nals(&pkts[0].data).iter().any(|n| n.0 == 5);
+            out.push(LivePic { qp: if idr { enc.next_qp(0) } else { qp }, bits: pkts[0].data.len() * 8, idr, busy: i - last_scroll < 8, pts });
+        }
+        out
+    }
+
+    struct LiveStats {
+        sd: f64,
+        reversals: usize,
+        rate_share: f64,
+        burst_secs: f64,
+    }
+
+    fn live_measure(rate: u32, noise: u32) -> LiveStats {
+        let pics = live_run(rate, noise);
+        let rate = rate as f64;
+        // steady typing: after the start-up, leaving out IDR pictures and the few pictures after a scroll
+        let steady: Vec<&LivePic> = pics.iter().enumerate().filter(|(i, p)| *i >= 15 && !p.idr && !p.busy).map(|(_, p)| p).collect();
+        let qps: Vec<f64> = steady.iter().map(|p| p.qp as f64).collect();
+        let mean = qps.iter().sum::<f64>() / qps.len() as f64;
+        let sd = (qps.iter().map(|q| (q - mean).powi(2)).sum::<f64>() / qps.len() as f64).sqrt();
+        // direction reversals of the quantiser, a step up followed by a step down or the other way
+        let steps: Vec<i32> = steady.windows(2).map(|p| (p[1].qp - p[0].qp).signum()).filter(|&d| d != 0).collect();
+        let reversals = steps.windows(2).filter(|d| d[0] != d[1]).count();
+        let total: usize = pics.iter().map(|p| p.bits).sum();
+        let secs = (pics.last().unwrap().pts - pics[0].pts) as f64 / 30.0;
+        let burst = pics.iter().filter(|p| !p.idr).map(|p| p.bits).max().unwrap() as f64;
+        let maxjump = steady.windows(2).map(|p| (p[1].qp - p[0].qp).abs()).max().unwrap();
+        eprintln!(
+            "LIVE rate {rate} steady n={} qp mean {mean:.1} sd {sd:.2} reversals {reversals} maxjump {maxjump} | avg rate {:.0} bit/s ({:.1}% of target) over {secs:.1}s | largest non-IDR picture {burst:.0} bits = {:.0} ms of rate",
+            steady.len(),
+            total as f64 / secs,
+            100.0 * total as f64 / secs / rate,
+            1000.0 * burst / rate,
+        );
+        LiveStats { sd, reversals, rate_share: total as f64 / secs / rate, burst_secs: burst / rate }
+    }
+
+    /// Quiet typing at 4 Mbit/s asks for far less than the rate: the quantiser must settle, not wander, and
+    /// the largest picture outside an IDR stays near a quarter second of bits. Before the leaky bucket this
+    /// had 15 direction reversals and a 403 ms picture.
+    #[test]
+    fn live_typing_at_a_high_rate_has_a_steady_quantiser() {
+        let s = live_measure(4_000_000, 0);
+        assert!(s.sd < 2.5 && s.reversals <= 5, "qp sd {:.2}, {} reversals", s.sd, s.reversals);
+        assert!(s.burst_secs < 0.35, "a burst of {:.0} ms", s.burst_secs * 1000.0);
+    }
+
+    /// With a busy region the rate binds. Pictures come on change only, so the rate must follow the time
+    /// between them, not the picture count: before, the encoder used 21 percent of the rate at quantiser 40
+    /// and its quantiser reversed direction 87 times (with only the clock fixed, 82 times and 1.4 s bursts).
+    #[test]
+    fn live_busy_screen_follows_the_rate_in_real_time() {
+        let s = live_measure(1_000_000, 60);
+        assert!(s.rate_share > 0.5 && s.rate_share < 1.1, "{:.0} percent of the rate", s.rate_share * 100.0);
+        assert!(s.sd < 3.0 && s.reversals <= 12, "qp sd {:.2}, {} reversals", s.sd, s.reversals);
     }
 }
