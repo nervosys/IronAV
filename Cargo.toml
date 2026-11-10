@@ -16,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 rust-version = "1.88"
@@ -27,17 +27,17 @@ authors = ["nervosys"]
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-ironav-core = { path = "crates/ironav-core", version = "0.1.7" }
-ironav-hwaccel = { path = "crates/ironav-hwaccel", version = "0.1.7" }
-ironav-codec = { path = "crates/ironav-codec", version = "0.1.7" }
-ironav-formats = { path = "crates/ironav-formats", version = "0.1.7" }
-ironav-ontology = { path = "crates/ironav-ontology", version = "0.1.7" }
-ironav-analyze = { path = "crates/ironav-analyze", version = "0.1.7" }
-ironav-live = { path = "crates/ironav-live", version = "0.1.7" }
-ironav-player = { path = "crates/ironav-player", version = "0.1.7", default-features = false }
-ironav-engine = { path = "crates/ironav-engine", version = "0.1.7" }
-ironav-webui = { path = "crates/ironav-webui", version = "0.1.7" }
-ironav-gui = { path = "crates/ironav-gui", version = "0.1.7" }
+ironav-core = { path = "crates/ironav-core", version = "0.1.8" }
+ironav-hwaccel = { path = "crates/ironav-hwaccel", version = "0.1.8" }
+ironav-codec = { path = "crates/ironav-codec", version = "0.1.8" }
+ironav-formats = { path = "crates/ironav-formats", version = "0.1.8" }
+ironav-ontology = { path = "crates/ironav-ontology", version = "0.1.8" }
+ironav-analyze = { path = "crates/ironav-analyze", version = "0.1.8" }
+ironav-live = { path = "crates/ironav-live", version = "0.1.8" }
+ironav-player = { path = "crates/ironav-player", version = "0.1.8", default-features = false }
+ironav-engine = { path = "crates/ironav-engine", version = "0.1.8" }
+ironav-webui = { path = "crates/ironav-webui", version = "0.1.8" }
+ironav-gui = { path = "crates/ironav-gui", version = "0.1.8" }
 
 # Codec code follows its specifications: tables keep their published digits, loops index several
 # arrays at once, and the decoding functions take what the syntax hands them.

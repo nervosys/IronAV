@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-11-10
+
 ### Fixed
 
 - `ironav-codec`: the H.264 encoder's bit rate control no longer swings the quantiser when pictures come only on change. The
