@@ -7,6 +7,15 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Fixed
+
+- `ironav-live`: an `@` in the URL path or query is no longer taken for user information, so `rtsp://192.168.1.10:554/live/ch@1`
+  connects to the host it names and is logged unchanged; an unescaped `/` in a password is still read as part of it when the text
+  before the first `/` looks like `user:password`.
+- `redact` no longer prints a malformed password that starts with digits and holds an unescaped `/`, `?` or `#` (such as
+  `rtsp://user:123/x@host/live`), which the parser reads as a port; it masks conservatively, and leaves `cam:554/live?x=a@b` and
+  `cam:554/live/ch@1` alone.
+
 ## [0.1.7] - 2026-11-09
 
 ### Added

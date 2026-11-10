@@ -161,8 +161,41 @@ pub fn redact(url: &str) -> String {
             Some((user, _)) => format!("{scheme}://{user}:***@{host}{tail}"),
             None => format!("{scheme}://***@{host}{tail}"),
         },
-        (None, ..) => url.to_string(),
+        (None, ..) => match digit_password_end(rest) {
+            Some(at) => {
+                let user = rest.split_once(':').map_or("", |(u, _)| u);
+                format!("{scheme}://{user}:***@{}", &rest[at + 1..])
+            }
+            None => url.to_string(),
+        },
     }
+}
+
+/// Redaction only: the position of the `@` ending a password that `split_authority` read as a
+/// port. A malformed `user:123/x@host/live` (or `user:12#3@host`, `user:12?3@host`) has an
+/// authority segment `user:123`, which is a clean `name:port`, so the connection parser rightly
+/// takes no userinfo; but a log line must not print the rest. Heuristic, deliberately leaning to
+/// masking too much: the segment is `name:digits` with a non-empty `name` that is not an IPv4
+/// literal, and some later `@` is followed by a plausible host (letters, digits, `.`, `-`, `_`,
+/// brackets, optional `:port`, at least one letter, ending at `/`, `?`, `#` or the end) while the
+/// text between the first `:` and that `@` has no `=` (which reads as a query, as in
+/// `cam:554/live?x=a@b`). The last such `@` wins. Limits: `cam:554/live/ch@hd` (a host-like name
+/// after the `@`, no `=`) is masked, and a path `@` followed by an all-digit name (`ch@1`) or a
+/// query `@` after a `key=` is not; a password holding `=` after a digit-only start with a
+/// bracketed or IPv4 name is not caught.
+fn digit_password_end(rest: &str) -> Option<usize> {
+    let segment = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    let (name, port) = segment.split_once(':')?;
+    let ipv4 = !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit() || b == b'.');
+    if name.is_empty() || name.starts_with('[') || ipv4 || port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) || segment.len() == rest.len() {
+        return None;
+    }
+    let plausible_host = |h: &str| {
+        let h = h.split_once(':').map_or(h, |(h, p)| if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) { h } else { "" });
+        !h.is_empty() && h.bytes().any(|b| b.is_ascii_alphabetic()) && h.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'[' | b']'))
+    };
+    let colon = name.len();
+    rest.match_indices('@').map(|(i, _)| i).rfind(|&i| i > colon && !rest[colon..i].contains('=') && plausible_host(&rest[i + 1..][..rest[i + 1..].find(['/', '?', '#']).unwrap_or(rest.len() - i - 1)]))
 }
 
 /// `url` with the value of each `token=` in its query replaced by `***`.
@@ -246,6 +279,17 @@ mod tests {
     fn password_with_a_literal_at_sign_in_the_authority() {
         assert_eq!(split_authority("user:p@ss@cam:554/live"), (Some("user:p@ss"), "cam:554", "/live"));
         assert_eq!(redact("rtsp://user:p@ss@cam:554/live"), "rtsp://user:***@cam:554/live");
+    }
+
+    #[test]
+    fn password_starting_with_digits_and_holding_a_delimiter_is_masked() {
+        assert_eq!(redact("rtsp://user:123/x@host/live"), "rtsp://user:***@host/live");
+        assert_eq!(redact("rtsp://user:12#3@host:554/live"), "rtsp://user:***@host:554/live");
+        assert_eq!(redact("rtsp://user:12?3@host/live"), "rtsp://user:***@host/live");
+        assert_eq!(redact("rtsp://user:12/x@host/live?x=a@b"), "rtsp://user:***@host/live?x=a@b");
+        for url in ["rtsp://cam:554/live/ch@1", "rtsp://192.168.1.10:554/live/ch@1", "rtsp://[fe80::1]:554/live@x", "rtsp://cam:554/live?x=a@b", "rtsp://cam:554/live", "rtsp://cam:554"] {
+            assert_eq!(redact(url), url);
+        }
     }
 
     #[test]
