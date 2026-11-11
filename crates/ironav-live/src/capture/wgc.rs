@@ -15,7 +15,7 @@ use super::window::{client_crop, pack_rows, plan_frame, mapped_len, Crop, Signal
 use ironav_core::{Error, ErrorCode, Result};
 use std::ffi::c_void;
 use std::marker::PhantomData;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 use windows::core::{factory, IInspectable, Interface};
 use windows::Foundation::TypedEventHandler;
@@ -34,6 +34,7 @@ use windows::Win32::Graphics::Dxgi::{IDXGIAdapter, IDXGIDevice, DXGI_ERROR_DEVIC
 use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::System::WinRT::Direct3D11::{CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess};
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
+use windows::Win32::System::Com::CoIncrementMTAUsage;
 use windows::Win32::System::WinRT::{RoInitialize, RoUninitialize, RO_INIT_MULTITHREADED};
 use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, IsIconic, IsWindow, IsWindowVisible};
 
@@ -82,8 +83,23 @@ struct Apartment {
     _not_send: PhantomData<*const ()>,
 }
 
+/// Keeps the process's multithreaded apartment alive for good, once.
+///
+/// Without it the apartment ends when the last thread that joined it leaves, and the Windows Runtime
+/// factories this module has already activated (windows-rs keeps them for the life of the process)
+/// would then belong to an apartment that is gone: the next capture would call into them. With it, a
+/// thread can join and leave as often as it likes.
+fn keep_mta_alive() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        // the cookie is never given back: the apartment stays until the process ends
+        let _ = unsafe { CoIncrementMTAUsage() };
+    });
+}
+
 impl Apartment {
     fn enter() -> Apartment {
+        keep_mta_alive();
         // S_OK and S_FALSE (already in this mode) both count one more join
         // RPC_E_CHANGED_MODE (an STA thread) and any other failure join nothing, and leave nothing to undo
         let joined = unsafe { RoInitialize(RO_INIT_MULTITHREADED) }.is_ok();
@@ -181,6 +197,15 @@ impl WindowCapture {
     /// to capture that window, and with `InvalidArgument` for a null handle. The window need not be
     /// visible: a minimized window gives no frames until it is restored (see [`WindowCapture::state`]).
     pub fn open(hwnd: isize, opts: WindowCaptureOptions) -> Result<WindowCapture> {
+        WindowCapture::open_traced(hwnd, opts, |_| {})
+    }
+
+    /// [`WindowCapture::open`] that names each step to `trace` just before taking it, so that a program
+    /// that dies inside a Windows call can say which one (the last name printed). The names are fixed
+    /// words, never anything about the window.
+    #[doc(hidden)]
+    pub fn open_traced(hwnd: isize, opts: WindowCaptureOptions, mut trace: impl FnMut(&str)) -> Result<WindowCapture> {
+        trace("validate the window handle");
         if hwnd == 0 {
             return Err(Error::invalid_arg("the window handle is null"));
         }
@@ -188,22 +213,30 @@ impl WindowCapture {
         if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
             return Err(Error::new(ErrorCode::NotFound, "there is no window with that handle"));
         }
+        trace("roinit");
         let apartment = Apartment::enter();
+        trace("IsSupported");
         if !GraphicsCaptureSession::IsSupported().unwrap_or(false) {
             return Err(unsupported());
         }
+        trace("d3d device");
         let (device, ctx) = create_device()?;
+        trace("winrt device");
         let winrt_device = {
             let dxgi: IDXGIDevice = device.cast().map_err(|e| fail("could not use the Direct3D device", e))?;
             let inspectable = unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi) }.map_err(|e| fail("could not share the Direct3D device with Windows.Graphics.Capture", e))?;
             inspectable.cast::<IDirect3DDevice>().map_err(|e| fail("could not share the Direct3D device with Windows.Graphics.Capture", e))?
         };
+        trace("item interop factory");
         let interop = factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>().map_err(|_| unsupported())?;
+        trace("item (CreateForWindow)");
         let item: GraphicsCaptureItem = unsafe { interop.CreateForWindow(hwnd) }.map_err(|e| {
             Error::new(ErrorCode::HardwareUnavailable, format!("Windows will not capture that window: {}", e.message())).hint("a window that is not a top-level application window, or that belongs to the system's shell, cannot be captured")
         })?;
+        trace("item size");
         let size = item.Size().map_err(|e| fail("reading the window's size", e))?;
         let pool_size = (size.Width.max(1) as u32, size.Height.max(1) as u32);
+        trace("pool");
         let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(&winrt_device, FORMAT, BUFFERS, SizeInt32 { Width: pool_size.0 as i32, Height: pool_size.1 as i32 }).map_err(|e| fail("could not make the frame pool", e))?;
         // from here the struct owns everything made so far, and its Drop undoes whatever has been set up
         let mut cap = WindowCapture {
@@ -227,33 +260,39 @@ impl WindowCapture {
             _not_send: PhantomData,
             _apartment: apartment,
         };
-        cap.start()?;
+        cap.start(&mut trace)?;
         Ok(cap)
     }
 
-    fn start(&mut self) -> Result<()> {
+    fn start(&mut self, trace: &mut impl FnMut(&str)) -> Result<()> {
+        trace("frame handler");
         let sig = self.signal.clone();
         let on_frame = TypedEventHandler::<Direct3D11CaptureFramePool, IInspectable>::new(move |_, _| {
             sig.frame_arrived();
             Ok(())
         });
         self.arrived_token = Some(self.pool.FrameArrived(&on_frame).map_err(|e| fail("could not listen for frames", e))?);
+        trace("closed handler");
         let sig = self.signal.clone();
         let on_closed = TypedEventHandler::<GraphicsCaptureItem, IInspectable>::new(move |_, _| {
             sig.close();
             Ok(())
         });
         self.closed_token = Some(self.item.Closed(&on_closed).map_err(|e| fail("could not listen for the window closing", e))?);
+        trace("session");
         let session = self.pool.CreateCaptureSession(&self.item).map_err(|e| fail("could not start a capture session", e))?;
         // The cursor property needs Windows 10 2004. Leaving the cursor in is the default, so a failure
         // to say so is harmless; a failure to leave it out is not, and fails the open.
+        trace("session cursor");
         let cursor = session.SetIsCursorCaptureEnabled(self.opts.cursor);
         if let (false, Err(e)) = (self.opts.cursor, cursor) {
             return Err(Error::new(ErrorCode::HardwareUnavailable, format!("could not leave the cursor out: {}", e.message())).hint("turning the cursor off needs Windows 10 version 2004 or later"));
         }
         // The border can be taken off on Windows 11 (and some Windows 10 builds) when the system allows
         // it; otherwise this fails, and the capture goes on with the border.
+        trace("session border");
         self.border_hidden = !self.opts.border && session.SetIsBorderRequired(false).is_ok();
+        trace("start");
         session.StartCapture().map_err(|e| fail("could not start capturing the window", e))?;
         self.session = Some(session);
         Ok(())

@@ -43,6 +43,7 @@ mod imp {
     use std::time::{Duration, Instant};
     use windows::core::BOOL;
     use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT};
+    use windows::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS};
     use windows::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION};
     use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
     use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindowVisible};
@@ -108,40 +109,67 @@ mod imp {
         BOOL(1)
     }
 
-    /// The largest visible top-level window of a process named `name`, and how many such windows there are.
-    fn find_by_process(name: &str) -> Option<(isize, usize)> {
+    /// The names (lower case, without `.exe`) of the running processes, from a snapshot, which needs no
+    /// access to the processes themselves (opening a packaged app's process can be refused).
+    fn snapshot_names() -> Vec<(u32, String)> {
+        let mut out = Vec::new();
+        let Ok(snap) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else { return out };
+        let mut e = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+        let mut more = unsafe { Process32FirstW(snap, &mut e) }.is_ok();
+        while more {
+            let end = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(e.szExeFile.len());
+            let file = String::from_utf16_lossy(&e.szExeFile[..end]).to_lowercase();
+            out.push((e.th32ProcessID, file.strip_suffix(".exe").map(str::to_string).unwrap_or(file)));
+            more = unsafe { Process32NextW(snap, &mut e) }.is_ok();
+        }
+        let _ = unsafe { CloseHandle(snap) };
+        out
+    }
+
+    /// The largest visible top-level window of a process named `name`, and how many such windows there
+    /// are. On failure the message says what was seen (counts and process ids, never titles).
+    fn find_by_process(name: &str) -> Result<(isize, usize), String> {
         let want = name.to_lowercase();
         let want = want.strip_suffix(".exe").unwrap_or(&want).to_string();
+        let names = snapshot_names();
+        let pids: Vec<u32> = names.iter().filter(|(_, n)| *n == want).map(|(p, _)| *p).collect();
         let mut all: Vec<HWND> = Vec::new();
         let _ = unsafe { EnumWindows(Some(collect), LPARAM(&mut all as *mut Vec<HWND> as isize)) };
+        eprintln!("lookup: {} processes in the snapshot, {} named '{want}' (ids {pids:?}); {} visible top-level windows", names.len(), pids.len(), all.len());
         let mut best: Option<(i64, isize)> = None;
         let mut count = 0;
         for h in all {
             let mut pid = 0u32;
             unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
-            if pid == 0 || exe_name(pid).as_deref() != Some(want.as_str()) {
+            // the snapshot decides; a process it lacks (it ended, or started since) is asked directly
+            let mine = pids.contains(&pid) || (pid != 0 && !names.iter().any(|(p, _)| *p == pid) && exe_name(pid).as_deref() == Some(want.as_str()));
+            if !mine {
                 continue;
             }
             let mut r = RECT::default();
             if unsafe { GetWindowRect(h, &mut r) }.is_err() {
+                eprintln!("lookup: a window of process {pid} has no rectangle");
                 continue;
             }
-            let area = i64::from(r.right - r.left).max(0) * i64::from(r.bottom - r.top).max(0);
-            if area == 0 || unsafe { IsIconic(h) }.as_bool() && area < 100_000 {
+            let (w, hh) = (i64::from(r.right - r.left).max(0), i64::from(r.bottom - r.top).max(0));
+            let iconic = unsafe { IsIconic(h) }.as_bool();
+            eprintln!("lookup: window of process {pid}: {w}x{hh}, minimized: {iconic}");
+            if w * hh == 0 || iconic && w * hh < 100_000 {
                 continue;
             }
             count += 1;
-            if best.is_none_or(|(a, _)| area > a) {
-                best = Some((area, h.0 as isize));
+            if best.is_none_or(|(a, _)| w * hh > a) {
+                best = Some((w * hh, h.0 as isize));
             }
         }
-        best.map(|(_, h)| (h, count))
+        best.map(|(_, h)| (h, count)).ok_or_else(|| format!("no visible window of a process named '{want}' ({} such processes running)", pids.len()))
     }
 
     pub fn run() -> Result<u8, String> {
         let args = parse()?;
         // the client area is matched to the picture in physical pixels: be per-monitor DPI aware
         let _ = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        eprintln!("step: support check");
         let supported = window_capture_supported();
         println!("WGC supported: {}", if supported { "yes" } else { "NO" });
         if !supported {
@@ -149,18 +177,18 @@ mod imp {
         }
         let hwnd = match (args.hwnd, &args.process) {
             (Some(h), _) => h,
-            (None, Some(p)) => match find_by_process(p) {
-                Some((h, n)) => {
-                    println!("found {n} visible window(s) of the process; capturing the largest");
-                    h
-                }
-                None => return Err(format!("no visible window of a process named '{p}'")),
-            },
+            (None, Some(p)) => {
+                let (h, n) = find_by_process(p)?;
+                println!("found {n} visible window(s) of the process; capturing the largest");
+                h
+            }
             _ => unreachable!(),
         };
         println!("options: cursor={} border={} client_area={}", args.opts.cursor, args.opts.border, args.opts.client_area);
         let opened = Instant::now();
-        let mut cap = WindowCapture::open(hwnd, args.opts).map_err(|e| format!("open failed: {e}"))?;
+        // Each step is named on stderr just before it is taken: if the program dies inside a Windows
+        // call, the last "step:" line says which one.
+        let mut cap = WindowCapture::open_traced(hwnd, args.opts, |s| eprintln!("step: {s}")).map_err(|e| format!("open failed: {e}"))?;
         println!("opened in {:.1} ms; border hidden: {}; state: {:?}", opened.elapsed().as_secs_f64() * 1000.0, cap.border_hidden(), cap.state());
 
         let (mut intervals, mut copies) = (Vec::new(), Vec::new());
@@ -172,9 +200,15 @@ mod imp {
         let (mut time_first, mut time_last) = (Duration::ZERO, Duration::ZERO);
         let deadline = Instant::now() + Duration::from_secs(args.seconds);
         while frames < args.frames && Instant::now() < deadline {
+            if frames == 0 && timeouts == 0 {
+                eprintln!("step: first frame (waiting up to 500 ms per try)");
+            }
             match cap.next_frame(Duration::from_millis(500)) {
                 Ok(Some(f)) => {
                     frames += 1;
+                    if frames == 1 {
+                        eprintln!("step: first frame arrived ({}x{})", f.width, f.height);
+                    }
                     let ok = f.stride == f.width as usize * 4 && f.bgra.len() == f.stride * f.height as usize && f.width > 0 && f.height > 0;
                     if !ok {
                         inconsistent += 1;
