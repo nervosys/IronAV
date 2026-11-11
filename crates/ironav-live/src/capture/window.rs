@@ -17,9 +17,10 @@ pub struct WindowCaptureOptions {
     /// off needs Windows 10 version 2004 or later; on an older build opening fails rather than
     /// showing a cursor that was asked to be left out. Default true.
     pub cursor: bool,
-    /// Whether the yellow border Windows draws around a captured window is kept. When false (the
-    /// default) the capture asks the system to leave it out; Windows 11 allows that, and on a build
-    /// or in a setting that does not the request is ignored and the border stays (see
+    /// Whether the yellow border Windows draws around a captured window is kept, so that the person at
+    /// the machine can see the window is being captured. Default true. When false the capture asks the
+    /// system to leave it out; Windows 11 allows that, and on a build or in a setting that does not the
+    /// request is ignored and the border stays (see
     /// [`WindowCapture::border_hidden`](super::WindowCapture::border_hidden)).
     pub border: bool,
     /// Whether only the window's client area is captured (without the title bar and the frame)
@@ -34,7 +35,7 @@ pub struct WindowCaptureOptions {
 
 impl Default for WindowCaptureOptions {
     fn default() -> WindowCaptureOptions {
-        WindowCaptureOptions { cursor: true, border: false, client_area: false }
+        WindowCaptureOptions { cursor: true, border: true, client_area: false }
     }
 }
 

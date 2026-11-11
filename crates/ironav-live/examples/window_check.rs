@@ -17,7 +17,7 @@
 //!
 //! Options: `--hwnd N` (a window handle, decimal or 0x...) or `--process NAME` (the largest visible
 //! window of the first process with that executable name, `.exe` optional); `--client` for the client
-//! area only; `--no-cursor`; `--border` to keep the system's capture border; `--frames N` (120);
+//! area only; `--no-cursor`; `--no-border` to ask the system to leave out its capture border (kept by default); `--frames N` (120);
 //! `--seconds N` (60), the longest the run waits for them.
 //!
 //! Exit code 0 when frames came and every frame was consistent, 1 otherwise (and 2 when WGC is not
@@ -75,6 +75,7 @@ mod imp {
                 "--client" => a.opts.client_area = true,
                 "--no-cursor" => a.opts.cursor = false,
                 "--border" => a.opts.border = true,
+                "--no-border" => a.opts.border = false,
                 other => return Err(format!("unknown option '{other}'")),
             }
         }

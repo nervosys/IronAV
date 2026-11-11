@@ -16,7 +16,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   `WindowCapture::open(hwnd, WindowCaptureOptions)` and `next_frame(timeout) -> Result<Option<WindowFrame>>`; frames carry their size,
   a sequence number, whether the size changed (`resized`), how many pool frames were skipped for a newer one (`dropped`) and the time
   the copy took. The frame pool is recreated when the window is resized, as WGC requires; the one frame made while a window grows
-  is marked `truncated`. Options: `cursor`, `border` (the system's capture border is asked to be left out, which Windows 11 allows;
+  is marked `truncated`. Options: `cursor`, `border` (the system's capture border is kept by default; when false it is asked to be left out, which Windows 11 allows;
   `border_hidden()` says whether it was) and `client_area` (cut to the client area when Windows' numbers for it match the picture).
   `state()` tells `Running`, `Minimized`, `Hidden` or `Closed` (a minimized window sends no frames, so `next_frame` returns
   `Ok(None)`); a closed window is an error (`NotFound`, "the window was closed"). `window_capture_supported()` and the open error
