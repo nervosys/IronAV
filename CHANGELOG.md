@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-11-10
+
 ### Added
 
 - `ironav-live`, Windows: `capture::WindowCapture`, per-window capture through Windows.Graphics.Capture (a `GraphicsCaptureItem`

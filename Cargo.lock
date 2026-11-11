@@ -2204,7 +2204,7 @@ dependencies = [
 
 [[package]]
 name = "ironav-analyze"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "ironav-codec",
  "ironav-core",
@@ -2214,7 +2214,7 @@ dependencies = [
 
 [[package]]
 name = "ironav-cli"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "ironav-core",
  "ironav-engine",
@@ -2231,7 +2231,7 @@ dependencies = [
 
 [[package]]
 name = "ironav-codec"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "ironav-core",
  "serde",
@@ -2240,7 +2240,7 @@ dependencies = [
 
 [[package]]
 name = "ironav-core"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "serde",
  "serde_json",
@@ -2248,7 +2248,7 @@ dependencies = [
 
 [[package]]
 name = "ironav-engine"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "ironav-analyze",
  "ironav-codec",
@@ -2266,7 +2266,7 @@ dependencies = [
 
 [[package]]
 name = "ironav-formats"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "flate2",
  "ironav-codec",
@@ -2277,7 +2277,7 @@ dependencies = [
 
 [[package]]
 name = "ironav-gui"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "eframe",
  "ironav-codec",
@@ -2293,7 +2293,7 @@ dependencies = [
 
 [[package]]
 name = "ironav-hwaccel"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "ironav-core",
  "libloading",
@@ -2302,7 +2302,7 @@ dependencies = [
 
 [[package]]
 name = "ironav-live"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "block2 0.6.2",
  "dispatch2",
@@ -2326,7 +2326,7 @@ dependencies = [
 
 [[package]]
 name = "ironav-ontology"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "ironav-codec",
  "ironav-core",
@@ -2338,7 +2338,7 @@ dependencies = [
 
 [[package]]
 name = "ironav-player"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "cpal",
  "ironav-codec",
@@ -2352,7 +2352,7 @@ dependencies = [
 
 [[package]]
 name = "ironav-webui"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "ic-drbg",
  "ironav-core",
