@@ -32,10 +32,18 @@ mod mf;
 mod screen;
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 mod v4l2;
+#[cfg_attr(not(windows), allow(dead_code))] // the pure parts are built and tested everywhere
+mod window;
+#[cfg(windows)]
+mod wgc;
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 mod x11;
 
 pub use screen::{list_screens, MoveRect, Rect, ScreenCapture, ScreenFrame, ScreenInfo, ScreenOptions};
+#[cfg(windows)]
+pub use wgc::{window_capture_supported, WindowCapture};
+#[cfg(windows)]
+pub use window::{WindowCaptureOptions, WindowFrame, WindowState};
 
 use crate::source::{SourceInfo, ThreadSource};
 use crate::url::SourceUrl;

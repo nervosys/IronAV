@@ -37,8 +37,8 @@ ic-core = "0.3.2"
 
 [target.'cfg(windows)'.dependencies]
 # cameras and microphones through Media Foundation, screens through DXGI Desktop Duplication (on
-# Direct3D 11), and a WHIP endpoint's UDP receive buffer
-windows = { version = "0.62", features = ["Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_Networking_WinSock", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi"] }
+# Direct3D 11), single windows through Windows.Graphics.Capture, and a WHIP endpoint's UDP receive buffer
+windows = { version = "0.62", features = ["Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_Networking_WinSock", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_UI_WindowsAndMessaging", "Win32_System_WinRT", "Win32_System_WinRT_Direct3D11", "Win32_System_WinRT_Graphics_Capture", "Graphics_Capture", "Graphics_DirectX_Direct3D11"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # cameras through Video4Linux2's ioctls, and a WHIP endpoint's UDP receive buffer
@@ -57,3 +57,7 @@ block2 = "0.6"
 
 [dev-dependencies]
 # the TLS test issues its own certificates (ic-drbg is a dependency already)
+
+[target.'cfg(windows)'.dev-dependencies]
+# examples/window_check.rs finds a window by its process's name and makes the process DPI aware
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"] }

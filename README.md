@@ -258,7 +258,7 @@ meanwhile). On Linux it reads the X server with `XGetImage`, loading libX11 (and
 monitors and the cursor) when it is opened, so nothing is needed to build; a Wayland-only session is refused with an error
 that says it needs the PipeWire portal, which is not supported yet. On macOS it uses CoreGraphics, which asks for the Screen
 Recording permission in System Settings > Privacy & Security (a refusal says so) and never draws the cursor. The
-Windows capture has been run on a real desktop; the Linux and macOS ones are compile-checked only. A screen shows
+Windows capture has been run on a real desktop; the Linux and macOS ones are compile-checked only. From Rust on Windows, one application window can also be captured on its own with `ironav_live::capture::WindowCapture` (Windows.Graphics.Capture): only that window's pixels, wherever it is and whatever covers it, as BGRA with its size; it is written and compile-checked, and awaits its owner-run check (`examples/window_check.rs`). A screen shows
 everything on the display, passwords and other people's messages included, so the agent tools treat it as a device
 (`IRONAV_ALLOW_DEVICES`), and nothing opens it unless a source asks.
 For testing without either, `test://video` and `test://audio` are made up at the pace they play: a grey ramp with a

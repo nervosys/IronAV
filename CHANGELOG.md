@@ -7,6 +7,25 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+
+- `ironav-live`, Windows: `capture::WindowCapture`, per-window capture through Windows.Graphics.Capture (a `GraphicsCaptureItem`
+  made for the window's handle, a free-threaded `Direct3D11CaptureFramePool`, a `GraphicsCaptureSession`). It gives one window's own
+  pixels, tightly packed BGRA, wherever the window is: while it is dragged, under other windows, partly off the display. This is
+  what a remote desktop that shows one application window needs instead of copying the display and masking what lies outside it.
+  `WindowCapture::open(hwnd, WindowCaptureOptions)` and `next_frame(timeout) -> Result<Option<WindowFrame>>`; frames carry their size,
+  a sequence number, whether the size changed (`resized`), how many pool frames were skipped for a newer one (`dropped`) and the time
+  the copy took. The frame pool is recreated when the window is resized, as WGC requires; the one frame made while a window grows
+  is marked `truncated`. Options: `cursor`, `border` (the system's capture border is asked to be left out, which Windows 11 allows;
+  `border_hidden()` says whether it was) and `client_area` (cut to the client area when Windows' numbers for it match the picture).
+  `state()` tells `Running`, `Minimized`, `Hidden` or `Closed` (a minimized window sends no frames, so `next_frame` returns
+  `Ok(None)`); a closed window is an error (`NotFound`, "the window was closed"). `window_capture_supported()` and the open error
+  (`HardwareUnavailable`, with a hint) let a caller fall back to `ScreenCapture`. The capture is not `Send`: it is used on the thread
+  that opened it, which joins the Windows Runtime's multithreaded apartment until it is dropped.
+- New example `window_check` in `ironav-live`, an owner-run check of window capture on a real window (by handle or process name):
+  it takes about 120 frames and prints verdicts and timings (frame count, sizes seen, time between frames and copy time as median
+  and maximum, whether 60 fps is possible at that size, minimized and closed handling), and no pixels or window titles.
+
 ## [0.1.8] - 2026-11-10
 
 ### Fixed
