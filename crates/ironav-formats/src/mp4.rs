@@ -636,6 +636,8 @@ struct Fragments {
     seq: u32,
     start: Option<f64>,
     moov_written: bool,
+    /// A cut was asked for (`FragmentedMp4Writer::flush`) and waits for the next key frame.
+    cut: bool,
 }
 
 /// Sample size in bits of a PCM codec.
@@ -702,7 +704,7 @@ impl Mp4Muxer {
     /// `seconds` long (in a file with no video, at the first packet after that), so each one can be played
     /// alone. Used for live delivery and for files that are read while they are written.
     pub fn fragmented(out: Box<dyn WriteSeek>, quicktime: bool, seconds: f64) -> Self {
-        Self { quicktime, fragments: Some(Fragments { seconds, seq: 0, start: None, moov_written: false }), ..Self::new(out) }
+        Self { quicktime, fragments: Some(Fragments { seconds, seq: 0, start: None, moov_written: false, cut: false }), ..Self::new(out) }
     }
 
     /// Like `new`, but once the file is complete it is rewritten so that the index comes first and
@@ -804,6 +806,7 @@ impl Mp4Muxer {
         if let Some(f) = self.fragments.as_mut() {
             f.seq = seq;
             f.start = None;
+            f.cut = false;
         }
         Ok(())
     }
@@ -832,11 +835,11 @@ impl Mp4Muxer {
         }
         let at = p.pts as f64 * tr.time_base.as_f64();
         let cut_here = if tr.is_video() { key } else { !self.tracks.iter().any(Track::is_video) };
-        let (seconds, start) = match self.fragments.as_ref() {
-            Some(f) => (f.seconds, f.start),
-            None => (0.0, None),
+        let (seconds, start, cut) = match self.fragments.as_ref() {
+            Some(f) => (f.seconds, f.start, f.cut),
+            None => (0.0, None, false),
         };
-        if cut_here && start.is_some_and(|s| at - s >= seconds) {
+        if cut_here && start.is_some_and(|s| cut || at - s >= seconds) {
             self.write_fragment()?;
         }
         if let Some(f) = self.fragments.as_mut() {
@@ -853,6 +856,22 @@ impl Mp4Muxer {
         tr.dts += delta as u64;
         tr.frag_total += 1;
         Ok(())
+    }
+
+    /// Close the fragment being gathered ahead of time. Without video that is done at once; with video the
+    /// fragment ends at the next key frame (a fragment is only cut where it can be played alone), and the
+    /// samples gathered until then stay pending.
+    fn cut_fragment(&mut self) -> Result<()> {
+        if self.tracks.iter().any(Track::is_video) {
+            if let Some(f) = self.fragments.as_mut() {
+                f.cut = true;
+            }
+            return Ok(());
+        }
+        if self.tracks.iter().all(|t| t.pending.is_empty()) {
+            return Ok(());
+        }
+        self.write_fragment()
     }
 
     /// Copy the finished file to a new one in the order ftyp, moov, mdat, then replace it.
@@ -1088,6 +1107,112 @@ impl Muxer for Mp4Muxer {
             Some(path) => self.move_index_first(&path),
             None => Ok(()),
         }
+    }
+}
+
+/// A `Write`-and-`Seek` sink whose seeks fail, over a buffer shared with its owner: the fragmented writer
+/// never seeks, and this lets `FragmentedMp4Writer` take any `Write`, with no `Send` or `'static` bound.
+struct Staging(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Staging {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Seek for Staging {
+    fn seek(&mut self, _: SeekFrom) -> std::io::Result<u64> {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "a fragmented MP4 stream cannot seek"))
+    }
+}
+
+/// A streaming fragmented-MP4 writer: `ftyp`, then a `moov` with empty sample tables and a `mvex`, then a
+/// `moof` and `mdat` per fragment, written to any `Write` with no seeking (for an HTTP response, say). It is
+/// the box writer of the file muxer (`create_muxer_with(path, "mp4", Some(secs))`), so the same packets
+/// give the same bytes. Holds one video and/or one audio stream of the codecs that muxer accepts
+/// (H.264, HEVC, VP9, AV1, AAC, MP2, AC-3, FLAC, ALAC); as there, video has a constant frame rate.
+///
+/// A fragment is cut at the first key frame once it is `fragment_seconds` long (with no video, at the first
+/// packet after that). Differences from the path-based file: none in the bytes; but the `moov` is not
+/// written by `new`, it goes out with the first fragment, because it describes the streams from their first
+/// packets (H.264 parameter sets are read from the first access unit). Only `ftyp` is written at once.
+/// There is no `mfra`.
+///
+/// [`flush`](Self::flush) ends the fragment early: with no video at the next packet boundary, at once;
+/// with video at the next key frame, so that every fragment starts at one (until it arrives, the video
+/// packets gathered stay in the writer: a stream that wants a bounded delay needs regular key frames).
+///
+/// ```
+/// use ironav_core::{CodecId, Packet, Rational, StreamInfo, StreamParams};
+/// use ironav_formats::FragmentedMp4Writer;
+///
+/// let info = StreamInfo {
+///     index: 0,
+///     codec: CodecId::Aac,
+///     time_base: Rational::new(1, 48_000),
+///     duration: None,
+///     bits: None,
+///     extradata: vec![0x11, 0x88], // AudioSpecificConfig: AAC-LC, 48 kHz, mono
+///     lead_in: 0,
+///     params: StreamParams::Audio { sample_rate: 48_000, channels: 1 },
+/// };
+/// let mut w = FragmentedMp4Writer::new(Vec::new(), &[info], 2.0)?;
+/// w.write_packet(&Packet { stream: 0, pts: 0, duration: 1024, data: vec![0x21, 0x10, 0x04] })?;
+/// w.flush()?; // the fragment is closed and in the Vec
+/// let bytes = w.finish()?;
+/// assert_eq!(&bytes[4..8], b"ftyp");
+/// # Ok::<(), ironav_core::Error>(())
+/// ```
+pub struct FragmentedMp4Writer<W: std::io::Write> {
+    w: W,
+    staged: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    mux: Mp4Muxer,
+}
+
+impl<W: std::io::Write> FragmentedMp4Writer<W> {
+    /// Start a stream of `streams` (one video and/or one audio stream), writing `ftyp` to `w` now.
+    pub fn new(w: W, streams: &[StreamInfo], fragment_seconds: f64) -> Result<Self> {
+        let staged = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut mux = Mp4Muxer::fragmented(Box::new(Staging(staged.clone())), false, fragment_seconds);
+        mux.write_header(streams)?;
+        let mut me = Self { w, staged, mux };
+        me.drain()?;
+        Ok(me)
+    }
+
+    fn drain(&mut self) -> Result<()> {
+        let mut buf = self.staged.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !buf.is_empty() {
+            self.w.write_all(&buf)?;
+            buf.clear();
+        }
+        Ok(())
+    }
+
+    /// Add a packet; a finished fragment goes to `w` as soon as the packet that ends it arrives.
+    pub fn write_packet(&mut self, p: &Packet) -> Result<()> {
+        self.mux.write_packet(p)?;
+        self.drain()
+    }
+
+    /// End the current fragment early (see the type's notes for video) and flush `w`.
+    pub fn flush(&mut self) -> Result<()> {
+        self.mux.cut_fragment()?;
+        self.drain()?;
+        self.w.flush()?;
+        Ok(())
+    }
+
+    /// Write the last fragment and give back `w`. Errors when a stream received no packets.
+    pub fn finish(mut self) -> Result<W> {
+        self.mux.finish()?;
+        self.drain()?;
+        self.w.flush()?;
+        Ok(self.w)
     }
 }
 

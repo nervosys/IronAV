@@ -9,7 +9,7 @@ use crate::ogg::crc;
 use crate::WriteSeek;
 use crate::flac::{flac_audio_params, FlacStats};
 use ironav_core::{CodecId, Error, ErrorCode, Muxer, Packet, Result, StreamInfo, StreamParams};
-use std::io::{Seek, SeekFrom};
+use std::io::{Seek, SeekFrom, Write};
 
 const SERIAL: u32 = 0x4952_4F4E;
 /// A page is written once it holds this many samples (0.5 s at 48 kHz) …
@@ -19,8 +19,10 @@ const PAGE_SEGMENTS: usize = 240;
 const HEADER_BOS: u8 = 0x02;
 const HEADER_EOS: u8 = 0x04;
 
-pub struct OggWriter {
-    out: Box<dyn WriteSeek>,
+/// The page-building state shared by `OggWriter` (a seekable file) and `OggStreamWriter` (any `Write`):
+/// pages are appended to `buf`, and the owner drains it into its sink after each call.
+struct OggCore {
+    buf: Vec<u8>,
     seq: u32,
     /// Input time base, to turn packet durations into 48 kHz samples.
     time_base: (i64, i64),
@@ -41,9 +43,9 @@ pub struct OggWriter {
     last_trim: i64,
 }
 
-impl OggWriter {
-    pub fn new(out: Box<dyn WriteSeek>) -> Self {
-        Self { out, seq: 0, time_base: (1, 48_000), granule: 0, pending: Vec::new(), pending_segments: 0, pending_samples: 0, started: false, rate: 48_000, flac: None, vorbis: None, last_trim: 0 }
+impl OggCore {
+    fn new() -> Self {
+        Self { buf: Vec::new(), seq: 0, time_base: (1, 48_000), granule: 0, pending: Vec::new(), pending_segments: 0, pending_samples: 0, started: false, rate: 48_000, flac: None, vorbis: None, last_trim: 0 }
     }
 
     fn build_page(&self, kind: u8, granule: i64, packets: &[Vec<u8>]) -> Vec<u8> {
@@ -77,7 +79,7 @@ impl OggWriter {
 
     fn page(&mut self, kind: u8, granule: i64, packets: &[Vec<u8>]) -> Result<()> {
         let page = self.build_page(kind, granule, packets);
-        self.out.write_all(&page)?;
+        self.buf.extend_from_slice(&page);
         self.seq += 1;
         Ok(())
     }
@@ -91,7 +93,7 @@ impl OggWriter {
     }
 }
 
-impl Muxer for OggWriter {
+impl OggCore {
     fn write_header(&mut self, streams: &[StreamInfo]) -> Result<()> {
         let [s] = streams else {
             return Err(Error::invalid_arg("Ogg holds exactly one audio stream here"));
@@ -135,7 +137,7 @@ impl Muxer for OggWriter {
             comment.extend(&(tags.len() as u32).to_be_bytes()[1..]);
             comment.extend(tags);
             let first = self.build_page(HEADER_BOS, 0, &[head]);
-            self.out.write_all(&first)?;
+            self.buf.extend_from_slice(&first);
             self.seq += 1;
             self.page(0, 0, &[comment])?;
             self.flac = Some(((rate, channels, bits), FlacStats::new(), first));
@@ -189,7 +191,17 @@ impl Muxer for OggWriter {
         Ok(())
     }
 
-    fn finish(&mut self) -> Result<()> {
+    /// Force out a page with the packets pending (nothing when there are none).
+    fn flush_pending(&mut self) -> Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        self.flush_page(false)
+    }
+
+    /// Write the last page. For FLAC, returns the first page with its STREAMINFO filled in from the
+    /// packets seen, for a seekable sink to rewrite in place.
+    fn finish(&mut self) -> Result<Option<Vec<u8>>> {
         if self.pending.is_empty() {
             // no audio at all: the stream still needs its last page
             self.page(HEADER_EOS, self.granule, &[])?;
@@ -197,17 +209,135 @@ impl Muxer for OggWriter {
             self.pending_samples -= self.last_trim;
             self.flush_page(true)?;
         }
-        if let Some(((rate, channels, bits), stats, mut first)) = self.flac.take() {
+        Ok(self.flac.take().map(|((rate, channels, bits), stats, mut first)| {
             // STREAMINFO sits after the 27-byte page header, 1 table entry and 17 bytes of mapping header
             first[45..79].copy_from_slice(&stats.streaminfo(rate, channels, bits));
             first[22..26].fill(0);
             let sum = crc(&first);
             first[22..26].copy_from_slice(&sum.to_le_bytes());
+            first
+        }))
+    }
+}
+
+pub struct OggWriter {
+    out: Box<dyn WriteSeek>,
+    core: OggCore,
+}
+
+impl OggWriter {
+    pub fn new(out: Box<dyn WriteSeek>) -> Self {
+        Self { out, core: OggCore::new() }
+    }
+
+    fn drain(&mut self) -> Result<()> {
+        self.out.write_all(&self.core.buf)?;
+        self.core.buf.clear();
+        Ok(())
+    }
+}
+
+impl Muxer for OggWriter {
+    fn write_header(&mut self, streams: &[StreamInfo]) -> Result<()> {
+        self.core.write_header(streams)?;
+        self.drain()
+    }
+
+    fn write_packet(&mut self, p: &Packet) -> Result<()> {
+        self.core.write_packet(p)?;
+        self.drain()
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        let first = self.core.finish()?;
+        self.drain()?;
+        if let Some(first) = first {
             self.out.seek(SeekFrom::Start(0))?;
             self.out.write_all(&first)?;
             self.out.seek(SeekFrom::End(0))?;
         }
         self.out.flush()?;
         Ok(())
+    }
+}
+
+/// A streaming Ogg writer for Opus, Vorbis and FLAC: pages go to any `Write` as they are formed, with no
+/// seeking, so it can feed a socket or an HTTP response body. The page layout, granule positions (Opus: 48 kHz,
+/// pre-skip included) and the end-of-stream trimming are those of the file writer, so the same packets give
+/// the same bytes.
+///
+/// Pages are normally about half a second long and go out when the next packet arrives after one is full;
+/// [`flush`](Self::flush) forces the pending packets out at once, in a shorter page, for low latency.
+/// Limitation: a file writer goes back to fill in FLAC's STREAMINFO (totals, MD5) at the end; a stream cannot,
+/// so a FLAC stream keeps the header it started with (sample counts unknown, as a live FLAC stream's are).
+///
+/// ```
+/// use ironav_core::{CodecId, Packet, Rational, StreamInfo, StreamParams};
+/// use ironav_formats::OggStreamWriter;
+///
+/// let mut head = b"OpusHead".to_vec();
+/// head.extend_from_slice(&312u16.to_le_bytes());
+/// head.extend_from_slice(&48_000u32.to_le_bytes());
+/// head.extend_from_slice(&[0, 0, 0]);
+/// let info = StreamInfo {
+///     index: 0,
+///     codec: CodecId::Opus,
+///     time_base: Rational::new(1, 48_000),
+///     duration: None,
+///     bits: None,
+///     extradata: head,
+///     lead_in: 0,
+///     params: StreamParams::Audio { sample_rate: 48_000, channels: 1 },
+/// };
+/// let mut w = OggStreamWriter::new(Vec::new(), &[info])?;
+/// w.write_packet(&Packet { stream: 0, pts: 0, duration: 960, data: vec![0xF8, 0xFF, 0xFE] })?;
+/// w.flush()?; // the packet is now in the Vec, as a page of its own
+/// let bytes = w.finish()?;
+/// assert!(bytes.starts_with(b"OggS"));
+/// # Ok::<(), ironav_core::Error>(())
+/// ```
+pub struct OggStreamWriter<W: Write> {
+    w: W,
+    core: OggCore,
+}
+
+impl<W: Write> OggStreamWriter<W> {
+    /// Start a stream of the single audio stream described by `streams`, writing its header pages to `w` now.
+    pub fn new(w: W, streams: &[StreamInfo]) -> Result<Self> {
+        let mut me = Self { w, core: OggCore::new() };
+        me.core.write_header(streams)?;
+        me.drain()?;
+        Ok(me)
+    }
+
+    fn drain(&mut self) -> Result<()> {
+        if !self.core.buf.is_empty() {
+            self.w.write_all(&self.core.buf)?;
+            self.core.buf.clear();
+        }
+        Ok(())
+    }
+
+    /// Add a packet. A page is written when it fills (when the packet after it arrives).
+    pub fn write_packet(&mut self, p: &Packet) -> Result<()> {
+        self.core.write_packet(p)?;
+        self.drain()
+    }
+
+    /// Write out a page with the packets pending, with the granule position they reach, and flush `w`. After
+    /// it returns every packet written so far is in `w`. With nothing pending it only flushes `w`.
+    pub fn flush(&mut self) -> Result<()> {
+        self.core.flush_pending()?;
+        self.drain()?;
+        self.w.flush()?;
+        Ok(())
+    }
+
+    /// Write the last page (end of stream) and give back `w`.
+    pub fn finish(mut self) -> Result<W> {
+        self.core.finish()?;
+        self.drain()?;
+        self.w.flush()?;
+        Ok(self.w)
     }
 }

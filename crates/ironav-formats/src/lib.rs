@@ -15,6 +15,8 @@ pub mod stream;
 mod ogg;
 mod vpxav1;
 mod oggwrite;
+pub use mp4::FragmentedMp4Writer;
+pub use oggwrite::OggStreamWriter;
 pub mod renditions;
 pub mod rtp;
 pub mod ts;
