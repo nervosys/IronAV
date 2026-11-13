@@ -16,6 +16,7 @@ mod mc;
 mod tables;
 
 pub mod enc;
+pub use enc::Mpeg4Encoder;
 
 use bits::{Bits, Rl, Vlc};
 use ironav_core::{Decoder, Error, ErrorCode, Frame, Packet, PixelFormat, Result, VideoFrame};

@@ -8,6 +8,7 @@ pub mod block;
 pub mod cdef;
 pub mod cdf_tables;
 pub mod enc;
+pub use enc::Av1Encoder;
 pub mod film_grain;
 pub mod grain_tables;
 pub mod inter;

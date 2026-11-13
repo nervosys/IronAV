@@ -2,6 +2,36 @@
 //!
 //! The registries ([`implemented`], [`FILTERS`]) are the single source of truth for
 //! "what can IronAV actually do"; the ontology and the planner both read them.
+//!
+//! # Where the codec types live
+//!
+//! Every codec is a module named for it (behind the Cargo feature of the same name), and its
+//! decoder and encoder are re-exported at the top of that module as `<codec>::<Codec>Decoder` and
+//! `<codec>::<Codec>Encoder`. Encoders are also gathered in [`encoders`]. Sub-modules such as
+//! `av1::enc` or `mpeg4::enc` are implementation detail; use the paths below.
+//!
+//! | Codec | Decoder | Encoder | Also in [`encoders`] |
+//! |---|---|---|---|
+//! | AAC | `aac::AacDecoder` | `aac::AacEncoder` | `encoders::AacEncoder` |
+//! | AC-3 | `ac3::Ac3Decoder` | `ac3::Ac3Encoder` | `encoders::Ac3Encoder` |
+//! | ALAC | `alac::AlacDecoder` | `alac::AlacEncoder` | `encoders::AlacEncoder` |
+//! | AV1 | `av1::Av1Decoder` | `av1::Av1Encoder` | `encoders::Av1Encoder` |
+//! | FLAC | `flac::FlacDecoder` | `flac::FlacEncoder` | `encoders::FlacEncoder` |
+//! | H.264 | `h264::H264Decoder` | `h264::H264Encoder` | `encoders::H264Encoder` |
+//! | HEVC | `hevc::HevcDecoder` | `hevc::HevcEncoder` | `encoders::HevcEncoder` |
+//! | JPEG | `jpeg::JpegDecoder` | `jpeg::JpegEncoder` | `encoders::JpegEncoder` |
+//! | MP3 | `mp3::Mp3Decoder` | `mp3::Mp3Encoder` | `encoders::Mp3Encoder` |
+//! | MPEG-2 video | `mpeg2::Mpeg2Decoder` | `mpeg2::Mpeg2Encoder` | `encoders::Mpeg2Encoder` |
+//! | MPEG-4 part 2 | `mpeg4::Mpeg4Decoder` | `mpeg4::Mpeg4Encoder` | `encoders::Mpeg4Encoder` |
+//! | Opus | `opus::OpusDecoder` | `opus::OpusEncoder` | `encoders::OpusEncoder` |
+//! | ProRes | `prores::ProResDecoder` | `prores::ProResEncoder` | `encoders::ProResEncoder` |
+//! | Vorbis | `vorbis::VorbisDecoder` | `vorbis::VorbisEncoder` | `encoders::VorbisEncoder` |
+//! | VP8 | `vp8::Vp8Decoder` | `vp8::Vp8Encoder` | `encoders::Vp8Encoder` |
+//! | VP9 | `vp9::Vp9Decoder` | `vp9::Vp9Encoder` | `encoders::Vp9Encoder` |
+//!
+//! MP2 is in the `mp3` module (`mp3::Mp2Decoder`, `mp3::Mp2Encoder`). Opus also has
+//! `opus::MultistreamDecoder` and `opus::MultistreamEncoder`. To get a decoder or encoder for a
+//! `CodecId` without naming the type, use [`new_decoder`] and [`new_encoder`].
 
 #[cfg(feature = "aac")]
 pub mod aac;
@@ -62,6 +92,45 @@ mod mdct;
 mod channels;
 #[cfg(any(feature = "flac", feature = "alac"))]
 pub mod bitio;
+
+/// Every encoder under one path: `ironav_codec::encoders::H264Encoder`, `Vp9Encoder` and so on.
+///
+/// These are re-exports of the `<codec>::<Codec>Encoder` types, which stay where they are. Each
+/// is present when its codec's Cargo feature is on.
+pub mod encoders {
+    #[cfg(feature = "aac")]
+    pub use crate::aac::AacEncoder;
+    #[cfg(feature = "ac3")]
+    pub use crate::ac3::Ac3Encoder;
+    #[cfg(feature = "alac")]
+    pub use crate::alac::AlacEncoder;
+    #[cfg(feature = "av1")]
+    pub use crate::av1::Av1Encoder;
+    #[cfg(feature = "flac")]
+    pub use crate::flac::FlacEncoder;
+    #[cfg(feature = "h264")]
+    pub use crate::h264::H264Encoder;
+    #[cfg(feature = "hevc")]
+    pub use crate::hevc::HevcEncoder;
+    #[cfg(feature = "jpeg")]
+    pub use crate::jpeg::JpegEncoder;
+    #[cfg(feature = "mp3")]
+    pub use crate::mp3::Mp3Encoder;
+    #[cfg(feature = "mpeg2")]
+    pub use crate::mpeg2::Mpeg2Encoder;
+    #[cfg(feature = "mpeg4")]
+    pub use crate::mpeg4::Mpeg4Encoder;
+    #[cfg(feature = "opus")]
+    pub use crate::opus::OpusEncoder;
+    #[cfg(feature = "prores")]
+    pub use crate::prores::ProResEncoder;
+    #[cfg(feature = "vorbis")]
+    pub use crate::vorbis::VorbisEncoder;
+    #[cfg(feature = "vp8")]
+    pub use crate::vp8::Vp8Encoder;
+    #[cfg(feature = "vp9")]
+    pub use crate::vp9::Vp9Encoder;
+}
 
 #[cfg(feature = "filters")]
 pub use filters::{build_filter, FilterSpec, ParamSpec, FILTERS};
