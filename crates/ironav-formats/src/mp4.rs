@@ -333,6 +333,18 @@ impl Track {
         self.duration * movie_ts / self.timescale as u64
     }
 
+    /// A packet's duration, given in the stream's time base, in this track's media time units (an audio
+    /// track's are samples). Rounded to nearest, and at least 1 for a packet that has any length.
+    fn media_duration(&self, duration: i64) -> i64 {
+        let tb = self.time_base;
+        if tb.num <= 0 || tb.den <= 0 || (tb.num == 1 && tb.den == self.timescale as i64) {
+            return duration; // already in media time units
+        }
+        let n = duration as i128 * tb.num as i128 * self.timescale as i128;
+        let d = tb.den as i128;
+        (((n + d / 2) / d) as i64).max(1)
+    }
+
     /// A packet time in this track's media time units (rounded to nearest).
     fn media_time(&self, pts: i64) -> i64 {
         let tb = self.time_base;
@@ -825,13 +837,13 @@ impl Mp4Muxer {
                 return Err(Error::new(ErrorCode::Internal, "audio packet has no duration"));
             }
             tr.ac3_config(&p.data)?;
-            (p.data.clone(), true, p.duration as u32, None)
+            (p.data.clone(), true, tr.media_duration(p.duration).min(u32::MAX as i64) as u32, None)
         };
         if sample.len() > u32::MAX as usize {
             return Err(Error::invalid_input("a single sample exceeds 4 GiB"));
         }
         if !tr.is_video() && tr.codec == CodecId::Flac {
-            tr.flac.record(p);
+            tr.flac.record_frame(p.data.len(), tr.media_duration(p.duration));
         }
         let at = p.pts as f64 * tr.time_base.as_f64();
         let cut_here = if tr.is_video() { key } else { !self.tracks.iter().any(Track::is_video) };
@@ -1059,7 +1071,7 @@ impl Muxer for Mp4Muxer {
                 return Err(Error::new(ErrorCode::Internal, "audio packet has no duration"));
             }
             tr.ac3_config(&p.data)?;
-            (p.data.clone(), false, p.duration as u32)
+            (p.data.clone(), false, tr.media_duration(p.duration).min(u32::MAX as i64) as u32)
         };
         if sample.len() > u32::MAX as usize {
             return Err(Error::invalid_input("a single sample exceeds 4 GiB"));
@@ -1073,7 +1085,7 @@ impl Muxer for Mp4Muxer {
             _ => tr.stts.push((1, delta)),
         }
         if !tr.is_video() && tr.codec == CodecId::Flac {
-            tr.flac.record(p);
+            tr.flac.record_frame(p.data.len(), tr.media_duration(p.duration));
         }
         tr.duration += delta as u64;
         tr.pending.extend_from_slice(&sample);
@@ -1135,6 +1147,9 @@ impl Seek for Staging {
 /// the box writer of the file muxer (`create_muxer_with(path, "mp4", Some(secs))`), so the same packets
 /// give the same bytes. Holds one video and/or one audio stream of the codecs that muxer accepts
 /// (H.264, HEVC, VP9, AV1, AAC, MP2, AC-3, FLAC, ALAC); as there, video has a constant frame rate.
+/// Packet times and durations are read in each stream's `time_base`: audio durations are converted to
+/// samples, and video presentation times to the frame-rate time scale (video decode times follow the
+/// frame rate, so only the presentation order and offsets come from `pts`).
 ///
 /// A fragment is cut at the first key frame once it is `fragment_seconds` long (with no video, at the first
 /// packet after that). Differences from the path-based file: none in the bytes; but the `moov` is not
@@ -1572,5 +1587,118 @@ mod tests {
         let mut m = Mp4Muxer::new(Box::new(Shared(sink)));
         let [v, _] = av_streams();
         assert!(m.write_header(&[v.clone(), v]).is_err());
+    }
+
+    // ---- time base ----
+
+    fn aac_info(time_base: Rational) -> StreamInfo {
+        StreamInfo {
+            index: 0,
+            codec: CodecId::Aac,
+            time_base,
+            duration: None,
+            bits: None,
+            extradata: vec![0x11, 0x88],
+            lead_in: 0,
+            params: StreamParams::Audio { sample_rate: 48_000, channels: 1 },
+        }
+    }
+
+    /// Ten AAC frames of `dur` time-base units each, in a file (`fragmented` false) or fragmented output.
+    fn aac_file(time_base: Rational, dur: i64, fragmented: bool) -> Vec<u8> {
+        let packets: Vec<Packet> = (0..10).map(|i| Packet { stream: 0, pts: i * dur, duration: dur, data: vec![0x21, 0x10, i as u8] }).collect();
+        if fragmented {
+            let mut w = FragmentedMp4Writer::new(Vec::new(), &[aac_info(time_base)], 100.0).unwrap();
+            for p in &packets {
+                w.write_packet(p).unwrap();
+            }
+            return w.finish().unwrap();
+        }
+        let sink = Arc::new(Mutex::new(Cursor::new(Vec::new())));
+        let mut m = Mp4Muxer::new(Box::new(Shared(sink.clone())));
+        m.write_header(&[aac_info(time_base)]).unwrap();
+        for p in &packets {
+            m.write_packet(p).unwrap();
+        }
+        m.finish().unwrap();
+        let v = sink.lock().unwrap().get_ref().clone();
+        v
+    }
+
+    fn mdhd_duration(file: &[u8]) -> u32 {
+        let mdhd = find(file, &[b"moov", b"trak", b"mdia", b"mdhd"]).unwrap();
+        u32::from_be_bytes(mdhd[16..20].try_into().unwrap())
+    }
+
+    #[test]
+    fn audio_duration_follows_the_stream_time_base() {
+        for fragmented in [false, true] {
+            // 1024 samples at 48 kHz, written in three time bases that all say so
+            let a = aac_file(Rational::new(1, 48_000), 1024, fragmented);
+            let b = aac_file(Rational::new(1, 96_000), 2048, fragmented);
+            let c = aac_file(Rational::new(1, 24_000), 512, fragmented);
+            let d = aac_file(Rational::new(1, 1000), 1, fragmented); // 1 ms packets
+            assert_eq!(a, b, "same packets in a finer time base (fragmented: {fragmented})");
+            assert_eq!(a, c, "same packets in a coarser time base (fragmented: {fragmented})");
+            // a time base twice as coarse, the same numbers: twice as long
+            let slow = aac_file(Rational::new(1, 24_000), 1024, fragmented);
+            let moov = |f: &[u8]| find(f, &[b"moov", b"trak", b"mdia", b"minf", b"stbl", b"stts"]).map(|s| s.to_vec());
+            if fragmented {
+                let fast = find(&a, &[b"moof", b"traf", b"trun"]).unwrap().to_vec();
+                let slow = find(&slow, &[b"moof", b"traf", b"trun"]).unwrap().to_vec();
+                assert_ne!(fast, slow, "the fragment's sample durations differ");
+                let dur = |t: &[u8]| u32::from_be_bytes(t[12..16].try_into().unwrap());
+                assert_eq!(dur(&slow), 2 * dur(&fast));
+                assert_eq!(dur(&fast), 1024);
+            } else {
+                assert!(moov(&a).is_some());
+                assert_eq!(mdhd_duration(&a), 10 * 1024);
+                assert_eq!(mdhd_duration(&slow), 20 * 1024);
+                assert_eq!(mdhd_duration(&d), 10 * 48);
+            }
+        }
+    }
+
+    /// An in-order H.264 stream of `n` frames, with presentation times `pts_of(i)`.
+    fn video_file(time_base: Rational, pts: &[i64], duration: i64) -> Vec<u8> {
+        let sink = Arc::new(Mutex::new(Cursor::new(Vec::new())));
+        let mut m = Mp4Muxer::new(Box::new(Shared(sink.clone())));
+        let info = StreamInfo {
+            index: 0,
+            codec: CodecId::H264,
+            time_base,
+            duration: None,
+            bits: None,
+            extradata: Vec::new(),
+            lead_in: 0,
+            params: StreamParams::Video { width: 64, height: 48, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational::new(30, 1) },
+        };
+        m.write_header(&[info]).unwrap();
+        let sps = vec![0, 0, 0, 1, 0x67, 100, 0, 40, 0xAC];
+        let pps = vec![0, 0, 0, 1, 0x68, 0xEE, 0x3C];
+        let idr = [sps, pps, vec![0, 0, 0, 1, 0x65], vec![7; 20]].concat();
+        let p = [&[0u8, 0, 0, 1, 0x41][..], &[5; 6]].concat();
+        for (i, &pts) in pts.iter().enumerate() {
+            m.write_packet(&Packet { stream: 0, pts, duration, data: if i == 0 { idr.clone() } else { p.clone() } }).unwrap();
+        }
+        m.finish().unwrap();
+        let v = sink.lock().unwrap().get_ref().clone();
+        v
+    }
+
+    #[test]
+    fn video_times_follow_the_stream_time_base() {
+        // Decode order I P B P (presentation I B P P), at 30 fps: time bases 1/30 and 1/90000 agree.
+        let a = video_file(Rational::new(1, 30), &[1, 4, 2, 3], 1);
+        let b = video_file(Rational::new(1, 90_000), &[3000, 12_000, 6000, 9000], 3000);
+        assert_eq!(a, b, "the same times in another time base");
+        // A time base twice as coarse puts every frame twice as late (the decode times stay at the frame rate).
+        let c = video_file(Rational::new(1, 15), &[1, 4, 2, 3], 1);
+        assert_ne!(a, c);
+        let ctts = |f: &[u8]| find(f, &[b"moov", b"trak", b"mdia", b"minf", b"stbl", b"ctts"]).unwrap().to_vec();
+        let words = |t: Vec<u8>| -> Vec<u32> { t[4..].chunks(4).map(|w| u32::from_be_bytes(w.try_into().unwrap())).collect() };
+        // dts 0..3 against pts 1,4,2,3 (units of a frame) and 2,8,4,6
+        assert_eq!(words(ctts(&a)), vec![3, 1, 1, 1, 3, 2, 0]);
+        assert_eq!(words(ctts(&c)), vec![4, 1, 2, 1, 7, 1, 2, 1, 3]);
     }
 }

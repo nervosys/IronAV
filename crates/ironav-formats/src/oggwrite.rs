@@ -341,3 +341,47 @@ impl<W: Write> OggStreamWriter<W> {
         Ok(self.w)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ironav_core::{CodecId, Rational, StreamParams};
+
+    fn opus_stream(time_base: Rational, duration: i64) -> Vec<u8> {
+        let mut head = b"OpusHead".to_vec();
+        head.extend_from_slice(&[1, 1]); // version, channels
+        head.extend_from_slice(&312u16.to_le_bytes());
+        head.extend_from_slice(&48_000u32.to_le_bytes());
+        head.extend_from_slice(&[0, 0, 0]);
+        let info = StreamInfo {
+            index: 0,
+            codec: CodecId::Opus,
+            time_base,
+            duration: None,
+            bits: None,
+            extradata: head,
+            lead_in: 0,
+            params: StreamParams::Audio { sample_rate: 48_000, channels: 1 },
+        };
+        let mut w = OggStreamWriter::new(Vec::new(), &[info]).unwrap();
+        for i in 0..5 {
+            w.write_packet(&Packet { stream: 0, pts: i * duration, duration, data: vec![0xF8, 0xFF, 0xFE] }).unwrap();
+        }
+        w.finish().unwrap()
+    }
+
+    /// The granule position of the last page.
+    fn last_granule(ogg: &[u8]) -> u64 {
+        let at = ogg.windows(4).rposition(|w| w == b"OggS").unwrap();
+        u64::from_le_bytes(ogg[at + 6..at + 14].try_into().unwrap())
+    }
+
+    #[test]
+    fn packet_durations_follow_the_stream_time_base() {
+        let a = opus_stream(Rational::new(1, 48_000), 960);
+        assert_eq!(last_granule(&a), 5 * 960, "five 20 ms packets");
+        assert_eq!(opus_stream(Rational::new(1, 1000), 20), a, "20 ms packets counted in milliseconds");
+        assert_eq!(opus_stream(Rational::new(1, 96_000), 1920), a);
+        assert_eq!(last_granule(&opus_stream(Rational::new(1, 24_000), 960)), 2 * last_granule(&a));
+    }
+}

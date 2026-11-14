@@ -776,4 +776,46 @@ mod tests {
         }
         assert_eq!(pts, vec![0, 40, 80, 120, 160, 200]);
     }
+
+    /// The block times are seconds in the stream's time base: the same picture times in 1/25, 1/1000 and
+    /// 1/90000 come out the same, and a time base twice as coarse doubles them.
+    #[test]
+    fn block_times_follow_the_stream_time_base() {
+        let times = |tb: Rational, step: i64| -> Vec<f64> {
+            let sink = Arc::new(Mutex::new(Cursor::new(Vec::new())));
+            let mut m = MatroskaWriter::new(Box::new(Shared(sink.clone())));
+            let video = StreamInfo {
+                index: 0,
+                codec: CodecId::H264,
+                time_base: tb,
+                duration: None,
+                bits: None,
+                extradata: Vec::new(),
+                lead_in: 0,
+                params: StreamParams::Video { width: 64, height: 48, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational::new(25, 1) },
+            };
+            m.write_header(&[video]).unwrap();
+            let sc = [0, 0, 0, 1];
+            let idr = [&sc[..], &[0x67, 0x42, 0, 0x1E, 0xAA], &sc, &[0x68, 0xCE], &sc, &[0x65, 0x88, 1, 2, 3]].concat();
+            let p = [&sc[..], &[0x41, 0x9A, 4, 5]].concat();
+            for i in 0..6 {
+                m.write_packet(&Packet { stream: 0, pts: i * step, duration: step, data: if i == 0 { idr.clone() } else { p.clone() } }).unwrap();
+            }
+            m.finish().unwrap();
+            let bytes = sink.lock().unwrap().get_ref().clone();
+            let mut d = crate::mkv::open(Cursor::new(bytes)).unwrap();
+            let tb = d.streams()[0].time_base.as_f64();
+            let mut out = Vec::new();
+            while let Some(p) = d.read_packet().unwrap() {
+                out.push(p.pts as f64 * tb);
+            }
+            out
+        };
+        let base = times(Rational::new(1, 25), 1);
+        assert_eq!(base, vec![0.0, 0.04, 0.08, 0.12, 0.16, 0.2]);
+        assert_eq!(times(Rational::new(1, 1000), 40), base);
+        assert_eq!(times(Rational::new(1, 90_000), 3600), base);
+        let slow = times(Rational::new(1, 12), 1); // 1/12 s per tick instead of 1/25 s
+        assert!((slow[5] - 5.0 / 12.0).abs() < 1e-3, "{slow:?}");
+    }
 }

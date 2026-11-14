@@ -211,10 +211,15 @@ impl FlacStats {
     }
 
     pub(crate) fn record(&mut self, p: &Packet) {
-        self.min_frame = self.min_frame.min(p.data.len() as u32);
-        self.max_frame = self.max_frame.max(p.data.len() as u32);
-        self.block_sizes.push(p.duration);
-        self.total += p.duration as u64;
+        self.record_frame(p.data.len(), p.duration);
+    }
+
+    /// One frame of `bytes` bytes and `samples` samples.
+    pub(crate) fn record_frame(&mut self, bytes: usize, samples: i64) {
+        self.min_frame = self.min_frame.min(bytes as u32);
+        self.max_frame = self.max_frame.max(bytes as u32);
+        self.block_sizes.push(samples);
+        self.total += samples as u64;
     }
 
     /// The 34-byte STREAMINFO body. The MD5 of the audio is left zero, which means "not computed".

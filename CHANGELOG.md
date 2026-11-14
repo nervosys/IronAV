@@ -13,6 +13,10 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - ironav-formats: `OggStreamWriter<W: Write>`, an Ogg writer (Opus, Vorbis, FLAC) for sinks that cannot seek, such as an HTTP response. The header pages go out when it is created, `flush` forces the pending packets out as a page with the right granule position, and `finish` gives the sink back. The file writer is built on the same page core, so the same packets give the same bytes; a FLAC stream keeps its initial STREAMINFO, as it cannot go back to fill in the totals.
 - ironav-formats: `FragmentedMp4Writer<W: Write>`, the fragmented MP4 muxer as a streaming writer: the same boxes as `create_muxer_with(path, "mp4", Some(seconds))`, with no seeking. `flush` ends the fragment early (at once for audio, at the next key frame with video). The `moov` goes out with the first fragment, not at creation, as it describes the streams from their first packets.
 
+### Fixed
+
+- ironav-formats: the MP4 muxer (file and `FragmentedMp4Writer`) read an audio packet's `duration` as samples whatever the stream's `time_base` said, so audio in a coarser or finer time base (a millisecond tick, say) came out too short or too long. Durations are now converted from the time base to the track's sample time scale; with a `time_base` of 1 / sample rate, the usual case, the bytes are unchanged. Video timing was already read through the time base (presentation times) and the frame rate (decode times). Tests also pin that the Matroska and Ogg writers follow it.
+
 ## [0.1.9] - 2026-11-10
 
 ### Added
