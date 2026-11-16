@@ -15,6 +15,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Fixed
 
+- MCP annotations: `analyze` was marked as a writer and `play_open` as read-only, both wrong. `analyze` writes nothing now and is `readOnlyHint: true`; writing thumbnails to a directory (`thumbnail_dir`, CLI `--thumbnails DIR`) is the new `analyze_thumbnails` tool, which is a writer, and `analyze` refuses `thumbnail_dir` with a hint pointing there. `play_open` is no longer read-only: it opens a decoder and, by default, the sound device. A client that filters on `readOnlyHint` (such as Rodeo's `ironav-readonly` preset) now lists `analyze` and no longer lists `play_open`. `play_control` is now `destructiveHint: true` (a snapshot to `path` overwrites).
+- ironav-engine: a `play_control` snapshot written to a `path` skipped `IRONAV_ROOTS` and `IRONAV_READ_ONLY`; it is now checked like any other write. A test classifies every registered tool as read-only or not and fails when a tool that writes or acts on a device is annotated read-only.
 - ironav-formats: the MP4 muxer (file and `FragmentedMp4Writer`) read an audio packet's `duration` as samples whatever the stream's `time_base` said, so audio in a coarser or finer time base (a millisecond tick, say) came out too short or too long. Durations are now converted from the time base to the track's sample time scale; with a `time_base` of 1 / sample rate, the usual case, the bytes are unchanged. Video timing was already read through the time base (presentation times) and the frame rate (decode times). Tests also pin that the Matroska and Ogg writers follow it.
 
 ## [0.1.9] - 2026-11-10

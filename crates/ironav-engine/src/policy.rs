@@ -168,7 +168,7 @@ impl Policy {
         if self.read_only {
             crate::audit::refused("read_only", "write");
             return Err(Error::new(ErrorCode::PermissionDenied, "this server is read-only: it does not write files")
-                .hint(format!("the operator set {READ_ONLY_VAR}; use plan, probe and analyze without thumbnail_dir, which write nothing")));
+                .hint(format!("the operator set {READ_ONLY_VAR}; use plan, probe and analyze, which write nothing")));
         }
         Ok(())
     }
@@ -304,7 +304,8 @@ pub fn writes_files(tool: &str, args: &serde_json::Value) -> bool {
     let given = |k: &str| args.get(k).is_some_and(|v| !v.is_null());
     match tool {
         "run" | "stream_clip" => true,
-        "analyze" => given("thumbnail_dir"),
+        "analyze" | "analyze_thumbnails" => given("thumbnail_dir"),
+        "play_control" => args.get("cmd").and_then(|c| c.as_str()) == Some("snapshot") && given("path"),
         "stream_open" | "stream_configure" => given("record") || given("transcode"),
         _ => false,
     }
@@ -401,6 +402,10 @@ mod tests {
         assert!(writes_files("run", &serde_json::json!({})));
         assert!(writes_files("analyze", &serde_json::json!({ "thumbnail_dir": "x" })));
         assert!(!writes_files("analyze", &serde_json::json!({ "input": "x" })));
+        assert!(writes_files("analyze_thumbnails", &serde_json::json!({ "thumbnail_dir": "x" })));
+        assert!(writes_files("play_control", &serde_json::json!({ "cmd": "snapshot", "path": "x.png" })));
+        assert!(!writes_files("play_control", &serde_json::json!({ "cmd": "snapshot" })));
+        assert!(!writes_files("play_control", &serde_json::json!({ "cmd": "pause", "path": "x" })));
         assert!(writes_files("stream_open", &serde_json::json!({ "record": "r.m3u8" })));
         assert!(!writes_files("stream_open", &serde_json::json!({ "source": "test://video" })));
         // sending media out writes no file: it is the destination that is checked

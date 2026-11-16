@@ -108,7 +108,7 @@ fn cuts_and_black_in_a_y4m() {
     cut_and_black(&y4m);
     let thumbs = d.join("thumbs");
     let r = call_tool(
-        "analyze",
+        "analyze_thumbnails",
         &json!({ "input": y4m.display().to_string(), "digest_seconds": 1, "thumbnail_dir": thumbs.display().to_string(), "thumbnail_seconds": 2 }),
     )
     .unwrap();

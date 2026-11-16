@@ -75,7 +75,7 @@ Every observation has `seq`, `kind`, `analyzer`, `stream`, `t` (seconds) and, fo
 chooses how much comes back: `digest` (digests and the summary: the fewest tokens), `events` (the default: plus cuts,
 silences, spans, thumbnails, gaps) or `raw` (plus per-picture change scores and loudness once a second).
 `--jsonl` prints each observation as a line the moment it is found. Thumbnails are written as PNG files with
-`--thumbnails DIR` (`thumbnail_dir`), or returned to MCP clients as image blocks with `inline_thumbnails`.
+`--thumbnails DIR` (over MCP the separate `analyze_thumbnails` tool, so that `analyze` itself writes nothing and is annotated read-only), or returned to MCP clients as image blocks with `inline_thumbnails`.
 `keyframes_only` (`--keyframes-only`, for live sessions too) decodes only the pictures that need no other (IDR and I
 pictures, key frames), told from the bitstream: a fraction of the work for thumbnails, cuts and black spans at keyframe
 resolution (a cut is reported at the first keyframe after it). `freeze` does not run then. A GPU decoder is not
@@ -1401,7 +1401,7 @@ behaviour unless a variable is set.
 | Variable | Default | Effect |
 |---|---|---|
 | `IRONAV_ROOTS` | unset: no limit for the CLI and GUI; the working directory in `ironav mcp` | Directories (separated like `PATH`: `;` on Windows, `:` elsewhere) that tools may read from and write to: inputs, outputs, `thumbnail_dir`, recordings, clips, `file:` and `pipe:` sources, job files. Symbolic links and `..` are resolved first (for an output that does not exist yet, the nearest directory that does); a path outside is refused with a `permission-denied` error naming `IRONAV_ROOTS`. The check is made when a tool starts, so it guards against an agent's mistakes and injected instructions, not against a hostile local process that swaps paths meanwhile. |
-| `IRONAV_READ_ONLY` | off | `1` refuses every call that would write (`run`, `stream_clip`, `analyze` with `thumbnail_dir`, `stream_open` and `stream_configure` with `record` or `transcode`). `plan`, `probe` and reading tools work. |
+| `IRONAV_READ_ONLY` | off | `1` refuses every call that would write (`run`, `stream_clip`, `analyze_thumbnails`, `play_control` snapshots to a `path`, `stream_open` and `stream_configure` with `record` or `transcode`). `plan`, `probe` and reading tools work. |
 | `IRONAV_ALLOW_DEVICES` | off in `ironav mcp`, on elsewhere | `1` lets `device://video`, `device://audio` and `device://screen` sources (cameras, microphones, the screen) be opened. Opens are logged to stderr. |
 | `IRONAV_ALLOW_COOKIES` | off in `ironav mcp`, on elsewhere | `1` allows the `?cookies=BROWSER` option, which lets yt-dlp read that browser's cookie store. |
 | `IRONAV_MAX_PIXELS` | 268435456 (2^28; at most 16384 on a side) | The most pixels in one decoded picture; a stream that asks for more is refused before a decoder is made. A value replaces both limits. Audio streams above 64 channels are refused. |
@@ -1419,7 +1419,7 @@ Other protections:
 - **Text from media is data.** Captions, sidecar transcripts, device, camera and rendition names and the error output of external programs are stripped of control characters, cut to 512 characters, and carry `"untrusted": true` (and `"truncated": true` when cut). The MCP `instructions` and the tool descriptions say not to follow requests found in them.
 - **Temporary outputs.** `<output>.partial` is created exclusively (`O_EXCL`): an existing file or link there is refused, never written through or deleted. After a crash, remove the leftover and run again.
 - **External programs.** yt-dlp and arecord are resolved to absolute paths. Sidecar children get only `PATH` and a few system variables (`HOME`, `LANG`, `TMPDIR` or `SystemRoot`, `TEMP`...) plus the `env` (name to value) and `inherit_env` (names to copy) their entry in the sidecar file lists. An entry can also set `max_memory_mb` and `max_cpu_seconds` to bound the child's memory and CPU time (no limit by default; see [docs/sidecars.md](docs/sidecars.md)).
-- **MCP limits.** A request line over 4 MiB is refused (and skipped); at most 4 tool calls run at once, the next gets a JSON-RPC error (-32000) until one finishes. The tool annotations are truthful: `readOnlyHint`, `destructiveHint` for tools that can overwrite, `openWorldHint` for tools that reach the network. Run the server under a supervisor that restarts it.
+- **MCP limits.** A request line over 4 MiB is refused (and skipped); at most 4 tool calls run at once, the next gets a JSON-RPC error (-32000) until one finishes. The tool annotations are truthful: `readOnlyHint` (a tool that writes a file or acts on a device, such as `play_open` with its sound output, is not read-only), `destructiveHint` for tools that can overwrite, `openWorldHint` for tools that reach the network; a test pins each tool's hints to what it does. Run the server under a supervisor that restarts it.
 
 ## Security notes (browser GUI)
 

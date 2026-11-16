@@ -359,5 +359,13 @@ mod tests {
         assert_eq!(ann("probe")["readOnlyHint"], true);
         assert_eq!(ann("probe")["destructiveHint"], false);
         assert_eq!(ann("onvif_discover")["openWorldHint"], true);
+        // analyze reads and reports; the tool that writes thumbnails is separate. Opening a player is an effect.
+        assert_eq!(ann("analyze")["readOnlyHint"], true);
+        assert_eq!(ann("analyze")["destructiveHint"], false);
+        assert_eq!(ann("analyze_thumbnails")["readOnlyHint"], false);
+        assert_eq!(ann("analyze_thumbnails")["destructiveHint"], true);
+        assert_eq!(ann("play_open")["readOnlyHint"], false);
+        assert_eq!(ann("play_open")["idempotentHint"], false);
+        assert_eq!(ann("play_status")["readOnlyHint"], true);
     }
 }

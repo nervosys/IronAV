@@ -65,6 +65,12 @@ pub fn open(args: &Value) -> Result<Value> {
 
 pub fn control(args: &Value) -> Result<Value> {
     let p = get(args)?;
+    // a snapshot written to a path is a file write: it takes the same roots and read-only checks as any other
+    if args.get("cmd").and_then(Value::as_str) == Some("snapshot") {
+        if let Some(path) = args.get("path").and_then(Value::as_str) {
+            crate::policy::check_write(path)?;
+        }
+    }
     let mut req = args.clone();
     if let Some(o) = req.as_object_mut() {
         o.remove("session");

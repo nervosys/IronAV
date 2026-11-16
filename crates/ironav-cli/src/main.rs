@@ -290,7 +290,8 @@ fn analyze(mut a: Args, progress: bool) -> Result<Value> {
     let report = |done: f64, total: Option<f64>, message: &str| eprintln!("{}", json!({ "event": "progress", "done": done, "total": total, "message": message }));
     let ctx = ironav_engine::Ctx { progress: progress.then_some(&report as &(dyn Fn(f64, Option<f64>, &str) + Sync)), cancel: None };
     if !jsonl {
-        return ironav_engine::call_tool_with("analyze", &args, &ctx);
+        let tool = if args.get("thumbnail_dir").is_some() { "analyze_thumbnails" } else { "analyze" };
+        return ironav_engine::call_tool_with(tool, &args, &ctx);
     }
     let job: ironav_engine::AnalyzeJob = serde_json::from_value(args).map_err(|e| Error::invalid_arg(format!("invalid arguments: {e}")))?;
     let mut out = std::io::stdout().lock();
