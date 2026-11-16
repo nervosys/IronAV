@@ -6,16 +6,18 @@ use ironav_live::synthetic::frame_number;
 use serde_json::json;
 use std::time::{Duration, Instant};
 
-fn open(source: &str) -> std::sync::Arc<live::Session> {
+/// Opens `source` with a tap attached before its first packet: a test:// source starts at once,
+/// so `Session::tap` on the running session would miss its first frames.
+fn open(source: &str, tap: TapConfig) -> (std::sync::Arc<live::Session>, ironav_engine::tap::Tap) {
     let args: OpenArgs = serde_json::from_value(json!({ "source": source, "analyzers": ["levels", "black"] })).unwrap();
-    live::open(&args).unwrap()
+    let (s, mut taps) = live::open_with_taps(&args, vec![tap]).unwrap();
+    (s, taps.pop().unwrap())
 }
 
 #[test]
 fn a_test_picture_numbers_its_frames_and_says_it_is_synthetic() {
     let started = Instant::now();
-    let s = open("test://video?duration=1&fps=20&size=320x180");
-    let tap = s.tap(TapConfig { layout: PixelLayout::Gray, queue: 64, ..TapConfig::video() }).unwrap();
+    let (s, tap) = open("test://video?duration=1&fps=20&size=320x180", TapConfig { layout: PixelLayout::Gray, queue: 64, ..TapConfig::video() });
     let mut numbers = Vec::new();
     while let Ok(Some(f)) = tap.recv_timeout(Duration::from_secs(10)) {
         let TapData::Video { width, height, pixels, .. } = &f.data else { panic!() };
@@ -42,8 +44,7 @@ fn a_test_picture_numbers_its_frames_and_says_it_is_synthetic() {
 
 #[test]
 fn a_test_sound_is_a_tone_half_of_each_second() {
-    let s = open("test://audio?duration=2");
-    let tap = s.tap(TapConfig { window_ms: 250, queue: 64, ..TapConfig::audio() }).unwrap();
+    let (_s, tap) = open("test://audio?duration=2", TapConfig { window_ms: 250, queue: 64, ..TapConfig::audio() });
     let mut levels = Vec::new();
     while let Ok(Some(f)) = tap.recv_timeout(Duration::from_secs(10)) {
         let TapData::Audio { samples, .. } = &f.data else { panic!() };
@@ -84,8 +85,7 @@ fn keyframe_pictures_are_kept_as_jpeg() {
 
 #[test]
 fn an_audio_tap_measures_its_windows() {
-    let s = open("test://audio?duration=2");
-    let tap = s.tap(TapConfig { window_ms: 250, features: true, queue: 64, ..TapConfig::audio() }).unwrap();
+    let (_s, tap) = open("test://audio?duration=2", TapConfig { window_ms: 250, features: true, queue: 64, ..TapConfig::audio() });
     let mut seen = 0;
     while let Ok(Some(f)) = tap.recv_timeout(Duration::from_secs(10)) {
         let TapData::Audio { features: Some(x), .. } = f.data else { panic!("no features") };
