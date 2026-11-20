@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-11-19
+
 ### Added
 
 - ironav-codec: every encoder is now reachable as `ironav_codec::<codec>::<Codec>Encoder`: `av1::Av1Encoder`, `mpeg2::Mpeg2Encoder` and `mpeg4::Mpeg4Encoder` join the rest (the `<codec>::enc` paths still work). `ironav_codec::encoders` re-exports them all under one path, and the crate docs carry a table of each codec's decoder and encoder path.
