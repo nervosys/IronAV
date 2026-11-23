@@ -273,6 +273,10 @@ const SEEDS: &[Seed] = &[
     Seed { name: "mpegps-mpeg2-mp2", video: true, audio: true, out: &["-c:v", "mpeg2video", "-c:a", "mp2", "-f", "mpeg"], ext: "mpg" },
     Seed { name: "mpegps-ac3", video: true, audio: true, out: &["-c:v", "mpeg2video", "-c:a", "ac3", "-f", "mpeg"], ext: "vob" },
     Seed { name: "mpegts-h264-aac", video: true, audio: true, out: &["-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-f", "mpegts"], ext: "ts" },
+    Seed { name: "avi-mjpeg-pcm", video: true, audio: true, out: &["-c:v", "mjpeg", "-c:a", "pcm_s16le"], ext: "avi" },
+    Seed { name: "avi-mpeg4-mp3", video: true, audio: true, out: &["-c:v", "mpeg4", "-c:a", "libmp3lame"], ext: "avi" },
+    Seed { name: "avi-h264-ac3", video: true, audio: true, out: &["-c:v", "libx264", "-preset", "ultrafast", "-c:a", "ac3"], ext: "avi" },
+    Seed { name: "avi-mpeg4-mp2", video: true, audio: true, out: &["-c:v", "mpeg4", "-c:a", "mp2"], ext: "avi" },
     Seed { name: "mpegts-mpeg2-mp2", video: true, audio: true, out: &["-c:v", "mpeg2video", "-c:a", "mp2", "-f", "mpegts"], ext: "ts" },
 ];
 

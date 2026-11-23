@@ -271,7 +271,12 @@ fn h_probe(args: &Value) -> Result<Value> {
     let d = open_demuxer(Path::new(path))?;
     let size = std::fs::metadata(path).map(|m| m.len()).ok();
     let duration = d.streams().iter().filter_map(|s| s.duration_secs()).fold(None, |a: Option<f64>, x| Some(a.map_or(x, |a| a.max(x))));
-    Ok(json!({ "path": path, "format": d.format_name(), "size_bytes": size, "duration_seconds": duration, "streams": d.streams() }))
+    let mut out = json!({ "path": path, "format": d.format_name(), "size_bytes": size, "duration_seconds": duration, "streams": d.streams() });
+    let unsupported = d.unsupported_streams();
+    if !unsupported.is_empty() {
+        out["unsupported_streams"] = json!(unsupported);
+    }
+    Ok(out)
 }
 
 fn h_plan(args: &Value) -> Result<Value> {
