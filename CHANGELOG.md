@@ -7,6 +7,10 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+
+- ironav-formats: an AVI reader (`avi`, `.avi`): RIFF AVI and OpenDML (AVIX RIFFs, `indx` super indexes and `ix##` standard indexes, so files over 1 GB read), seeking by the OpenDML or `idx1` index and, with neither, by a walk over the `movi` lists (key frames then come from the bitstream). Video: MPEG-4 Part 2 (XVID, DIVX, DX50, FMP4, MP4V; DivX packed bitstream, whose padding VOPs are dropped), H.264 (Annex B, or length-prefixed with an avcC record) and Motion-JPEG; audio: PCM, MP2, MP3 (CBR by bytes, VBR by chunk), AC-3 and AAC. Streams of any other codec or kind are left out and listed by the new `Demuxer::unsupported_streams()` (a default method, empty for other formats), which `probe` shows as `unsupported_streams`; a file with nothing playable is refused with an error that names them. An index that does not match the file is not believed. Chunk sizes are checked against the file before anything is allocated.
+
 ## [0.1.10] - 2026-11-19
 
 ### Added

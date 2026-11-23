@@ -4,6 +4,7 @@ mod ac3;
 mod adts;
 mod annexb;
 mod audio_stream;
+mod avi;
 pub(crate) mod flac;
 mod mkv;
 mod mkvwrite;
@@ -119,6 +120,15 @@ pub static FORMATS: &[FormatSpec] = &[
         demux: true,
         mux: true,
         codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Vp8, CodecId::Vp9, CodecId::Av1, CodecId::Mjpeg, CodecId::Mpeg4, CodecId::Mpeg2Video, CodecId::Aac, CodecId::Mp3, CodecId::Mp2, CodecId::Ac3, CodecId::Opus, CodecId::Vorbis, CodecId::Flac, CodecId::PcmU8, CodecId::PcmS16Le, CodecId::PcmS24Le, CodecId::PcmS32Le, CodecId::PcmF32Le, CodecId::PcmF64Le],
+    },
+    FormatSpec {
+        name: "avi",
+        extensions: &["avi", "divx"],
+        description: "AVI (RIFF, and OpenDML for files over 1 GB): read with MPEG-4 Part 2 (XVID, DIVX, DX50, FMP4, MP4V; DivX packed bitstream too), H.264 or Motion-JPEG video and PCM, MP2, MP3 (CBR and VBR), AC-3 or AAC audio; seeks by the idx1 or OpenDML index, or scans the movi lists when there is none; streams of other codecs are reported as unsupported, not played; read only",
+        media: MediaType::Video,
+        demux: true,
+        mux: false,
+        codecs: &[CodecId::Mpeg4, CodecId::H264, CodecId::Mjpeg, CodecId::PcmU8, CodecId::PcmS16Le, CodecId::PcmS24Le, CodecId::PcmS32Le, CodecId::PcmF32Le, CodecId::PcmF64Le, CodecId::Mp3, CodecId::Mp2, CodecId::Ac3, CodecId::Aac],
     },
     FormatSpec {
         name: "mp3",
@@ -250,6 +260,9 @@ pub fn open_demuxer(path: &Path) -> Result<Box<dyn Demuxer>> {
     };
     if ts::packet_size(magic).is_some() {
         Ok(Box::new(ts::TsDemuxer::open(f)?))
+    } else if avi::looks_like_avi(magic) {
+        // Like Matroska, the AVI reader buffers for itself: it seeks over every chunk while indexing.
+        Ok(Box::new(avi::open(f.into_inner())?))
     } else if magic.len() >= 12 && &magic[..4] == b"RIFF" && &magic[8..12] == b"WAVE" {
         Ok(Box::new(wav::WavDemuxer::open(f)?))
     } else if flac::looks_like_flac(magic) && behind_id3.as_ref().is_none_or(|b| b.starts_with(b"fLaC")) {

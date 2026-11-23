@@ -17,6 +17,11 @@ pub trait Demuxer: Send {
     fn seek(&mut self, _seconds: f64) -> Result<f64> {
         Err(Error::new(ErrorCode::UnsupportedFormat, format!("{} files cannot seek", self.format_name())))
     }
+    /// The streams of the file that were left out because IronAV does not decode them (a codec it lacks,
+    /// a kind of stream it does not play), each as a short description. Empty for most formats.
+    fn unsupported_streams(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 pub trait Muxer: Send {
