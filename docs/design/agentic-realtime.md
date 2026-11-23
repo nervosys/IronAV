@@ -286,6 +286,14 @@ Every tool returns the existing envelope and error codes. New codes: `source-unr
 - **Resources**: `ironav://sessions/{id}/status`, `…/digest/latest` and `…/frames/{t}.jpg`, with
   `resources/subscribe`, plus `notifications/resources/updated` when a new digest lands, for clients that support it.
   Long polling stays the baseline.
+  File chunks are the first resources that are not static: `chunk` (see the README) returns descriptors with
+  `uri: ironav://chunks/{id}`, `resources/templates/list` offers that template, and `resources/read` returns the
+  descriptor from the in-memory chunk table (an LRU of 8, keyed by the file's fingerprint and the chunking
+  parameters). It is not a store: an id whose table was evicted, or never built in this process, is an error whose
+  hint says to call `chunk` first, and the pictures and sound of a chunk are fetched with the `chunk_media` tool
+  (which accepts the id alone: it carries its range and the file's fingerprint) rather than as a resource, so that
+  nothing is written and every read stays under `IRONAV_ROOTS`. The session resources above would follow the same
+  template/read split.
 - **Prompts** (optional): `watch-stream` and `summarize-recording`, ready-made templates that call the tools above.
 
 ### 4.3 CLI

@@ -6,7 +6,7 @@ mod mcp;
 mod play;
 
 use ironav_core::{Error, Result};
-use ironav_engine::{call_tool, ontology, tools, FilterCall, Job, Latency, OpusJob, OpusMode, OpusSignal, ProResProfile};
+use ironav_engine::{call_tool, call_tool_with, ontology, tools, FilterCall, Job, Latency, OpusJob, OpusMode, OpusSignal, ProResProfile};
 use serde_json::{json, Value};
 use std::io::{IsTerminal, Read, Write};
 
@@ -59,6 +59,8 @@ fn help() -> Value {
             "probe <path>": "inspect a media file",
             "convert -i IN [-i MORE]... -o OUT [-f FMT] [--acodec C] [--vcodec C] [--abitrate KBPS] [--vbitrate KBPS | --qp N] [--latency low] [--keyint N] [--refs N] [--bframes N] [--tiles COLSxROWS] [--quarter-mv] [--altref LAG] [--fragment-seconds S] [--prores-profile proxy|lt|standard|hq|4444|4444xq] [--opus-mode M] [--opus-signal S] [--opus-frame-ms N] [--opus-fec PCT] [--opus-dtx] [--filter name[:k=v,..]]... [--hwaccel P] [-y] [--dry-run] [--progress]": "convert, handbrake/ffmpeg style",
             "analyze FILE [--analyzers a,b] [--sidecars a,b] [--level digest|events|raw] [--digest-seconds N] [--from S] [--to S] [--streams 0,1] [--max N] [--thumbnails DIR] [--hwaccel P] [--keyframes-only] [--jsonl]": "what is in a file: loudness, silence, scene cuts, black and frozen pictures, thumbnails, gaps; --jsonl prints each observation as a line as it is found",
+            "chunk FILE [--mode time|scene] [--seconds N] [--min-seconds N] [--max-seconds N] [--from S] [--to S] [--cursor C] [--limit N] [--budget-tokens N] [--include thumbnail,audio,transcript,stats] [--sidecars a,b] [--thumbnail-width N] [--hwaccel P]": "cut a file into stable, addressable chunks (fixed windows or scenes), each with an id, a time range and optional thumbnail, audio figures, stats and transcript; page with --cursor",
+            "chunk-media FILE (--id ID | --t S --t-end S) [--frames N] [--audio] [--clip] [--max-side N] [--format jpeg|png] [--audio-seconds N] [--max-bytes N] [--hwaccel P]": "pictures, sound (WAV) or a small MP4 clip of one chunk or time range, inline as base64; nothing is written (an id carries its range, so it works in a later run, while the file is unchanged)",
             "watch SOURCE [--analyzers a,b] [--sidecars a,b] [--level digest|events|raw] [--digest-seconds N] [--format F] [--fps N] [--pace realtime] [--retain S] [--duration S] [--hwaccel P] [--keyframes-only] [--record OUT.ts|OUT.m3u8 [--segment-seconds S] [--keep-segments N] [-y]] [--transcode OUT.ts|OUT.m3u8 [--width N] [--qp N | --vbitrate KBPS]] [--publish srt://HOST:PORT | srt://:PORT?mode=listener [?latency=MS&streamid=S&passphrase=P&pbkeylen=16|24|32&reconnect=0] | whip://HOST:PORT/PATH | whips://HOST:PORT/PATH [?token=T&reconnect=0]] [--commands]": "follow a live source (path, path?follow, -, tcp://host:port, tcp://:port, udp://:port, srt://host:port, srt://:port?mode=listener, whip://:port[/path][?token=T], whips://:port[/path]?cert=CHAIN.pem&key=KEY.pem[&token=T], device://video[/N]?size=1280x720&fps=30, device://audio, device://screen[/N]?fps=30&size=1280x720&cursor=0): every observation as a JSON line as it happens, then a summary; with --commands, stdin takes one command per line (status, query kinds=speech_end newest_first=true, configure add=silence, configure stop_recording=true record=next.ts, snapshot, clip from=1 to=5 output=c.ts, close, or the same as JSON) and each reply is a line {\"reply\":...}. --publish also sends the media out live (what --transcode writes, else what --record would): as MPEG-TS over SRT, srt://host:port calls a receiver that listens and srt://:port?mode=listener waits for one; or to a WHIP endpoint (RFC 9725), whip://host:port/path (whips:// over TLS, with ?token=T for its bearer token), which takes H.264 video and Opus audio: the video must be H.264 (add --transcode for other video), and other audio is not sent (a publish_audio_skipped event). A caller that is lost is opened again unless ?reconnect=0, and a failure is a publish_lost or publish_failed event, not the end of the watch. A keyframe the WHIP server asks for (a PLI or FIR) is made into an IDR picture when --transcode encodes the output, at most one per 500 ms (keyframes_forced in the status counts them); without --transcode nothing can be forced, and the request is only counted (keyframe_requests, with keyframes_forced at 0)",
             "plan <job.json|->": "validate a JSON job without writing",
             "run <job.json|->": "execute a JSON job",
@@ -104,6 +106,8 @@ fn dispatch(mut a: Args, progress: bool) -> Result<Value> {
         "plan" => call_tool("plan", &read_job_arg(&mut a)?),
         "run" => run_job(read_job_arg(&mut a)?, progress),
         "analyze" => analyze(a, progress),
+        "chunk" => chunk(a, progress),
+        "chunk-media" => chunk_media(a, progress),
         "watch" => watch(a),
         "convert" => {
             let dry = a.switch(&["--dry-run", "-n"]);
@@ -238,7 +242,7 @@ fn dispatch(mut a: Args, progress: bool) -> Result<Value> {
             .collect::<Vec<_>>())),
         other => Err(Error::invalid_arg(format!("unknown command '{other}'"))
             .hint("run `ironav help`")
-            .alternatives(["capabilities", "devices", "onvif", "probe", "analyze", "watch", "convert", "plan", "run", "hw", "ontology", "tools", "mcp", "play", "gui"])),
+            .alternatives(["capabilities", "devices", "onvif", "probe", "analyze", "chunk", "chunk-media", "watch", "convert", "plan", "run", "hw", "ontology", "tools", "mcp", "play", "gui"])),
     }
 }
 
@@ -304,6 +308,84 @@ fn analyze(mut a: Args, progress: bool) -> Result<Value> {
         obj.remove("observations");
     }
     Ok(result)
+}
+
+fn num_flag(a: &mut Args, name: &str) -> Result<Option<f64>> {
+    a.flag(&[name])?.map(|s| s.parse::<f64>().map_err(|_| Error::invalid_arg(format!("{name} must be a number, got '{s}'")))).transpose()
+}
+
+fn whole_flag(a: &mut Args, name: &str) -> Result<Option<u64>> {
+    a.flag(&[name])?.map(|s| s.parse::<u64>().map_err(|_| Error::invalid_arg(format!("{name} must be a whole number, got '{s}'")))).transpose()
+}
+
+fn progress_ctx<'a>(progress: bool, report: &'a (dyn Fn(f64, Option<f64>, &str) + Sync)) -> ironav_engine::Ctx<'a> {
+    ironav_engine::Ctx { progress: progress.then_some(report), cancel: None }
+}
+
+fn chunk(mut a: Args, progress: bool) -> Result<Value> {
+    let input = a.positional("file to chunk")?;
+    let mut args = json!({ "input": input });
+    if let Some(v) = a.flag(&["--mode"])? {
+        args["mode"] = json!(v);
+    }
+    for (flag, key) in [("--seconds", "seconds"), ("--min-seconds", "min_seconds"), ("--max-seconds", "max_seconds"), ("--from", "from"), ("--to", "to")] {
+        if let Some(v) = num_flag(&mut a, flag)? {
+            args[key] = json!(v);
+        }
+    }
+    for (flag, key) in [("--limit", "limit"), ("--budget-tokens", "budget_tokens"), ("--thumbnail-width", "thumbnail_width")] {
+        if let Some(v) = whole_flag(&mut a, flag)? {
+            args[key] = json!(v);
+        }
+    }
+    for (flag, key) in [("--cursor", "cursor"), ("--hwaccel", "hwaccel")] {
+        if let Some(v) = a.flag(&[flag])? {
+            args[key] = json!(v);
+        }
+    }
+    for (flag, key) in [("--include", "include"), ("--sidecars", "sidecars")] {
+        if let Some(v) = a.flag(&[flag])? {
+            args[key] = json!(v.split(',').map(|x| x.trim()).filter(|x| !x.is_empty()).collect::<Vec<_>>());
+        }
+    }
+    if let Some(extra) = a.rest.first() {
+        return Err(Error::invalid_arg(format!("unexpected argument '{extra}'")));
+    }
+    let report = |done: f64, total: Option<f64>, message: &str| eprintln!("{}", json!({ "event": "progress", "done": done, "total": total, "message": message }));
+    call_tool_with("chunk", &args, &progress_ctx(progress, &report))
+}
+
+fn chunk_media(mut a: Args, progress: bool) -> Result<Value> {
+    let input = a.positional("file")?;
+    let mut args = json!({ "input": input });
+    if let Some(v) = a.flag(&["--id"])? {
+        args["id"] = json!(v);
+    }
+    for (flag, key) in [("--t", "t"), ("--t-end", "t_end"), ("--audio-seconds", "audio_seconds")] {
+        if let Some(v) = num_flag(&mut a, flag)? {
+            args[key] = json!(v);
+        }
+    }
+    for (flag, key) in [("--frames", "frames"), ("--max-side", "max_side"), ("--max-bytes", "max_bytes")] {
+        if let Some(v) = whole_flag(&mut a, flag)? {
+            args[key] = json!(v);
+        }
+    }
+    for (flag, key) in [("--format", "format"), ("--hwaccel", "hwaccel")] {
+        if let Some(v) = a.flag(&[flag])? {
+            args[key] = json!(v);
+        }
+    }
+    for (flag, key) in [("--audio", "audio"), ("--clip", "clip")] {
+        if a.switch(&[flag]) {
+            args[key] = json!(true);
+        }
+    }
+    if let Some(extra) = a.rest.first() {
+        return Err(Error::invalid_arg(format!("unexpected argument '{extra}'")));
+    }
+    let report = |done: f64, total: Option<f64>, message: &str| eprintln!("{}", json!({ "event": "progress", "done": done, "total": total, "message": message }));
+    call_tool_with("chunk_media", &args, &progress_ctx(progress, &report))
 }
 
 fn watch(mut a: Args) -> Result<Value> {
