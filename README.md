@@ -35,6 +35,7 @@ Each release carries a CycloneDX SBOM of the locked dependency graph, made by `t
 | Player (window) | `ironav gui --play [file]` | native player window: seek bar, volume, snapshot, drag and drop |
 | GUI (browser) | `ironav gui --web` | same layout as a loopback-only web app, for machines without a display stack |
 | Analysis | `ironav analyze file [--level digest\|events\|raw] [--jsonl]` | what is in a file, as typed observations (see below) |
+| Chunking | `ironav chunk file [--mode time\|scene] [--seconds N] [--cursor C]`, `ironav chunk-media file --id ID [--frames N]` | a long file as stable, addressable chunks, and the pictures, sound or clip of one (see below) |
 | MCP | `ironav mcp` | agents; resident process, no per-call startup; concurrent calls, progress and cancellation |
 | Tool schemas | `ironav tools` | JSON Schema for function-calling APIs |
 
@@ -46,7 +47,7 @@ Every CLI command prints one JSON envelope: `{"ok":true,"result":…}` or
 1. `ironav capabilities` — what exists in this build, with the workflow spelled out.
 2. `ironav ontology search|describe|convert` — what is implemented vs planned, and why a conversion is or is not feasible.
 3. `ironav probe <file>` → `ironav convert --dry-run …` (or `plan`) → `ironav run job.json`.
-4. `ironav analyze <file>` (the `analyze` tool) to learn what is in a file without looking at its pictures.
+4. `ironav analyze <file>` (the `analyze` tool) to learn what is in a file without looking at its pictures; `ironav chunk <file>` to cut a long one into addressable pieces.
 
 Design choices for agents: declarative JSON jobs; `plan` validates without writing; outputs are atomic
 (`.partial` then rename) and never overwrite unless `overwrite: true`; errors name valid alternatives.
@@ -94,6 +95,67 @@ detection with ONNX Runtime, and a model-free DTMF detector) are in [docs/sideca
 
 Checked against EBU Tech 3341/3342 test signals (a -23 dBFS stereo sine reads -23.0 LUFS at 44.1 and 48 kHz; two levels
 10 dB apart give a 10 LU range).
+
+## Reading a long file in pieces (`chunk`, `chunk_media`)
+
+An agent cannot read an hour of media at once, and should not need to. `chunk` cuts a file into **chunks** it can
+list, page through, cite and fetch, and describes each one in a few tokens; `chunk_media` then fetches the pictures,
+sound or a small clip of the chunks it cares about. Both only read: they are annotated `readOnlyHint: true`, write
+nothing (everything comes back inline) and read files only under `IRONAV_ROOTS`.
+
+```
+ironav chunk talk.mp4 --seconds 60 --limit 10 --include thumbnail,audio,stats
+ironav chunk talk.mp4 --mode scene --min-seconds 2 --max-seconds 90 --budget-tokens 2000
+ironav chunk talk.mp4 --seconds 60 --cursor 3f2a91c4.10          # the next_cursor of the last page
+ironav chunk-media talk.mp4 --id 9c1e...-5d7a03b1-3-180000-240000 --frames 4
+```
+
+`mode` is `time` (windows of `seconds`, 30 by default) or `scene` (cut to cut, from the `scene` analyzer; a cut that
+would leave a scene shorter than `min_seconds` is not one, a scene longer than `max_seconds` is cut into equal parts that
+share their `scene_id`; scene figures are taken from 1 s windows, so they are exact to about a second at the edges).
+`from` and `to` limit the range. A chunk is:
+
+| Field | |
+|---|---|
+| `id`, `uri` | `ironav://chunks/{id}`; the same file and arguments give the same ids on every run (see below) |
+| `index`, `t`, `t_end` | its place; a page's chunks, and the pages, meet exactly: no gaps, no overlaps |
+| `scene_id`, `part`, `parts` | scene mode |
+| `thumbnail` | with `include: ["thumbnail"]`: a small keyframe (`thumbnail_width`, 160 by default), returned as an image block over MCP; `thumbnail.image` says which; `exact: false` when the picture is from before the chunk |
+| `audio` | levels (peak, RMS, clipping), loudness, silent seconds, speech seconds, per audio stream |
+| `stats` | cuts and change, black and frozen seconds, bit rate, per video stream |
+| `transcript` | the text of the `sidecars` you name (none run otherwise), marked `"untrusted": true` like every text that comes from media |
+
+`include` defaults to `audio`, `transcript` and `stats`; thumbnails are opt in, and only what is asked for is
+analyzed. The first call analyzes the whole range (the same pipeline as `analyze`: one decoder loop) and keeps the
+table in memory (the 8 most recently used, keyed by the file's fingerprint and the parameters), so the pages after it,
+and `chunk_media` and the resource reads, do not analyze again (`cached` in the response says which it was). `limit`
+(20 by default) is the page size, `next_cursor` the next page, `total_chunks` the count.
+
+`budget_tokens` is a rough budget for a page, at 4 characters of JSON per token (a thumbnail counts its base64).
+Over it, the optional fields go in this order: thumbnails, stats, audio, transcript; if the places alone do not fit,
+the page holds fewer chunks (and `next_cursor` goes on from there). `trimmed` names what was dropped. Ask again with
+more budget, or fetch what you need for the chunks you care about.
+
+**Ids.** An id is `FINGERPRINT-PARAMS-INDEX-T-TEND`: the file's fingerprint (a hash of its size, modification time and
+first and last MiB), a hash of the mode and its parameters (`seconds`, `min_seconds`, `max_seconds`, `from`, `to`), the
+chunk's index, and its range in milliseconds. It does not depend on `include`, on the page or on the run. Because it
+carries its range, `chunk_media` accepts an id even after a restart, as long as the file is unchanged (another
+fingerprint is refused); a changed file has new ids.
+
+`chunk_media` takes `input` and an `id` (or `t` and `t_end`), and returns any of:
+
+- `frames` (4 when nothing else is asked for, at most 16): evenly spaced pictures, `format` `jpeg` (the default) or
+  `png`, each at most `max_side` (320 by default; never above the operator's limits) on a side. Over MCP each is an
+  image block with its own mimeType, and the entry says which (`image`).
+- `audio: true`: a mono 16-bit WAV of the start of the range, at most `audio_seconds` (10) and `max_bytes` (1 MiB; at
+  most 8 MiB); `truncated` says when it was cut. Over MCP it is an audio block.
+- `clip: true`: the range's packets copied, without re-encoding, into a fragmented MP4 held in memory (from the keyframe
+  at or before `t`), refused over `max_bytes`, and only for codecs an MP4 can hold. Over MCP it is an embedded
+  resource.
+
+Over MCP, `resources/templates/list` offers `ironav://chunks/{id}`, and `resources/read` of such a URI returns the
+cached descriptor with everything the table holds (and where the chunk came from). A chunk that is not cached
+is an error whose hint says to call `chunk` first.
 
 ## Watching live sources (`watch`, `stream_*`)
 

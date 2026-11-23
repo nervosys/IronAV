@@ -7,6 +7,16 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+
+- `chunk`, a read-only tool (CLI `ironav chunk`, MCP `readOnlyHint: true`) that cuts a file into stable, addressable chunks for agents: fixed windows (`mode: "time"`, `seconds`) or scenes (`mode: "scene"`, cut to cut, with `min_seconds` merging and `max_seconds` splitting). Each chunk has an `id` that is the same for the same file and arguments on every run (the file's fingerprint, a hash of the mode and parameters, the index and the range), `t`, `t_end`, `index`, `scene_id`, a `uri` (`ironav://chunks/{id}`), and what `include` asks for: a small keyframe `thumbnail`, `audio` figures (levels, loudness, voice activity, silence), `stats` and the `transcript` of the named sidecars (marked `untrusted`). `limit` and `cursor` page it, and `budget_tokens` bounds a page by dropping thumbnails, stats, audio and transcript in that order, then chunks. It reuses the analyze pipeline (one decoder loop) and keeps the chunk table in an in-memory LRU of 8, keyed by fingerprint and parameters, so paging does not analyze again.
+- `chunk_media`, a read-only tool (CLI `ironav chunk-media`) that returns, inline and without writing anything, evenly spaced `frames` of a chunk (JPEG or PNG, limited by `max_side`), a short `audio` WAV (capped in seconds and bytes) or a `clip` (an MP4 of the copied packets, made in memory with `FragmentedMp4Writer`, under a byte cap).
+- MCP: `resources/templates/list` offers `ironav://chunks/{id}`, and `resources/read` of a chunk URI returns the cached descriptor, or an error whose hint says to call `chunk` first. Audio in a tool result goes out as an audio block, and an MP4 clip as an embedded resource.
+
+### Fixed
+
+- MCP: pictures in a tool result are image blocks whatever their encoding. Only `png_base64` was turned into one, so the JPEGs of `stream_keyframes` (`jpeg_base64`) reached the model as base64 text; they are now `image/jpeg` blocks, and each entry says which block is its own.
+
 ## [0.1.10] - 2026-11-19
 
 ### Added
