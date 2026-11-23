@@ -32,7 +32,7 @@ Each release carries a CycloneDX SBOM of the locked dependency graph, made by `t
 | CLI | `ironav convert -i in.wav -o out.wav --acodec pcm_f32le --filter volume:gain=0.5` | humans and scripts |
 | GUI (native) | `ironav gui [file]` | HandBrake-style desktop window (egui): source, tabs, queue, drag-and-drop |
 | Player (terminal) | `ironav play file` | full-screen TUI on a terminal; JSON lines on stdin/stdout otherwise, for agents |
-| Player (window) | `ironav gui --play [file]` | native player window: seek bar, volume, snapshot, drag and drop |
+| Player (window) | `ironav gui --play [file]` | native player window: GPU colour conversion and scaling (CPU fallback), seek bar, volume, snapshot, drag and drop |
 | GUI (browser) | `ironav gui --web` | same layout as a loopback-only web app, for machines without a display stack |
 | Analysis | `ironav analyze file [--level digest\|events\|raw] [--jsonl]` | what is in a file, as typed observations (see below) |
 | MCP | `ironav mcp` | agents; resident process, no per-call startup; concurrent calls, progress and cancellation |

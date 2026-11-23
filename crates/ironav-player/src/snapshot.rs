@@ -1,11 +1,117 @@
 //! Turning a decoded picture into something a screen, a terminal or an agent can use.
 
+use crate::color::{Colorimetry, YuvToRgb};
 use ironav_codec::resize_frame;
 use ironav_core::{Error, ErrorCode, PixelFormat, Result, VideoFrame};
+use std::borrow::Cow;
 
 /// RGB24 pixels of `v`, resized to fit inside `max_w` x `max_h` (aspect kept) when given.
 /// Returns `(width, height, rgb)`. Uses BT.709 for HD pictures and BT.601 below, limited range.
+///
+/// The conversion is integer fixed point (Q16) over row slices, with the chroma terms worked out
+/// once per chroma sample; it matches [`rgb_frame_reference`] to within 1 per channel.
 pub fn rgb_frame(v: &VideoFrame, max_w: Option<u32>, max_h: Option<u32>) -> (u32, u32, Vec<u8>) {
+    let mut src: Cow<VideoFrame> = Cow::Borrowed(v);
+    if let Some((w, h)) = fit(v.width, v.height, max_w, max_h) {
+        let mut scaled = resize_frame(v, w, h);
+        scaled.pts = v.pts;
+        src = Cow::Owned(scaled);
+    }
+    // High-bit-depth pictures are narrowed to 8 bits first; a screen shows 8 bits anyway.
+    if src.pix_fmt.bit_depth() > 8 {
+        src = Cow::Owned(ironav_codec::convert_pixel_format(src.into_owned(), PixelFormat::Yuv420p, ironav_codec::Matrix::Bt709));
+    }
+    let (w, h) = (src.width as usize, src.height as usize);
+    let mut out = vec![0u8; w * h * 3];
+    let c = Colorimetry::of(v);
+    convert_8bit(&src, &Fixed::new(Colorimetry { bits: 8, ..c }), &mut out);
+    (w as u32, h as u32, out)
+}
+
+/// The YUV to RGB matrix as Q16 integers over raw 8-bit sample differences.
+struct Fixed {
+    y: i32,
+    rv: i32,
+    gu: i32,
+    gv: i32,
+    bu: i32,
+}
+
+const Q: i32 = 16;
+const HALF: i32 = 1 << (Q - 1);
+
+impl Fixed {
+    fn new(c: Colorimetry) -> Self {
+        let m = YuvToRgb::new(c).m;
+        let q = |x: f32| (f64::from(x) * f64::from(1 << Q)).round() as i32;
+        Self { y: q(m[0][0]), rv: q(m[0][2]), gu: q(m[1][1]), gv: q(m[1][2]), bu: q(m[2][1]) }
+    }
+}
+
+#[inline(always)]
+fn clamp8(v: i32) -> u8 {
+    (v >> Q).clamp(0, 255) as u8
+}
+
+/// Write one pixel from its luma and the chroma terms (already multiplied out).
+#[inline(always)]
+fn put(o: &mut [u8], k: &Fixed, y: u8, rv: i32, g: i32, bu: i32) {
+    let yy = k.y * (i32::from(y) - 16) + HALF;
+    o[0] = clamp8(yy + rv);
+    o[1] = clamp8(yy + g);
+    o[2] = clamp8(yy + bu);
+}
+
+fn convert_8bit(src: &VideoFrame, k: &Fixed, out: &mut [u8]) {
+    let (w, h) = (src.width as usize, src.height as usize);
+    if w == 0 || h == 0 {
+        return;
+    }
+    match src.pix_fmt {
+        PixelFormat::Rgb24 => out.copy_from_slice(&src.planes[0][..w * h * 3]),
+        PixelFormat::Gray8 => {
+            for (orow, yrow) in out.chunks_exact_mut(w * 3).zip(src.planes[0].chunks_exact(w)) {
+                for (o, &y) in orow.as_chunks_mut::<3>().0.iter_mut().zip(yrow) {
+                    o.fill(clamp8(k.y * (i32::from(y) - 16) + HALF));
+                }
+            }
+        }
+        fmt => {
+            let (sx, sy) = match fmt {
+                PixelFormat::Yuv420p => (2, 2),
+                PixelFormat::Yuv422p => (2, 1),
+                PixelFormat::Yuv440p => (1, 2),
+                _ => (1, 1),
+            };
+            let cw = w.div_ceil(sx);
+            let (py, pu, pv) = (&src.planes[0], &src.planes[1], &src.planes[2]);
+            for (y, (orow, yrow)) in out.chunks_exact_mut(w * 3).zip(py.chunks_exact(w)).enumerate() {
+                let cy = (y / sy) * cw;
+                let (urow, vrow) = (&pu[cy..cy + cw], &pv[cy..cy + cw]);
+                if sx == 2 {
+                    // Two pixels share each chroma sample.
+                    for ((o, ys), (&u, &v)) in orow.chunks_mut(6).zip(yrow.chunks(2)).zip(urow.iter().zip(vrow)) {
+                        let (cb, cr) = (i32::from(u) - 128, i32::from(v) - 128);
+                        let (rv, g, bu) = (k.rv * cr, k.gu * cb + k.gv * cr, k.bu * cb);
+                        for (op, &yv) in o.as_chunks_mut::<3>().0.iter_mut().zip(ys) {
+                            put(op, k, yv, rv, g, bu);
+                        }
+                    }
+                } else {
+                    for ((op, &yv), (&u, &v)) in orow.as_chunks_mut::<3>().0.iter_mut().zip(yrow).zip(urow.iter().zip(vrow)) {
+                        let (cb, cr) = (i32::from(u) - 128, i32::from(v) - 128);
+                        put(op, k, yv, k.rv * cr, k.gu * cb + k.gv * cr, k.bu * cb);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The original scalar converter (f32 per pixel, a `match` per pixel). Kept as the reference the
+/// fast path is tested against and as the baseline `bench_decode` times; not for use in a player.
+#[doc(hidden)]
+pub fn rgb_frame_reference(v: &VideoFrame, max_w: Option<u32>, max_h: Option<u32>) -> (u32, u32, Vec<u8>) {
     let mut scaled;
     let mut src = v;
     if let Some((w, h)) = fit(v.width, v.height, max_w, max_h) {
@@ -13,7 +119,6 @@ pub fn rgb_frame(v: &VideoFrame, max_w: Option<u32>, max_h: Option<u32>) -> (u32
         scaled.pts = v.pts;
         src = &scaled;
     }
-    // High-bit-depth pictures are narrowed to 8 bits first; a screen shows 8 bits anyway.
     let narrowed;
     if src.pix_fmt.bit_depth() > 8 {
         narrowed = ironav_codec::convert_pixel_format(src.clone(), PixelFormat::Yuv420p, ironav_codec::Matrix::Bt709);
@@ -142,5 +247,44 @@ mod tests {
         let ten = VideoFrame { width: 2, height: 2, pix_fmt: PixelFormat::Yuv420p10, pts: 0, planes: vec![words(81 << 2, 4), words(90 << 2, 1), words(240 << 2, 1)] };
         let eight = VideoFrame { width: 2, height: 2, pix_fmt: PixelFormat::Yuv420p, pts: 0, planes: vec![vec![81; 4], vec![90], vec![240]] };
         assert_eq!(rgb_frame(&ten, None, None), rgb_frame(&eight, None, None));
+    }
+
+    /// A deterministic pseudo-random picture, so every code path sees varied samples.
+    fn noise(w: u32, h: u32, fmt: PixelFormat) -> VideoFrame {
+        let mut seed = 0x1234_5678u32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 24) as u8
+        };
+        let planes = fmt.planes(w as usize, h as usize).iter().map(|&(pw, ph, bpp)| (0..pw * ph * bpp).map(|_| next()).collect()).collect();
+        VideoFrame { width: w, height: h, pix_fmt: fmt, pts: 0, planes }
+    }
+
+    #[test]
+    fn the_fixed_point_converter_matches_the_scalar_one_within_one() {
+        for fmt in [PixelFormat::Yuv420p, PixelFormat::Yuv422p, PixelFormat::Yuv440p, PixelFormat::Yuv444p, PixelFormat::Gray8, PixelFormat::Rgb24] {
+            // SD and HD, even and odd sizes, with and without a downscale.
+            for (w, h, fit) in [(64u32, 48u32, None), (33, 17, None), (64, 720, None), (96, 64, Some(40u32))] {
+                let f = noise(w, h, fmt);
+                let (ow, oh, new) = rgb_frame(&f, fit, fit);
+                let (rw, rh, old) = rgb_frame_reference(&f, fit, fit);
+                assert_eq!((ow, oh, new.len()), (rw, rh, old.len()), "{fmt:?} {w}x{h}");
+                let worst = new.iter().zip(&old).map(|(a, b)| (i32::from(*a) - i32::from(*b)).abs()).max().unwrap();
+                assert!(worst <= 1, "{fmt:?} {w}x{h}: worst difference {worst}");
+            }
+        }
+    }
+
+    #[test]
+    fn high_bit_depth_still_matches_the_scalar_converter() {
+        let mut f = noise(32, 32, PixelFormat::Yuv420p10);
+        for p in &mut f.planes {
+            for c in p.as_chunks_mut::<2>().0.iter_mut() {
+                c[1] &= 3; // keep the samples inside 10 bits
+            }
+        }
+        let (_, _, new) = rgb_frame(&f, None, None);
+        let (_, _, old) = rgb_frame_reference(&f, None, None);
+        assert!(new.iter().zip(&old).all(|(a, b)| (i32::from(*a) - i32::from(*b)).abs() <= 1));
     }
 }

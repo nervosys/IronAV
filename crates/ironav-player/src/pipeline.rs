@@ -221,6 +221,8 @@ fn push_video(inner: &Inner, gen: u64, t: TimedFrame) -> bool {
     q.bytes += t.frame.planes.iter().map(Vec::len).sum::<usize>();
     q.frames.push_back(Arc::new(t));
     q.ready = true;
+    drop(q);
+    inner.wake();
     true
 }
 
