@@ -3,6 +3,7 @@
 //! sockets), and its "Agent" tab shows the exact `ironav` command and job JSON behind the form.
 
 mod app;
+mod gpu;
 mod player;
 pub mod model;
 
@@ -37,8 +38,15 @@ pub fn run_player(initial_file: Option<String>) -> Result<()> {
             .with_inner_size([1024.0, 640.0])
             .with_min_inner_size([520.0, 320.0])
             .with_drag_and_drop(true),
+        // wgpu is eframe's default backend; named here because the video view is a wgpu paint callback.
+        renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
-    eframe::run_native("IronAV Player", options, Box::new(move |_cc| Ok(Box::new(player::PlayerApp::new(initial_file.clone())))))
+    let make = move |cc: &eframe::CreationContext<'_>| {
+        // The GPU video path needs a wgpu render state; without one the player converts on the CPU.
+        let gpu = cc.wgpu_render_state.as_ref().map(gpu::install).is_some();
+        Ok(Box::new(player::PlayerApp::new(initial_file.clone(), gpu, cc.egui_ctx.clone())) as Box<dyn eframe::App>)
+    };
+    eframe::run_native("IronAV Player", options, Box::new(make))
         .map_err(|e| Error::new(ErrorCode::Internal, format!("could not start the player window: {e}")).hint("on a headless machine use `ironav play`, which has a terminal and a JSON mode"))
 }

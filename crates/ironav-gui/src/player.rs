@@ -1,10 +1,12 @@
 //! The player window: picture, transport bar, and an "Agent" panel showing the live status
 //! JSON an agent would get from the same player.
 
+use crate::gpu;
 use eframe::egui::{self, Color32, RichText};
 use ironav_core::Error;
 use ironav_formats::FORMATS;
 use ironav_player::{rgb_frame, to_png, AudioMode, OpenOptions, Player, State, TimedFrame};
+use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,7 +14,13 @@ const ACCENT: Color32 = Color32::from_rgb(249, 115, 22);
 const BAD: Color32 = Color32::from_rgb(248, 81, 73);
 
 pub struct PlayerApp {
+    ctx: egui::Context,
+    /// Pictures are shown by the GPU (planes uploaded, converted in a shader) when this is set and
+    /// the picture's format allows; otherwise they are converted on the CPU into `tex`.
+    gpu: bool,
     player: Option<Player>,
+    /// The picture last shown, kept so a seek does not flash black while the next one decodes.
+    last: Option<Arc<TimedFrame>>,
     path: String,
     error: Option<Error>,
     tex: Option<egui::TextureHandle>,
@@ -31,8 +39,8 @@ fn fmt_time(s: f64) -> String {
 }
 
 impl PlayerApp {
-    pub fn new(initial: Option<String>) -> Self {
-        let mut a = Self { player: None, path: String::new(), error: None, tex: None, shown: None, scrub: None, show_agent: false, note: None, fullscreen: false };
+    pub fn new(initial: Option<String>, gpu: bool, ctx: egui::Context) -> Self {
+        let mut a = Self { ctx, gpu, last: None, player: None, path: String::new(), error: None, tex: None, shown: None, scrub: None, show_agent: false, note: None, fullscreen: false };
         if let Some(p) = initial {
             a.open(&p);
         }
@@ -43,8 +51,12 @@ impl PlayerApp {
         self.player = None; // stop the old one first so two decoders never compete for the GPU
         self.tex = None;
         self.shown = None;
+        self.last = None;
         match Player::open(path, &OpenOptions { audio: AudioMode::Auto, ..Default::default() }) {
             Ok(p) => {
+                // Repaint the moment a decoder thread queues a picture or fails, not on a timer.
+                let ctx = self.ctx.clone();
+                p.set_waker(Arc::new(move || ctx.request_repaint()));
                 self.path = path.to_string();
                 self.error = None;
                 self.player = Some(p);
@@ -101,7 +113,7 @@ impl PlayerApp {
                 i.key_pressed(egui::Key::Home),
             )
         });
-        let vol = p.status()["volume"].as_f64().unwrap_or(1.0) as f32;
+        let vol = p.volume();
         if toggle {
             p.toggle();
         }
@@ -121,8 +133,7 @@ impl PlayerApp {
             p.set_volume((vol - 0.05).max(0.0));
         }
         if mute {
-            let on = !p.status()["muted"].as_bool().unwrap_or(false);
-            p.set_muted(on);
+            p.set_muted(!p.muted());
         }
         if full {
             self.fullscreen = !self.fullscreen;
@@ -133,17 +144,15 @@ impl PlayerApp {
         }
     }
 
-    /// Bring the texture up to date with the picture that should be on screen.
-    fn update_texture(&mut self, ctx: &egui::Context, avail: egui::Vec2) {
-        let Some(p) = &self.player else { return };
-        let Some(f) = p.frame() else { return };
+    /// CPU fallback: bring the texture up to date with the picture that should be on screen.
+    fn update_texture(&mut self, ctx: &egui::Context, f: &TimedFrame, key_id: usize, avail: egui::Vec2) {
         let ppp = ctx.pixels_per_point();
         let (mw, mh) = ((avail.x * ppp).max(2.0) as u32, (avail.y * ppp).max(2.0) as u32);
-        let key = (Arc::as_ptr(&f) as usize, mw, mh);
+        let key = (key_id, mw, mh);
         if self.shown == Some(key) {
             return;
         }
-        let img = picture(&f, mw, mh);
+        let img = picture(f, mw, mh);
         match &mut self.tex {
             Some(t) => t.set(img, egui::TextureOptions::LINEAR),
             None => self.tex = Some(ctx.load_texture("video", img, egui::TextureOptions::LINEAR)),
@@ -196,16 +205,15 @@ impl PlayerApp {
                 ui.weak("buffering…");
             }
             ui.separator();
-            let st = p.status();
-            let mut vol = st["volume"].as_f64().unwrap_or(1.0) as f32 * 100.0;
-            let muted = st["muted"].as_bool().unwrap_or(false);
+            let mut vol = p.volume() * 100.0;
+            let muted = p.muted();
             if ui.selectable_label(muted, if muted { "🔇" } else { "🔊" }).clicked() {
                 p.set_muted(!muted);
             }
             if ui.add(egui::Slider::new(&mut vol, 0.0..=200.0).suffix("%").integer().show_value(true)).changed() {
                 p.set_volume(vol / 100.0);
             }
-            let mut looping = st["looping"].as_bool().unwrap_or(false);
+            let mut looping = p.looping();
             if ui.checkbox(&mut looping, "Repeat").changed() {
                 p.set_looping(looping);
             }
@@ -229,6 +237,9 @@ impl eframe::App for PlayerApp {
             self.open(&p.display().to_string());
         }
         self.keys(&ctx);
+        // The status JSON is built at most once per UI frame, and only for what shows it: the Agent
+        // view and the audio-only level meter.
+        let status: Option<Value> = self.player.as_ref().filter(|p| self.show_agent || !p.has_video()).map(Player::status);
 
         egui::Panel::top("bar").show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -256,13 +267,13 @@ impl eframe::App for PlayerApp {
             self.controls(ui);
             ui.add_space(2.0);
             if self.show_agent {
-                if let Some(p) = &self.player {
+                if let (Some(_), Some(st)) = (&self.player, &status) {
                     ui.separator();
                     ui.horizontal_wrapped(|ui| {
                         ui.weak("same player, as an agent sees it:");
                         ui.monospace(format!("ironav play \"{}\" --json   then   {{\"cmd\":\"status\"}}", self.path));
                     });
-                    let mut json = serde_json::to_string_pretty(&p.status()).unwrap_or_default();
+                    let mut json = serde_json::to_string_pretty(st).unwrap_or_default();
                     egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
                         ui.add(egui::TextEdit::multiline(&mut json).code_editor().desired_width(f32::INFINITY).interactive(false));
                     });
@@ -272,16 +283,39 @@ impl eframe::App for PlayerApp {
 
         egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::BLACK)).show(ui, |ui| {
             let avail = ui.available_size();
-            self.update_texture(&ctx, avail);
             let full = ui.max_rect();
-            if let Some(t) = &self.tex {
-                let sz = t.size_vec2();
-                let scale = (avail.x / sz.x).min(avail.y / sz.y);
-                let rect = egui::Rect::from_center_size(full.center(), sz * scale);
-                ui.painter().image(t.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+            let fresh = self.player.as_ref().and_then(Player::frame);
+            if fresh.is_some() {
+                self.last.clone_from(&fresh);
+            }
+            let mut drawn = false;
+            if let Some(f) = fresh.or_else(|| self.last.clone()) {
+                if self.gpu && gpu::supported(&f.frame) {
+                    // The planes go to the GPU as they are; the shader converts and scales.
+                    let size = egui::vec2(f.frame.width as f32, f.frame.height as f32);
+                    let rect = egui::Rect::from_center_size(full.center(), size * (avail.x / size.x).min(avail.y / size.y));
+                    ui.painter().add(gpu::VideoCallback::shape(rect, f));
+                    self.tex = None;
+                    self.shown = None;
+                    drawn = true;
+                } else {
+                    self.update_texture(&ctx, &f, Arc::as_ptr(&f) as usize, avail);
+                    if let Some(t) = &self.tex {
+                        let sz = t.size_vec2();
+                        let scale = (avail.x / sz.x).min(avail.y / sz.y);
+                        let rect = egui::Rect::from_center_size(full.center(), sz * scale);
+                        ui.painter().image(t.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+                        drawn = true;
+                    }
+                }
+            }
+            if drawn {
+                // the picture is up
             } else if let Some(p) = &self.player {
                 if !p.has_video() {
-                    audio_only(ui, full, p);
+                    if let Some(st) = &status {
+                        audio_only(ui, full, p, st);
+                    }
                 }
             } else {
                 ui.centered_and_justified(|ui| {
@@ -298,13 +332,45 @@ impl eframe::App for PlayerApp {
             }
         });
 
-        ctx.request_repaint_after(Duration::from_millis(if self.player.as_ref().is_some_and(|p| p.state() == State::Playing) { 8 } else { 100 }));
+        self.schedule_repaint(&ctx);
+    }
+}
+
+impl PlayerApp {
+    /// Ask for the next repaint only when something will have changed by then: the next picture
+    /// is due, the clock text and seek bar need a tick, or a message expires. A paused player, an
+    /// ended one and an empty window ask for nothing and stay idle until input or a decoder
+    /// thread wakes them.
+    fn schedule_repaint(&self, ctx: &egui::Context) {
+        let mut wait: Option<Duration> = None;
+        let mut soonest = |d: Duration| wait = Some(wait.map_or(d, |w| w.min(d)));
+        if let Some(p) = &self.player {
+            match p.state() {
+                State::Playing => {
+                    // The clock and seek bar move at 20 Hz; audio-only files also drive a level meter.
+                    soonest(Duration::from_millis(if p.has_video() { 50 } else { 33 }));
+                    if let Some(due) = p.next_frame_due() {
+                        soonest(Duration::from_secs_f64(due).max(Duration::from_millis(1)));
+                    }
+                }
+                State::Buffering => soonest(Duration::from_millis(50)),
+                State::Ended if p.looping() => soonest(Duration::from_millis(50)),
+                _ => {}
+            }
+        }
+        if let Some((_, t)) = &self.note {
+            if let Some(left) = Duration::from_secs(4).checked_sub(t.elapsed()) {
+                soonest(left + Duration::from_millis(20));
+            }
+        }
+        if let Some(w) = wait {
+            ctx.request_repaint_after(w);
+        }
     }
 }
 
 /// A level meter for files with no picture.
-fn audio_only(ui: &mut egui::Ui, rect: egui::Rect, p: &Player) {
-    let st = p.status();
+fn audio_only(ui: &mut egui::Ui, rect: egui::Rect, p: &Player, st: &Value) {
     let level = st["audio"]["level"].as_f64().unwrap_or(0.0).clamp(0.0, 1.0).sqrt() as f32;
     let meter = egui::Rect::from_center_size(rect.center(), egui::vec2((rect.width() * 0.6).max(40.0), 14.0));
     let painter = ui.painter();

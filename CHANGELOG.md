@@ -7,6 +7,17 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+
+- ironav-gui: the player window shows video on the GPU. The decoder's planes (8-bit, or 10/12-bit as 16-bit integers) are uploaded to textures that stay alive across frames and are updated in place; a shader converts YUV to RGB with the picture's matrix (BT.601 below 720 lines, BT.709 from 720 up; BT.2020 and full range are in the shared constants) and scales with bilinear filtering, as an `egui_wgpu` paint callback on eframe's default wgpu backend. The CPU converter remains the fallback (packed RGB pictures, a window without a wgpu render state) and is what snapshots use.
+- ironav-player: `Colorimetry`, `Matrix` and `YuvToRgb`, the YUV to RGB matrix and offsets shared by the CPU converter and the shader, with tests that check the shader's formula against the CPU path; `Player::set_waker` (called when a picture is queued or playback fails), `Player::next_frame_due`, and cheap `volume`, `muted` and `looping` accessors.
+- ironav-player: `examples/bench_decode.rs`, a headless benchmark (`cargo run --release -p ironav-player --example bench_decode -- [FILE]`). It decodes a file, or a 1080p H.264 clip it encodes in-process, and prints JSON with the time to the first decoded frame, decode frames per second, and the CPU YUV to RGB time per frame for the old and new converters.
+
+### Changed
+
+- ironav-gui: the player window no longer repaints every 8 ms. While playing it repaints when the next picture is due or a decoder thread queues one (20 Hz for the clock and seek bar at the most otherwise), and it stays idle when paused. The status JSON is built at most once per UI frame, and only when the Agent view is open or the file has no video; volume and mute are read directly.
+- ironav-player: `rgb_frame` converts in integer fixed point over row slices, with the chroma terms worked out once per chroma sample, and no longer clones a 10-bit picture to narrow it. The output is within 1 per channel of the old scalar converter (kept as `rgb_frame_reference` for the test and the benchmark); about 5 times faster at 1080p.
+
 ## [0.1.10] - 2026-11-19
 
 ### Added

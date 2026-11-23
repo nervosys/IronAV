@@ -9,6 +9,7 @@
 //! The same object serves every front end: the terminal player, the GUI, and the JSON
 //! command interface agents use ([`Player::command`]). Nothing here draws or reads input.
 
+mod color;
 mod command;
 mod output;
 mod pipeline;
@@ -18,7 +19,8 @@ pub use output::{AudioOutput, NullOutput};
 #[cfg(feature = "audio")]
 pub use output::{device_description, CpalOutput};
 pub use pipeline::{open_video_decoder, open_video_decoder_with};
-pub use snapshot::{base64, rgb_frame, to_png};
+pub use color::{Colorimetry, Matrix, YuvToRgb};
+pub use snapshot::{base64, rgb_frame, rgb_frame_reference, to_png};
 
 use ironav_core::{CodecId, Error, ErrorCode, MediaType, Result, StreamInfo, StreamParams, VideoFrame};
 use ironav_formats::open_demuxer;
@@ -177,12 +179,27 @@ pub(crate) struct Inner {
     pub video: Mutex<VideoQueue>,
     pub error: Mutex<Option<Error>>,
     pub shutdown: AtomicBool,
+    /// Called when a new picture is queued or playback fails, so a window can repaint at once.
+    pub waker: Mutex<Option<Waker>>,
 }
+
+/// A callback that wakes whoever is showing the pictures.
+pub type Waker = Arc<dyn Fn() + Send + Sync>;
 
 impl Inner {
     pub fn fail(&self, e: Error) {
-        let mut g = self.error.lock().unwrap();
-        g.get_or_insert(e);
+        {
+            let mut g = self.error.lock().unwrap();
+            g.get_or_insert(e);
+        }
+        self.wake();
+    }
+
+    pub fn wake(&self) {
+        let w = self.waker.lock().unwrap().clone();
+        if let Some(w) = w {
+            w();
+        }
     }
 
     fn position_locked(&self, c: &Clock) -> f64 {
@@ -393,6 +410,7 @@ impl Player {
             video: Mutex::new(VideoQueue { gen: 1, ..Default::default() }),
             error: Mutex::new(None),
             shutdown: AtomicBool::new(false),
+            waker: Mutex::new(None),
         });
 
         let (mut tx, mut threads) = (Vec::new(), Vec::new());
@@ -544,6 +562,33 @@ impl Player {
             }
             _ => q.last.clone(),
         }
+    }
+
+    /// Call `wake` (from a decoder thread) whenever a new picture is queued or playback fails.
+    /// A window uses it to repaint exactly when there is something new, instead of polling.
+    pub fn set_waker(&self, wake: Waker) {
+        *self.inner.waker.lock().unwrap() = Some(wake);
+    }
+
+    /// Seconds of media time until the next queued picture is due, or None if none is queued
+    /// beyond the one on show. At normal speed this is also wall time.
+    pub fn next_frame_due(&self) -> Option<f64> {
+        let pos = self.inner.update()?;
+        let q = self.inner.video.lock().unwrap();
+        q.frames.iter().find(|f| f.time > pos + 1e-4).map(|f| f.time - pos)
+    }
+
+    /// The volume (0..2), whether it is muted, and whether it repeats; cheaper than [`Player::status`].
+    pub fn volume(&self) -> f32 {
+        self.inner.clock.lock().unwrap().volume
+    }
+
+    pub fn muted(&self) -> bool {
+        self.inner.clock.lock().unwrap().muted
+    }
+
+    pub fn looping(&self) -> bool {
+        self.inner.clock.lock().unwrap().looping
     }
 
     pub fn error(&self) -> Option<Error> {
