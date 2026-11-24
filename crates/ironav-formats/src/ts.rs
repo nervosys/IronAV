@@ -92,6 +92,9 @@ fn codec_of(stream_type: u8) -> Option<CodecId> {
         0x03 | 0x04 => Some(CodecId::Mp3),
         // AC-3 as the ATSC and Blu-ray tables give it (0x06 with a descriptor is the DVB way)
         0x81 => Some(CodecId::Ac3),
+        // E-AC-3: ATSC's stream type, and Blu-ray's primary and secondary audio (0x06 with a
+        // descriptor is the DVB way)
+        0x87 | 0x84 | 0xA1 => Some(CodecId::Eac3),
         _ => None,
     }
 }
@@ -155,6 +158,21 @@ fn has_ac3_descriptor(desc: &[u8]) -> bool {
         let (tag, len) = (desc[i], desc[i + 1] as usize);
         let Some(body) = desc.get(i + 2..i + 2 + len) else { return false };
         if tag == 0x6A || (tag == 0x05 && body.starts_with(b"AC-3")) {
+            return true;
+        }
+        i += 2 + len;
+    }
+    false
+}
+
+/// Whether a private (0x06) stream's PMT descriptors say it is E-AC-3: the DVB enhanced AC-3
+/// descriptor (tag 0x7A) or the `EAC3` registration descriptor (tag 0x05).
+fn has_eac3_descriptor(desc: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 2 <= desc.len() {
+        let (tag, len) = (desc[i], desc[i + 1] as usize);
+        let Some(body) = desc.get(i + 2..i + 2 + len) else { return false };
+        if tag == 0x7A || (tag == 0x05 && body.starts_with(b"EAC3")) {
             return true;
         }
         i += 2 + len;
@@ -515,7 +533,8 @@ impl TsParser {
                 // private PES (0x06) carries Opus when its descriptors say so
                 let opus = if ty == 0x06 { body.get(i + 5..i + 5 + es_len).and_then(opus_head_from_descriptors) } else { None };
                 let ac3 = ty == 0x06 && body.get(i + 5..i + 5 + es_len).is_some_and(has_ac3_descriptor);
-                if let Some(codec) = if opus.is_some() { Some(CodecId::Opus) } else if ac3 { Some(CodecId::Ac3) } else { codec_of(ty) } {
+                let eac3 = ty == 0x06 && body.get(i + 5..i + 5 + es_len).is_some_and(has_eac3_descriptor);
+                if let Some(codec) = if opus.is_some() { Some(CodecId::Opus) } else if eac3 { Some(CodecId::Eac3) } else if ac3 { Some(CodecId::Ac3) } else { codec_of(ty) } {
                     self.es.push(Es {
                         pid,
                         codec,
@@ -643,6 +662,40 @@ impl TsParser {
                         continue;
                     }
                 }
+            } else if codec == CodecId::Eac3 {
+                match ironav_codec::ac3::eac3_frame_info(&data[i..]) {
+                    // a dependent frame with no independent frame before it is dropped
+                    Ok(f) if f.offset == 0 && f.skipped => {
+                        i += f.frame_size.min(data.len() - i);
+                        continue;
+                    }
+                    Ok(f) if f.offset == 0 => {
+                        // the independent frame and the dependent frames behind it are one access unit
+                        let mut len = f.frame_size;
+                        let mut more = true;
+                        while i + len < data.len() {
+                            match ironav_codec::ac3::eac3_frame_info(&data[i + len..]) {
+                                Ok(g) if g.offset == 0 && g.skipped => {
+                                    if i + len + g.frame_size > data.len() {
+                                        more = false; // the rest of it is in the next PES
+                                        break;
+                                    }
+                                    len += g.frame_size;
+                                }
+                                _ => break,
+                            }
+                        }
+                        if !more && !last {
+                            break;
+                        }
+                        (len, 0, f.sample_rate, f.channels, f.samples, Vec::new(), CodecId::Eac3)
+                    }
+                    _ if data.len() - i < 16 && !last => break,
+                    _ => {
+                        i += 1;
+                        continue;
+                    }
+                }
             } else {
                 // MPEG audio is labelled MP3, but a Layer II (MP2) frame is MP2: the frame says which
                 match ironav_codec::mp3::parse_frame(&data[i..]) {
@@ -686,7 +739,9 @@ impl TsParser {
             e.next = Some(t + ticks / rate as i64);
             e.rem = ticks % rate as i64;
             let frame = data[i + hdr..i + len].to_vec();
-            self.unit(k, Unit { pts: t, data: frame, key: true, dur: None });
+            // E-AC-3 frames have 1, 2, 3 or 6 blocks
+            let dur = (frame_codec == CodecId::Eac3).then_some(samples as i64);
+            self.unit(k, Unit { pts: t, data: frame, key: true, dur });
             i += len;
         }
         if !last {
@@ -797,7 +852,7 @@ impl TsParser {
         let (pts, duration) = match e.info.as_ref().map(|i| &i.params) {
             Some(StreamParams::Audio { sample_rate, .. }) => {
                 let r = *sample_rate as i64;
-                let samples = u.dur.unwrap_or_else(|| if e.codec == CodecId::Aac { 1024 } else if e.codec == CodecId::Ac3 { 1536 } else { ironav_codec::mp3::parse_header(&u.data).map_or(1152, |h| h.samples() as i64) });
+                let samples = u.dur.unwrap_or_else(|| if e.codec == CodecId::Aac { 1024 } else if matches!(e.codec, CodecId::Ac3 | CodecId::Eac3) { 1536 } else { ironav_codec::mp3::parse_header(&u.data).map_or(1152, |h| h.samples() as i64) });
                 ((t * r + CLOCK / 2).div_euclid(CLOCK), samples)
             }
             _ => (t, e.frame.max(1)),
@@ -921,7 +976,7 @@ impl<R: Read + Seek + Send> TsDemuxer<R> {
                 // an Opus frame is 20 ms; the last one's length is not read from the tail
                 StreamParams::Audio { sample_rate, .. } => span * sample_rate as i64 / CLOCK + match e.codec {
                     CodecId::Aac => 1024,
-                    CodecId::Ac3 => 1536,
+                    CodecId::Ac3 | CodecId::Eac3 => 1536,
                     CodecId::Opus => 960,
                     _ => 1152,
                 },

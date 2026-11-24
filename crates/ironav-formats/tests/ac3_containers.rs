@@ -328,19 +328,19 @@ fn ac3_written_raw_plays_in_ffmpeg() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// E-AC-3 (bit stream id 16) is refused with a clear error, not decoded as AC-3.
+/// An E-AC-3 file named `.ac3` is not read as AC-3: the file's first frame says which it is (the
+/// containers' tests are in `eac3_containers.rs`).
 #[test]
-fn eac3_is_refused() {
+fn eac3_in_an_ac3_named_file_is_read_as_eac3() {
     if !ffmpeg_available() {
         eprintln!("skipped: ffmpeg is not on PATH");
         return;
     }
     let dir = scratch();
-    let file = dir.join("refused.eac3");
+    let file = dir.join("named.ac3");
     assert!(ffmpeg(&["-f", "lavfi", "-i", SIGNAL, "-ac", "2", "-c:a", "eac3", "-f", "eac3", file.to_str().unwrap()]), "encoding E-AC-3");
-    let err = open_demuxer(&file).err().expect("E-AC-3 is refused");
-    assert_eq!(err.code, ironav_core::ErrorCode::UnsupportedCodec, "{}", err.message);
-    assert!(err.message.contains("E-AC-3"), "{}", err.message);
+    let d = open_demuxer(&file).expect("the file opens");
+    assert_eq!(d.streams()[0].codec, CodecId::Eac3);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

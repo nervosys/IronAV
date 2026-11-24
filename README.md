@@ -5,7 +5,7 @@ A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so 
 
 > **Status: foundation (v0.1.10).** The architecture, agent interface, ontology, hardware model, CLI, MCP server
 > and both GUIs are working and tested. Containers: **WAV, FLAC, Y4M, MP4, QuickTime MOV (read and write), Matroska/WebM (read and write), Ogg, ADTS, MP3, JPEG and MPEG transport streams (read and write); AVI (read, with OpenDML), MPEG program streams (`.mpg`, `.vob`, read) and raw MPEG-1/2 video (`.m2v`, read; MPEG-2 also written); subtitles as streams (`.srt`, `.vtt`, `.ass`/`.ssa` files and Matroska text tracks, read); `probe` also lists the entries of M3U and PLS playlists and the chapters and attachments of Matroska files; raw H.264 and HEVC (Annex B: read and written as files, and read as live sources).**
-> Audio codecs, each decoded and encoded: **PCM, FLAC, ALAC, AAC-LC (plus HE-AAC v1 decode), MP3, MP2, AC-3, Opus and Vorbis.**
+> Audio codecs, each decoded and encoded: **PCM, FLAC, ALAC, AAC-LC (plus HE-AAC v1 decode), MP3, MP2, AC-3, Opus and Vorbis.** E-AC-3 is decoded only.
 > Video: **software decoders for H.264, HEVC (including 4:2:2 and 4:4:4), VP8 and VP9; a software H.264 encoder (High profile: CABAC and the 8x8 transform), a software HEVC encoder (Main profile, 8-bit 4:2:0, merge and skip, SAO), a software VP8 encoder, and a software VP9 encoder (key and inter frames), and a software AV1 encoder (key and inter frames, profile 0, 8-bit 4:2:0); JPEG/Motion-JPEG and Apple ProRes decoded and encoded in software; MPEG-4 Part 2 (Simple and Advanced Simple profiles) decoded in software, and Simple profile I and P pictures encoded in software, with Advanced Simple B pictures as an option (MP4 and Matroska); MPEG-1 and MPEG-2 video (frame and field pictures, 4:2:0 and 4:2:2) decoded in software, and MPEG-2 video (Main profile, 4:2:0, progressive frames, optional B pictures) encoded in software.**
 > NVIDIA GPUs encode H.264 and HEVC (NVENC, preferred when usable) and decode H.264, HEVC and AV1 (NVDEC).
 > AV1 is decoded on NVIDIA GPUs (NVDEC) or in software (key, intra-only and inter frames, superres included). VP9 and AV1 copy between WebM, Matroska and MP4.
@@ -1309,7 +1309,7 @@ AC-3 (Dolby Digital, ATSC A/52) is decoded as the `ac3` codec, a translation of 
 channel mode from mono to 3/2 with the LFE channel decodes, with coupling, rematrixing, delta bit allocation, block switching and
 dynamic range at FFmpeg's default (`drc_scale` 1). The output is float, in FFmpeg's channel order. It is read from raw `.ac3`
 files, Matroska (`A_AC3`), MPEG-TS (stream type 0x81, or 0x06 with the AC-3 descriptor) and MP4 (`ac-3` with `dac3`). The encoder
-writes the same containers (see "AC-3 encoder" below). E-AC-3 is refused with an error.
+writes the same containers (see "AC-3 encoder" below). E-AC-3 is decoded too (see "E-AC-3" below).
 
 Measured against `ffmpeg -c:a ac3 -f f32le` on FFmpeg-encoded streams (3 seconds each, tones with noise bursts):
 
@@ -1322,7 +1322,7 @@ Measured against `ffmpeg -c:a ac3 -f f32le` on FFmpeg-encoded streams (3 seconds
 The worst difference is about one 16-bit step (3.05e-5), and is larger than the 1e-5 aimed for; the cause is not isolated.
 Block switching follows FFmpeg's `do_imdct`, but it is unverified: FFmpeg's encoder writes no short blocks, so no test stream
 has them. The tests are `crates/ironav-codec/tests/ac3_ffmpeg.rs` (the decoder) and `crates/ironav-formats/tests/ac3_containers.rs`
-(the containers, and the E-AC-3 refusal); both skip without `ffmpeg` on the PATH.
+(the containers); both skip without `ffmpeg` on the PATH.
 
 ### AC-3 encoder
 
@@ -1352,6 +1352,35 @@ differently, and in the first stereo frame the header, the bit allocation and th
 mantissas differ (the CRC-1 fields match FFmpeg's). The test is `crates/ironav-engine/tests/ac3_encode.rs`, which skips without
 `ffmpeg` on the PATH. The containers are checked in `crates/ironav-formats/tests/ac3_containers.rs`: FFmpeg's probe names each
 written file AC-3 with the right channel count, the packets read back byte for byte, and the MP4 `dac3` body matches FFmpeg's.
+
+## E-AC-3
+
+E-AC-3 (Dolby Digital Plus, ATSC A/52 annex E, ETSI TS 102 366) is decoded as the `eac3` codec, by the same decoder as AC-3
+(`ironav_codec::ac3::Ac3Decoder` tells the two apart by the bit stream id), a translation of FFmpeg's `eac3dec.c` and the E-AC-3
+parts of `ac3dec.c`. Syncframes of 1, 2, 3 and 6 blocks decode, with the frame-based exponent strategy, standard coupling,
+spectral extension, and the adaptive hybrid transform (the 6-point transform with gain adaptive and vector quantisation, which
+real 5.1 streams at low bit rates use). Transient pre-noise processing data is parsed and ignored, as FFmpeg does. The output is
+float, in the same channel order as AC-3.
+
+Not decoded: enhanced coupling and the reduced sample rates (fscod 3) are refused with an `unsupported_codec` error that names the
+feature (FFmpeg does not decode them either). **Dependent substreams** (`strmtyp` 1, which carry the channels of a 7.1 stream
+beyond its 5.1 core) and substreams other than 0 are skipped: only the independent substream 0, at most 5.1 channels, is decoded,
+so a 7.1 file plays as its 5.1 core. The stream's channel count is the independent substream's where the container says it (MP4's
+`dec3` box, MPEG-TS and raw files, which read it from the frames); a Matroska track that states 8 channels keeps that number in its
+stream parameters while the decoded frames carry 6, and the frames' count is the true one.
+
+It is read from raw `.eac3` and `.ec3` files (an independent frame and the dependent frames after it are one packet), Matroska
+(`A_EAC3`), MPEG-TS (stream type 0x87, the Blu-ray types 0x84 and 0xA1, or 0x06 with the DVB enhanced AC-3 descriptor 0x7A or the
+`EAC3` registration descriptor) and MP4 (`ec-3` with `dec3`). It is not encoded.
+
+Measured against `ffmpeg -f f32le` on streams made with FFmpeg's E-AC-3 encoder (3 seconds each: mono, stereo, 5.1, 5.0, 4.0, quad,
+3.0 and 2.1, at 32, 44.1 and 48 kHz, 96 to 640 kb/s, with and without coupling and metadata): 102 to 112 dB SNR (and the same through raw files, Matroska, MP4 and both MPEG-TS forms). FFmpeg's encoder
+writes no spectral extension and no adaptive hybrid transform, so those are checked with synthetic streams the tests write
+themselves (random mantissas on a valid layout, following the decoder's own bit allocation): mono, stereo and 5.1, with every gain
+adaptive quantisation mode, spectral extension with custom bands and attenuation, coupling together with spectral extension, and
+transient data, each decoded by FFmpeg and by IronAV: 124 to 134 dB SNR in all 19 cases. The tests are `crates/ironav-codec/tests/eac3_ffmpeg.rs`,
+the synthetic streams in `crates/ironav-codec/src/ac3/eac3_synth.rs`, and `crates/ironav-formats/tests/eac3_containers.rs`; all skip
+without `ffmpeg` on the PATH.
 
 ## Matroska output
 

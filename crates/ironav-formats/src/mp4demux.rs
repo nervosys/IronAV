@@ -679,6 +679,7 @@ fn parse_trak(trak: &[u8], index: usize, samples: &mut Vec<Sample>, movie_ts: u3
             (None, b"Opus") => CodecId::Opus,
             (None, b"alac") => CodecId::Alac,
             (None, b"ac-3") => CodecId::Ac3,
+            (None, b"ec-3") => CodecId::Eac3,
             (None, b".mp3") => CodecId::Mp3,
             _ => return Ok(None),
         };
@@ -699,6 +700,13 @@ fn parse_trak(trak: &[u8], index: usize, samples: &mut Vec<Sample>, movie_ts: u3
             rate = (packed >> 44) as u32;
             channels = ((packed >> 41) & 7) as u16 + 1;
             bits = Some(((packed >> 36) & 31) as u8 + 1);
+        }
+        if codec == CodecId::Eac3 {
+            // the dec3 box describes the independent substream, which is what the decoder outputs; the
+            // entry's own count may include the channels of dependent substreams
+            if let Some(c) = child(kids, b"dec3")?.and_then(ironav_codec::ac3::dec3_channels) {
+                channels = c;
+            }
         }
         if codec == CodecId::Aac {
             extradata = aac_config(sound_child(kids, b"esds", "the mp4a entry")?)?;
