@@ -354,6 +354,18 @@ impl Dpb {
         p
     }
 
+    /// Forget every reference and waiting picture and the order-count history (a seek).
+    pub fn reset(&mut self) {
+        self.clear_refs();
+        self.pending.clear();
+        self.prev_poc_msb = 0;
+        self.prev_poc_lsb = 0;
+        self.prev_frame_num_offset = 0;
+        self.prev_frame_num = 0;
+        self.max_long_idx = None;
+        self.last_out = None;
+    }
+
     pub fn drain_all(&mut self) -> Vec<Pending> {
         let mut v = Vec::new();
         while !self.pending.is_empty() {

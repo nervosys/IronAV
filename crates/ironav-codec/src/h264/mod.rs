@@ -397,4 +397,17 @@ impl Decoder for H264Decoder {
         }
         Ok(std::mem::take(&mut self.out))
     }
+
+    fn reset(&mut self) -> bool {
+        // the pictures decoding on other threads are dropped once they finish
+        self.cur = None;
+        while !self.running.is_empty() {
+            self.join_oldest();
+        }
+        self.ready.clear();
+        self.out.clear();
+        self.failed = None;
+        self.dpb.reset();
+        true
+    }
 }

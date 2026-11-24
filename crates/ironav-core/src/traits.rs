@@ -43,6 +43,12 @@ pub trait Decoder: Send {
     fn flush(&mut self) -> Result<Vec<Frame>> {
         Ok(Vec::new())
     }
+    /// Forget the pictures and references held so far, as before a seek, so the next packet (a
+    /// keyframe) starts cleanly, while keeping what was set up at open (parameter sets, driver
+    /// state). Returns false if the decoder cannot do that, and the caller must build a new one.
+    fn reset(&mut self) -> bool {
+        false
+    }
 }
 
 pub trait Encoder: Send {

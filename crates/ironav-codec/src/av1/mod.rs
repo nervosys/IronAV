@@ -448,4 +448,12 @@ impl Decoder for Av1Decoder {
         self.temporal_unit(&packet.data, packet.pts)?;
         Ok(std::mem::take(&mut self.out))
     }
+
+    fn reset(&mut self) -> bool {
+        // the sequence header stays: a keyframe packet repeats it, but one without would need it
+        self.refs = Default::default();
+        self.cur = None;
+        self.out.clear();
+        true
+    }
 }

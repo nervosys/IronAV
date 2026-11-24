@@ -548,6 +548,8 @@ pub struct NvdecDecoder {
     parser: *mut c_void,
     set_ctx: FnSetCtx,
     flushed: bool,
+    /// The parser's codec id, kept so `reset` can make a new parser.
+    parser_codec: u32,
     /// AV1 configuration OBUs given to the parser; it may read them after creation.
     _seqhdr: Option<Box<FormatEx>>,
 }
@@ -637,10 +639,20 @@ impl NvdecDecoder {
                 error: None,
             }));
             // From here on the struct owns everything, so Drop cleans up on any error path.
-            let mut this = NvdecDecoder { _cuvid: cuvid, cuda, ctx, dev, state, parser: ptr::null_mut(), set_ctx, flushed: false, _seqhdr: seqhdr };
-            let ext_video_info = this._seqhdr.as_deref_mut().map_or(ptr::null_mut(), |x| (x as *mut FormatEx).cast());
+            let mut this = NvdecDecoder { _cuvid: cuvid, cuda, ctx, dev, state, parser: ptr::null_mut(), set_ctx, flushed: false, parser_codec, _seqhdr: seqhdr };
+            this.create_parser()?;
+            Ok(this)
+        }
+    }
+
+    /// Make the parser (at open, and again after a seek, which starts a new sequence).
+    fn create_parser(&mut self) -> Result<()> {
+        // SAFETY: as in `new`; the parser gets the heap state's address, which never changes.
+        unsafe {
+            let api = (*self.state).api;
+            let ext_video_info = self._seqhdr.as_deref_mut().map_or(ptr::null_mut(), |x| (x as *mut FormatEx).cast());
             let mut params = ParserParams {
-                codec: parser_codec,
+                codec: self.parser_codec,
                 max_num_decode_surfaces: 1,
                 clock_rate: 0,
                 error_threshold: 100,
@@ -648,7 +660,7 @@ impl NvdecDecoder {
                 max_display_delay: 4,
                 flags: 0,
                 reserved1: [0; 4],
-                user_data: state.cast(),
+                user_data: self.state.cast(),
                 on_sequence: Some(sequence_cb),
                 on_decode: Some(decode_cb),
                 on_display: Some(display_cb),
@@ -657,8 +669,8 @@ impl NvdecDecoder {
                 reserved2: [ptr::null_mut(); 5],
                 ext_video_info,
             };
-            cu((api.create_parser)(&mut this.parser, &mut params), "cuvidCreateVideoParser")?;
-            Ok(this)
+            cu((api.create_parser)(&mut self.parser, &mut params), "cuvidCreateVideoParser")?;
+            Ok(())
         }
     }
 
@@ -695,6 +707,33 @@ impl Decoder for NvdecDecoder {
         }
         self.flushed = true;
         self.feed(&[], 0, PKT_ENDOFSTREAM)
+    }
+
+    /// Start over for a seek without reloading the driver libraries or the CUDA context: the
+    /// parser is ended, its pictures dropped, and a new one made. The decoder is rebuilt by the
+    /// next sequence header.
+    fn reset(&mut self) -> bool {
+        // SAFETY: binds the context we retained to this thread; the parser is ours and idle.
+        unsafe {
+            (self.set_ctx)(self.ctx);
+            let mut pkt = SourcePacket { flags: PKT_ENDOFSTREAM.into(), payload_size: 0, payload: ptr::null(), timestamp: 0 };
+            if !self.flushed {
+                let _ = (self.state().api.parse)(self.parser, &mut pkt);
+            }
+            let st = self.state();
+            st.out.clear();
+            st.error = None;
+            let destroy = st.api.destroy_parser;
+            if !self.parser.is_null() {
+                destroy(self.parser);
+                self.parser = ptr::null_mut();
+            }
+        }
+        if self.create_parser().is_err() {
+            return false;
+        }
+        self.flushed = false;
+        true
     }
 }
 

@@ -236,6 +236,12 @@ impl Decoder for Vp9Decoder {
     fn flush(&mut self) -> Result<Vec<OutFrame>> {
         Ok(std::mem::take(&mut self.out))
     }
+
+    fn reset(&mut self) -> bool {
+        let pool = std::mem::take(&mut self.pool);
+        *self = Self { pool, ..Self::new() };
+        true
+    }
 }
 
 fn set_tile_offset(idx: usize, log2_n: u32, n: usize) -> (usize, usize) {

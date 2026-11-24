@@ -481,4 +481,18 @@ impl Decoder for HevcDecoder {
         while self.bump() {}
         Ok(std::mem::take(&mut self.out))
     }
+
+    fn reset(&mut self) -> bool {
+        self.cur = None;
+        self.dpb.clear();
+        self.out.clear();
+        self.prev_tid0_poc = 0;
+        self.first_picture = true;
+        self.after_eos = false;
+        self.no_rasl_output = true;
+        self.skipping_picture = false;
+        self.last_hdr = None;
+        self.carry = Carry::default();
+        true
+    }
 }
