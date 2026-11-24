@@ -48,7 +48,8 @@ pub mod change;
 pub mod flac;
 #[cfg(feature = "h264")]
 pub mod h264;
-#[cfg(feature = "h264")]
+#[cfg(any(feature = "h264", feature = "filters"))]
+#[cfg_attr(not(feature = "h264"), allow(dead_code))]
 mod pool;
 #[cfg(feature = "hevc")]
 pub mod hevc;
@@ -56,6 +57,8 @@ pub mod hevc;
 pub mod vp9;
 #[cfg(feature = "jpeg")]
 pub mod jpeg;
+#[cfg(feature = "filters")]
+mod deinterlace;
 #[cfg(feature = "filters")]
 mod filters;
 #[cfg(feature = "mp3")]
@@ -133,6 +136,8 @@ pub mod encoders {
     pub use crate::vp9::Vp9Encoder;
 }
 
+#[cfg(feature = "filters")]
+pub use deinterlace::{deinterlace_frame, DeintMethod, DeintMode, DeintOptions, DeintParity, DeintSelect, Deinterlacer};
 #[cfg(feature = "filters")]
 pub use filters::{build_filter, FilterSpec, ParamSpec, FILTERS};
 #[cfg(feature = "filters")]

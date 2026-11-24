@@ -21,6 +21,9 @@ pub struct Format {
 }
 
 impl Filter for Format {
+    fn keeps_field_order(&self) -> bool {
+        true
+    }
     fn output_params(&self, input: &StreamParams) -> StreamParams {
         match input {
             StreamParams::Video { width, height, frame_rate, .. } => {

@@ -28,7 +28,7 @@ pub(crate) mod tables;
 use bits::{split_annexb, unescape};
 pub use enc::H264Encoder;
 use dpb::{DecodedPic, Pending, RefList};
-use ironav_core::{Decoder, Error, ErrorCode, Frame, Packet, PixelFormat, Result, VideoFrame};
+use ironav_core::{Decoder, Error, ErrorCode, FieldOrder, Frame, Packet, PixelFormat, Result, VideoFrame};
 use mb::{LevelScale, Picture, SliceDec, SliceParams};
 use ps::{parse_pps, parse_slice_header, parse_sps, Pps, SliceHeader, SliceType, Sps};
 use shared::{Published, Publisher};
@@ -50,6 +50,9 @@ pub struct H264Decoder {
     ready: VecDeque<Pending>,
     /// An error of a picture decoded on another thread, for the next call to return.
     failed: Option<Error>,
+    /// The field order of each frame in `out`, and of those the last call returned.
+    out_orders: Vec<FieldOrder>,
+    last_orders: Vec<FieldOrder>,
 }
 
 struct Current {
@@ -184,7 +187,7 @@ impl H264Decoder {
         let mut dpb = Dpb::default();
         // a picture in flight holds two buffers: the one it is decoded in and the one it is shared in
         dpb.spare_extra = if n > 1 { n } else { 0 };
-        H264Decoder { sps: vec![None; 32], pps: vec![None; 256], cur: None, dpb, out: Vec::new(), threads: n, running: VecDeque::new(), ready: VecDeque::new(), failed: None }
+        H264Decoder { sps: vec![None; 32], pps: vec![None; 256], cur: None, dpb, out: Vec::new(), threads: n, running: VecDeque::new(), ready: VecDeque::new(), failed: None, out_orders: Vec::new(), last_orders: Vec::new() }
     }
 
     /// For live sources: when the stream does not declare how deep its reordering goes (VUI
@@ -219,6 +222,7 @@ impl H264Decoder {
         let frame = pic.frame.lock().unwrap_or_else(PoisonError::into_inner).take();
         let mut frame = frame.unwrap_or_else(|| output(pic, [0, 1, 2].map(|pl| pic.data.plane(pl, pic.mb_h))));
         frame.pts = p.pts;
+        self.out_orders.push(p.pic.order);
         self.dpb.release(p.pic);
         self.out.push(Frame::Video(frame));
     }
@@ -233,7 +237,15 @@ impl H264Decoder {
         let frame_poc = c.poc[0].min(c.poc[1]);
         let field_poc = if mmco5 { c.poc.map(|p| p - frame_poc) } else { c.poc };
         let poc = if mmco5 { 0 } else { frame_poc };
-        let decoded = |data| DecodedPic { data, frame: Mutex::new(None), mb_w, mb_h, cf, cw: if cf == 3 { 16 } else { 8 }, poc, field_poc, id, crop, bit_depth: bd };
+        // a stream that allows interlaced pictures says so in its sequence parameters; the order of the
+        // fields is the order of their counts (a picture whose counts are equal does not say)
+        let order = match (c.sps.frame_mbs_only, c.poc[0].cmp(&c.poc[1])) {
+            (true, _) => FieldOrder::Progressive,
+            (false, std::cmp::Ordering::Less) => FieldOrder::TopFirst,
+            (false, std::cmp::Ordering::Greater) => FieldOrder::BottomFirst,
+            (false, std::cmp::Ordering::Equal) => FieldOrder::Interlaced,
+        };
+        let decoded = |data| DecodedPic { data, frame: Mutex::new(None), mb_w, mb_h, cf, cw: if cf == 3 { 16 } else { 8 }, poc, field_poc, id, crop, bit_depth: bd, order };
         let pic = match c.pic.take() {
             Some(mut p) => {
                 deblock::deblock_picture(&mut p, bd);
@@ -381,6 +393,7 @@ impl Decoder for H264Decoder {
         if let Some(e) = err.or_else(|| self.failed.take()) {
             return Err(e);
         }
+        self.last_orders = std::mem::take(&mut self.out_orders);
         Ok(std::mem::take(&mut self.out))
     }
 
@@ -395,6 +408,7 @@ impl Decoder for H264Decoder {
         if let Some(e) = self.failed.take() {
             return Err(e);
         }
+        self.last_orders = std::mem::take(&mut self.out_orders);
         Ok(std::mem::take(&mut self.out))
     }
 
@@ -406,8 +420,14 @@ impl Decoder for H264Decoder {
         }
         self.ready.clear();
         self.out.clear();
+        self.out_orders.clear();
         self.failed = None;
         self.dpb.reset();
+        self.last_orders.clear();
         true
+    }
+
+    fn field_orders(&self) -> Vec<FieldOrder> {
+        self.last_orders.clone()
     }
 }

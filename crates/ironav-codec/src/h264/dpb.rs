@@ -27,6 +27,8 @@ pub struct DecodedPic {
     /// Cropping (left, right, top, bottom) in luma samples, applied when the picture is output.
     pub crop: [usize; 4],
     pub bit_depth: u32,
+    /// Progressive, or the order of the two fields of an interlaced (MBAFF) frame.
+    pub order: ironav_core::FieldOrder,
 }
 
 /// One entry of a reference picture list.
