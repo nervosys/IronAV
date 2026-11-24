@@ -8,7 +8,12 @@
 //!
 //! Not handled: ADTS frames holding several raw data blocks, channel configuration 0 (the layout is
 //! in the stream), and streams that change their parameters (frames that differ from the first are
-//! dropped). No encoder detects HE-AAC here either: an SBR stream decodes as its core.
+//! dropped).
+//!
+//! HE-AAC is not signalled in an ADTS header (it says AAC-LC at the core's rate): the first
+//! [`PROBE_FRAMES`] frames are decoded as HE-AAC v2 and v1 to find out, and a stream that has SBR or
+//! parametric stereo gets a config that says so, and the output rate and channel count (two for
+//! parametric stereo) a decoder will deliver. A stream whose first frames show none is read as AAC-LC.
 
 use crate::mp4demux::{Config, Mp4Demuxer, Sample, TrackInfo};
 use crate::WriteSeek;
@@ -41,6 +46,26 @@ pub(crate) fn parse(b: &[u8]) -> Option<Header> {
     let len = if b[1] & 1 == 1 { 7 } else { 9 };
     // one raw data block per frame
     (sfi < 13 && channels != 0 && frame > len && b[6] & 3 == 0).then_some(Header { profile: b[2] >> 6, sfi, channels, len, frame })
+}
+
+/// How many frames at the start of a stream are looked at for SBR and parametric stereo, which ADTS
+/// does not signal, and how many bytes of a live stream are waited for to have that many.
+pub(crate) const PROBE_FRAMES: usize = 12;
+pub(crate) const PROBE_BYTES: usize = 64 << 10;
+
+/// The AudioSpecificConfig, sample rate and channel count of an ADTS stream whose first raw data blocks
+/// are `frames`: the ADTS header's own, unless the frames carry SBR or parametric stereo (HE-AAC), in
+/// which case the config says so and the rate and channels are the decoder's output, as the other
+/// containers' are, before any frame has been decoded.
+pub(crate) fn stream_config(asc: &[u8], rate: u32, channels: u8, frames: &[&[u8]]) -> (Vec<u8>, u32, u16) {
+    let plain = (asc.to_vec(), rate, if channels == 7 { 8 } else { channels as u16 });
+    match ironav_codec::aac::implicit_config(asc, frames) {
+        Some(explicit) => match ironav_codec::aac::output_params(&explicit) {
+            Some((r, c)) => (explicit, r, c),
+            None => plain,
+        },
+        None => plain,
+    }
 }
 
 /// Whether `magic` starts an ADTS frame.
@@ -98,16 +123,18 @@ pub fn open<R: Read + Seek + Send>(mut r: R) -> Result<Mp4Demuxer<R>> {
     };
     let rate = RATES[h.sfi as usize];
     // AudioSpecificConfig: object type (profile + 1) 5 bits, rate index 4, channel configuration 4
-    let asc = ((h.profile as u16 + 1) << 11) | ((h.sfi as u16) << 7) | ((h.channels as u16) << 3);
+    let asc = (((h.profile as u16 + 1) << 11) | ((h.sfi as u16) << 7) | ((h.channels as u16) << 3)).to_be_bytes();
+    let frames: Vec<&[u8]> = samples.iter().take(PROBE_FRAMES).map(|s| &file[s.offset as usize..s.offset as usize + s.size as usize]).collect();
+    let (extradata, out_rate, out_channels) = stream_config(&asc, rate, h.channels, &frames);
     let stream = StreamInfo {
         index: 0,
         codec: CodecId::Aac,
         time_base: Rational::new(1, rate as i64),
         duration: Some(total),
         bits: None,
-        extradata: asc.to_be_bytes().to_vec(),
+        extradata,
         lead_in: 0,
-        params: StreamParams::Audio { sample_rate: rate, channels: if h.channels == 7 { 8 } else { h.channels as u16 } },
+        params: StreamParams::Audio { sample_rate: out_rate, channels: out_channels },
     };
     let track = TrackInfo { stream, config: Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma: 1 }, convert: false, swap: 0, unwrap: Vec::new() };
     Ok(Mp4Demuxer::from_parts(r, "aac", vec![track], samples))

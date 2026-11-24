@@ -5,7 +5,7 @@ A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so 
 
 > **Status: foundation (v0.1.10).** The architecture, agent interface, ontology, hardware model, CLI, MCP server
 > and both GUIs are working and tested. Containers: **WAV, FLAC, Y4M, MP4, QuickTime MOV (read and write), Matroska/WebM (read and write), Ogg, ADTS, MP3, JPEG and MPEG transport streams (read and write); AVI (read, with OpenDML), MPEG program streams (`.mpg`, `.vob`, read) and raw MPEG-1/2 video (`.m2v`, read; MPEG-2 also written); subtitles as streams (`.srt`, `.vtt`, `.ass`/`.ssa` files and Matroska text tracks, read); `probe` also lists the entries of M3U and PLS playlists and the chapters and attachments of Matroska files; raw H.264 and HEVC (Annex B: read and written as files, and read as live sources).**
-> Audio codecs, each decoded and encoded: **PCM, FLAC, ALAC, AAC-LC (plus HE-AAC v1 decode), MP3, MP2, AC-3, Opus and Vorbis.** E-AC-3 is decoded only.
+> Audio codecs, each decoded and encoded: **PCM, FLAC, ALAC, AAC-LC (plus HE-AAC v1 and v2 decode), MP3, MP2, AC-3, Opus and Vorbis.** E-AC-3 is decoded only.
 > Video: **software decoders for H.264, HEVC (including 4:2:2 and 4:4:4), VP8 and VP9; a software H.264 encoder (High profile: CABAC and the 8x8 transform), a software HEVC encoder (Main profile, 8-bit 4:2:0, merge and skip, SAO), a software VP8 encoder, and a software VP9 encoder (key and inter frames), and a software AV1 encoder (key and inter frames, profile 0, 8-bit 4:2:0); JPEG/Motion-JPEG and Apple ProRes decoded and encoded in software; MPEG-4 Part 2 (Simple and Advanced Simple profiles) decoded in software, and Simple profile I and P pictures encoded in software, with Advanced Simple B pictures as an option (MP4 and Matroska); MPEG-1 and MPEG-2 video (frame and field pictures, 4:2:0 and 4:2:2) decoded in software, and MPEG-2 video (Main profile, 4:2:0, progressive frames, optional B pictures) encoded in software.**
 > NVIDIA GPUs encode H.264 and HEVC (NVENC, preferred when usable) and decode H.264, HEVC and AV1 (NVDEC).
 > AV1 is decoded on NVIDIA GPUs (NVDEC) or in software (key, intra-only and inter frames, superres included). VP9 and AV1 copy between WebM, Matroska and MP4.
@@ -729,8 +729,29 @@ sample archive, 22.05 kHz core), which decodes to within float rounding of FFmpe
 all the testing the SBR path has had**: it is not committed, mono SBR, coupled channels, the harmonic and short-envelope
 paths, and cores other than 22.05 kHz are unchecked, and the committed test only checks the filter bank on a tone.
 
-Not decoded, and refused with an explanation rather than decoded wrongly: HE-AAC v2 (parametric stereo) and SBR that is only
-signalled implicitly in the stream, AAC Main prediction, LTP,
+**HE-AAC v2 (SBR with parametric stereo)** is decoded too: a mono AAC-LC core with SBR whose extension data carries `ps_data`
+(ISO/IEC 14496-3 subpart 8) comes out as two channels. Everything in the tool is decoded: IID (coarse and fine, 10, 20 and 34
+bands), ICC (10, 20, 34), IPD and OPD (the full profile, not just the baseline one), the hybrid filterbank in both layouts, the
+decorrelator with its transient ducking, the interpolated mixing matrices (rotations A and B), and the hybrid synthesis. The
+signalling is the explicit one: object type 29 in the AudioSpecificConfig, or the backward-compatible extension (sync word
+0x2b7, then 0x548 and the PS flag), as MP4 and Matroska carry it; both give two channels and the doubled rate up front, before
+any frame is decoded (`ironav_codec::aac::output_params`), and the MP4 and Matroska readers report them for the stream. ADTS
+says only AAC-LC at the core's rate in each header, so the ADTS reader (file, live stream and MPEG-TS) decodes the first twelve
+frames as HE-AAC v2 and v1 to find SBR and parametric stereo, and gives the stream the explicit config if they have them
+(a stream whose first frames show neither is read as AAC-LC; a live stream waits for twelve frames, up to 64 KiB, before it
+starts). The tables are the Huffman codes from FFmpeg's `aacpsdata.c` by `tools/gen_ps_tables.py`; the rest is computed from the
+standard's formulas, and the structure follows FFmpeg's float decoder. No FFmpeg build here has an encoder that writes parametric
+stereo (libfdk_aac is not in it), so the test streams are made by a test-only writer: a real mono AAC-LC core from this crate's
+encoder, a random but valid SBR payload, and random valid `ps_data` covering every IID and ICC mode, both frame classes,
+time- and frequency-differential coding, IPD/OPD, the fake last envelope, and switches between the 20- and 34-band layouts. 18
+such streams decode to within 62 to 77 dB SNR of FFmpeg's output (the SBR path alone, with no `ps_data`, is at 79 dB on these
+streams: the PS stage adds little to it); the committed test asserts 55 dB. This is checked on synthetic streams only, never on
+a stream from a real HE-AAC v2 encoder. One deliberate difference from FFmpeg: when a header turns the PS extension off after it
+was on, FFmpeg goes on using the old IPD/OPD values and this decoder does not. A damaged `ps_data` (a reserved mode, borders
+going backwards, a cut-off payload) turns parametric stereo off until the next header, and the mono signal goes to both channels.
+
+Not decoded, and refused with an explanation rather than decoded wrongly: SBR or parametric stereo that is only
+signalled implicitly in a stream no reader above gets to look at, AAC Main prediction, LTP,
 coupling channel elements, 960-sample frames, gain control, and channel layouts given by a program config element.
 AAC comes from MP4/M4A, Matroska and raw `.aac` (ADTS) files; the ADTS reader strips each frame's header, builds the AudioSpecificConfig from it, and decodes to the same samples as the MP4 copy of the same audio (checked on the one fixture, remuxed by FFmpeg). ADTS frames with several raw data blocks and channel configuration 0 are not read, and nothing is trimmed at the start (as with FFmpeg).
 On a 5-minute stereo 44.1 kHz file the decoder takes roughly 0.3-0.5 s (FFmpeg's: about 0.11 s) on a noisy machine, so it

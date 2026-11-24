@@ -1,10 +1,21 @@
 //! AAC-LC decoder (ISO/IEC 14496-3): single and paired channel elements, M/S and intensity
-//! stereo, PNS, TNS, pulses, all window shapes and sequences, and SBR (HE-AAC v1) when the
-//! AudioSpecificConfig announces it. Not decoded: parametric stereo (HE-AAC v2), implicit SBR
-//! signalling, Main-profile prediction, LTP, coupling channels, 960-sample frames and gain control;
-//! streams that need them are refused with an error rather than decoded wrongly.
+//! stereo, PNS, TNS, pulses, all window shapes and sequences, SBR (HE-AAC v1) and parametric stereo
+//! (HE-AAC v2, in `ps.rs`) when the AudioSpecificConfig announces them. Not decoded: implicit SBR and
+//! PS signalling (an ADTS stream that only says AAC-LC; see [`implicit_config`] for how the stream
+//! readers find it out), Main-profile prediction, LTP, coupling channels, 960-sample frames and gain
+//! control; streams that need them are refused with an error rather than decoded wrongly.
+//!
+//! Parametric stereo is announced by object type 29 (the explicit hierarchical form: core rate and
+//! channels, then the output rate, then the core's object type), or by the backward-compatible
+//! extension after the core's config (sync word 0x2b7, object type 5, SBR flag, output rate, sync word
+//! 0x548, PS flag). Its core is mono, and the decoder then outputs two channels: [`output_params`]
+//! says so from the config alone, before the first frame.
 
 mod enc;
+mod ps;
+#[cfg(test)]
+mod ps_synth;
+mod ps_tables;
 mod sbr;
 mod sbr_tables;
 mod tables;
@@ -250,7 +261,12 @@ struct ChannelState {
 
 struct Config {
     sfi: usize,
+    /// Channels the core codec decodes.
     channels: u16,
+    /// Channels the decoder outputs: the core's, or two for a mono core with parametric stereo.
+    out_channels: u16,
+    /// Parametric stereo: the SBR signal of the mono core is made into two channels.
+    ps: bool,
     /// Output rate (doubled by SBR).
     sample_rate: u32,
     /// Whether SBR doubles the rate; the core codec then runs at `sample_rate / 2`.
@@ -270,13 +286,12 @@ fn parse_asc(asc: &[u8], declared_rate: u32, declared_channels: u16) -> Result<C
         if i == 15 { b.read(24) } else { SAMPLE_RATES.get(i).copied().unwrap_or(0) }
     };
     let mut aot = read_aot(&mut b);
-    if aot == 29 {
-        return Err(unsupported("HE-AAC v2 (parametric stereo) is not decoded"));
-    }
-    // SBR announced up front: the core's rate and channels come first, then the output rate
-    let mut sbr = aot == 5;
+    // SBR (object type 5) or SBR with parametric stereo (29) announced up front: the core's rate and
+    // channels come first, then the output rate, then the core's object type
+    let mut ps = aot == 29;
+    let mut sbr = aot == 5 || ps;
     let mut ext_rate = 0;
-    if aot != 5 && aot != 1 && aot != 2 {
+    if !sbr && aot != 1 && aot != 2 {
         return Err(unsupported(format!("audio object type {aot}")));
     }
     let mut sfi = b.read(4) as usize;
@@ -316,9 +331,7 @@ fn parse_asc(asc: &[u8], declared_rate: u32, declared_channels: u16) -> Result<C
             ext_rate = read_rate(&mut b);
             if b.left() >= 12 && b.peek(11) == 0x548 {
                 b.skip(11);
-                if b.flag() {
-                    return Err(unsupported("HE-AAC v2 (parametric stereo) is not decoded"));
-                }
+                ps = b.flag();
             }
         }
     }
@@ -332,8 +345,12 @@ fn parse_asc(asc: &[u8], declared_rate: u32, declared_channels: u16) -> Result<C
         7 => (8, &[2, 0, 1, 6, 7, 4, 5, 3]),
         _ => return Err(unsupported("a channel layout given by a program config element")),
     };
-    if declared_channels != 0 && declared_channels != channels {
-        return Err(bad(format!("the stream says {declared_channels} channels but its AudioSpecificConfig says {channels}")));
+    // parametric stereo needs a mono core (and so SBR); with anything else the flag means nothing
+    let ps = ps && sbr && channels == 1;
+    let out_channels = if ps { 2 } else { channels };
+    // a container may count the core's channels or the output's for an HE-AAC v2 stream
+    if declared_channels != 0 && declared_channels != out_channels && declared_channels != channels {
+        return Err(bad(format!("the stream says {declared_channels} channels but its AudioSpecificConfig says {out_channels}")));
     }
     let mut sample_rate = if rate != 0 { rate } else { SAMPLE_RATES[sfi] };
     if sbr {
@@ -345,7 +362,69 @@ fn parse_asc(asc: &[u8], declared_rate: u32, declared_channels: u16) -> Result<C
     if declared_rate != 0 && declared_rate != sample_rate {
         // The container's rate field is only a hint (HE-AAC doubles it); the config is authoritative.
     }
-    Ok(Config { sfi, channels, sample_rate, sbr, map })
+    Ok(Config { sfi, channels, out_channels, ps, sample_rate, sbr, map })
+}
+
+/// The output sample rate and channel count an AudioSpecificConfig describes, which is what the decoder
+/// delivers from its first frame: SBR doubles the rate of the core, and parametric stereo (explicit
+/// signalling only: object type 29, or the backward-compatible extension) makes two channels of a mono
+/// core. `None` if the config is not one this decoder takes.
+pub fn output_params(asc: &[u8]) -> Option<(u32, u16)> {
+    parse_asc(asc, 0, 0).ok().map(|c| (c.sample_rate, c.out_channels))
+}
+
+/// Whether a config announces parametric stereo, so the stream is two channels from a mono core.
+pub fn parametric_stereo(asc: &[u8]) -> bool {
+    parse_asc(asc, 0, 0).is_ok_and(|c| c.ps)
+}
+
+/// The explicit config of a stream whose SBR (and parametric stereo) is only signalled in the
+/// bitstream, as ADTS streams do: HE-AAC in an ADTS file or an internet radio stream says AAC-LC at the
+/// core's rate in every header and carries the rest in fill elements.
+///
+/// `asc` is the AAC-LC config built from an ADTS header and `frames` are the first raw data blocks of
+/// the stream (headers removed). They are decoded as HE-AAC v2 (for a mono core) and then as HE-AAC v1,
+/// and if SBR data (or `ps_data`) is found in them, the config that made them decode, in the
+/// backward-compatible form (the core's config, then the SBR and PS flags), is returned. `None` means
+/// the stream is plain AAC-LC, or its extension did not show up in `frames`: the SBR header is not
+/// in every frame, so the more frames, the surer (a dozen is plenty for the usual encoders).
+pub fn implicit_config(asc: &[u8], frames: &[&[u8]]) -> Option<Vec<u8>> {
+    let base = parse_asc(asc, 0, 0).ok()?;
+    if base.sbr || asc.len() < 2 {
+        return None;
+    }
+    let (aot, sfi, chan) = ((asc[0] >> 3) as u32, ((asc[0] & 7) << 1 | asc[1] >> 7) as u32, (asc[1] >> 3 & 15) as u32);
+    let out_sfi = SAMPLE_RATES.iter().position(|&r| r == base.sample_rate * 2)? as u32;
+    for ps in [true, false] {
+        if ps && base.channels != 1 {
+            continue;
+        }
+        let mut bits: Vec<bool> = Vec::new();
+        let mut put = |v: u32, n: u32| bits.extend((0..n).rev().map(|i| (v >> i) & 1 != 0));
+        put(aot, 5);
+        put(sfi, 4);
+        put(chan, 4);
+        put(0, 3);
+        put(0x2b7, 11);
+        put(5, 5);
+        put(1, 1);
+        put(out_sfi, 4);
+        if ps {
+            put(0x548, 11);
+            put(1, 1);
+        }
+        let explicit: Vec<u8> = bits.chunks(8).map(|c| c.iter().enumerate().fold(0u8, |a, (i, &b)| a | (b as u8) << (7 - i))).collect();
+        let Ok(mut dec) = AacDecoder::new(&explicit, &StreamParams::Audio { sample_rate: 0, channels: 0 }) else {
+            continue;
+        };
+        for f in frames {
+            let _ = dec.decode(&Packet { stream: 0, pts: 0, duration: 1024, data: f.to_vec() });
+        }
+        if dec.sbr.iter().any(|s| if ps { s.ps_started() } else { s.started() }) {
+            return Some(explicit);
+        }
+    }
+    None
 }
 
 pub struct AacDecoder {
@@ -885,7 +964,8 @@ impl AacDecoder {
                 6 => {
                     let mut cnt = br.read(4) as usize;
                     if cnt == 15 {
-                        cnt += br.read(8) as usize - 1;
+                        // 15 plus the escape count, less one (an escape of 0 is 14, not an underflow)
+                        cnt = 14 + br.read(8) as usize;
                     }
                     let end = br.pos + cnt * 8;
                     let ext = br.peek(4);
@@ -896,7 +976,7 @@ impl AacDecoder {
                         if let Some(&(kind, ..)) = elems.last() {
                             let at = elems.len() - 1;
                             while self.sbr.len() <= at {
-                                self.sbr.push(sbr::Sbr::new(self.cfg.sample_rate / 2));
+                                self.sbr.push(self.new_sbr(kind));
                             }
                             br.skip(4);
                             self.sbr[at].decode_extension(&mut br, ext == 0xE, cnt, kind);
@@ -914,16 +994,33 @@ impl AacDecoder {
         Ok(out)
     }
 
-    /// Rebuild the upper band of every channel element: 1024 samples per channel in, 2048 out.
+    /// The SBR decoder of a new channel element of type `kind`.
+    fn new_sbr(&self, kind: u8) -> sbr::Sbr {
+        let mut s = sbr::Sbr::new(self.cfg.sample_rate / 2);
+        if self.cfg.ps && kind == sbr::TYPE_SCE {
+            s.enable_ps();
+        }
+        s
+    }
+
+    /// Rebuild the upper band of every channel element: 1024 samples per channel in, 2048 out (and
+    /// with parametric stereo two channels out of the mono one).
     fn apply_sbr(&mut self, elems: &[(u8, usize, usize)], core: Vec<Vec<f32>>) -> Vec<Vec<f32>> {
-        let mut out = vec![vec![0f32; 2048]; core.len()];
+        let mut out = vec![vec![0f32; 2048]; self.cfg.out_channels as usize];
         for (at, &(kind, first, n)) in elems.iter().enumerate() {
             while self.sbr.len() <= at {
-                self.sbr.push(sbr::Sbr::new(self.cfg.sample_rate / 2));
+                self.sbr.push(self.new_sbr(kind));
             }
             let idx: Vec<usize> = (first..first + n).filter_map(|i| self.cfg.map.get(i).copied()).collect();
             let planes: Vec<&[f32]> = idx.iter().map(|&i| core[i].as_slice()).collect();
             let res = self.sbr[at].apply(kind, &planes);
+            if res.len() != idx.len() {
+                // parametric stereo: the one mono element is the whole stream
+                for (o, r) in out.iter_mut().zip(res) {
+                    *o = r;
+                }
+                continue;
+            }
             for (j, &i) in idx.iter().enumerate() {
                 out[i] = res[j].clone();
             }
@@ -957,7 +1054,7 @@ impl Decoder for AacDecoder {
                 samples[i * channels + c] = s as f64;
             }
         }
-        Ok(vec![Frame::Audio(AudioFrame { sample_rate: self.cfg.sample_rate, channels: self.cfg.channels, pts: packet.pts, samples })])
+        Ok(vec![Frame::Audio(AudioFrame { sample_rate: self.cfg.sample_rate, channels: self.cfg.out_channels, pts: packet.pts, samples })])
     }
 }
 
@@ -1004,6 +1101,33 @@ mod tests {
         let he = parse_asc(&[0x2b, 0x92, 0x08], 0, 0).unwrap();
         assert!(he.sbr);
         assert_eq!((he.channels, he.sample_rate), (2, 44100));
-        assert!(parse_asc(&[0xeb, 0x92, 0x08], 0, 0).is_err(), "HE-AAC v2 (parametric stereo) is refused");
+        assert!(!he.ps);
+        // object type 29 over a stereo core is SBR only: parametric stereo needs a mono core
+        let stereo_core = parse_asc(&[0xeb, 0x92, 0x08], 0, 0).unwrap();
+        assert!(stereo_core.sbr && !stereo_core.ps);
+        assert_eq!((stereo_core.channels, stereo_core.out_channels), (2, 2));
+    }
+
+    #[test]
+    fn parametric_stereo_makes_two_channels_of_a_mono_core() {
+        // HE-AAC v2, explicit hierarchical signalling: object type 29, 22.05 kHz mono core, 44.1 kHz out
+        let v2 = parse_asc(&[0xeb, 0x8a, 0x08, 0x00], 0, 0).unwrap();
+        assert!(v2.sbr && v2.ps);
+        assert_eq!((v2.channels, v2.out_channels, v2.sample_rate), (1, 2, 44100));
+        assert_eq!(output_params(&[0xeb, 0x8a, 0x08, 0x00]), Some((44100, 2)));
+        // the backward-compatible form: AAC-LC, then the 0x2b7 extension with SBR and the 0x548 PS flag
+        let compat = [0x13, 0x88, 0x56, 0xe5, 0xa5, 0x48, 0x80];
+        assert_eq!(output_params(&compat), Some((44100, 2)));
+        // the same without the PS flag is HE-AAC v1: mono out
+        let mut v1 = compat;
+        v1[6] = 0x00;
+        assert_eq!(output_params(&v1), Some((44100, 1)));
+        // a container that counts the core's channel (1) or the output's (2) is accepted; 6 is not
+        assert!(parse_asc(&compat, 44100, 1).is_ok() && parse_asc(&compat, 44100, 2).is_ok());
+        assert!(parse_asc(&compat, 44100, 6).is_err());
+        // plain AAC-LC and HE-AAC v1 are as before
+        assert_eq!(output_params(&[0x12, 0x10]), Some((44100, 2)));
+        assert_eq!(output_params(&[0x2b, 0x92, 0x08]), Some((44100, 2)));
+        assert_eq!(output_params(&[]), None);
     }
 }

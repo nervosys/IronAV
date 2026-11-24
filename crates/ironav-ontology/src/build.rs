@@ -12,7 +12,7 @@ fn codec_meta(c: CodecId) -> (&'static str, &'static str) {
         PcmS32Le => ("PCM signed 32-bit LE", "Uncompressed audio, 32-bit signed little-endian samples."),
         PcmF32Le => ("PCM float 32-bit LE", "Uncompressed audio, 32-bit IEEE float samples."),
         PcmF64Le => ("PCM float 64-bit LE", "Uncompressed audio, 64-bit IEEE float samples."),
-        Aac => ("AAC", "Lossy audio codec (MPEG-4 Part 3); default for MP4 and streaming."),
+        Aac => ("AAC", "Lossy audio codec (MPEG-4 Part 3); default for MP4 and streaming. Decoded as AAC-LC, HE-AAC v1 (SBR) and HE-AAC v2 (SBR with parametric stereo); encoded as AAC-LC."),
         Mp3 => ("MP3", "Lossy audio codec (MPEG-1/2 Layer III); universal compatibility."),
         Mp2 => ("MP2", "Lossy audio codec (MPEG-1/2 Layer II), used in broadcast (DVB, DAB); decoded and encoded."),
         Ac3 => ("AC-3", "Lossy audio codec (ATSC A/52, Dolby Digital) used in DVD, broadcast and Blu-ray; decoded, not encoded."),

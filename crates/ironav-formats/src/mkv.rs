@@ -1109,7 +1109,9 @@ fn build_track(t: &MkTrack, index: usize, frames: &[&Frame], scale: u64, samples
                 }
             }
         }
-        params = StreamParams::Audio { sample_rate: rate, channels: t.channels };
+        // HE-AAC v2 is a mono core with parametric stereo: two channels out, whatever the track says
+        let channels = if codec == CodecId::Aac && ironav_codec::aac::parametric_stereo(&extradata) { 2 } else { t.channels };
+        params = StreamParams::Audio { sample_rate: rate, channels };
     }
     let duration: i64 = samples[first..].iter().map(|s| s.duration as i64).sum::<i64>() - trim;
     let stream = StreamInfo { index, codec, time_base, duration: Some(duration.max(0)), bits, extradata, lead_in, params };

@@ -8,9 +8,13 @@
 //! Samples are scaled to the 16-bit range inside, as the envelope data expects (its units are those of
 //! 16-bit PCM).
 //!
-//! Not done: parametric stereo (HE-AAC v2), the USAC variant, 960-sample frames, and the downsampled
-//! (low-power) synthesis for decoders that only want the core rate.
+//! Parametric stereo (HE-AAC v2) rides in the SBR extension payload and runs on this module's QMF
+//! samples before the synthesis; it is in `ps.rs`.
+//!
+//! Not done: the USAC variant, 960-sample frames, and the downsampled (low-power) synthesis for
+//! decoders that only want the core rate.
 
+use super::ps::Ps;
 use super::sbr_tables::*;
 use super::Bits;
 use std::collections::HashMap;
@@ -245,6 +249,8 @@ pub struct Sbr {
     q_m: [[f32; 48]; 8],
     s_m: [[f32; 48]; 8],
     gain: [[f32; 48]; 8],
+    /// Parametric stereo, when the stream says (explicitly) that it is present.
+    ps: Option<Box<Ps>>,
 }
 
 fn bit_vec(br: &mut Bits, v: &mut [u8], n: usize) {
@@ -297,6 +303,7 @@ impl Sbr {
             q_m: [[0.0; 48]; 8],
             s_m: [[0.0; 48]; 8],
             gain: [[0.0; 48]; 8],
+            ps: None,
         };
         s.turnoff();
         s
@@ -935,12 +942,40 @@ impl Sbr {
             return;
         }
         if br.flag() {
-            // bs_extended_data: extensions are parametric stereo (not decoded) or reserved; either is skipped
+            // bs_extended_data: parametric stereo (extension id 2) when the stream is announced as
+            // having it, else reserved extensions, which are skipped
             let mut n = br.read(4) as i32;
             if n == 15 {
                 n += br.read(8) as i32;
             }
-            br.skip(n as u32 * 8);
+            let end = br.pos + n as usize * 8;
+            let mut left = n * 8;
+            while left > 7 {
+                left -= 2;
+                let id = br.read(2);
+                match (&mut self.ps, id) {
+                    (Some(ps), 2) => left -= ps.read(br, left),
+                    _ => break,
+                }
+            }
+            br.pos = end;
+        }
+    }
+
+    /// Whether an SBR header has been read (and its band layout accepted).
+    pub fn started(&self) -> bool {
+        self.start
+    }
+
+    /// Whether parametric stereo parameters with a header have been read.
+    pub fn ps_started(&self) -> bool {
+        self.start && self.ps.as_ref().is_some_and(|p| p.start)
+    }
+
+    /// Expect parametric stereo in this element's extension data, and make two channels of the mono signal.
+    pub fn enable_ps(&mut self) {
+        if self.ps.is_none() {
+            self.ps = Some(Box::new(Ps::new()));
         }
     }
 
@@ -974,6 +1009,16 @@ impl Sbr {
         if (used + 4).div_ceil(8) > cnt {
             self.turnoff();
         }
+    }
+
+    /// Test-only: the band counts `(n, n_q)` that a header (the bytes after the header flag) gives, or
+    /// `None` if the decoder refuses its band layout.
+    #[cfg(test)]
+    pub(super) fn header_bands(&mut self, header: &[u8]) -> Option<([i32; 2], i32)> {
+        let mut br = Bits::new(header);
+        self.read_header(&mut br);
+        self.reset_tables();
+        self.start.then_some((self.n, self.n_q))
     }
 
     // ---- processing ----
@@ -1522,6 +1567,20 @@ impl Sbr {
                 }
             }
             self.x_gen(ch);
+        }
+        // parametric stereo makes the second channel of a mono element, or copies the signal if no
+        // parameters have arrived yet
+        let mut nch = nch;
+        if nch == 1 {
+            let top = (self.kx[1] + self.m[1]).max(0) as usize;
+            if let Some(ps) = self.ps.as_mut() {
+                if ps.start {
+                    ps.apply(&mut self.x, top);
+                } else {
+                    self.x[1] = self.x[0].clone();
+                }
+                nch = 2;
+            }
         }
         let mut out = vec![vec![0.0f32; 2048]; nch];
         for ch in 0..nch {

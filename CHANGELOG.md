@@ -26,6 +26,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - GUI: files open on a background thread with a loading indicator.
 - `bench_seek` example: open-to-first-frame, seek latency in both modes, and Matroska open time with and without Cues, as JSON.
 
+- ironav-codec, ironav-formats: HE-AAC v2 is decoded. The AAC decoder handles parametric stereo (ISO/IEC 14496-3 subpart 8, the new `aac/ps.rs`): the `ps_data` in the SBR extension payload with IID (coarse and fine; 10, 20 and 34 bands), ICC and the IPD/OPD extension, the hybrid analysis and synthesis filterbanks of both layouts, the decorrelator (all-pass links with fractional delay, transient detection and ducking), and the mixing matrices (rotations A and B) interpolated across the envelopes, applied in the QMF domain before the SBR synthesis. A mono core with parametric stereo comes out as two channels. Signalled by object type 29 or by the backward-compatible extension; `aac::output_params` gives the output rate and channel count (two with parametric stereo) from the AudioSpecificConfig alone, and the MP4 and Matroska readers use it for the stream's channel count (and MP4 the doubled rate). `aac::implicit_config` finds SBR and parametric stereo in the first frames of an ADTS stream, which signals neither, and the ADTS file reader, the live ADTS stream reader and the MPEG-TS reader use it, so HE-AAC v1 and v2 in raw `.aac` files and internet radio streams decode instead of being refused. Tests: 18 synthetic streams made by a test-only writer (no FFmpeg encoder here writes parametric stereo) decode to 62 to 77 dB SNR of FFmpeg's decode, plus fixtures in MP4 and ADTS, malformed-input tests, and the hybrid filterbank's reconstruction. `tools/gen_ps_tables.py` generates the Huffman tables from FFmpeg's `aacpsdata.c`.
+
 ### Changed
 
 - ironav-gui: the player window no longer repaints every 8 ms. While playing it repaints when the next picture is due or a decoder thread queues one (20 Hz for the clock and seek bar at the most otherwise), and it stays idle when paused. The status JSON is built at most once per UI frame, and only when the Agent view is open or the file has no video; volume and mute are read directly.
@@ -36,6 +38,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Fixed
 
+- ironav-codec: a fill element in an AAC frame whose escape count was 0 panicked in debug builds (subtract with overflow) and wrapped in release builds; the count is now 14, as the standard has it.
 - MCP: pictures in a tool result are image blocks whatever their encoding. Only `png_base64` was turned into one, so the JPEGs of `stream_keyframes` (`jpeg_base64`) reached the model as base64 text; they are now `image/jpeg` blocks, and each entry says which block is its own.
 - Player: every seek rebuilt the video decoder (NVDEC reloaded its libraries and recreated the context and parser).
 
