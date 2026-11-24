@@ -14,6 +14,7 @@
 //! |---|---|---|---|
 //! | AAC | `aac::AacDecoder` | `aac::AacEncoder` | `encoders::AacEncoder` |
 //! | AC-3 | `ac3::Ac3Decoder` | `ac3::Ac3Encoder` | `encoders::Ac3Encoder` |
+//! | E-AC-3 | `ac3::Ac3Decoder` (decodes both) | none | none |
 //! | ALAC | `alac::AlacDecoder` | `alac::AlacEncoder` | `encoders::AlacEncoder` |
 //! | AV1 | `av1::Av1Decoder` | `av1::Av1Encoder` | `encoders::Av1Encoder` |
 //! | FLAC | `flac::FlacDecoder` | `flac::FlacEncoder` | `encoders::FlacEncoder` |
@@ -176,6 +177,10 @@ pub fn implemented() -> Vec<CodecImpl> {
             #[cfg(feature = "ac3")]
             if c == CodecId::Ac3 {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-ac3" });
+            }
+            #[cfg(feature = "ac3")]
+            if c == CodecId::Eac3 {
+                return Some(CodecImpl { codec: c, decode: true, encode: false, implementation: "ironav-ac3" });
             }
             #[cfg(feature = "alac")]
             if c == CodecId::Alac {
@@ -408,7 +413,7 @@ pub fn new_decoder_for(s: &ironav_core::StreamInfo) -> Result<Box<dyn Decoder>> 
         #[cfg(feature = "mp3")]
         CodecId::Mp2 => Ok(kept_span(s, Box::new(mp3::Mp2Decoder::new(&s.params)?))),
         #[cfg(feature = "ac3")]
-        CodecId::Ac3 => Ok(kept_span(s, Box::new(ac3::Ac3Decoder::new()))),
+        CodecId::Ac3 | CodecId::Eac3 => Ok(kept_span(s, Box::new(ac3::Ac3Decoder::new()))),
         #[cfg(feature = "alac")]
         CodecId::Alac => Ok(Box::new(alac::AlacDecoder::new(&s.extradata, &s.params)?)),
         #[cfg(feature = "opus")]

@@ -1,12 +1,13 @@
 //! The state of an AC-3 decoder and the decoding of one audio block: its side information
 //! (ATSC A/52 section 5.4.3), the exponents and bit allocation, the mantissas and the dequantised
 //! coefficients (section 7), coupling, rematrixing and the inverse transform. Translated from
-//! FFmpeg's `libavcodec/ac3dec.c` and `ac3dec_float.c`, with the spectral extension, enhanced
-//! coupling and the E-AC-3 syntax left out (they are not part of AC-3) and no downmix.
+//! FFmpeg's `libavcodec/ac3dec.c` and `ac3dec_float.c`, with no downmix. The E-AC-3 differences
+//! (the frame-level syntax, spectral extension, the adaptive hybrid transform) are in `eac3.rs`.
 
 use super::alloc::{self, AllocParams, Dba};
 use super::bits::BitReader;
 use super::synth::{fmul_window, Synth, BLOCK};
+use super::eac3_tables::{DEFAULT_CPL_BAND_STRUCT, HEBAP_TAB};
 use super::tables::*;
 
 /// The coupling channel's index in the per-channel arrays; the full-bandwidth channels are 1 to 5
@@ -79,6 +80,36 @@ pub(super) struct State {
     pub dba_lengths: [[u8; 8]; NCH],
     pub dba_values: [[u8; 8]; NCH],
 
+    // the E-AC-3 frame-level syntax (the AC-3 values for an AC-3 frame)
+    pub eac3: bool,
+    pub frame_type: u8,
+    pub snr_offset_strategy: u8,
+    pub block_switch_syntax: bool,
+    pub dither_flag_syntax: bool,
+    pub bit_allocation_syntax: bool,
+    pub fast_gain_syntax: bool,
+    pub dba_syntax: bool,
+    pub skip_syntax: bool,
+    pub cpl_strategy_exists: [bool; 6],
+    pub first_cpl_leak: bool,
+    pub cpl_band_struct: [u8; 18],
+    pub channel_uses_aht: [bool; NCH],
+    /// The six pre-mantissas of each bin of an AHT channel (24-bit fixed point), kept for the frame.
+    pub pre_mantissa: Vec<[[i32; 6]; 256]>,
+    // spectral extension
+    pub spx_in_use: bool,
+    pub channel_uses_spx: [bool; NCH],
+    pub first_spx_coords: [bool; NCH],
+    pub spx_atten_code: [i32; NCH],
+    pub spx_src_start_freq: usize,
+    pub spx_dst_start_freq: usize,
+    pub spx_dst_end_freq: usize,
+    pub num_spx_bands: usize,
+    pub spx_band_sizes: [u8; 17],
+    pub spx_band_struct: [u8; 17],
+    pub spx_noise_blend: [[f32; 17]; NCH],
+    pub spx_signal_blend: [[f32; 17]; NCH],
+
     // per-channel working arrays
     pub dexps: Vec<[i8; 256]>,
     pub bap: Vec<[u8; 256]>,
@@ -113,7 +144,7 @@ impl Lfg {
     }
 
     /// `av_lfg_get`: the next number, from the two lags 24 and 55 back.
-    fn get(&mut self) -> u32 {
+    pub(super) fn get(&mut self) -> u32 {
         let i = self.index;
         let v = self.state[(i.wrapping_sub(24) & 63) as usize].wrapping_add(self.state[(i.wrapping_sub(55) & 63) as usize]);
         self.state[(i & 63) as usize] = v;
@@ -157,6 +188,32 @@ impl State {
             dba_offsets: [[0; 8]; NCH],
             dba_lengths: [[0; 8]; NCH],
             dba_values: [[0; 8]; NCH],
+            eac3: false,
+            frame_type: 2,
+            snr_offset_strategy: 2,
+            block_switch_syntax: true,
+            dither_flag_syntax: true,
+            bit_allocation_syntax: true,
+            fast_gain_syntax: false,
+            dba_syntax: true,
+            skip_syntax: true,
+            cpl_strategy_exists: [false; 6],
+            first_cpl_leak: false,
+            cpl_band_struct: DEFAULT_CPL_BAND_STRUCT,
+            channel_uses_aht: [false; NCH],
+            pre_mantissa: vec![[[0; 6]; 256]; NCH],
+            spx_in_use: false,
+            channel_uses_spx: [false; NCH],
+            first_spx_coords: [true; NCH],
+            spx_atten_code: [-1; NCH],
+            spx_src_start_freq: 0,
+            spx_dst_start_freq: 0,
+            spx_dst_end_freq: 0,
+            num_spx_bands: 0,
+            spx_band_sizes: [0; 17],
+            spx_band_struct: super::eac3_tables::DEFAULT_SPX_BAND_STRUCT,
+            spx_noise_blend: [[0.0; 17]; NCH],
+            spx_signal_blend: [[0.0; 17]; NCH],
             dexps: vec![[0; 256]; NCH],
             bap: vec![[0; 256]; NCH],
             psd: vec![[0; 256]; NCH],
@@ -180,16 +237,20 @@ impl State {
         let mut different_transforms = false;
 
         // block switch flags
-        for ch in 1..=fbw {
-            self.block_switch[ch] = r.bit();
-            if ch > 1 && self.block_switch[ch] != self.block_switch[1] {
-                different_transforms = true;
+        if self.block_switch_syntax {
+            for ch in 1..=fbw {
+                self.block_switch[ch] = r.bit();
+                if ch > 1 && self.block_switch[ch] != self.block_switch[1] {
+                    different_transforms = true;
+                }
             }
         }
 
         // dithering flags
-        for ch in 1..=fbw {
-            self.dither_flag[ch] = r.bit();
+        if self.dither_flag_syntax {
+            for ch in 1..=fbw {
+                self.dither_flag[ch] = r.bit();
+            }
         }
 
         // dynamic range (two words for dual mono, which reads the second channel's first)
@@ -207,13 +268,32 @@ impl State {
             i -= 1;
         }
 
+        // spectral extension strategy and coordinates (E-AC-3 only)
+        if self.eac3 && (blk == 0 || r.bit()) {
+            self.spx_in_use = r.bit();
+            if self.spx_in_use {
+                self.spx_strategy(r, blk)?;
+            }
+        }
+        if !self.eac3 || !self.spx_in_use {
+            self.spx_in_use = false;
+            for ch in 1..=fbw {
+                self.channel_uses_spx[ch] = false;
+                self.first_spx_coords[ch] = true;
+            }
+        }
+        if self.spx_in_use {
+            self.spx_coordinates(r);
+        }
+
         // coupling strategy
-        if r.bit() {
+        if if self.eac3 { self.cpl_strategy_exists[blk] } else { r.bit() } {
             stages = [3; NCH];
             self.coupling_strategy(r, blk)?;
-        } else if blk == 0 {
-            return Err("new coupling strategy must be present in block 0");
-        } else {
+        } else if !self.eac3 {
+            if blk == 0 {
+                return Err("new coupling strategy must be present in block 0");
+            }
             self.cpl_in_use[blk] = self.cpl_in_use[blk - 1];
         }
         let cpl_in_use = self.cpl_in_use[blk];
@@ -225,10 +305,12 @@ impl State {
 
         // stereo rematrixing
         if channel_mode == MODE_STEREO {
-            if r.bit() {
+            if (self.eac3 && blk == 0) || r.bit() {
                 self.num_rematrixing_bands = 4;
                 if cpl_in_use && self.start_freq[CPL] <= 61 {
                     self.num_rematrixing_bands -= 1 + (self.start_freq[CPL] == 37) as usize;
+                } else if self.spx_in_use && self.spx_src_start_freq <= 61 {
+                    self.num_rematrixing_bands -= 1;
                 }
                 for bnd in 0..self.num_rematrixing_bands {
                     self.rematrixing_flags[bnd] = r.bit();
@@ -242,8 +324,10 @@ impl State {
         // exponent strategies of each channel
         let first = (!cpl_in_use) as usize;
         for ch in first..=self.channels {
-            let width = if ch == self.lfe_ch { 1 } else { 2 };
-            self.exp_strategy[blk][ch] = r.bits(width) as u8;
+            if !self.eac3 {
+                let width = if ch == self.lfe_ch { 1 } else { 2 };
+                self.exp_strategy[blk][ch] = r.bits(width) as u8;
+            }
             if self.exp_strategy[blk][ch] != EXP_REUSE {
                 stages[ch] = 3;
             }
@@ -257,6 +341,8 @@ impl State {
                 let prev = self.end_freq[ch];
                 if self.channel_in_cpl[ch] {
                     self.end_freq[ch] = self.start_freq[CPL];
+                } else if self.channel_uses_spx[ch] {
+                    self.end_freq[ch] = self.spx_src_start_freq;
                 } else {
                     let code = r.bits(6);
                     if code > 60 {
@@ -296,41 +382,70 @@ impl State {
         }
 
         // bit allocation information
-        if r.bit() {
-            self.ba.slow_decay = SLOW_DECAY[r.bits(2) as usize] as i32 >> self.ba.sr_shift;
-            self.ba.fast_decay = FAST_DECAY[r.bits(2) as usize] as i32 >> self.ba.sr_shift;
-            self.ba.slow_gain = SLOW_GAIN[r.bits(2) as usize] as i32;
-            self.ba.db_per_bit = DB_PER_BIT[r.bits(2) as usize] as i32;
-            self.ba.floor = FLOOR[r.bits(3) as usize] as i32;
-            for s in stages.iter_mut().take(self.channels + 1).skip(first) {
-                *s = (*s).max(2);
+        if self.bit_allocation_syntax {
+            if r.bit() {
+                self.ba.slow_decay = SLOW_DECAY[r.bits(2) as usize] as i32 >> self.ba.sr_shift;
+                self.ba.fast_decay = FAST_DECAY[r.bits(2) as usize] as i32 >> self.ba.sr_shift;
+                self.ba.slow_gain = SLOW_GAIN[r.bits(2) as usize] as i32;
+                self.ba.db_per_bit = DB_PER_BIT[r.bits(2) as usize] as i32;
+                self.ba.floor = FLOOR[r.bits(3) as usize] as i32;
+                for s in stages.iter_mut().take(self.channels + 1).skip(first) {
+                    *s = (*s).max(2);
+                }
+            } else if blk == 0 {
+                return Err("new bit allocation info must be present in block 0");
             }
-        } else if blk == 0 {
-            return Err("new bit allocation info must be present in block 0");
         }
 
         // snr offsets and fast gains (the signal-to-mask ratios)
-        if r.bit() {
-            let csnr = (r.bits(6) as i32 - 15) << 4;
-            for ch in first..=self.channels {
-                let snr = (csnr + r.bits(4) as i32) << 2;
-                if blk > 0 && self.snr_offset[ch] != snr {
-                    stages[ch] = stages[ch].max(1);
+        if !self.eac3 || blk == 0 {
+            if self.snr_offset_strategy != 0 && r.bit() {
+                let csnr = (r.bits(6) as i32 - 15) << 4;
+                let mut snr = 0;
+                for ch in first..=self.channels {
+                    if ch == first || self.snr_offset_strategy == 2 {
+                        snr = (csnr + r.bits(4) as i32) << 2;
+                    }
+                    if blk > 0 && self.snr_offset[ch] != snr {
+                        stages[ch] = stages[ch].max(1);
+                    }
+                    self.snr_offset[ch] = snr;
+                    if !self.eac3 {
+                        let prev = self.fast_gain[ch];
+                        self.fast_gain[ch] = FAST_GAIN[r.bits(3) as usize] as i32;
+                        if blk > 0 && prev != self.fast_gain[ch] {
+                            stages[ch] = stages[ch].max(2);
+                        }
+                    }
                 }
-                self.snr_offset[ch] = snr;
+            } else if !self.eac3 && blk == 0 {
+                return Err("new snr offsets must be present in block 0");
+            }
+        }
+
+        // fast gains (E-AC-3)
+        if self.fast_gain_syntax && r.bit() {
+            for ch in first..=self.channels {
                 let prev = self.fast_gain[ch];
                 self.fast_gain[ch] = FAST_GAIN[r.bits(3) as usize] as i32;
                 if blk > 0 && prev != self.fast_gain[ch] {
                     stages[ch] = stages[ch].max(2);
                 }
             }
-        } else if blk == 0 {
-            return Err("new snr offsets must be present in block 0");
+        } else if self.eac3 && blk == 0 {
+            for ch in first..=self.channels {
+                self.fast_gain[ch] = FAST_GAIN[4] as i32;
+            }
+        }
+
+        // the E-AC-3 to AC-3 converter's SNR offset
+        if self.eac3 && self.frame_type == 0 && r.bit() {
+            r.skip(10);
         }
 
         // coupling leak
         if cpl_in_use {
-            if r.bit() {
+            if self.first_cpl_leak || r.bit() {
                 let fl = r.bits(3) as i32;
                 let sl = r.bits(3) as i32;
                 if blk > 0 && (fl != self.ba.cpl_fast_leak || sl != self.ba.cpl_slow_leak) {
@@ -338,13 +453,14 @@ impl State {
                 }
                 self.ba.cpl_fast_leak = fl;
                 self.ba.cpl_slow_leak = sl;
-            } else if blk == 0 {
+            } else if !self.eac3 && blk == 0 {
                 return Err("new coupling leak info must be present in block 0");
             }
+            self.first_cpl_leak = false;
         }
 
         // delta bit allocation
-        if r.bit() {
+        if self.dba_syntax && r.bit() {
             for ch in first..=fbw {
                 self.dba_mode[ch] = r.bits(2) as u8;
                 if self.dba_mode[ch] == DBA_RESERVED {
@@ -405,20 +521,20 @@ impl State {
                     self.end_freq[ch],
                     self.snr_offset[ch],
                     self.ba.floor,
-                    &BAP_TAB,
+                    if self.channel_uses_aht[ch] { &HEBAP_TAB } else { &BAP_TAB },
                     &mut self.bap[ch],
                 );
             }
         }
 
         // unused dummy data
-        if r.bit() {
+        if self.skip_syntax && r.bit() {
             let skipl = r.bits(9) as usize;
             r.skip(8 * skipl);
         }
 
         // the mantissas, which also uncouple the coupled channels
-        self.decode_transform_coeffs(r);
+        self.decode_transform_coeffs(r, blk);
 
         if channel_mode == MODE_STEREO {
             self.rematrix();
@@ -433,6 +549,11 @@ impl State {
             }
         }
 
+        // spectral extension of the high bins (E-AC-3)
+        if self.spx_in_use {
+            self.apply_spx()?;
+        }
+
         // the inverse transform; with mixed block sizes FFmpeg first restores the upmixed delay
         if different_transforms && self.downmixed {
             self.downmixed = false;
@@ -443,32 +564,50 @@ impl State {
     }
 
     fn coupling_strategy(&mut self, r: &mut BitReader, blk: usize) -> Res<()> {
-        self.cpl_in_use[blk] = r.bit();
+        if !self.eac3 {
+            self.cpl_in_use[blk] = r.bit();
+        }
         if self.cpl_in_use[blk] {
             if self.channel_mode < MODE_STEREO {
                 return Err("coupling not allowed in mono or dual-mono");
             }
-            for ch in 1..=self.fbw {
-                self.channel_in_cpl[ch] = r.bit();
+            if self.eac3 && r.bit() {
+                return Err("E-AC-3 enhanced coupling is not supported");
+            }
+            if self.eac3 && self.channel_mode == MODE_STEREO {
+                self.channel_in_cpl[1] = true;
+                self.channel_in_cpl[2] = true;
+            } else {
+                for ch in 1..=self.fbw {
+                    self.channel_in_cpl[ch] = r.bit();
+                }
             }
             if self.channel_mode == MODE_STEREO {
                 self.phase_flags_in_use = r.bit();
             }
             let start_subband = r.bits(4) as usize;
-            let end_subband = r.bits(4) as usize + 3;
+            let end_subband = if self.spx_in_use {
+                // the coupling range ends where the spectral extension's source starts
+                self.spx_src_start_freq.saturating_sub(37) / 12
+            } else {
+                r.bits(4) as usize + 3
+            };
             if start_subband >= end_subband {
                 return Err("invalid coupling range");
             }
             self.start_freq[CPL] = start_subband * 12 + 37;
             self.end_freq[CPL] = end_subband * 12 + 37;
             let mut sizes = [0u8; 18];
-            self.num_cpl_bands = band_structure(r, start_subband, end_subband, &mut sizes);
+            let mut st = self.cpl_band_struct;
+            self.num_cpl_bands = band_structure(r, blk, self.eac3, start_subband, end_subband, &DEFAULT_CPL_BAND_STRUCT, &mut st, &mut sizes);
+            self.cpl_band_struct = st;
             self.cpl_band_sizes = sizes;
         } else {
             for ch in 1..=self.fbw {
                 self.channel_in_cpl[ch] = false;
                 self.first_cpl_coords[ch] = true;
             }
+            self.first_cpl_leak = self.eac3;
             self.phase_flags_in_use = false;
         }
         Ok(())
@@ -478,7 +617,7 @@ impl State {
         let mut cpl_coords_exist = false;
         for ch in 1..=self.fbw {
             if self.channel_in_cpl[ch] {
-                if r.bit() {
+                if (self.eac3 && self.first_cpl_coords[ch]) || r.bit() {
                     self.first_cpl_coords[ch] = false;
                     cpl_coords_exist = true;
                     let master = 3 * r.bits(2) as i32;
@@ -503,14 +642,14 @@ impl State {
         Ok(())
     }
 
-    fn decode_transform_coeffs(&mut self, r: &mut BitReader) {
+    fn decode_transform_coeffs(&mut self, r: &mut BitReader, blk: usize) {
         let mut m = MantGroups::default();
         let mut got_cpl = false;
         for ch in 1..=self.channels {
-            self.decode_coeffs_ch(r, ch, &mut m);
+            self.decode_coeffs_blk(r, blk, ch, &mut m);
             let end = if self.channel_in_cpl[ch] {
                 if !got_cpl {
-                    self.decode_coeffs_ch(r, CPL, &mut m);
+                    self.decode_coeffs_blk(r, blk, CPL, &mut m);
                     self.calc_cpl_coeffs();
                     got_cpl = true;
                 }
@@ -530,6 +669,22 @@ impl State {
                         self.coeffs[ch][i] = 0.0;
                     }
                 }
+            }
+        }
+    }
+
+    /// The coefficients of one channel in block `blk`: from the block's mantissas, or from the
+    /// pre-mantissas of the frame's adaptive hybrid transform (decoded with the first block).
+    fn decode_coeffs_blk(&mut self, r: &mut BitReader, blk: usize, ch: usize, m: &mut MantGroups) {
+        if !self.channel_uses_aht[ch] {
+            self.decode_coeffs_ch(r, ch, m);
+        } else {
+            if blk == 0 {
+                self.decode_aht_ch(r, ch);
+            }
+            for bin in self.start_freq[ch]..self.end_freq[ch] {
+                let e = (self.dexps[ch][bin] as usize).min(24);
+                self.coeffs[ch][bin] = self.pre_mantissa[ch][bin][blk] as f32 * SCALE[e];
             }
         }
     }
@@ -775,20 +930,28 @@ fn group_width(strategy: u8) -> usize {
     (strategy + (strategy == EXP_D45) as u8) as usize
 }
 
-/// The bands of a coupling range from its band structure (one bit per subband after the first,
-/// 1 to join the previous band). Returns the number of bands; `sizes` gets their widths in bins.
-fn band_structure(r: &mut BitReader, start_subband: usize, end_subband: usize, sizes: &mut [u8; 18]) -> usize {
+/// The bands of a coupling or spectral extension range from its band structure (one bit per
+/// subband after the first, 1 to join the previous band). `st` is the structure that persists from
+/// block to block, set to `default` in block 0; an E-AC-3 stream says whether a new one follows.
+/// Returns the number of bands; `sizes` gets their widths in bins.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn band_structure(r: &mut BitReader, blk: usize, eac3: bool, start_subband: usize, end_subband: usize, default: &[u8], st: &mut [u8], sizes: &mut [u8]) -> usize {
     let n_sub = end_subband - start_subband;
-    let mut join = [0u8; 18];
-    for b in join.iter_mut().take(n_sub.saturating_sub(1)) {
-        *b = r.bit() as u8;
+    if blk == 0 {
+        st.copy_from_slice(default);
+    }
+    let base = start_subband + 1;
+    if !eac3 || r.bit() {
+        for sub in 0..n_sub.saturating_sub(1) {
+            st[base + sub] = r.bit() as u8;
+        }
     }
     let mut n_bands = n_sub;
-    let mut sz = [0u8; 18];
+    let mut sz = [0u8; 22];
     sz[0] = 12;
     let mut bnd = 0;
     for sub in 1..n_sub {
-        if join[sub - 1] != 0 {
+        if st[base + sub - 1] != 0 {
             n_bands -= 1;
             sz[bnd] += 12;
         } else {

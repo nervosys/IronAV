@@ -195,6 +195,7 @@ codecs! {
     Mp3 => "mp3", Audio;
     Mp2 => "mp2", Audio;
     Ac3 => "ac3", Audio;
+    Eac3 => "eac3", Audio;
     Opus => "opus", Audio;
     Vorbis => "vorbis", Audio;
     Flac => "flac", Audio;

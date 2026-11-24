@@ -75,6 +75,10 @@ name = "ac3_ffmpeg"
 required-features = ["ac3"]
 
 [[test]]
+name = "eac3_ffmpeg"
+required-features = ["ac3"]
+
+[[test]]
 name = "av1_perf"
 required-features = ["av1"]
 

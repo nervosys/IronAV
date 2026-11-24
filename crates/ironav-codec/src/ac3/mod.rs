@@ -1,8 +1,17 @@
-//! AC-3 (Dolby Digital, ATSC A/52) audio decoder: the full-bandwidth channels of every channel
-//! mode (1/0 to 3/2) with the LFE channel, coupling, rematrixing, delta bit allocation, block
-//! switching and dynamic range control at FFmpeg's default settings (`drc_scale` 1). Output is
-//! float, in the channel order of the mode (FL FR FC LFE BL BR for 3/2 with LFE), as FFmpeg's
-//! `ac3` decoder gives it. Not decoded: E-AC-3 (refused with an error), and the downmix.
+//! AC-3 (Dolby Digital, ATSC A/52) and E-AC-3 (Dolby Digital Plus, ETSI TS 102 366 annex E) audio
+//! decoder: the full-bandwidth channels of every channel mode (1/0 to 3/2) with the LFE channel,
+//! coupling, rematrixing, delta bit allocation, block switching and dynamic range control at
+//! FFmpeg's default settings (`drc_scale` 1). Output is float, in the channel order of the mode
+//! (FL FR FC LFE BL BR for 3/2 with LFE), as FFmpeg's `ac3` and `eac3` decoders give it.
+//!
+//! E-AC-3: syncframes of 1, 2, 3 or 6 blocks, the frame-based exponent strategy, spectral extension,
+//! the adaptive hybrid transform (gain adaptive and vector quantisation), and standard coupling.
+//! Transient pre-noise processing data is parsed and ignored (applying it is optional). Dependent
+//! substreams (`strmtyp` 1, as 7.1 uses for the channels beyond 5.1) and substreams other than 0 are
+//! skipped: only the independent substream 0, at most 5.1 channels, is decoded, which is what a
+//! player without 7.1 output plays and what the decoder's frames say they hold. Refused with an
+//! error naming the feature: enhanced coupling and the reduced sample rates (`fscod` 3), which
+//! FFmpeg does not decode either. Not decoded for either codec: the downmix.
 //!
 //! The decoding follows FFmpeg's `libavcodec/ac3dec.c`, `ac3dec_float.c`, `ac3.c` and `ac3dsp.c`,
 //! which are licensed under the LGPL-2.1 or later (Copyright (c) 2000-2008 the FFmpeg developers,
@@ -11,6 +20,10 @@
 mod alloc;
 mod bits;
 mod block;
+mod eac3;
+#[cfg(test)]
+mod eac3_synth;
+mod eac3_tables;
 mod enc;
 mod header;
 mod synth;
@@ -21,9 +34,8 @@ use bits::BitReader;
 use std::borrow::Cow;
 use ironav_core::{AudioFrame, Decoder, Error, ErrorCode, Frame, Packet, Result};
 
-/// Samples per channel in one audio block, and blocks per AC-3 frame.
+/// Samples per channel in one audio block.
 const BLOCK: usize = 256;
-const BLOCKS: usize = 6;
 
 /// For each channel mode (acmod) and LFE flag: the decoded channel that each output channel
 /// takes, in the output order (FL FR FC LFE BL BR for 3/2 with LFE).
@@ -57,13 +69,25 @@ impl Ac3Decoder {
 
     /// Decodes the frame at the start of `data` (after any bytes before its sync word). Returns the
     /// interleaved samples, the frame's header and the number of bytes the frame used.
-    fn decode_frame(&mut self, data: &[u8]) -> Result<(Vec<f64>, header::Header, usize)> {
+    /// The samples are `None` for a frame the decoder leaves out (an E-AC-3 dependent substream).
+    fn decode_frame(&mut self, data: &[u8]) -> Result<(Option<Vec<f64>>, header::Header, usize)> {
         let off = sync_offset(data)?;
         let frame = unswapped(&data[off..]);
         let mut r = BitReader::new(&frame);
         let hdr = parse_header(&mut r)?;
+        let kind = if hdr.eac3 { "E-AC-3" } else { "AC-3" };
+        if hdr.skipped() {
+            // a dependent frame is passed over, whole or cut short
+            return Ok((None, hdr, off + hdr.frame_size.min(frame.len())));
+        }
         if hdr.frame_size > frame.len() {
-            return Err(Error::invalid_input("AC-3: the frame is cut short by the end of the data"));
+            return Err(Error::invalid_input(format!("{kind}: the frame is cut short by the end of the data")));
+        }
+        if hdr.eac3 {
+            // the reader reads zeros past the frame, not the bytes of the next one
+            let pos = r.pos;
+            r = BitReader::new(&frame[..hdr.frame_size]);
+            r.pos = pos;
         }
 
         let st = &mut self.st;
@@ -82,13 +106,25 @@ impl Ac3Decoder {
             st.num_exp_groups[st.lfe_ch] = 2;
             st.channel_in_cpl[st.lfe_ch] = false;
         }
-        st.num_blocks = BLOCKS;
-        for blk in 0..BLOCKS {
-            st.decode_block(&mut r, blk).map_err(|msg| Error::invalid_input(format!("AC-3: {msg}")))?;
+        st.num_blocks = hdr.num_blocks;
+        let fail = |msg: &str| {
+            let code = if msg.contains("not supported") { ErrorCode::UnsupportedCodec } else { ErrorCode::InvalidInput };
+            Error::new(code, format!("{kind}: {msg}"))
+        };
+        if hdr.eac3 {
+            st.parse_audio_frame(&mut r, &hdr).map_err(fail)?;
+        } else {
+            st.begin_ac3_frame();
+        }
+        for blk in 0..hdr.num_blocks {
+            st.decode_block(&mut r, blk).map_err(fail)?;
+        }
+        if hdr.eac3 && r.pos > 8 * hdr.frame_size {
+            return Err(Error::invalid_input("E-AC-3: the audio blocks run past the end of the frame"));
         }
 
         let map = OUTPUT_MAP[hdr.acmod][hdr.lfe_on as usize];
-        let n = BLOCKS * BLOCK;
+        let n = hdr.num_blocks * BLOCK;
         let nch = map.len();
         let mut samples = vec![0f64; n * nch];
         for (j, &c) in map.iter().enumerate() {
@@ -96,7 +132,7 @@ impl Ac3Decoder {
                 samples[i * nch + j] = s as f64;
             }
         }
-        Ok((samples, hdr, off + hdr.frame_size))
+        Ok((Some(samples), hdr, off + hdr.frame_size))
     }
 }
 
@@ -110,14 +146,75 @@ pub struct FrameInfo {
     pub sample_rate: u32,
     /// The channels the frame carries, the LFE channel included.
     pub channels: u16,
+    /// Whether the frame is E-AC-3 (bit stream id 11 to 16) rather than AC-3.
+    pub eac3: bool,
+    /// Samples per channel the frame decodes to: 1536 for AC-3, 256 per block for E-AC-3.
+    pub samples: usize,
+    /// Whether the decoder leaves the frame out: an E-AC-3 dependent substream, or a substream
+    /// other than 0. Such a frame belongs to the independent frame before it.
+    pub skipped: bool,
 }
 
-/// The header of the first AC-3 frame in `data`. An E-AC-3 frame is an error.
+/// The header of the first AC-3 frame in `data`. An E-AC-3 frame is an `UnsupportedCodec` error:
+/// see `eac3_frame_info` and `any_frame_info`.
 pub fn frame_info(data: &[u8]) -> Result<FrameInfo> {
+    let info = any_frame_info(data)?;
+    if info.eac3 {
+        return Err(Error::new(ErrorCode::UnsupportedCodec, "AC-3: this is an E-AC-3 frame, not an AC-3 one"));
+    }
+    Ok(info)
+}
+
+/// The header of the first E-AC-3 frame in `data`. An AC-3 frame is an `InvalidInput` error.
+pub fn eac3_frame_info(data: &[u8]) -> Result<FrameInfo> {
+    let info = any_frame_info(data)?;
+    if !info.eac3 {
+        return Err(Error::invalid_input("E-AC-3: this is an AC-3 frame"));
+    }
+    Ok(info)
+}
+
+/// The header of the first frame in `data`, AC-3 or E-AC-3 (`FrameInfo::eac3` says which).
+pub fn any_frame_info(data: &[u8]) -> Result<FrameInfo> {
     let offset = sync_offset(data)?;
     let frame = unswapped(&data[offset..]);
     let hdr = parse_header(&mut BitReader::new(&frame))?;
-    Ok(FrameInfo { offset, frame_size: hdr.frame_size, sample_rate: hdr.sample_rate, channels: hdr.channels as u16 })
+    Ok(FrameInfo {
+        offset,
+        frame_size: hdr.frame_size,
+        sample_rate: hdr.sample_rate,
+        channels: hdr.channels as u16,
+        eac3: hdr.eac3,
+        samples: hdr.samples(),
+        skipped: hdr.skipped(),
+    })
+}
+
+/// The 5-byte body of the `dec3` box (ETSI TS 102 366, annex F.6) for the independent
+/// substream 0 at the start of `data` (a frame set of an independent frame and its dependent ones
+/// is described by its independent frame alone, with no dependent substreams listed). `bit_rate_kbps`
+/// is the data rate of the stream.
+pub fn dec3_body(data: &[u8], bit_rate_kbps: u32) -> Option<[u8; 5]> {
+    let offset = sync_offset(data).ok()?;
+    let frame = unswapped(&data[offset..]);
+    let hdr = parse_header(&mut BitReader::new(&frame)).ok()?;
+    if !hdr.eac3 || hdr.skipped() {
+        return None;
+    }
+    // data_rate (13), num_ind_sub (3, one less than the count), then the substream: fscod (2),
+    // bsid (5), reserved (1), asvc (1), bsmod (3, 0 for the main audio service), acmod (3),
+    // lfeon (1), reserved (3), num_dep_sub (4), reserved (1)
+    let rate = bit_rate_kbps.min(0x1FFF);
+    Some([(rate >> 5) as u8, ((rate & 0x1F) << 3) as u8, (hdr.sr_code.min(2) as u8) << 6 | (hdr.bsid as u8) << 1, (hdr.acmod as u8) << 1 | hdr.lfe_on as u8, 0])
+}
+
+/// The channel count of the independent substream described by a `dec3` box body, as the decoder
+/// outputs it (the dependent substreams, which the decoder skips, add no channels).
+pub fn dec3_channels(body: &[u8]) -> Option<u16> {
+    // data_rate (13), num_ind_sub (3), fscod (2), bsid (5), reserved (1), then asvc (1), bsmod (3),
+    // acmod (3) and lfeon (1) in the fourth byte
+    let b = *body.get(3)?;
+    Some([2u16, 1, 2, 3, 3, 4, 4, 5][(b as usize >> 1) & 7] + (b & 1) as u16)
 }
 
 /// The 3-byte body of the `dac3` box (ETSI TS 102 366, annex F) for the frame at the start of `data`:
@@ -126,6 +223,9 @@ pub fn dac3_body(data: &[u8]) -> Option<[u8; 3]> {
     let offset = sync_offset(data).ok()?;
     let frame = unswapped(&data[offset..]);
     let hdr = parse_header(&mut BitReader::new(&frame)).ok()?;
+    if hdr.eac3 {
+        return None;
+    }
     let fscod = frame[4] >> 6;
     let bit_rate_code = (frame[4] & 0x3F) >> 1; // frmsizecod, which pairs two frame sizes per bit rate
     let bsmod = frame[5] & 7;
@@ -151,8 +251,8 @@ fn unswapped(data: &[u8]) -> Cow<'_, [u8]> {
 
 fn parse_header(r: &mut BitReader) -> Result<header::Header> {
     header::parse(r).map_err(|msg| {
-        let code = if msg.contains("E-AC-3") { ErrorCode::UnsupportedCodec } else { ErrorCode::InvalidInput };
-        Error::new(code, format!("AC-3: {msg}"))
+        let e = if msg.starts_with("E-AC-3") { msg } else { format!("AC-3: {msg}") };
+        Error::invalid_input(e)
     })
 }
 
@@ -163,8 +263,10 @@ impl Decoder for Ac3Decoder {
         let mut pts = packet.pts;
         loop {
             let (samples, hdr, used) = self.decode_frame(&packet.data[pos..])?;
-            frames.push(Frame::Audio(AudioFrame { sample_rate: hdr.sample_rate, channels: hdr.channels as u16, pts, samples }));
-            pts += (BLOCKS * BLOCK) as i64;
+            if let Some(samples) = samples {
+                frames.push(Frame::Audio(AudioFrame { sample_rate: hdr.sample_rate, channels: hdr.channels as u16, pts, samples }));
+                pts += hdr.samples() as i64;
+            }
             pos += used;
             // whatever follows a frame is decoded only if it holds another frame
             if pos >= packet.data.len() || header::find_syncword(&packet.data[pos..]).is_none() {

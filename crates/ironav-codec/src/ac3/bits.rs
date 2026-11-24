@@ -44,3 +44,34 @@ impl<'a> BitReader<'a> {
         self.pos += n;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_msb_first_and_zeros_past_the_end() {
+        let data = [0b1010_0110, 0xFF, 0x80];
+        let mut r = BitReader::new(&data);
+        assert!(r.bit());
+        assert_eq!(r.bits(3), 0b010);
+        assert_eq!(r.sbits(4), 0b0110);
+        assert_eq!(r.sbits(4), -1);
+        r.skip(4);
+        assert_eq!(r.bits(2), 0b10);
+        assert_eq!(r.pos, 18);
+        // past the end: zeros, and the position still counts
+        assert_eq!(r.bits(20), 0);
+        assert_eq!(r.sbits(0), 0);
+        assert!(!r.bit());
+        assert_eq!(r.pos, 39);
+    }
+
+    #[test]
+    fn sign_extends_to_the_width_asked() {
+        let data = [0x80, 0x00, 0x00, 0x00];
+        assert_eq!(BitReader::new(&data).sbits(1), -1);
+        assert_eq!(BitReader::new(&data).sbits(16), -32768);
+        assert_eq!(BitReader::new(&[0x7F, 0xFF]).sbits(16), 32767);
+    }
+}

@@ -16,6 +16,7 @@ fn codec_meta(c: CodecId) -> (&'static str, &'static str) {
         Mp3 => ("MP3", "Lossy audio codec (MPEG-1/2 Layer III); universal compatibility."),
         Mp2 => ("MP2", "Lossy audio codec (MPEG-1/2 Layer II), used in broadcast (DVB, DAB); decoded and encoded."),
         Ac3 => ("AC-3", "Lossy audio codec (ATSC A/52, Dolby Digital) used in DVD, broadcast and Blu-ray; decoded, not encoded."),
+        Eac3 => ("E-AC-3", "Lossy audio codec (ATSC A/52 annex E, Dolby Digital Plus) of streaming services, broadcast and Blu-ray; decoded (the independent substream, up to 5.1 channels, with spectral extension and the adaptive hybrid transform), not encoded."),
         Opus => ("Opus","Lossy low-latency audio codec (RFC 6716); best quality per bit for speech and music."),
         Vorbis => ("Vorbis", "Lossy audio codec used in Ogg and WebM."),
         Flac => ("FLAC", "Lossless audio compression."),
