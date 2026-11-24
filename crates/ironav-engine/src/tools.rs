@@ -276,6 +276,17 @@ fn h_probe(args: &Value) -> Result<Value> {
     if !unsupported.is_empty() {
         out["unsupported_streams"] = json!(unsupported);
     }
+    // chapter titles and attachment names are the file's own text: cleaned, and the answer is marked untrusted
+    let (chapters, attachments) = (d.chapters(), d.attachments());
+    if !chapters.is_empty() {
+        out["chapters"] = json!(chapters);
+    }
+    if !attachments.is_empty() {
+        out["attachments"] = json!(attachments);
+    }
+    if !chapters.is_empty() || !attachments.is_empty() {
+        crate::untrusted::mark(&mut out);
+    }
     Ok(out)
 }
 

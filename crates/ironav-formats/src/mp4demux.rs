@@ -214,7 +214,9 @@ pub struct Mp4Demuxer<R: Read + Seek + Send> {
     discarded: Vec<bool>,
     /// Samples handed out per stream, to know when a stream's first sample is due.
     seen: Vec<u64>,
-    /// A description of each track the container held that was left out.
+    /// What the container held besides its streams (Matroska chapters and attachments), and the tracks left out.
+    chapters: Vec<ironav_core::Chapter>,
+    attachments: Vec<ironav_core::Attachment>,
     unsupported: Vec<String>,
 }
 
@@ -358,11 +360,13 @@ impl<R: Read + Seek + Send> Mp4Demuxer<R> {
         samples.sort_by(|a, b| (a.dts as f64 * scale[a.stream as usize]).total_cmp(&(b.dts as f64 * scale[b.stream as usize])));
         let n = tracks.len();
         let streams = tracks.iter().map(|t| t.stream.clone()).collect();
-        Self { name, r, pos: u64::MAX, streams, tracks, samples, next: 0, discarded: vec![false; n], seen: vec![0; n], unsupported: Vec::new() }
+        Self { name, r, pos: u64::MAX, streams, tracks, samples, next: 0, discarded: vec![false; n], seen: vec![0; n], chapters: Vec::new(), attachments: Vec::new(), unsupported: Vec::new() }
     }
 
-    /// Records a description of each track of the container that was left out.
-    pub(crate) fn with_unsupported(mut self, unsupported: Vec<String>) -> Self {
+    /// Adds what a container holds besides its streams: chapters, attachments, and a description of each track left out.
+    pub(crate) fn with_extras(mut self, chapters: Vec<ironav_core::Chapter>, attachments: Vec<ironav_core::Attachment>, unsupported: Vec<String>) -> Self {
+        self.chapters = chapters;
+        self.attachments = attachments;
         self.unsupported = unsupported;
         self
     }
@@ -1012,6 +1016,14 @@ impl<R: Read + Seek + Send> Demuxer for Mp4Demuxer<R> {
         if let Some(d) = self.discarded.get_mut(stream) {
             *d = true;
         }
+    }
+
+    fn chapters(&self) -> Vec<ironav_core::Chapter> {
+        self.chapters.clone()
+    }
+
+    fn attachments(&self) -> Vec<ironav_core::Attachment> {
+        self.attachments.clone()
     }
 
     fn unsupported_streams(&self) -> Vec<String> {
