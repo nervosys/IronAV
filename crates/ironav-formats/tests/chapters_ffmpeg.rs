@@ -1,7 +1,6 @@
 //! Matroska chapters and attachments in files made by FFmpeg, read with `open_demuxer`. Skipped without
 //! `ffmpeg` on PATH.
 
-use ironav_core::Demuxer;
 use ironav_formats::open_demuxer;
 use std::path::{Path, PathBuf};
 use std::process::Command;
