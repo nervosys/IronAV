@@ -1,4 +1,4 @@
-use crate::{Error, ErrorCode, Frame, Packet, Result, StreamInfo, StreamParams};
+use crate::{Attachment, Chapter, Error, ErrorCode, Frame, Packet, Result, StreamInfo, StreamParams};
 
 // All stage traits are `Send` so the engine can run each stage on its own thread and
 // move packets/frames between stages without copying.
@@ -20,6 +20,14 @@ pub trait Demuxer: Send {
     /// The streams of the file that were left out because IronAV does not decode them (a codec it lacks,
     /// a kind of stream it does not play), each as a short description. Empty for most formats.
     fn unsupported_streams(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// The file's chapters, in order, when the format has them (Matroska). Their titles come from the file.
+    fn chapters(&self) -> Vec<Chapter> {
+        Vec::new()
+    }
+    /// The files attached to the container (Matroska): names and types, not the data.
+    fn attachments(&self) -> Vec<Attachment> {
         Vec::new()
     }
 }

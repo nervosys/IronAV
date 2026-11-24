@@ -20,7 +20,7 @@
 pub(crate) mod live;
 
 use crate::mp4demux::{av1c_config, gcd, parse_avcc, parse_hvcc, unwrap_frame, Config, Mp4Demuxer, Sample, TrackInfo, Unwrap};
-use ironav_core::{CodecId, Error, ErrorCode, Rational, Result, StreamInfo, StreamParams};
+use ironav_core::{Attachment, Chapter, CodecId, Error, ErrorCode, Rational, Result, StreamInfo, StreamParams};
 use std::io::{BufReader, Read, Seek, SeekFrom};
 
 const EBML: u32 = 0x1A45_DFA3;
@@ -69,6 +69,28 @@ const REFERENCE_BLOCK: u32 = 0xFB;
 
 const TRACK_SUBTITLE: u64 = 17;
 
+const EDITION_ENTRY: u32 = 0x45B9;
+const CHAPTER_ATOM: u32 = 0xB6;
+const CHAPTER_TIME_START: u32 = 0x91;
+const CHAPTER_TIME_END: u32 = 0x92;
+const CHAPTER_FLAG_HIDDEN: u32 = 0x98;
+const CHAPTER_FLAG_ENABLED: u32 = 0x4598;
+const CHAPTER_DISPLAY: u32 = 0x80;
+const CHAP_STRING: u32 = 0x85;
+const CHAP_LANGUAGE: u32 = 0x437C;
+const CHAP_LANGUAGE_IETF: u32 = 0x437D;
+const ATTACHED_FILE: u32 = 0x61A7;
+const FILE_NAME: u32 = 0x466E;
+const FILE_MEDIA_TYPE: u32 = 0x4660;
+const FILE_DATA: u32 = 0x465C;
+
+/// The Chapters element is read whole up to this size.
+const MAX_CHAPTERS: u64 = 16 << 20;
+/// The most chapters and attachments listed, the deepest chapter nesting followed, and the longest name or title kept.
+const MAX_LISTED: usize = 10_000;
+const MAX_CHAPTER_DEPTH: u32 = 8;
+const MAX_NAME: usize = 512;
+
 /// Sanity cap on the Tracks element we are willing to hold in memory.
 const MAX_TRACKS: u64 = 64 << 20;
 
@@ -113,6 +135,8 @@ struct Scan<R: Read + Seek> {
     /// Nanoseconds per tick.
     scale: u64,
     tracks: Option<Vec<u8>>,
+    chapters: Option<Vec<u8>>,
+    attachments: Vec<Attachment>,
     doc_type: String,
 }
 
@@ -267,6 +291,15 @@ impl<R: Read + Seek> Scan<R> {
                         }
                     }
                 }
+                CHAPTERS if size <= MAX_CHAPTERS => self.chapters = Some(self.body(size)?),
+                ATTACHMENTS => {
+                    // a damaged list of attachments is left out; it is not a reason to refuse the file
+                    if self.read_attachments(body_end).is_err() {
+                        self.attachments.clear();
+                        self.r.seek(SeekFrom::Start(body_end))?;
+                        self.pos = body_end;
+                    }
+                }
                 TRACKS => {
                     if size > MAX_TRACKS {
                         return Err(bad("the track list is implausibly large"));
@@ -278,6 +311,46 @@ impl<R: Read + Seek> Scan<R> {
             }
         }
         Ok(())
+    }
+
+    /// The Attachments element: each file's name and type and the size of its data, which is not read.
+    fn read_attachments(&mut self, end: u64) -> Result<()> {
+        while self.pos < end && self.attachments.len() < MAX_LISTED {
+            let Some(id) = self.id()? else { break };
+            let size = self.size()?.ok_or_else(|| bad("an attachment element has unknown size"))?;
+            let file_end = self.pos.saturating_add(size);
+            if file_end > end {
+                return Err(bad("an attachment is larger than the attachments element"));
+            }
+            if id != ATTACHED_FILE {
+                self.skip_to(file_end)?;
+                continue;
+            }
+            let mut a = Attachment { name: String::new(), mime_type: String::new(), size: 0 };
+            while self.pos < file_end {
+                let Some(id) = self.id()? else { break };
+                let size = self.size()?.ok_or_else(|| bad("an attachment field has unknown size"))?;
+                let field_end = self.pos.saturating_add(size);
+                if field_end > file_end {
+                    return Err(bad("an attachment field is larger than its attachment"));
+                }
+                match id {
+                    FILE_NAME | FILE_MEDIA_TYPE if size <= MAX_NAME as u64 * 4 => {
+                        let v = self.body(size)?;
+                        let s = String::from_utf8_lossy(&v).trim_end_matches('\0').chars().take(MAX_NAME).collect::<String>();
+                        if id == FILE_NAME { a.name = s } else { a.mime_type = s }
+                    }
+                    FILE_DATA => {
+                        a.size = size;
+                        self.skip_to(field_end)?;
+                    }
+                    _ => self.skip_to(field_end)?,
+                }
+            }
+            self.skip_to(file_end)?;
+            self.attachments.push(a);
+        }
+        self.skip_to(end)
     }
 
     fn cluster(&mut self, end: Option<u64>) -> Result<()> {
@@ -602,6 +675,77 @@ fn parse_tracks(body: &[u8]) -> Result<Vec<MkTrack>> {
     Ok(out)
 }
 
+/// The chapters of a Chapters element, depth first, in the order the file gives them. Hidden and disabled
+/// chapters are left out. A chapter's title is its first display string, the one in English or an
+/// undetermined language when there are several. Lists are capped; nesting past [`MAX_CHAPTER_DEPTH`] is cut.
+fn parse_chapters(body: &[u8]) -> Result<Vec<Chapter>> {
+    let mut out = Vec::new();
+    for e in Elems(body) {
+        let (id, edition) = e?;
+        if id == EDITION_ENTRY {
+            chapter_atoms(edition, 0, &mut out)?;
+        }
+    }
+    Ok(out)
+}
+
+fn chapter_atoms(parent: &[u8], depth: u32, out: &mut Vec<Chapter>) -> Result<()> {
+    for e in Elems(parent) {
+        let (id, atom) = e?;
+        if id == CHAPTER_ATOM {
+            chapter_atom(atom, depth, out)?;
+        }
+    }
+    Ok(())
+}
+
+fn chapter_atom(atom: &[u8], depth: u32, out: &mut Vec<Chapter>) -> Result<()> {
+    if out.len() >= MAX_LISTED {
+        return Ok(());
+    }
+    let (mut start, mut end, mut hidden, mut enabled) = (0u64, None, false, true);
+    let mut titles: Vec<(String, Option<String>)> = Vec::new();
+    let text = |s: &[u8]| String::from_utf8_lossy(s).trim_end_matches('\0').chars().take(MAX_NAME).collect::<String>();
+    for e in Elems(atom) {
+        let (id, v) = e?;
+        match id {
+            CHAPTER_TIME_START => start = be_uint(v)?,
+            CHAPTER_TIME_END => end = Some(be_uint(v)?),
+            CHAPTER_FLAG_HIDDEN => hidden = be_uint(v)? != 0,
+            CHAPTER_FLAG_ENABLED => enabled = be_uint(v)? != 0,
+            CHAPTER_DISPLAY => {
+                let (mut title, mut lang, mut ietf) = (String::new(), None, None);
+                for e in Elems(v) {
+                    let (id, s) = e?;
+                    match id {
+                        CHAP_STRING => title = text(s),
+                        CHAP_LANGUAGE => lang = Some(text(s)),
+                        CHAP_LANGUAGE_IETF => ietf = Some(text(s)),
+                        _ => {}
+                    }
+                }
+                titles.push((title, ietf.or(lang)));
+            }
+            _ => {}
+        }
+    }
+    if !hidden && enabled {
+        let pick = titles.iter().find(|(_, l)| l.as_deref().is_some_and(|l| l.starts_with("en") || l == "und")).or(titles.first());
+        let (title, language) = pick.cloned().unwrap_or_default();
+        let secs = |ns: u64| ns as f64 / 1e9;
+        out.push(Chapter { start: secs(start), end: end.map(secs), title, language, depth });
+    }
+    if depth < MAX_CHAPTER_DEPTH {
+        for e in Elems(atom) {
+            let (id, child) = e?;
+            if id == CHAPTER_ATOM {
+                chapter_atom(child, depth + 1, out)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn subtitle_codec(id: &str) -> Option<CodecId> {
     Some(match id {
         "S_TEXT/UTF8" | "S_TEXT/ASCII" => CodecId::SubRip,
@@ -891,6 +1035,8 @@ pub fn open<R: Read + Seek + Send>(mut r: R) -> Result<Mp4Demuxer<BufReader<R>>>
         frames: Vec::new(),
         scale: 1_000_000,
         tracks: None,
+        chapters: None,
+        attachments: Vec::new(),
         doc_type: String::new(),
     };
     scan.file()?;
@@ -934,7 +1080,10 @@ pub fn open<R: Read + Seek + Send>(mut r: R) -> Result<Mp4Demuxer<BufReader<R>>>
         return Err(Error::new(ErrorCode::UnsupportedCodec, "the file has no audio or video track IronAV recognises"));
     }
     let name = if scan.doc_type == "webm" { "webm" } else { "matroska" };
-    Ok(Mp4Demuxer::from_parts(scan.r, name, tracks, samples).with_unsupported(unsupported))
+    // chapters are a convenience: damaged ones are left out, not a reason to refuse the file
+    let chapters = scan.chapters.as_deref().and_then(|c| parse_chapters(c).ok()).unwrap_or_default();
+    let attachments = std::mem::take(&mut scan.attachments);
+    Ok(Mp4Demuxer::from_parts(scan.r, name, tracks, samples).with_extras(chapters, attachments, unsupported))
 }
 
 /// A track IronAV does not read, for `unsupported_streams`.
@@ -1170,6 +1319,59 @@ mod tests {
         assert_eq!(n, 1);
         // seeking in it lands on the cue
         assert_eq!(d.seek(0.0).unwrap(), 0.0);
+    }
+
+    fn atom(start_ns: u64, end_ns: Option<u64>, titles: &[(&str, &str)], children: &[Vec<u8>], hidden: bool) -> Vec<u8> {
+        let mut a = vec![uint(0x73C4, 7), uint(CHAPTER_TIME_START, start_ns)];
+        if let Some(e) = end_ns {
+            a.push(uint(CHAPTER_TIME_END, e));
+        }
+        if hidden {
+            a.push(uint(CHAPTER_FLAG_HIDDEN, 1));
+        }
+        for (lang, title) in titles {
+            a.push(el(CHAPTER_DISPLAY, &[el(CHAP_STRING, title.as_bytes()), el(CHAP_LANGUAGE, lang.as_bytes())].concat()));
+        }
+        a.extend(children.iter().cloned());
+        el(CHAPTER_ATOM, &a.concat())
+    }
+
+    #[test]
+    fn chapters_and_attachments_are_listed() {
+        let nested = atom(5_000_000_000, Some(8_000_000_000), &[("eng", "Scene one")], &[], false);
+        let chapters = el(CHAPTERS, &el(EDITION_ENTRY, &[
+            atom(0, Some(10_000_000_000), &[("fre", "Chapitre"), ("eng", "Intro")], &[nested], false),
+            atom(10_000_000_000, None, &[("und", "Hidden")], &[], true),
+            atom(20_500_000_000, None, &[("jpn", "Only Japanese")], &[], false),
+            atom(30_000_000_000, None, &[], &[], false),
+        ].concat()));
+        let attached = |name: &str, mime: &str, data: &[u8]| el(ATTACHED_FILE, &[el(FILE_NAME, name.as_bytes()), el(FILE_MEDIA_TYPE, mime.as_bytes()), el(FILE_DATA, data)].concat());
+        let attachments = el(ATTACHMENTS, &[attached("font.ttf", "font/ttf", &[7; 1000]), attached("cover.jpg", "image/jpeg", &[1; 10])].concat());
+        let cluster = [uint(CLUSTER_TIMECODE, 0), simple(1, 0, true, &[0xAA; 5])].concat();
+        let video = el(TRACK_ENTRY, &[uint(TRACK_NUMBER, 1), uint(TRACK_TYPE, 1), el(CODEC_ID, b"V_VP9"), el(VIDEO, &[uint(PIXEL_WIDTH, 64), uint(PIXEL_HEIGHT, 48)].concat())].concat());
+        let d = open(Cursor::new(file_with(&[video], [chapters, attachments].concat(), cluster))).unwrap();
+        let c = d.chapters();
+        let view: Vec<(f64, Option<f64>, &str, u32)> = c.iter().map(|c| (c.start, c.end, c.title.as_str(), c.depth)).collect();
+        assert_eq!(
+            view,
+            vec![(0.0, Some(10.0), "Intro", 0), (5.0, Some(8.0), "Scene one", 1), (20.5, None, "Only Japanese", 0), (30.0, None, "", 0)],
+            "the hidden chapter is left out, English is preferred, and nesting is kept"
+        );
+        assert_eq!(c[0].language.as_deref(), Some("eng"));
+        let a = d.attachments();
+        assert_eq!(a.iter().map(|a| (a.name.as_str(), a.mime_type.as_str(), a.size)).collect::<Vec<_>>(), vec![("font.ttf", "font/ttf", 1000), ("cover.jpg", "image/jpeg", 10)]);
+    }
+
+    #[test]
+    fn damaged_chapters_and_attachments_do_not_stop_the_file_opening() {
+        // a chapter atom whose size runs past its parent, and an attachment whose field is larger than its file
+        let bad_chapters = el(CHAPTERS, &[0x45, 0xB9, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0xB6, 0x84]);
+        let bad_attachments = el(ATTACHMENTS, &el(ATTACHED_FILE, &[el(FILE_NAME, b"a"), vec![0x46, 0x5C, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF]].concat()));
+        let cluster = [uint(CLUSTER_TIMECODE, 0), simple(1, 0, true, &[0xAA; 5])].concat();
+        let video = el(TRACK_ENTRY, &[uint(TRACK_NUMBER, 1), uint(TRACK_TYPE, 1), el(CODEC_ID, b"V_VP9"), el(VIDEO, &[uint(PIXEL_WIDTH, 64), uint(PIXEL_HEIGHT, 48)].concat())].concat());
+        let mut d = open(Cursor::new(file_with(&[video], [bad_chapters, bad_attachments].concat(), cluster))).unwrap();
+        assert!(d.chapters().is_empty() && d.attachments().is_empty());
+        assert!(d.read_packet().unwrap().is_some(), "the media is still read");
     }
 
     #[test]

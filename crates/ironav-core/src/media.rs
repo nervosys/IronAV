@@ -319,6 +319,32 @@ impl StreamInfo {
     }
 }
 
+/// A chapter of a container: a named span of the timeline. Chapters nest (`depth` counts the levels above it).
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
+pub struct Chapter {
+    /// Seconds.
+    pub start: f64,
+    /// Seconds, when the file gives an end.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub end: Option<f64>,
+    pub title: String,
+    /// The language of the title (a three-letter or IETF code), when the file says.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub language: Option<String>,
+    pub depth: u32,
+}
+
+/// A file attached to a container (a font for the subtitles, cover art): its name and type, not its data.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
+pub struct Attachment {
+    pub name: String,
+    pub mime_type: String,
+    /// Bytes of data, when the file says.
+    pub size: u64,
+}
+
 /// A compressed (or raw-bitstream) chunk. Moved, never cloned, between pipeline stages.
 #[derive(Debug, Clone)]
 pub struct Packet {
