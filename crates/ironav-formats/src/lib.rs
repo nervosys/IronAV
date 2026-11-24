@@ -26,6 +26,7 @@ mod jpeg;
 mod keyframe;
 pub use keyframe::is_keyframe;
 mod y4m;
+pub mod playlist;
 pub mod subtitle;
 pub mod webvtt;
 
