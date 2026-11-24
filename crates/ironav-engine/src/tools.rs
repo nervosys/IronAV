@@ -268,6 +268,9 @@ fn h_capabilities(_: &Value) -> Result<Value> {
 fn h_probe(args: &Value) -> Result<Value> {
     let path = need_str(args, "path")?;
     crate::policy::check_read(path)?;
+    if let Some(list) = playlist_entries(path)? {
+        return Ok(list);
+    }
     let d = open_demuxer(Path::new(path))?;
     let size = std::fs::metadata(path).map(|m| m.len()).ok();
     let duration = d.streams().iter().filter_map(|s| s.duration_secs()).fold(None, |a: Option<f64>, x| Some(a.map_or(x, |a| a.max(x))));
@@ -288,6 +291,25 @@ fn h_probe(args: &Value) -> Result<Value> {
         crate::untrusted::mark(&mut out);
     }
     Ok(out)
+}
+
+/// What `probe` says of an M3U or PLS playlist file: its entries. Nothing in it is opened, and no URL
+/// is fetched; the entries are the file's own text, so the answer is cleaned and marked `untrusted`.
+/// `None` when the file is not a playlist. An HLS playlist (`#EXT-X-` tags) is a stream to open, not a list.
+fn playlist_entries(path: &str) -> Result<Option<Value>> {
+    use std::io::Read;
+    let mut magic = [0u8; 2048];
+    let n = std::fs::File::open(path)?.read(&mut magic)?;
+    let ext = Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("");
+    let Some(kind) = ironav_formats::playlist::sniff(&magic[..n], ext) else { return Ok(None) };
+    let hls = || Error::new(ErrorCode::UnsupportedFormat, "this is an HLS playlist (it has #EXT-X- tags), which is a stream, not a list of files").hint("open it as a stream with stream_open, giving its URL");
+    if kind == ironav_formats::playlist::Kind::Hls {
+        return Err(hls());
+    }
+    let list = ironav_formats::playlist::parse_file(Path::new(path)).map_err(|e| if e.message.contains("HLS") { hls() } else { e })?;
+    let mut out = json!({ "path": path, "format": list.format, "count": list.entries.len(), "entries": list.entries });
+    crate::untrusted::mark(&mut out);
+    Ok(Some(out))
 }
 
 fn h_plan(args: &Value) -> Result<Value> {
