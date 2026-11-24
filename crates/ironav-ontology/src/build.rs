@@ -31,6 +31,9 @@ fn codec_meta(c: CodecId) -> (&'static str, &'static str) {
         Mpeg1Video => ("MPEG-1 video", "Legacy lossy video codec (ISO 11172-2) of Video CD; decoded."),
         ProRes => ("Apple ProRes", "Intra-frame mezzanine codec for editing."),
         Mjpeg => ("Motion JPEG", "Video as a sequence of independent JPEG images."),
+        SubRip => ("SubRip", "Timed text subtitles (.srt, and Matroska S_TEXT/UTF8); read as a subtitle stream of cues, not decoded to pictures."),
+        Ass => ("ASS / SSA", "Advanced SubStation Alpha subtitles (.ass, .ssa, and Matroska S_TEXT/ASS): timed events with styling override tags; read as a subtitle stream of cues."),
+        WebVtt => ("WebVTT", "Web Video Text Tracks subtitles (.vtt, and Matroska S_TEXT/WEBVTT); read as a subtitle stream of cues."),
     }
 }
 
@@ -67,11 +70,16 @@ pub fn build() -> Ontology {
     for &c in CodecId::ALL {
         let (label, desc) = codec_meta(c);
         let imp = implemented.iter().find(|i| i.codec == c);
-        let media = if c.media_type() == MediaType::Audio { "audio" } else { "video" };
+        let media = match c.media_type() {
+            MediaType::Audio => "audio",
+            MediaType::Video => "video",
+            MediaType::Subtitle => "subtitle",
+        };
         // A codec with no software implementation is still usable if a hardware provider encodes it.
         let hw_encoders: Vec<&str> = providers_for(c, Direction::Encode).iter().map(|b| b.name()).collect();
         let hw_decoders: Vec<&str> = providers_for(c, Direction::Decode).iter().map(|b| b.name()).collect();
-        let usable = imp.is_some() || !hw_encoders.is_empty() || !hw_decoders.is_empty();
+        // a subtitle codec is "implemented" when the container readers give its cues as packets: there is nothing to decode
+        let usable = imp.is_some() || !hw_encoders.is_empty() || !hw_decoders.is_empty() || c.media_type() == MediaType::Subtitle;
         o.add_entity(
             entity(Kind::Codec, c.name(), label, desc, if usable { Status::Implemented } else { Status::Planned })
                 .with_prop("media", media)

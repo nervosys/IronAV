@@ -67,6 +67,8 @@ const DISCARD_PADDING: u32 = 0x75A2;
 const CODEC_DELAY: u32 = 0x56AA;
 const REFERENCE_BLOCK: u32 = 0xFB;
 
+const TRACK_SUBTITLE: u64 = 17;
+
 /// Sanity cap on the Tracks element we are willing to hold in memory.
 const MAX_TRACKS: u64 = 64 << 20;
 
@@ -600,6 +602,40 @@ fn parse_tracks(body: &[u8]) -> Result<Vec<MkTrack>> {
     Ok(out)
 }
 
+fn subtitle_codec(id: &str) -> Option<CodecId> {
+    Some(match id {
+        "S_TEXT/UTF8" | "S_TEXT/ASCII" => CodecId::SubRip,
+        "S_TEXT/ASS" | "S_TEXT/SSA" | "S_ASS" | "S_SSA" => CodecId::Ass,
+        // WebM's form of WebVTT (what FFmpeg writes) holds the cue payload in the block; the settings are in a block addition
+        "S_TEXT/WEBVTT" | "D_WEBVTT/SUBTITLES" | "D_WEBVTT/CAPTIONS" => CodecId::WebVtt,
+        _ => return None,
+    })
+}
+
+/// A subtitle track's cues as samples: a block's time and its BlockDuration (or the track's default
+/// duration). Blocks of no size, or longer than a cue may be, are left out, and the track holds
+/// [`crate::subtitle::MAX_CUES`] cues and [`crate::subtitle::MAX_TOTAL_BYTES`] bytes at most.
+fn build_subtitle(t: &MkTrack, codec: CodecId, index: usize, frames: &[&Frame], scale: u64, samples: &mut Vec<Sample>) -> TrackInfo {
+    let g = gcd(scale as i64, 1_000_000_000);
+    let tick = Rational::new(scale as i64 / g, 1_000_000_000 / g);
+    let default_ticks = (t.default_ns / scale.max(1)) as i64;
+    let (mut end, mut bytes, mut cues) = (0i64, 0usize, 0usize);
+    for f in frames {
+        let size = f.size as usize;
+        if size == 0 || size > crate::subtitle::MAX_CUE_BYTES * 2 || cues >= crate::subtitle::MAX_CUES || bytes + size > crate::subtitle::MAX_TOTAL_BYTES {
+            continue;
+        }
+        let duration = f.duration.filter(|&d| d > 0).unwrap_or(default_ticks).max(0);
+        end = end.max(f.tc + duration);
+        bytes += size;
+        cues += 1;
+        samples.push(Sample { stream: index as u16, sync: true, offset: f.offset, size: f.size, dts: f.tc, cts_offset: 0, duration: u32::try_from(duration).unwrap_or(u32::MAX) });
+    }
+    let extradata = t.private[..t.private.len().min(crate::subtitle::MAX_CUE_BYTES * 32)].to_vec();
+    let stream = StreamInfo { index, codec, time_base: tick, duration: Some(end), bits: None, extradata, lead_in: 0, params: StreamParams::Subtitle };
+    TrackInfo { stream, config: Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma: 1 }, convert: false, swap: 0, unwrap: t.encodings.clone() }
+}
+
 fn video_codec(id: &str) -> Option<CodecId> {
     Some(match id {
         "V_MPEG4/ISO/AVC" => CodecId::H264,
@@ -702,6 +738,9 @@ fn pcm_format(id: &str, bits: Option<u8>) -> Result<Option<MkPcm>> {
 }
 
 fn build_track(t: &MkTrack, index: usize, frames: &[&Frame], scale: u64, samples: &mut Vec<Sample>, vp9: Option<(u8, u8)>) -> Result<Option<TrackInfo>> {
+    if t.kind == TRACK_SUBTITLE {
+        return Ok(subtitle_codec(&t.codec).map(|codec| build_subtitle(t, codec, index, frames, scale, samples)));
+    }
     let video = match t.kind {
         1 => true,
         2 => false,
@@ -860,6 +899,7 @@ pub fn open<R: Read + Seek + Send>(mut r: R) -> Result<Mp4Demuxer<BufReader<R>>>
 
     let mut tracks = Vec::new();
     let mut samples = Vec::new();
+    let mut unsupported = Vec::new();
     for t in &mk {
         let frames: Vec<&Frame> = scan.frames.iter().filter(|f| f.track == t.number).collect();
         let mut vp9 = None;
@@ -874,7 +914,11 @@ pub fn open<R: Read + Seek + Send>(mut r: R) -> Result<Mp4Demuxer<BufReader<R>>>
                 }
             }
         }
-        if let Some(mut info) = build_track(t, tracks.len(), &frames, scan.scale, &mut samples, vp9)? {
+        let built = build_track(t, tracks.len(), &frames, scan.scale, &mut samples, vp9)?;
+        if built.is_none() {
+            unsupported.push(describe_track(t));
+        }
+        if let Some(mut info) = built {
             // MPEG-2 whose codec configuration has no sequence header: the first picture has one
             if let (Some(f), Some(CodecId::Mpeg2Video)) = (frames.iter().find(|f| f.key), video_codec(&t.codec)) {
                 let mut head = vec![0u8; (f.size as usize).min(1024)];
@@ -890,7 +934,19 @@ pub fn open<R: Read + Seek + Send>(mut r: R) -> Result<Mp4Demuxer<BufReader<R>>>
         return Err(Error::new(ErrorCode::UnsupportedCodec, "the file has no audio or video track IronAV recognises"));
     }
     let name = if scan.doc_type == "webm" { "webm" } else { "matroska" };
-    Ok(Mp4Demuxer::from_parts(scan.r, name, tracks, samples))
+    Ok(Mp4Demuxer::from_parts(scan.r, name, tracks, samples).with_unsupported(unsupported))
+}
+
+/// A track IronAV does not read, for `unsupported_streams`.
+fn describe_track(t: &MkTrack) -> String {
+    let kind = match t.kind {
+        1 => "video",
+        2 => "audio",
+        TRACK_SUBTITLE => "subtitle",
+        _ => "other",
+    };
+    let codec: String = t.codec.chars().filter(|c| c.is_ascii_graphic()).take(64).collect();
+    format!("{kind} track {}: codec '{codec}'", t.number)
 }
 
 #[cfg(test)]
@@ -1039,6 +1095,81 @@ mod tests {
             got.push((p.pts, p.duration));
         }
         assert_eq!(got, vec![(0, 40), (120, 40), (40, 40), (80, 40)]);
+    }
+
+    fn subtitle_entry(number: u64, codec: &str, private: &[u8]) -> Vec<u8> {
+        let mut t = vec![uint(TRACK_NUMBER, number), uint(TRACK_TYPE, TRACK_SUBTITLE), el(CODEC_ID, codec.as_bytes())];
+        if !private.is_empty() {
+            t.push(el(CODEC_PRIVATE, private));
+        }
+        el(TRACK_ENTRY, &t.concat())
+    }
+
+    /// A block group holding one cue: the block, then its duration in ticks.
+    fn cue_block(track: u8, rel: i16, text: &[u8], duration: u64) -> Vec<u8> {
+        let mut b = vec![0x80 | track];
+        b.extend_from_slice(&rel.to_be_bytes());
+        b.push(0);
+        b.extend_from_slice(text);
+        el(BLOCK_GROUP, &[el(BLOCK, &b), uint(BLOCK_DURATION, duration)].concat())
+    }
+
+    /// A file with `entries` as its tracks, `extra` (chapters, attachments) after them and `cluster` as its only cluster.
+    fn file_with(entries: &[Vec<u8>], extra: Vec<u8>, cluster: Vec<u8>) -> Vec<u8> {
+        let body = [el(INFO, &uint(TIMECODE_SCALE, 1_000_000)), el(TRACKS, &entries.concat()), extra, el(CLUSTER, &cluster)].concat();
+        let mut f = el(EBML, &el(DOC_TYPE, b"matroska"));
+        f.extend(el(SEGMENT, &body));
+        f
+    }
+
+    #[test]
+    fn text_tracks_are_subtitle_streams_with_their_cues() {
+        let video = el(TRACK_ENTRY, &[uint(TRACK_NUMBER, 1), uint(TRACK_TYPE, 1), el(CODEC_ID, b"V_VP9"), uint(DEFAULT_DURATION, 40_000_000), el(VIDEO, &[uint(PIXEL_WIDTH, 64), uint(PIXEL_HEIGHT, 48)].concat())].concat());
+        let header = b"[Script Info]\nTitle: x\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n";
+        let entries = [video, subtitle_entry(2, "S_TEXT/UTF8", b""), subtitle_entry(3, "S_TEXT/ASS", header), subtitle_entry(4, "S_TEXT/WEBVTT", b""), subtitle_entry(5, "S_VOBSUB", b"")];
+        let cluster = [
+            uint(CLUSTER_TIMECODE, 1000),
+            simple(1, 0, true, &[0xAA; 5]),
+            cue_block(2, 100, b"<i>Hello</i>", 1500),
+            cue_block(3, 200, b"0,0,Default,,0,0,0,,{\\an8}Top", 700),
+            cue_block(4, 300, b"web cue", 400),
+            cue_block(5, 400, b"\x00\x01", 400),
+            cue_block(2, 2000, b"later", 500),
+            simple(1, 40, false, &[0xBB; 5]),
+        ]
+        .concat();
+        let mut d = open(Cursor::new(file_with(&entries, Vec::new(), cluster))).unwrap();
+        let s = d.streams().to_vec();
+        assert_eq!(s.iter().map(|s| s.codec).collect::<Vec<_>>(), vec![CodecId::Vp9, CodecId::SubRip, CodecId::Ass, CodecId::WebVtt]);
+        assert!(s[1..].iter().all(|s| s.params == StreamParams::Subtitle && s.time_base == Rational::new(1, 1000)));
+        assert_eq!(s[2].extradata, header.to_vec(), "the ASS header is the track's private data");
+        assert_eq!(s[1].duration, Some(3500));
+        let mut cues: Vec<Vec<(i64, i64, Vec<u8>)>> = vec![Vec::new(); 4];
+        while let Some(p) = d.read_packet().unwrap() {
+            cues[p.stream].push((p.pts, p.duration, p.data));
+        }
+        assert_eq!(cues[1], vec![(1100, 1500, b"<i>Hello</i>".to_vec()), (3000, 500, b"later".to_vec())]);
+        assert_eq!(cues[2], vec![(1200, 700, b"0,0,Default,,0,0,0,,{\\an8}Top".to_vec())]);
+        assert_eq!(cues[3], vec![(1300, 400, b"web cue".to_vec())]);
+        assert_eq!(crate::subtitle::plain_text(CodecId::Ass, &cues[2][0].2), "Top");
+        let u = d.unsupported_streams();
+        assert_eq!(u.len(), 1);
+        assert!(u[0].contains("S_VOBSUB") && u[0].contains("subtitle"), "{u:?}");
+    }
+
+    #[test]
+    fn a_file_of_subtitles_alone_opens_and_oversize_cues_are_left_out() {
+        let big = vec![b'x'; crate::subtitle::MAX_CUE_BYTES * 2 + 1];
+        let cluster = [uint(CLUSTER_TIMECODE, 0), cue_block(1, 0, b"kept", 100), cue_block(1, 200, &big, 100), cue_block(1, 400, b"", 100)].concat();
+        let mut d = open(Cursor::new(file_with(&[subtitle_entry(1, "S_TEXT/UTF8", b"")], Vec::new(), cluster))).unwrap();
+        let mut n = 0;
+        while let Some(p) = d.read_packet().unwrap() {
+            assert_eq!(p.data, b"kept");
+            n += 1;
+        }
+        assert_eq!(n, 1);
+        // seeking in it lands on the cue
+        assert_eq!(d.seek(0.0).unwrap(), 0.0);
     }
 
     #[test]

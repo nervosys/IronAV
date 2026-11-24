@@ -278,11 +278,29 @@ const SEEDS: &[Seed] = &[
     Seed { name: "avi-h264-ac3", video: true, audio: true, out: &["-c:v", "libx264", "-preset", "ultrafast", "-c:a", "ac3"], ext: "avi" },
     Seed { name: "avi-mpeg4-mp2", video: true, audio: true, out: &["-c:v", "mpeg4", "-c:a", "mp2"], ext: "avi" },
     Seed { name: "mpegts-mpeg2-mp2", video: true, audio: true, out: &["-c:v", "mpeg2video", "-c:a", "mp2", "-f", "mpegts"], ext: "ts" },
+    // text seeds: no ffmpeg, the file is written from `text_seed`
+    Seed { name: "srt", video: false, audio: false, out: &[], ext: "srt" },
+    Seed { name: "vtt", video: false, audio: false, out: &[], ext: "vtt" },
+    Seed { name: "ass", video: false, audio: false, out: &[], ext: "ass" },
 ];
+
+/// The content of a text seed (a subtitle file), by name.
+fn text_seed(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "srt" => "1\r\n00:00:01,000 --> 00:00:03,500\r\n<i>Hello</i>, world\r\n\r\n2\r\n00:00:04.000 --> 00:00:06,000\r\nsecond\r\nline\r\n\r\n3\r\n00:01:00,000 --> 00:01:02,000\r\nlast\r\n",
+        "vtt" => "WEBVTT\n\nNOTE a note\n\nSTYLE\n::cue { color: red }\n\nintro\n00:00:01.000 --> 00:00:03.500 align:start\n<v Bob>Hello &amp; welcome\n\n00:04.000 --> 00:06.000\nsecond\n",
+        "ass" => "[Script Info]\nTitle: t\n\n[V4+ Styles]\nFormat: Name, Fontname\nStyle: Default,Arial\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:01.00,0:00:03.50,Default,Bob,0,0,0,,{\i1}Hello, world{\i0}\Nsecond\nDialogue: 1,0:00:05.00,0:00:06.00,Default,,10,20,30,Banner,Sign\n",
+        _ => return None,
+    })
+}
 
 /// Makes the seed file with ffmpeg. `false` when ffmpeg cannot make it (the seed is skipped).
 fn make_seed(dir: &Path, seed: &Seed) -> Option<PathBuf> {
     let out = dir.join(format!("{}.{}", seed.name, seed.ext));
+    if let Some(text) = text_seed(seed.name) {
+        std::fs::write(&out, text).ok()?;
+        return Some(out);
+    }
     let mut cmd = Command::new("ffmpeg");
     cmd.args(["-v", "error", "-y"]);
     if seed.video {

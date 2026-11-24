@@ -628,6 +628,9 @@ impl Pending {
                 stream["height"] = json!(height);
                 stream["frame_rate"] = json!(frame_rate.as_f64());
             }
+            StreamParams::Subtitle => {
+                stream["media"] = json!("subtitle");
+            }
         }
         let start = json!({ "op": "start", "protocol": PROTOCOL, "name": self.name, "live": self.live, "stream": stream });
         if !running.send(&start.to_string()) {

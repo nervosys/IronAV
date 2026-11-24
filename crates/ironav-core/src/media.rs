@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 pub enum MediaType {
     Audio,
     Video,
+    /// Timed text: SubRip, WebVTT, ASS. Its streams are cues, not samples or pictures.
+    Subtitle,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -208,6 +210,9 @@ codecs! {
     Mpeg1Video => "mpeg1video", Video;
     ProRes => "prores", Video;
     Mjpeg => "mjpeg", Video;
+    SubRip => "subrip", Subtitle;
+    Ass => "ass", Subtitle;
+    WebVtt => "webvtt", Subtitle;
 }
 
 impl CodecId {
@@ -269,6 +274,8 @@ impl<'de> Deserialize<'de> for CodecId {
 pub enum StreamParams {
     Audio { sample_rate: u32, channels: u16 },
     Video { width: u32, height: u32, pix_fmt: PixelFormat, frame_rate: Rational },
+    /// A stream of timed text cues: each packet's `data` is a cue's text, its `pts` and `duration` the time it shows.
+    Subtitle,
 }
 
 impl StreamParams {
@@ -276,6 +283,7 @@ impl StreamParams {
         match self {
             Self::Audio { .. } => MediaType::Audio,
             Self::Video { .. } => MediaType::Video,
+            Self::Subtitle => MediaType::Subtitle,
         }
     }
 }
