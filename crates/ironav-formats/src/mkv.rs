@@ -14,9 +14,11 @@
 //! Content encodings: header stripping and zlib are undone frame by frame (the live reader refuses encoded
 //! tracks); encryption, bzip2, lzo and encodings of the CodecPrivate alone are refused.
 //! Not handled:
-//! chapters, tags, cues and attachments, which are skipped; and a track's start offset, since a
-//! copy re-bases each track to its own first timestamp.
+//! tags, which are skipped; and a track's start offset, since a copy re-bases each track to its own
+//! first timestamp. The Cues are not used by [`open`], which reads every frame's place and so builds
+//! an exact index; [`lazy`] uses them to open a long file without walking it.
 
+pub(crate) mod lazy;
 pub(crate) mod live;
 
 use crate::mp4demux::{av1c_config, gcd, parse_avcc, parse_hvcc, unwrap_frame, Config, Mp4Demuxer, Sample, TrackInfo, Unwrap};
@@ -33,6 +35,10 @@ const TRACKS: u32 = 0x1654_AE6B;
 const CLUSTER: u32 = 0x1F43_B675;
 const CUES: u32 = 0x1C53_BB6B;
 const TAGS: u32 = 0x1254_C367;
+const SEEK: u32 = 0x4DBB;
+const SEEK_ID: u32 = 0x53AB;
+const SEEK_POSITION: u32 = 0x53AC;
+const DURATION: u32 = 0x4489;
 const CHAPTERS: u32 = 0x1043_A770;
 const ATTACHMENTS: u32 = 0x1941_A469;
 
@@ -93,6 +99,8 @@ const MAX_NAME: usize = 512;
 
 /// Sanity cap on the Tracks element we are willing to hold in memory.
 const MAX_TRACKS: u64 = 64 << 20;
+/// The SeekHead is read whole up to this size.
+const MAX_SEEK_HEAD: u64 = 1 << 20;
 
 fn bad(msg: impl std::fmt::Display) -> Error {
     Error::invalid_input(format!("Matroska: {msg}"))
@@ -138,6 +146,18 @@ struct Scan<R: Read + Seek> {
     chapters: Option<Vec<u8>>,
     attachments: Vec<Attachment>,
     doc_type: String,
+    /// Where the Segment's data starts: SeekHead and Cues positions are counted from here.
+    segment_data: u64,
+    /// The SeekHead's entries: an element id and its position from `segment_data`.
+    seek_entries: Vec<(u32, u64)>,
+    /// Stop at the first Cluster instead of walking the file (and note where it is).
+    stop_at_cluster: bool,
+    first_cluster: Option<u64>,
+    /// The Info element's Duration, in ticks.
+    duration: Option<f64>,
+    /// The first and last block times seen in `frames`, in ticks.
+    min_tc: i64,
+    max_tc: i64,
 }
 
 impl<R: Read + Seek> Scan<R> {
@@ -254,6 +274,7 @@ impl<R: Read + Seek> Scan<R> {
             let size = self.size()?;
             if id == SEGMENT {
                 let end = size.map_or(self.len, |s| self.pos.saturating_add(s).min(self.len));
+                self.segment_data = self.pos;
                 return self.segment(end);
             }
             let size = size.ok_or_else(|| bad("an element of unknown size before the segment"))?;
@@ -264,9 +285,14 @@ impl<R: Read + Seek> Scan<R> {
 
     fn segment(&mut self, end: u64) -> Result<()> {
         while self.pos < end && !self.truncated {
+            let at = self.pos;
             let Some(id) = self.id()? else { break };
             let size = self.size()?;
             if id == CLUSTER {
+                if self.stop_at_cluster {
+                    self.first_cluster = Some(at);
+                    return Ok(());
+                }
                 let cluster_end = size.map(|s| self.pos.saturating_add(s).min(self.len));
                 if size.is_some_and(|s| self.pos.saturating_add(s) > self.len) {
                     self.truncated = true;
@@ -281,34 +307,99 @@ impl<R: Read + Seek> Scan<R> {
             }
             let size = size.ok_or_else(|| bad("an element of unknown size that is not a cluster"))?;
             let Some(body_end) = self.end_of(size) else { break };
-            match id {
-                INFO => {
-                    let info = self.body(size)?;
-                    for e in Elems(&info) {
-                        let (id, v) = e?;
-                        if id == TIMECODE_SCALE {
-                            self.scale = be_uint(v)?.max(1);
+            self.level1(id, size, body_end)?;
+        }
+        Ok(())
+    }
+
+    /// A top-level element other than a cluster, whose header has been read: take what it holds, and
+    /// leave the position at its end.
+    fn level1(&mut self, id: u32, size: u64, body_end: u64) -> Result<()> {
+        match id {
+            INFO => {
+                let info = self.body(size)?;
+                for e in Elems(&info) {
+                    let (id, v) = e?;
+                    match id {
+                        TIMECODE_SCALE => self.scale = be_uint(v)?.max(1),
+                        DURATION => self.duration = be_float(v).ok().filter(|d| d.is_finite() && *d > 0.0),
+                        _ => {}
+                    }
+                }
+            }
+            SEEK_HEAD if size <= MAX_SEEK_HEAD => {
+                let head = self.body(size)?;
+                for e in Elems(&head) {
+                    let Ok((SEEK, entry)) = e else { continue };
+                    let (mut what, mut at) = (None, None);
+                    for e in Elems(entry) {
+                        let Ok((id, v)) = e else { break };
+                        match id {
+                            SEEK_ID if v.len() <= 4 => what = be_uint(v).ok().map(|n| n as u32),
+                            SEEK_POSITION => at = be_uint(v).ok(),
+                            _ => {}
+                        }
+                    }
+                    if let (Some(what), Some(at)) = (what, at) {
+                        if self.seek_entries.len() < 64 {
+                            self.seek_entries.push((what, at));
                         }
                     }
                 }
-                CHAPTERS if size <= MAX_CHAPTERS => self.chapters = Some(self.body(size)?),
-                ATTACHMENTS => {
-                    // a damaged list of attachments is left out; it is not a reason to refuse the file
-                    if self.read_attachments(body_end).is_err() {
-                        self.attachments.clear();
-                        self.r.seek(SeekFrom::Start(body_end))?;
-                        self.pos = body_end;
-                    }
-                }
-                TRACKS => {
-                    if size > MAX_TRACKS {
-                        return Err(bad("the track list is implausibly large"));
-                    }
-                    let t = self.body(size)?;
-                    self.tracks = Some(t);
-                }
-                _ => self.skip_to(body_end)?,
             }
+            CHAPTERS if size <= MAX_CHAPTERS => self.chapters = Some(self.body(size)?),
+            ATTACHMENTS => {
+                // a damaged list of attachments is left out; it is not a reason to refuse the file
+                if self.read_attachments(body_end).is_err() {
+                    self.attachments.clear();
+                    self.r.seek(SeekFrom::Start(body_end))?;
+                    self.pos = body_end;
+                }
+            }
+            TRACKS => {
+                if size > MAX_TRACKS {
+                    return Err(bad("the track list is implausibly large"));
+                }
+                let t = self.body(size)?;
+                self.tracks = Some(t);
+            }
+            _ => self.skip_to(body_end)?,
+        }
+        Ok(())
+    }
+
+    /// Read the frames of the clusters from `from` on, until they span at least `span` ticks and, when
+    /// `until` is given, reach that time, or until `end`. Leaves `pos` where the next window starts.
+    /// Clusters of unknown size are refused: their end is where the next element begins, which
+    /// a window cannot restart from.
+    fn window(&mut self, from: u64, end: u64, span: i64, until: Option<i64>) -> Result<()> {
+        self.frames.clear();
+        (self.min_tc, self.max_tc) = (i64::MAX, i64::MIN);
+        self.pending = None;
+        self.truncated = false;
+        self.r.seek(SeekFrom::Start(from))?;
+        self.pos = from;
+        while self.pos < end && !self.truncated {
+            let Some(id) = self.id()? else { break };
+            let size = self.size()?;
+            if id == CLUSTER {
+                let size = size.ok_or_else(|| bad("a cluster of unknown size cannot be indexed a window at a time"))?;
+                let cluster_end = self.pos.saturating_add(size).min(self.len);
+                if self.pos.saturating_add(size) > self.len {
+                    self.truncated = true;
+                }
+                self.cluster(Some(cluster_end))?;
+                if !self.truncated {
+                    self.skip_to(cluster_end)?;
+                }
+                if self.max_tc != i64::MIN && self.max_tc - self.min_tc >= span && until.is_none_or(|u| self.max_tc >= u) {
+                    break;
+                }
+                continue;
+            }
+            let size = size.ok_or_else(|| bad("an element of unknown size that is not a cluster"))?;
+            let Some(body_end) = self.end_of(size) else { break };
+            self.skip_to(body_end)?;
         }
         Ok(())
     }
@@ -482,6 +573,8 @@ impl<R: Read + Seek> Scan<R> {
                     *h = self.need()?;
                 }
             }
+            self.min_tc = self.min_tc.min(tc);
+            self.max_tc = self.max_tc.max(tc);
             self.frames.push(Frame { track, tc, key, offset, size, lace: lace as u32, duration: None, discard: 0, head });
             offset += s;
         }
@@ -1023,40 +1116,71 @@ fn build_track(t: &MkTrack, index: usize, frames: &[&Frame], scale: u64, samples
     Ok(Some(TrackInfo { stream, config, convert, swap, unwrap: t.encodings.clone() }))
 }
 
+impl<R: Read + Seek> Scan<R> {
+    fn new(r: R, len: u64) -> Self {
+        Scan {
+            r: BufReader::with_capacity(256 << 10, r),
+            pos: 0,
+            len,
+            pending: None,
+            truncated: false,
+            frames: Vec::new(),
+            scale: 1_000_000,
+            tracks: None,
+            chapters: None,
+            attachments: Vec::new(),
+            doc_type: String::new(),
+            segment_data: 0,
+            seek_entries: Vec::new(),
+            stop_at_cluster: false,
+            first_cluster: None,
+            duration: None,
+            min_tc: i64::MAX,
+            max_tc: i64::MIN,
+        }
+    }
+}
+
 /// Open a Matroska or WebM file for reading.
 pub fn open<R: Read + Seek + Send>(mut r: R) -> Result<Mp4Demuxer<BufReader<R>>> {
     let len = r.seek(SeekFrom::End(0))?;
     r.seek(SeekFrom::Start(0))?;
-    let mut scan = Scan {
-        r: BufReader::with_capacity(256 << 10, r),
-        pos: 0,
-        len,
-        pending: None,
-        truncated: false,
-        frames: Vec::new(),
-        scale: 1_000_000,
-        tracks: None,
-        chapters: None,
-        attachments: Vec::new(),
-        doc_type: String::new(),
-    };
+    let mut scan = Scan::new(r, len);
     scan.file()?;
     let body = scan.tracks.take().ok_or_else(|| bad("the file has no track list"))?;
     let mk = parse_tracks(&body)?;
+    let (tracks, samples, unsupported, _) = build_tracks(&mut scan, &mk, None)?;
+    if tracks.is_empty() {
+        return Err(Error::new(ErrorCode::UnsupportedCodec, "the file has no audio or video track IronAV recognises"));
+    }
+    let name = if scan.doc_type == "webm" { "webm" } else { "matroska" };
+    // chapters are a convenience: damaged ones are left out, not a reason to refuse the file
+    let chapters = scan.chapters.as_deref().and_then(|c| parse_chapters(c).ok()).unwrap_or_default();
+    let attachments = std::mem::take(&mut scan.attachments);
+    Ok(Mp4Demuxer::from_parts(scan.r, name, tracks, samples).with_extras(chapters, attachments, unsupported))
+}
 
+/// The tracks and samples of the frames found so far, `mk` being the file's track list. `vp9_hint` is the
+/// format of a VP9 track found earlier, for a part of the file that has no key frame. The last
+/// item returned is the VP9 format found.
+type Built = (Vec<TrackInfo>, Vec<Sample>, Vec<String>, Option<(u8, u8)>);
+
+fn build_tracks<R: Read + Seek>(scan: &mut Scan<R>, mk: &[MkTrack], vp9_hint: Option<(u8, u8)>) -> Result<Built> {
     let mut tracks = Vec::new();
     let mut samples = Vec::new();
     let mut unsupported = Vec::new();
-    for t in &mk {
+    let mut found = vp9_hint;
+    for t in mk {
         let frames: Vec<&Frame> = scan.frames.iter().filter(|f| f.track == t.number).collect();
-        let mut vp9 = None;
+        let mut vp9 = vp9_hint;
         if video_codec(&t.codec) == Some(CodecId::Vp9) {
             if let Some(f) = frames.iter().find(|f| f.key) {
                 // the header is read from the frame as the codec sees it, so an encoded track is decoded first
                 let mut raw = vec![0u8; f.size as usize];
                 if scan.r.seek(SeekFrom::Start(f.offset)).is_ok() && scan.r.read_exact(&mut raw).is_ok() {
                     if let Ok(frame) = unwrap_frame(&t.encodings, raw) {
-                        vp9 = vp9_format(&frame[..frame.len().min(16)]);
+                        vp9 = vp9_format(&frame[..frame.len().min(16)]).or(vp9);
+                        found = vp9;
                     }
                 }
             }
@@ -1077,14 +1201,7 @@ pub fn open<R: Read + Seek + Send>(mut r: R) -> Result<Mp4Demuxer<BufReader<R>>>
             tracks.push(info);
         }
     }
-    if tracks.is_empty() {
-        return Err(Error::new(ErrorCode::UnsupportedCodec, "the file has no audio or video track IronAV recognises"));
-    }
-    let name = if scan.doc_type == "webm" { "webm" } else { "matroska" };
-    // chapters are a convenience: damaged ones are left out, not a reason to refuse the file
-    let chapters = scan.chapters.as_deref().and_then(|c| parse_chapters(c).ok()).unwrap_or_default();
-    let attachments = std::mem::take(&mut scan.attachments);
-    Ok(Mp4Demuxer::from_parts(scan.r, name, tracks, samples).with_extras(chapters, attachments, unsupported))
+    Ok((tracks, samples, unsupported, found))
 }
 
 /// A track IronAV does not read, for `unsupported_streams`.

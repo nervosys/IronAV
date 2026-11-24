@@ -1046,13 +1046,19 @@ impl<R: Read + Seek + Send> Demuxer for Mp4Demuxer<R> {
         let video = |s: &Sample| {
             matches!(self.tracks[s.stream as usize].stream.params, StreamParams::Video { .. }) && !self.discarded[s.stream as usize]
         };
+        // The samples are in time order: those at or before `t` are a prefix, found by bisection, and
+        // the landing sample is searched backwards from its end (a keyframe is a GOP away at most).
+        let upto = &self.samples[..self.samples.partition_point(|s| at(s) <= t + 1e-9)];
+        // a key frame is wanted by when it is shown, not when it is decoded: with reordered pictures the
+        // key frame decoded just before the target can be shown just after it
+        let shown = |s: &Sample| (s.dts + s.cts_offset as i64) as f64 * self.tracks[s.stream as usize].stream.time_base.as_f64();
         let landing = if self.samples.iter().any(&video) {
-            self.samples.iter().rfind(|s| video(s) && s.sync && at(s) <= t + 1e-9).map_or(0.0, at)
+            upto.iter().rfind(|s| video(s) && s.sync && shown(s) <= t + 1e-9).map_or(0.0, at)
         } else {
             // No video: start on the packet that contains the requested time (a subtitle cue is not one, unless there is nothing else)
             let sub = |s: &Sample| matches!(self.tracks[s.stream as usize].stream.params, StreamParams::Subtitle);
             let timed = self.samples.iter().any(|s| !sub(s) && !self.discarded[s.stream as usize]);
-            self.samples.iter().rfind(|s| !self.discarded[s.stream as usize] && (!timed || !sub(s)) && at(s) <= t + 1e-9).map_or(t, at)
+            upto.iter().rfind(|s| !self.discarded[s.stream as usize] && (!timed || !sub(s))).map_or(t, at)
         };
         self.next = self.samples.partition_point(|s| at(s) < landing - 1e-9);
         self.seen.fill(0); // the first video packet after a seek needs its parameter sets again

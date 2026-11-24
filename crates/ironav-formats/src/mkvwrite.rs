@@ -2,7 +2,8 @@
 //! AV1 or Motion-JPEG video and AAC, FLAC, MP3, Opus, Vorbis or PCM audio, any number of tracks of each kind.
 //! PCM is written as `A_PCM/INT/LIT` (or `A_PCM/FLOAT/IEEE`) with its sample size as BitDepth.
 //!
-//! Layout: EBML header, Segment (its size patched at the end), Info, Tracks, Clusters, Cues. The
+//! Layout: EBML header, Segment (its size patched at the end), SeekHead (the places of Info, Tracks and
+//! Cues, the last patched at the end), Info, Tracks, Clusters, Cues. The
 //! timestamp scale is one millisecond. Nothing is written until every stream has delivered a
 //! packet and the video's parameter sets have been seen, because the Tracks element needs them
 //! (the packets that arrive meanwhile are held). A cluster is gathered in memory and written whole,
@@ -126,6 +127,8 @@ pub struct MatroskaWriter {
     segment_data: u64,
     segment_size_at: u64,
     duration_at: u64,
+    /// Where the SeekHead's position of the Cues is, patched when they are written.
+    cues_seek_at: u64,
     /// Per FLAC track (its index), the offset of its STREAMINFO in the file, patched when the stream ends.
     flac_info_at: Vec<(usize, u64)>,
     cluster: Option<Cluster>,
@@ -156,6 +159,7 @@ impl MatroskaWriter {
             segment_data: 0,
             segment_size_at: 0,
             duration_at: 0,
+            cues_seek_at: 0,
             flac_info_at: Vec::new(),
             cluster: None,
             cues: Vec::new(),
@@ -235,6 +239,15 @@ impl MatroskaWriter {
         let mut info = uint(0x2A_D7B1, 1_000_000);
         info.extend(string(0x4D80, "IronAV"));
         info.extend(string(0x5741, "IronAV"));
+        // the SeekHead comes first, so a reader finds the Cues at the end without walking the file;
+        // each position is eight bytes wide so the Cues' can be patched in
+        let info_total = (id_bytes(0x1549_A966).len() + size_bytes(info.len() as u64 + 11).len() + info.len() + 11) as u64;
+        let entry = |id: u32, at: u64| el(0x4DBB, &[el(0x53AB, &id_bytes(id)), el(0x53AC, &at.to_be_bytes())].concat());
+        let head_len = el(0x114D_9B74, &[entry(0x1549_A966, 0), entry(0x1654_AE6B, 0), entry(0x1C53_BB6B, 0)].concat()).len() as u64;
+        let head = el(0x114D_9B74, &[entry(0x1549_A966, head_len), entry(0x1654_AE6B, head_len + info_total), entry(0x1C53_BB6B, 0)].concat());
+        self.cues_seek_at = self.pos()? + head.len() as u64 - 8;
+        self.out.write_all(&head)?;
+
         let start = self.pos()?;
         let header_len = id_bytes(0x1549_A966).len() + size_bytes(info.len() as u64 + 11).len();
         self.duration_at = start + header_len as u64 + info.len() as u64 + 3;
@@ -546,6 +559,11 @@ impl Muxer for MatroskaWriter {
         self.close_cluster()?;
 
         if !self.cues.is_empty() {
+            let cues_at = self.pos()? - self.segment_data;
+            let end = self.pos()?;
+            self.out.seek(SeekFrom::Start(self.cues_seek_at))?;
+            self.out.write_all(&cues_at.to_be_bytes())?;
+            self.out.seek(SeekFrom::Start(end))?;
             let mut cues = Vec::new();
             for &(ms, track, at) in &self.cues {
                 let mut pos = uint(0xF7, track as u64); // CueTrack

@@ -280,6 +280,18 @@ pub fn format_for_path(path: &Path) -> Result<&'static FormatSpec> {
 
 /// Open `path` and pick a demuxer from the file's magic bytes (extension is ignored).
 pub fn open_demuxer(path: &Path) -> Result<Box<dyn Demuxer>> {
+    open_with(path, false)
+}
+
+/// [`open_demuxer`] for playback: a Matroska or WebM file whose Cues allow it is not indexed in full, but
+/// a window of clusters at a time from where it is read, so a long file opens and seeks without walking
+/// it. Its streams carry the Info's duration, and a video track is reordered a window at a time. Other
+/// formats, and Matroska without usable Cues, open as with [`open_demuxer`].
+pub fn open_demuxer_lazy(path: &Path) -> Result<Box<dyn Demuxer>> {
+    open_with(path, true)
+}
+
+fn open_with(path: &Path, lazy: bool) -> Result<Box<dyn Demuxer>> {
     let mut f = BufReader::with_capacity(1 << 20, File::open(path)?);
     // a transport stream shows itself by sync bytes 188 (or 192) bytes apart
     let mut magic = [0u8; 400];
@@ -310,7 +322,11 @@ pub fn open_demuxer(path: &Path) -> Result<Box<dyn Demuxer>> {
         Ok(Box::new(mp4demux::Mp4Demuxer::open(f)?))
     } else if mkv::looks_like_mkv(magic) {
         // Matroska does its own buffering: it seeks over every frame while indexing.
-        Ok(Box::new(mkv::open(f.into_inner())?))
+        if lazy {
+            mkv::lazy::open_indexed(f.into_inner())
+        } else {
+            Ok(Box::new(mkv::open(f.into_inner())?))
+        }
     } else if ogg::looks_like_ogg(magic) {
         Ok(Box::new(ogg::open(f)?))
     } else if ac3::looks_like_ac3(magic) || behind_id3.as_ref().is_some_and(|b| ac3::looks_like_ac3(b)) {
