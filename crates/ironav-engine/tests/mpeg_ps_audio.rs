@@ -142,6 +142,7 @@ fn program_streams_list_the_streams_ffprobe_lists() {
                 let kind = match s.params {
                     StreamParams::Video { .. } => "video",
                     StreamParams::Audio { .. } => "audio",
+                    StreamParams::Subtitle => "subtitle",
                 };
                 // IronAV carries DVD linear PCM as the little-endian PCM it converts to
                 let codec = if s.codec.name().starts_with("pcm_") { "pcm_dvd".to_string() } else { s.codec.name().to_string() };

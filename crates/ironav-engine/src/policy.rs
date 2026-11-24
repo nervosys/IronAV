@@ -216,6 +216,8 @@ impl Policy {
                     return Err(Error::new(ErrorCode::InvalidInput, format!("stream {} has {channels} audio channels; at most {MAX_CHANNELS} are decoded", s.index)));
                 }
             }
+            // a subtitle stream is text: there is nothing to decode, so nothing to bound
+            StreamParams::Subtitle => {}
         }
         Ok(())
     }

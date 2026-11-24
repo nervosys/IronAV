@@ -152,16 +152,24 @@ pub(crate) enum Unwrap {
     Inflate,
 }
 
+/// The most a compressed frame may inflate to.
+const MAX_INFLATED: u64 = 256 << 20;
+
 /// Applies `steps` to a stored frame, first step first.
 pub(crate) fn unwrap_frame(steps: &[Unwrap], mut data: Vec<u8>) -> Result<Vec<u8>> {
     for step in steps {
         data = match step {
             Unwrap::Prepend(prefix) => [prefix.as_slice(), data.as_slice()].concat(),
             Unwrap::Inflate => {
-                let mut out = Vec::with_capacity(data.len() * 2);
+                let mut out = Vec::with_capacity(data.len().saturating_mul(2).min(1 << 20));
+                // a frame that inflates past the cap is a zip bomb, not a frame
                 flate2::read::ZlibDecoder::new(&data[..])
+                    .take(MAX_INFLATED + 1)
                     .read_to_end(&mut out)
                     .map_err(|e| corrupt(format!("a zlib-compressed frame does not inflate: {e}")))?;
+                if out.len() as u64 > MAX_INFLATED {
+                    return Err(corrupt("a zlib-compressed frame inflates to more than 256 MiB"));
+                }
                 out
             }
         };
@@ -206,6 +214,8 @@ pub struct Mp4Demuxer<R: Read + Seek + Send> {
     discarded: Vec<bool>,
     /// Samples handed out per stream, to know when a stream's first sample is due.
     seen: Vec<u64>,
+    /// A description of each track the container held that was left out.
+    unsupported: Vec<String>,
 }
 
 impl<R: Read + Seek + Send> Mp4Demuxer<R> {
@@ -348,7 +358,13 @@ impl<R: Read + Seek + Send> Mp4Demuxer<R> {
         samples.sort_by(|a, b| (a.dts as f64 * scale[a.stream as usize]).total_cmp(&(b.dts as f64 * scale[b.stream as usize])));
         let n = tracks.len();
         let streams = tracks.iter().map(|t| t.stream.clone()).collect();
-        Self { name, r, pos: u64::MAX, streams, tracks, samples, next: 0, discarded: vec![false; n], seen: vec![0; n] }
+        Self { name, r, pos: u64::MAX, streams, tracks, samples, next: 0, discarded: vec![false; n], seen: vec![0; n], unsupported: Vec::new() }
+    }
+
+    /// Records a description of each track of the container that was left out.
+    pub(crate) fn with_unsupported(mut self, unsupported: Vec<String>) -> Self {
+        self.unsupported = unsupported;
+        self
     }
 }
 
@@ -998,6 +1014,10 @@ impl<R: Read + Seek + Send> Demuxer for Mp4Demuxer<R> {
         }
     }
 
+    fn unsupported_streams(&self) -> Vec<String> {
+        self.unsupported.clone()
+    }
+
     /// Lands on the last video keyframe at or before `seconds` (or the packet containing it when
     /// there is no video), so the decoder starts on a picture it can decode alone.
     fn seek(&mut self, seconds: f64) -> Result<f64> {
@@ -1009,8 +1029,10 @@ impl<R: Read + Seek + Send> Demuxer for Mp4Demuxer<R> {
         let landing = if self.samples.iter().any(&video) {
             self.samples.iter().rfind(|s| video(s) && s.sync && at(s) <= t + 1e-9).map_or(0.0, at)
         } else {
-            // No video: start on the packet that contains the requested time.
-            self.samples.iter().rfind(|s| !self.discarded[s.stream as usize] && at(s) <= t + 1e-9).map_or(t, at)
+            // No video: start on the packet that contains the requested time (a subtitle cue is not one, unless there is nothing else)
+            let sub = |s: &Sample| matches!(self.tracks[s.stream as usize].stream.params, StreamParams::Subtitle);
+            let timed = self.samples.iter().any(|s| !sub(s) && !self.discarded[s.stream as usize]);
+            self.samples.iter().rfind(|s| !self.discarded[s.stream as usize] && (!timed || !sub(s)) && at(s) <= t + 1e-9).map_or(t, at)
         };
         self.next = self.samples.partition_point(|s| at(s) < landing - 1e-9);
         self.seen.fill(0); // the first video packet after a seek needs its parameter sets again

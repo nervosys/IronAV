@@ -288,6 +288,8 @@ impl MatroskaWriter {
                     v.extend(uint(0xBA, *height as u64));
                     e.extend(el(0xE0, &v));
                 }
+                // the planner leaves subtitle streams out (no codec here is a subtitle codec), so none gets here
+                StreamParams::Subtitle => {}
                 StreamParams::Audio { sample_rate, channels } => {
                     // a fixed frame length lets readers time the frames without the container
                     if matches!(s.codec, CodecId::Aac | CodecId::Mp3 | CodecId::Mp2) && t.first_duration > 0 {

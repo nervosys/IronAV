@@ -96,6 +96,8 @@ impl Settings {
         match f.media {
             MediaType::Video => self.vcodec = pick,
             MediaType::Audio => self.acodec = pick,
+            // subtitle formats are read only: there is no codec to choose
+            MediaType::Subtitle => {}
         }
         if let Some(s) = src {
             self.output = default_output(&s.path, f);
@@ -119,6 +121,7 @@ impl Settings {
         match spec.media {
             MediaType::Video => j.video.codec = Some(self.vcodec.clone()),
             MediaType::Audio => j.audio.codec = Some(self.acodec.clone()),
+            MediaType::Subtitle => {}
         }
         for f in FILTERS.iter().filter(|f| f.media == spec.media && f.params.iter().all(|p| p.ty != "string")) {
             let Some(st) = self.filters.get(f.name).filter(|s| s.enabled) else { continue };

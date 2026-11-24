@@ -375,6 +375,7 @@ impl App {
                     ironav_core::StreamParams::Video { width, height, pix_fmt, frame_rate } => {
                         format!("{width}×{height} · {} · {:.3} fps", pix_fmt.name(), frame_rate.as_f64())
                     }
+                    ironav_core::StreamParams::Subtitle => "text cues".to_string(),
                 });
                 ui.end_row();
             }

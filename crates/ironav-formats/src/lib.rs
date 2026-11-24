@@ -26,6 +26,8 @@ mod jpeg;
 mod keyframe;
 pub use keyframe::is_keyframe;
 mod y4m;
+pub mod subtitle;
+pub mod webvtt;
 
 use ironav_core::{CodecId, Demuxer, Error, ErrorCode, MediaType, Muxer, Result};
 use serde::Serialize;
@@ -129,6 +131,33 @@ pub static FORMATS: &[FormatSpec] = &[
         demux: true,
         mux: false,
         codecs: &[CodecId::Mpeg4, CodecId::H264, CodecId::Mjpeg, CodecId::PcmU8, CodecId::PcmS16Le, CodecId::PcmS24Le, CodecId::PcmS32Le, CodecId::PcmF32Le, CodecId::PcmF64Le, CodecId::Mp3, CodecId::Mp2, CodecId::Ac3, CodecId::Aac],
+    },
+    FormatSpec {
+        name: "srt",
+        extensions: &["srt"],
+        description: "SubRip subtitles: one subtitle stream of timed cues (the `subrip` codec; each packet is a cue's lines, markup kept, with its time and duration in milliseconds). Tolerates a byte order mark, UTF-16, Latin-1, CRLF, a period before the milliseconds and missing blank lines or indexes; text is capped and binary data refused; read only",
+        media: MediaType::Subtitle,
+        demux: true,
+        mux: false,
+        codecs: &[CodecId::SubRip],
+    },
+    FormatSpec {
+        name: "webvtt",
+        extensions: &["vtt", "webvtt"],
+        description: "WebVTT subtitles: one subtitle stream of timed cues (the `webvtt` codec; each packet is a cue's lines with their tags, with its time and duration in milliseconds). NOTE, STYLE and REGION blocks are skipped; text is capped and binary data refused; read only",
+        media: MediaType::Subtitle,
+        demux: true,
+        mux: false,
+        codecs: &[CodecId::WebVtt],
+    },
+    FormatSpec {
+        name: "ass",
+        extensions: &["ass", "ssa"],
+        description: "Advanced SubStation Alpha and SubStation Alpha subtitles: one subtitle stream of timed events (the `ass` codec; each packet is an event in Matroska's form, `ReadOrder,Layer,Style,Name,MarginL,MarginR,MarginV,Effect,Text`, with the override tags kept, and the script header as the stream's codec private data); text is capped and binary data refused; read only",
+        media: MediaType::Subtitle,
+        demux: true,
+        mux: false,
+        codecs: &[CodecId::Ass],
     },
     FormatSpec {
         name: "mp3",
@@ -286,6 +315,12 @@ pub fn open_demuxer(path: &Path) -> Result<Box<dyn Demuxer>> {
         Ok(Box::new(y4m::Y4mDemuxer::open(f)?))
     } else if mpegvideo::looks_like_es(magic) || mpegvideo::looks_like_ps(magic) {
         Ok(Box::new(mpegvideo::MpegVideoDemuxer::open(f, mpegvideo::looks_like_ps(magic))?))
+    } else if let Some(kind) = subtitle::sniff(magic) {
+        Ok(match kind {
+            "webvtt" => Box::new(subtitle::SubtitleDemuxer::vtt(f)?) as Box<dyn Demuxer>,
+            "ass" => Box::new(subtitle::SubtitleDemuxer::ass(f)?),
+            _ => Box::new(subtitle::SubtitleDemuxer::srt(f)?),
+        })
     } else if let Some(codec) = annexb::looks_like(magic) {
         // last: a raw stream is recognised by its start code and first NAL unit alone
         Ok(Box::new(annexb::AnnexBDemuxer::open(f, codec)?))
