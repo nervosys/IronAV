@@ -72,7 +72,7 @@ pub fn decode_bytes(bytes: &[u8]) -> Result<String> {
         return Err(Error::invalid_input(format!("the subtitle file is longer than {} MiB", MAX_FILE_BYTES >> 20)).hint("subtitle files are text; this is not one"));
     }
     let utf16 = |b: &[u8], big: bool| {
-        let units = b.chunks_exact(2).map(|c| if big { u16::from_be_bytes([c[0], c[1]]) } else { u16::from_le_bytes([c[0], c[1]]) });
+        let units = b.as_chunks::<2>().0.iter().map(|c| if big { u16::from_be_bytes([c[0], c[1]]) } else { u16::from_le_bytes([c[0], c[1]]) });
         char::decode_utf16(units).map(|r| r.unwrap_or('\u{FFFD}')).collect::<String>()
     };
     let text = if let Some(b) = bytes.strip_prefix(&[0xFF, 0xFE]) {
@@ -234,7 +234,7 @@ fn srt_timing(line: &str) -> Option<(f64, f64)> {
 pub(crate) fn sniff(magic: &[u8]) -> Option<&'static str> {
     let text: String = if magic.starts_with(&[0xFF, 0xFE]) || magic.starts_with(&[0xFE, 0xFF]) {
         let big = magic[0] == 0xFE;
-        char::decode_utf16(magic[2..].chunks_exact(2).map(|c| if big { u16::from_be_bytes([c[0], c[1]]) } else { u16::from_le_bytes([c[0], c[1]]) })).map(|r| r.unwrap_or('\u{FFFD}')).collect()
+        char::decode_utf16(magic[2..].as_chunks::<2>().0.iter().map(|c| if big { u16::from_be_bytes([c[0], c[1]]) } else { u16::from_le_bytes([c[0], c[1]]) })).map(|r| r.unwrap_or('\u{FFFD}')).collect()
     } else {
         String::from_utf8_lossy(magic.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(magic)).into_owned()
     };

@@ -289,7 +289,7 @@ fn text_seed(name: &str) -> Option<&'static str> {
     Some(match name {
         "srt" => "1\r\n00:00:01,000 --> 00:00:03,500\r\n<i>Hello</i>, world\r\n\r\n2\r\n00:00:04.000 --> 00:00:06,000\r\nsecond\r\nline\r\n\r\n3\r\n00:01:00,000 --> 00:01:02,000\r\nlast\r\n",
         "vtt" => "WEBVTT\n\nNOTE a note\n\nSTYLE\n::cue { color: red }\n\nintro\n00:00:01.000 --> 00:00:03.500 align:start\n<v Bob>Hello &amp; welcome\n\n00:04.000 --> 00:06.000\nsecond\n",
-        "ass" => "[Script Info]\nTitle: t\n\n[V4+ Styles]\nFormat: Name, Fontname\nStyle: Default,Arial\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:01.00,0:00:03.50,Default,Bob,0,0,0,,{\i1}Hello, world{\i0}\Nsecond\nDialogue: 1,0:00:05.00,0:00:06.00,Default,,10,20,30,Banner,Sign\n",
+        "ass" => "[Script Info]\nTitle: t\n\n[V4+ Styles]\nFormat: Name, Fontname\nStyle: Default,Arial\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:01.00,0:00:03.50,Default,Bob,0,0,0,,{\\i1}Hello, world{\\i0}\\Nsecond\nDialogue: 1,0:00:05.00,0:00:06.00,Default,,10,20,30,Banner,Sign\n",
         _ => return None,
     })
 }
