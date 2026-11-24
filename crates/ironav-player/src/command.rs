@@ -2,7 +2,7 @@
 //! with. Every command returns the player's status afterwards, so one call both acts and shows
 //! the effect.
 
-use crate::{base64, rgb_frame, to_png, Player, State};
+use crate::{base64, rgb_frame, to_png, Player, SeekMode, State};
 use ironav_core::{Error, ErrorCode, Result};
 use serde_json::{json, Value};
 
@@ -11,7 +11,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("play", "start or resume playback (restarts from the beginning if it had ended)"),
     ("pause", "pause playback, keeping the position"),
     ("toggle", "switch between playing and paused"),
-    ("seek", "jump to a position: {\"to\": seconds} or {\"by\": seconds} or {\"fraction\": 0..1}"),
+    ("seek", "jump to a position: {\"to\": seconds} or {\"by\": seconds} or {\"fraction\": 0..1}; optional \"mode\": \"accurate\" (default, lands on the exact frame) or \"keyframe\" (shows the keyframe at or before, fast; for scrubbing)"),
     ("volume", "set the volume: {\"value\": 0..2}"),
     ("mute", "mute or unmute: {\"on\": bool} (toggles without it)"),
     ("loop", "repeat from the start at the end: {\"on\": bool}"),
@@ -85,12 +85,18 @@ impl Player {
             "toggle" => self.toggle(),
             "seek" => {
                 let dur = self.info().duration;
+                let mode = match req.get("mode") {
+                    None | Some(Value::Null) => SeekMode::Accurate,
+                    Some(Value::String(s)) if s == "accurate" => SeekMode::Accurate,
+                    Some(Value::String(s)) if s == "keyframe" => SeekMode::Keyframe,
+                    Some(_) => return Err(Error::invalid_arg("\"mode\" must be \"accurate\" or \"keyframe\"").alternatives(["accurate", "keyframe"])),
+                };
                 match (num(req, "to")?, num(req, "by")?, num(req, "fraction")?) {
-                    (Some(t), None, None) => self.seek(t),
-                    (None, Some(d), None) => self.seek_by(d),
+                    (Some(t), None, None) => self.seek_mode(t, mode),
+                    (None, Some(d), None) => self.seek_mode(self.position() + d, mode),
                     (None, None, Some(f)) => {
                         let d = dur.ok_or_else(|| Error::invalid_arg("the duration is unknown, so a fraction cannot be used").hint("use \"to\" or \"by\""))?;
-                        self.seek(f.clamp(0.0, 1.0) * d)
+                        self.seek_mode(f.clamp(0.0, 1.0) * d, mode)
                     }
                     _ => return Err(Error::invalid_arg("give exactly one of \"to\", \"by\" or \"fraction\"")),
                 }

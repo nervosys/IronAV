@@ -1,7 +1,8 @@
 //! IronAV playback engine.
 //!
 //! A [`Player`] opens a media file and decodes it on two background threads, one for audio and
-//! one for video, each with its own demuxer so neither can stall the other. Audio goes to an
+//! one for video, each with its own demuxer so neither can stall the other (the demuxer that
+//! probed the file at open goes to the video thread, so the file is indexed once for it). Audio goes to an
 //! [`AudioOutput`]; the number of audio frames the device has actually played is the master
 //! clock, and video frames are shown when that clock reaches their timestamp. A file without
 //! audio (or after its audio ends) is timed by the wall clock instead.
@@ -23,15 +24,15 @@ pub use color::{Colorimetry, Matrix, YuvToRgb};
 pub use snapshot::{base64, rgb_frame, rgb_frame_reference, to_png};
 
 use ironav_core::{CodecId, Error, ErrorCode, MediaType, Result, StreamInfo, StreamParams, VideoFrame};
-use ironav_formats::open_demuxer;
+use ironav_formats::open_demuxer_lazy;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// How sound is produced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,9 +104,48 @@ pub struct TimedFrame {
     pub frame: VideoFrame,
 }
 
+/// How exactly a seek lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SeekMode {
+    /// The first picture shown is the one on screen at the target: the video is decoded from the
+    /// keyframe before it up to the target.
+    #[default]
+    Accurate,
+    /// The first picture shown is the keyframe at or before the target, which needs no decoding up
+    /// to the target. For scrubbing; follow it with an accurate seek to the same position.
+    Keyframe,
+}
+
 pub(crate) enum Cmd {
-    Seek { to: f64, gen: u64 },
+    Seek { to: f64, gen: u64, mode: SeekMode },
     Stop,
+}
+
+/// What a decoding thread sleeps on when it has nothing to do: rung by commands and by whatever
+/// frees it to work (a picture taken from a full queue, playing again), so no thread polls.
+#[derive(Default)]
+pub(crate) struct Bell {
+    n: Mutex<u64>,
+    cv: Condvar,
+}
+
+impl Bell {
+    /// The ring count; read it before looking at what may have changed, and give it to [`Bell::wait`].
+    pub fn count(&self) -> u64 {
+        *self.n.lock().unwrap()
+    }
+
+    pub fn ring(&self) {
+        *self.n.lock().unwrap() += 1;
+        self.cv.notify_all();
+    }
+
+    /// Sleep until the bell has rung since `seen`, or `timeout` has passed.
+    pub fn wait(&self, seen: u64, timeout: Duration) {
+        let g = self.n.lock().unwrap();
+        let _ = self.cv.wait_timeout_while(g, timeout, |n| *n == seen);
+    }
 }
 
 #[derive(Default)]
@@ -179,6 +219,8 @@ pub(crate) struct Inner {
     pub video: Mutex<VideoQueue>,
     pub error: Mutex<Option<Error>>,
     pub shutdown: AtomicBool,
+    pub video_bell: Bell,
+    pub audio_bell: Bell,
     /// Called when a new picture is queued or playback fails, so a window can repaint at once.
     pub waker: Mutex<Option<Waker>>,
 }
@@ -327,10 +369,11 @@ impl Player {
         if !Path::new(path).exists() {
             return Err(Error::new(ErrorCode::NotFound, format!("'{path}' does not exist")).hint("check the path"));
         }
-        let probe = open_demuxer(Path::new(path))?;
+        // The probe is kept: the video thread reads from it, so the index it built is used.
+        let probe = open_demuxer_lazy(Path::new(path))?;
         let format = probe.format_name();
         let streams = probe.streams().to_vec();
-        drop(probe);
+        let mut probe = Some(probe);
 
         let mut warnings = Vec::new();
         // Video: needs a decoder (software, or a GPU one); built now so a failure is reported at open.
@@ -410,17 +453,19 @@ impl Player {
             video: Mutex::new(VideoQueue { gen: 1, ..Default::default() }),
             error: Mutex::new(None),
             shutdown: AtomicBool::new(false),
+            video_bell: Bell::default(),
+            audio_bell: Bell::default(),
             waker: Mutex::new(None),
         });
 
         let (mut tx, mut threads) = (Vec::new(), Vec::new());
         if let Some((s, dec, _)) = video {
-            let (t, h) = pipeline::spawn_video(inner.clone(), path.to_string(), s, dec, start);
+            let (t, h) = pipeline::spawn_video(inner.clone(), path.to_string(), s, dec, probe.take(), start);
             tx.push(t);
             threads.push(h);
         }
         if let Some((s, dec)) = audio {
-            let (t, h) = pipeline::spawn_audio(inner.clone(), path.to_string(), s, dec, start);
+            let (t, h) = pipeline::spawn_audio(inner.clone(), path.to_string(), s, dec, probe.take(), start);
             tx.push(t);
             threads.push(h);
         }
@@ -463,6 +508,9 @@ impl Player {
         if c.ready && !c.running {
             self.inner.start_clock(&mut c);
         }
+        drop(c);
+        // a decoder that stopped after a keyframe seek carries on
+        self.inner.video_bell.ring();
     }
 
     pub fn pause(&self) {
@@ -478,8 +526,14 @@ impl Player {
         if playing && self.state() != State::Ended { self.pause() } else { self.play() }
     }
 
-    /// Jump to `seconds` (clamped to the media). Playback continues or stays paused as it was.
+    /// Jump to `seconds` (clamped to the media), landing exactly. Playback continues or stays paused as it was.
     pub fn seek(&self, seconds: f64) {
+        self.seek_mode(seconds, SeekMode::Accurate);
+    }
+
+    /// [`Player::seek`] with a choice of how exactly to land: [`SeekMode::Keyframe`] shows the
+    /// keyframe at or before `seconds` at once, without decoding up to it.
+    pub fn seek_mode(&self, seconds: f64, mode: SeekMode) {
         let inner = &self.inner;
         let mut target = if seconds.is_finite() { seconds.max(0.0) } else { 0.0 };
         if let Some(d) = inner.info.duration {
@@ -509,8 +563,10 @@ impl Player {
             *v = VideoQueue { gen, shown, skipped, ..Default::default() };
         }
         for t in &self.tx {
-            let _ = t.send(Cmd::Seek { to: target, gen });
+            let _ = t.send(Cmd::Seek { to: target, gen, mode });
         }
+        inner.video_bell.ring();
+        inner.audio_bell.ring();
     }
 
     pub fn seek_by(&self, delta: f64) {
@@ -549,7 +605,12 @@ impl Player {
         if !q.ready {
             return None;
         }
+        let before = q.frames.len();
         q.discard_stale(pos);
+        if q.frames.len() < before {
+            // room for the decoder to queue more
+            self.inner.video_bell.ring();
+        }
         let front = q.frames.front().cloned();
         match front {
             Some(f) if f.time <= pos + 1e-4 || q.last.is_none() => {
@@ -606,6 +667,8 @@ impl Drop for Player {
         for t in &self.tx {
             let _ = t.send(Cmd::Stop);
         }
+        self.inner.video_bell.ring();
+        self.inner.audio_bell.ring();
         if let Some(out) = &self.inner.out {
             out.set_playing(false);
         }

@@ -927,7 +927,7 @@ pub fn tools() -> &'static [Tool] {
             },
             Tool {
                 name: "play_control",
-                description: "Send one command to a playback session and get the status back. Commands: play, pause, toggle, seek (to | by | fraction), volume (value), mute (on), loop (on), snapshot (the current picture as PNG; inline base64 unless path is given), wait (until position or state=ended), status, help. The status reports state, position, stream info, frames shown and skipped, and the audio level, which is above zero while sound is actually being played.",
+                description: "Send one command to a playback session and get the status back. Commands: play, pause, toggle, seek (to | by | fraction, and mode: \"accurate\" lands on the exact frame, \"keyframe\" shows the keyframe at or before at once, for scrubbing), volume (value), mute (on), loop (on), snapshot (the current picture as PNG; inline base64 unless path is given), wait (until position or state=ended), status, help. The status reports state, position, stream info, frames shown and skipped, and the audio level, which is above zero while sound is actually being played.",
                 cli: "ironav play <file> --json  then {\"cmd\":\"seek\",\"to\":30}",
                 input_schema: object(
                     json!({
@@ -936,6 +936,7 @@ pub fn tools() -> &'static [Tool] {
                         "to": { "type": "number", "description": "seek: absolute position in seconds" },
                         "by": { "type": "number", "description": "seek: relative offset in seconds, may be negative" },
                         "fraction": { "type": "number", "minimum": 0, "maximum": 1, "description": "seek: position as a fraction of the duration" },
+                        "mode": { "type": "string", "enum": ["accurate", "keyframe"], "default": "accurate", "description": "seek: accurate lands on the frame at the target; keyframe shows the keyframe at or before it, quickly (for scrubbing; follow with an accurate seek)" },
                         "value": { "type": "number", "minimum": 0, "maximum": 2, "description": "volume: linear gain" },
                         "on": { "type": "boolean", "description": "mute / loop: the new setting; toggles when omitted" },
                         "max_width": { "type": "integer", "description": "snapshot: shrink to fit this width" },

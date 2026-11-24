@@ -2,13 +2,13 @@
 //! read, decoded and queued independently; the clock in `lib.rs` decides what is shown.
 
 use crate::output::{AudioOutput, NullOutput};
-use crate::{AudioMode, Cmd, Inner, TimedFrame};
+use crate::{AudioMode, Cmd, Inner, SeekMode, TimedFrame};
 use ironav_codec::is_implemented;
-use ironav_core::{Decoder, Error, ErrorCode, Frame, MediaType, Result, StreamInfo, StreamParams};
-use ironav_formats::open_demuxer;
+use ironav_core::{Decoder, Demuxer, Error, ErrorCode, Frame, MediaType, Result, StreamInfo, StreamParams};
+use ironav_formats::open_demuxer_lazy;
 use ironav_hwaccel::{new_video_decoder, probe_all, select, Direction, HwPolicy};
 use std::path::Path;
-use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -68,29 +68,33 @@ pub fn open_output(mode: AudioMode, rate: u32, channels: u16, warnings: &mut Vec
 
 type Spawned = (Sender<Cmd>, JoinHandle<()>);
 
-pub fn spawn_video(inner: Arc<Inner>, path: String, stream: StreamInfo, dec: Box<dyn Decoder>, start: f64) -> Spawned {
+pub fn spawn_video(inner: Arc<Inner>, path: String, stream: StreamInfo, dec: Box<dyn Decoder>, demux: Option<Box<dyn Demuxer>>, start: f64) -> Spawned {
     let (tx, rx) = channel();
     let h = std::thread::Builder::new().name("ironav-video".into()).spawn(move || {
-        if let Err(e) = video_loop(&inner, &path, &stream, dec, start, rx) {
+        if let Err(e) = video_loop(&inner, &path, &stream, dec, demux, start, rx) {
             inner.fail(e);
         }
     });
     (tx, h.expect("spawn video thread"))
 }
 
-pub fn spawn_audio(inner: Arc<Inner>, path: String, stream: StreamInfo, dec: Box<dyn Decoder>, start: f64) -> Spawned {
+pub fn spawn_audio(inner: Arc<Inner>, path: String, stream: StreamInfo, dec: Box<dyn Decoder>, demux: Option<Box<dyn Demuxer>>, start: f64) -> Spawned {
     let (tx, rx) = channel();
     let h = std::thread::Builder::new().name("ironav-audio".into()).spawn(move || {
-        if let Err(e) = audio_loop(&inner, &path, &stream, dec, start, rx) {
+        if let Err(e) = audio_loop(&inner, &path, &stream, dec, demux, start, rx) {
             inner.fail(e);
         }
     });
     (tx, h.expect("spawn audio thread"))
 }
 
-/// Open a demuxer that only reads `stream`.
-fn demuxer_for(path: &str, stream: &StreamInfo) -> Result<Box<dyn ironav_core::Demuxer>> {
-    let mut d = open_demuxer(Path::new(path))?;
+/// A demuxer that only reads `stream`: the one the probe at open left (when it is handed over, so the
+/// file is not indexed again), or a new one.
+fn demuxer_for(path: &str, stream: &StreamInfo, given: Option<Box<dyn Demuxer>>) -> Result<Box<dyn Demuxer>> {
+    let mut d = match given {
+        Some(d) => d,
+        None => open_demuxer_lazy(Path::new(path))?,
+    };
     let others: Vec<usize> = d.streams().iter().map(|s| s.index).filter(|&i| i != stream.index).collect();
     for i in others {
         d.discard(i);
@@ -104,59 +108,90 @@ enum Wake {
     Closed,
 }
 
-fn poll(rx: &Receiver<Cmd>, wait: Duration) -> Wake {
-    let r = if wait.is_zero() { rx.try_recv().map_err(|e| matches!(e, std::sync::mpsc::TryRecvError::Disconnected)) } else {
-        rx.recv_timeout(wait).map_err(|e| matches!(e, RecvTimeoutError::Disconnected))
-    };
-    match r {
+/// The next command, if one is waiting. Waiting for one is `Bell::wait`, which a command rings.
+fn poll(rx: &Receiver<Cmd>) -> Wake {
+    match rx.try_recv() {
         Ok(c) => Wake::Cmd(c),
-        Err(true) => Wake::Closed,
-        Err(false) => Wake::Nothing,
+        Err(TryRecvError::Disconnected) => Wake::Closed,
+        Err(TryRecvError::Empty) => Wake::Nothing,
     }
 }
 
 // ---- video ----------------------------------------------------------------------------------
 
-fn video_loop(inner: &Inner, path: &str, stream: &StreamInfo, mut dec: Box<dyn Decoder>, start: f64, rx: Receiver<Cmd>) -> Result<()> {
+fn video_loop(inner: &Inner, path: &str, stream: &StreamInfo, mut dec: Box<dyn Decoder>, demux: Option<Box<dyn Demuxer>>, start: f64, rx: Receiver<Cmd>) -> Result<()> {
     let tb = stream.time_base.as_f64();
-    let mut demux = demuxer_for(path, stream)?;
+    let mut demux = demuxer_for(path, stream, demux)?;
     let mut gen = 1u64;
     let mut target = start;
     let mut need_seek = start > 0.0;
     let mut draining = false; // end of input reached and decoder flushed
+    // Whether the decoder has been given packets since it was made: only then does a seek need to reset it.
+    let mut fed = false;
     // The frame to show at the seek target is the last one at or before it, so one decoded
     // frame is held back until the next shows whether it is the one.
     let mut held: Option<TimedFrame> = None;
     let mut seeking = start > 0.0;
+    // A keyframe seek is over once its picture is queued: while paused nothing more is decoded, so a
+    // burst of them (a seek bar being dragged) costs one picture each.
+    let mut keyframe_only = false;
+    let mut parked = false;
+    // A keyframe seek asks the decoder for the keyframe's picture at once (a flush), which ends its stream
+    // as far as it is concerned: the time of that picture, when playing has to start over from it.
+    let mut flushed_at: Option<f64> = None;
+    let (mut asked, mut got) = (false, false);
 
     loop {
         if inner.shutdown.load(std::sync::atomic::Ordering::SeqCst) {
             return Ok(());
         }
-        let idle = draining || {
-            let q = inner.video.lock().unwrap();
-            q.frames.len() >= VIDEO_FRAMES_AHEAD || q.bytes >= VIDEO_BYTES_AHEAD
-        };
-        match poll(&rx, if idle { Duration::from_millis(5) } else { Duration::ZERO }) {
+        // read before looking at anything, so a ring after this point is not missed
+        let seen = inner.video_bell.count();
+        match poll(&rx) {
             Wake::Cmd(Cmd::Stop) | Wake::Closed => return Ok(()),
-            Wake::Cmd(Cmd::Seek { to, gen: g }) => {
+            Wake::Cmd(Cmd::Seek { to, gen: g, mode }) => {
                 gen = g;
                 target = to;
                 need_seek = true;
-                seeking = true;
+                seeking = mode == SeekMode::Accurate;
+                keyframe_only = !seeking;
+                parked = false;
+                flushed_at = None;
+                (asked, got) = (false, false);
                 draining = false;
                 held = None;
                 continue;
             }
             Wake::Nothing => {}
         }
-        if idle {
+        if parked && inner.clock.lock().unwrap().playing {
+            parked = false;
+            if let Some(t) = flushed_at.take() {
+                // the decoder was flushed to get the keyframe out: decode on from the keyframe again
+                target = t;
+                need_seek = true;
+                seeking = true;
+                held = None;
+            }
+        }
+        let full = {
+            let q = inner.video.lock().unwrap();
+            q.frames.len() >= VIDEO_FRAMES_AHEAD || q.bytes >= VIDEO_BYTES_AHEAD
+        };
+        if draining || parked || full {
             // Keep the queue moving even when nobody is displaying it (headless playback).
-            if !draining {
+            let mut wait = Duration::from_millis(250);
+            if !draining && !parked {
                 if let Some(pos) = inner.update() {
-                    inner.video.lock().unwrap().discard_stale(pos);
+                    let mut q = inner.video.lock().unwrap();
+                    q.discard_stale(pos);
+                    // the next picture falls due: look again then (a display that takes pictures rings sooner)
+                    if let Some(f) = q.frames.get(1) {
+                        wait = Duration::from_secs_f64((f.time - pos).clamp(0.001, 0.25));
+                    }
                 }
             }
+            inner.video_bell.wait(seen, wait);
             continue;
         }
         if need_seek {
@@ -164,21 +199,37 @@ fn video_loop(inner: &Inner, path: &str, stream: &StreamInfo, mut dec: Box<dyn D
             if target > 0.0 || gen > 1 {
                 demux.seek(target)?;
             }
-            // A new decoder: the old one may hold frames from before the jump.
-            dec = open_video_decoder(stream, &inner.hwaccel)?.0;
+            // The decoder may hold frames and references from before the jump: start it over. It is
+            // kept (a GPU decoder takes long to make); one that cannot be reset is made again. The
+            // packet read next feeds it, so `fed` stays set.
+            if fed && !dec.reset() {
+                dec = open_video_decoder(stream, &inner.hwaccel)?.0;
+            }
         }
 
         let mut frames: Vec<Frame> = Vec::new();
         match demux.read_packet()? {
-            Some(p) => frames.extend(dec.decode(&p)?),
+            Some(p) => {
+                fed = true;
+                frames.extend(dec.decode(&p)?);
+                if frames.is_empty() && keyframe_only && !asked {
+                    // a keyframe seek wants the keyframe's picture now, not when the decoder has been given
+                    // enough packets to fill its threads and its reordering
+                    asked = true;
+                    frames.extend(dec.flush()?);
+                    got = !frames.is_empty();
+                }
+            }
             None => {
                 frames.extend(dec.flush()?);
                 draining = true;
+                fed = true;
             }
         }
         for f in frames {
             let Frame::Video(v) = f else { continue };
             let t = TimedFrame { time: v.pts as f64 * tb, frame: v };
+            let t_time = t.time;
             let ready = if seeking && t.time <= target + 1e-6 {
                 held = Some(t);
                 None
@@ -194,7 +245,15 @@ fn video_loop(inner: &Inner, path: &str, stream: &StreamInfo, mut dec: Box<dyn D
                     if !push_video(inner, gen, t) {
                         break;
                     }
+                    if keyframe_only {
+                        keyframe_only = false;
+                        parked = true;
+                        flushed_at = got.then_some(t_time);
+                    }
                 }
+            }
+            if parked {
+                break; // the rest of the packet's pictures belong to the frames after the keyframe
             }
         }
         if draining {
@@ -296,13 +355,13 @@ impl Convert {
     }
 }
 
-fn audio_loop(inner: &Inner, path: &str, stream: &StreamInfo, mut dec: Box<dyn Decoder>, start: f64, rx: Receiver<Cmd>) -> Result<()> {
+fn audio_loop(inner: &Inner, path: &str, stream: &StreamInfo, mut dec: Box<dyn Decoder>, demux: Option<Box<dyn Demuxer>>, start: f64, rx: Receiver<Cmd>) -> Result<()> {
     let out = inner.out.clone().expect("audio pipeline has an output");
     let StreamParams::Audio { sample_rate, channels } = stream.params else {
         return Err(Error::new(ErrorCode::Internal, "audio pipeline given a non-audio stream"));
     };
     let tb = stream.time_base.as_f64();
-    let mut demux = demuxer_for(path, stream)?;
+    let mut demux = demuxer_for(path, stream, demux)?;
     let mut conv = Convert::new(sample_rate, channels as usize, out.rate(), out.channels() as usize);
     let (ahead, ready_at) = ((AUDIO_AHEAD * out.rate() as f64) as usize, (AUDIO_READY * out.rate() as f64) as usize);
     let mut gen = 1u64;
@@ -315,10 +374,10 @@ fn audio_loop(inner: &Inner, path: &str, stream: &StreamInfo, mut dec: Box<dyn D
         if inner.shutdown.load(std::sync::atomic::Ordering::SeqCst) {
             return Ok(());
         }
-        let idle = finished || out.queued_frames() >= ahead;
-        match poll(&rx, if idle { Duration::from_millis(5) } else { Duration::ZERO }) {
+        let seen = inner.audio_bell.count();
+        match poll(&rx) {
             Wake::Cmd(Cmd::Stop) | Wake::Closed => return Ok(()),
-            Wake::Cmd(Cmd::Seek { to, gen: g }) => {
+            Wake::Cmd(Cmd::Seek { to, gen: g, .. }) => {
                 gen = g;
                 trim_before = to;
                 need_seek = true;
@@ -327,7 +386,12 @@ fn audio_loop(inner: &Inner, path: &str, stream: &StreamInfo, mut dec: Box<dyn D
             }
             Wake::Nothing => {}
         }
-        if idle {
+        let queued = out.queued_frames();
+        if finished || queued >= ahead {
+            // The device drains the queue at its own rate, so look again when a quarter of it is gone
+            // (a command or a pause rings sooner).
+            let wait = if finished { Duration::from_millis(250) } else { Duration::from_secs_f64(((queued - ahead * 3 / 4) as f64 / out.rate() as f64).clamp(0.002, 0.1)) };
+            inner.audio_bell.wait(seen, wait);
             continue;
         }
         if need_seek {

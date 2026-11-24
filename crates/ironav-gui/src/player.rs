@@ -5,13 +5,22 @@ use crate::gpu;
 use eframe::egui::{self, Color32, RichText};
 use ironav_core::Error;
 use ironav_formats::FORMATS;
-use ironav_player::{rgb_frame, to_png, AudioMode, OpenOptions, Player, State, TimedFrame};
+use ironav_player::{rgb_frame, to_png, AudioMode, OpenOptions, Player, SeekMode, State, TimedFrame};
 use serde_json::Value;
+use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const ACCENT: Color32 = Color32::from_rgb(249, 115, 22);
 const BAD: Color32 = Color32::from_rgb(248, 81, 73);
+/// While the seek bar is dragged, a keyframe seek is sent at most this often.
+const SCRUB_EVERY: Duration = Duration::from_millis(40);
+
+/// A file being opened on another thread, so the window stays alive meanwhile.
+struct Opening {
+    path: String,
+    rx: Receiver<ironav_core::Result<Player>>,
+}
 
 pub struct PlayerApp {
     ctx: egui::Context,
@@ -19,6 +28,8 @@ pub struct PlayerApp {
     /// the picture's format allows; otherwise they are converted on the CPU into `tex`.
     gpu: bool,
     player: Option<Player>,
+    /// The file being opened; the result arrives here and replaces `player`.
+    opening: Option<Opening>,
     /// The picture last shown, kept so a seek does not flash black while the next one decodes.
     last: Option<Arc<TimedFrame>>,
     path: String,
@@ -28,6 +39,8 @@ pub struct PlayerApp {
     shown: Option<(usize, u32, u32)>,
     /// Position being dragged on the seek bar, as a fraction.
     scrub: Option<f32>,
+    /// When and where the last keyframe seek of a drag was sent.
+    scrub_sent: Option<(Instant, f32)>,
     show_agent: bool,
     note: Option<(String, std::time::Instant)>,
     fullscreen: bool,
@@ -40,7 +53,7 @@ fn fmt_time(s: f64) -> String {
 
 impl PlayerApp {
     pub fn new(initial: Option<String>, gpu: bool, ctx: egui::Context) -> Self {
-        let mut a = Self { ctx, gpu, last: None, player: None, path: String::new(), error: None, tex: None, shown: None, scrub: None, show_agent: false, note: None, fullscreen: false };
+        let mut a = Self { ctx, gpu, last: None, player: None, opening: None, path: String::new(), error: None, tex: None, shown: None, scrub: None, scrub_sent: None, show_agent: false, note: None, fullscreen: false };
         if let Some(p) = initial {
             a.open(&p);
         }
@@ -52,12 +65,40 @@ impl PlayerApp {
         self.tex = None;
         self.shown = None;
         self.last = None;
-        match Player::open(path, &OpenOptions { audio: AudioMode::Auto, ..Default::default() }) {
+        self.scrub = None;
+        self.scrub_sent = None;
+        self.error = None;
+        // Opening reads and indexes the file and starts the decoder, which can take a while for a
+        // large file or a slow disk: it runs on its own thread, and the window shows that it is working.
+        let (tx, rx) = channel();
+        let (p, ctx) = (path.to_string(), self.ctx.clone());
+        let spawned = std::thread::Builder::new().name("ironav-open".into()).spawn(move || {
+            let r = Player::open(&p, &OpenOptions { audio: AudioMode::Auto, ..Default::default() });
+            let _ = tx.send(r);
+            ctx.request_repaint();
+        });
+        match spawned {
+            Ok(_) => self.opening = Some(Opening { path: path.to_string(), rx }),
+            Err(e) => self.error = Some(Error::new(ironav_core::ErrorCode::Internal, format!("cannot start the open: {e}"))),
+        }
+    }
+
+    /// Take the player the open thread has finished, if it has.
+    fn finish_open(&mut self) {
+        let Some(o) = &self.opening else { return };
+        let r = match o.rx.try_recv() {
+            Ok(r) => r,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err(Error::new(ironav_core::ErrorCode::Internal, "the open stopped without a result")),
+        };
+        let path = std::mem::take(&mut self.opening.as_mut().unwrap().path);
+        self.opening = None;
+        match r {
             Ok(p) => {
                 // Repaint the moment a decoder thread queues a picture or fails, not on a timer.
                 let ctx = self.ctx.clone();
                 p.set_waker(Arc::new(move || ctx.request_repaint()));
-                self.path = path.to_string();
+                self.path = path;
                 self.error = None;
                 self.player = Some(p);
             }
@@ -172,10 +213,21 @@ impl PlayerApp {
                 self.scrub = Some(frac_at(pt.x));
             }
         }
+        // While the bar is dragged, show the keyframe at the pointer (quick); on release, seek to the exact frame.
+        if resp.dragged() {
+            if let (Some(f), Some(d)) = (self.scrub, dur) {
+                let due = self.scrub_sent.is_none_or(|(t, last)| last != f && t.elapsed() >= SCRUB_EVERY);
+                if due {
+                    p.seek_mode(f as f64 * d, SeekMode::Keyframe);
+                    self.scrub_sent = Some((Instant::now(), f));
+                }
+            }
+        }
         if (resp.drag_stopped() || resp.clicked()) && self.scrub.is_some() {
             if let (Some(f), Some(d)) = (self.scrub.take(), dur) {
                 p.seek(f as f64 * d);
             }
+            self.scrub_sent = None;
         }
         let shown_frac = self.scrub.map(f64::from).or_else(|| dur.filter(|d| *d > 0.0).map(|d| (pos / d).clamp(0.0, 1.0))).unwrap_or(0.0) as f32;
         let bar = egui::Rect::from_center_size(rect.center(), egui::vec2(rect.width(), 6.0));
@@ -236,6 +288,7 @@ impl eframe::App for PlayerApp {
         if let Some(p) = ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf())) {
             self.open(&p.display().to_string());
         }
+        self.finish_open();
         self.keys(&ctx);
         // The status JSON is built at most once per UI frame, and only for what shows it: the Agent
         // view and the audio-only level meter.
@@ -317,6 +370,15 @@ impl eframe::App for PlayerApp {
                         audio_only(ui, full, p, st);
                     }
                 }
+            } else if let Some(o) = &self.opening {
+                let name = std::path::Path::new(&o.path).file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+                ui.centered_and_justified(|ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space((avail.y / 2.0 - 30.0).max(0.0));
+                        ui.add(egui::Spinner::new().size(28.0).color(ACCENT));
+                        ui.label(RichText::new(format!("Opening {name}…")).color(Color32::GRAY).size(16.0));
+                    });
+                });
             } else {
                 ui.centered_and_justified(|ui| {
                     ui.label(RichText::new("Drop a file here, or choose Open…").color(Color32::GRAY).size(18.0));
@@ -357,6 +419,9 @@ impl PlayerApp {
                 State::Ended if p.looping() => soonest(Duration::from_millis(50)),
                 _ => {}
             }
+        }
+        if self.opening.is_some() {
+            soonest(Duration::from_millis(50));
         }
         if let Some((_, t)) = &self.note {
             if let Some(left) = Duration::from_secs(4).checked_sub(t.elapsed()) {

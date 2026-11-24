@@ -184,3 +184,139 @@ fn headless_playback_reaches_the_end_without_anyone_drawing_frames() {
     until("the end", 8.0, || pl.state() == State::Ended);
     assert!((pl.position() - 4.0).abs() < 0.2, "ended at {}", pl.position());
 }
+
+// ---- seeking in a file with key frames -------------------------------------------------------
+
+/// `frames` pictures of H.264 at 10 fps, an IDR picture every `keyint`, each picture a little different from the last, written to `path` as `format` ("mp4" or "mkv").
+fn write_h264(path: &std::path::Path, format: &str, frames: usize, keyint: u64) {
+    use ironav_core::{CodecId, Encoder, Frame, PixelFormat, Rational, StreamInfo, StreamParams, VideoFrame};
+    let (w, h) = (64u32, 48u32);
+    let params = StreamParams::Video { width: w, height: h, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational::new(10, 1) };
+    let mut enc = ironav_codec::encoders::H264Encoder::new(&params, None, None).unwrap().with_keyint(keyint);
+    let info = StreamInfo {
+        index: 0,
+        codec: CodecId::H264,
+        time_base: Rational::new(1, 10),
+        duration: Some(frames as i64),
+        bits: None,
+        extradata: ironav_codec::encoder_extradata(CodecId::H264, &params),
+        lead_in: ironav_codec::encoder_lead_in(CodecId::H264),
+        params,
+    };
+    let mut mux = ironav_formats::create_muxer(path, format).unwrap();
+    mux.write_header(std::slice::from_ref(&info)).unwrap();
+    let mut packets = Vec::new();
+    for n in 0..frames {
+        // a gradient that drifts a little each picture: smooth enough that the encoder sees no scene cut, so
+        // the key frames are the ones asked for
+        let (wu, hu) = (w as usize, h as usize);
+        let luma: Vec<u8> = (0..wu * hu).map(|k| (40 + ((k % wu) * 2 + (k / wu) + n) % 160) as u8).collect();
+        let f = VideoFrame { width: w, height: h, pix_fmt: PixelFormat::Yuv420p, pts: n as i64, planes: vec![luma, vec![128; wu * hu / 4], vec![128; wu * hu / 4]] };
+        packets.extend(enc.encode(&Frame::Video(f)).unwrap());
+    }
+    packets.extend(enc.flush().unwrap());
+    for p in packets {
+        mux.write_packet(&p).unwrap();
+    }
+    mux.finish().unwrap();
+}
+
+/// The time of the first picture shown after a seek to `to` in `mode`.
+fn first_after_seek(pl: &Player, to: f64, mode: ironav_player::SeekMode) -> f64 {
+    pl.seek_mode(to, mode);
+    until("a picture after the seek", 10.0, || pl.frame().is_some());
+    pl.frame().unwrap().time
+}
+
+#[test]
+fn accurate_seeks_land_on_the_frame_at_the_target_and_keyframe_seeks_on_the_keyframe_before_it() {
+    use ironav_player::SeekMode::{Accurate, Keyframe};
+    for format in ["mp4", "mkv"] {
+        let p = dir(&format!("gop-{format}")).join(format!("v.{format}"));
+        write_h264(&p, format, 60, 10); // six seconds, a key frame each second
+        let opts = OpenOptions { autoplay: false, hwaccel: "off".into(), ..silent() };
+        let pl = Player::open(p.to_str().unwrap(), &opts).unwrap();
+        until("first frame", 10.0, || pl.frame().is_some());
+        // a file with reordered pictures starts a frame or so after zero: times below are from its first picture
+        let off = pl.frame().unwrap().time;
+        assert!((0.0..0.25).contains(&off), "{format}: the first picture is at {off}");
+
+        // (target, the frame at it, the key frame at or before it), in seconds after the first picture
+        for (to, exact, key) in [(2.5, 2.5, 2.0), (2.55, 2.5, 2.0), (4.0, 4.0, 4.0), (4.99, 4.9, 4.0), (0.3, 0.3, 0.0), (5.95, 5.9, 5.0)] {
+            // the order matters: a keyframe seek leaves the decoder after the keyframe, an accurate one after the target
+            let k = first_after_seek(&pl, off + to, Keyframe);
+            assert!((k - (off + key)).abs() < 1e-6, "{format}: keyframe seek to {to} showed {}, wanted {key}", k - off);
+            let a = first_after_seek(&pl, off + to, Accurate);
+            assert!((a - (off + exact)).abs() < 1e-6, "{format}: accurate seek to {to} showed {}, wanted {exact}", a - off);
+        }
+    }
+}
+
+#[test]
+fn a_decoder_that_was_reset_for_a_seek_shows_the_same_pictures_as_a_new_one() {
+    use ironav_player::SeekMode::Accurate;
+    let p = dir("reset").join("v.mp4");
+    write_h264(&p, "mp4", 60, 10);
+    let opts = OpenOptions { autoplay: false, hwaccel: "off".into(), ..silent() };
+    let fresh = |t: f64| {
+        let pl = Player::open(p.to_str().unwrap(), &OpenOptions { start: t, ..opts.clone() }).unwrap();
+        until("a picture", 10.0, || pl.frame().is_some());
+        let f = pl.frame().unwrap();
+        (f.time, f.frame.planes[0].clone())
+    };
+    let pl = Player::open(p.to_str().unwrap(), &opts).unwrap();
+    until("first frame", 10.0, || pl.frame().is_some());
+    // forwards, backwards and into the same GOP twice, so the decoder holds references from elsewhere each time
+    for t in [3.5, 1.2, 5.4, 5.45, 0.0, 3.3] {
+        first_after_seek(&pl, t, Accurate);
+        let f = pl.frame().unwrap();
+        let (ft, fp) = fresh(t);
+        assert_eq!(f.time, ft, "seek to {t}");
+        assert!(f.frame.planes[0] == fp, "the picture at {t} differs from a freshly opened decoder's");
+    }
+}
+
+#[test]
+fn a_keyframe_seek_while_paused_decodes_one_picture_and_playing_carries_on_from_it() {
+    use ironav_player::SeekMode::Keyframe;
+    let p = dir("scrub").join("v.mkv");
+    write_h264(&p, "mkv", 60, 10);
+    let pl = Player::open(p.to_str().unwrap(), &OpenOptions { autoplay: false, hwaccel: "off".into(), ..silent() }).unwrap();
+    until("first frame", 10.0, || pl.frame().is_some());
+    let off = pl.frame().unwrap().time;
+    // a burst of them, as a seek bar being dragged makes
+    for t in [1.5, 2.5, 3.5, 4.5, 3.2] {
+        pl.seek_mode(off + t, Keyframe);
+    }
+    until("a picture", 10.0, || pl.frame().is_some());
+    let at = pl.frame().unwrap().time;
+    assert!((at - (off + 3.0)).abs() < 1e-6, "showed {}", at - off);
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(pl.status()["video"]["frames_queued"].as_u64().unwrap() <= 2, "paused after the keyframe: nothing more is decoded");
+    // playing resumes from the decoder where it stopped, and shows later pictures
+    pl.play();
+    until("later pictures", 10.0, || pl.frame().is_some_and(|f| f.time > off + 3.2));
+}
+
+#[test]
+fn the_seek_command_takes_an_optional_mode() {
+    let p = dir("cmdmode").join("v.mp4");
+    write_h264(&p, "mp4", 60, 10);
+    let pl = Player::open(p.to_str().unwrap(), &OpenOptions { autoplay: false, hwaccel: "off".into(), ..silent() }).unwrap();
+    until("first frame", 10.0, || pl.frame().is_some());
+    let off = pl.frame().unwrap().time;
+    let shown = |pl: &Player| pl.frame().unwrap().time - off;
+    pl.command(&json!({"cmd": "seek", "to": off + 2.5, "mode": "keyframe"})).unwrap();
+    until("a picture", 10.0, || pl.frame().is_some());
+    assert!((shown(&pl) - 2.0).abs() < 1e-6, "keyframe seek to 2.5 showed {}", shown(&pl));
+    pl.command(&json!({"cmd": "seek", "to": off + 2.5, "mode": "accurate"})).unwrap();
+    until("the exact picture", 10.0, || pl.frame().is_some_and(|f| f.time - off > 2.2));
+    assert!((shown(&pl) - 2.5).abs() < 1e-6, "showed {}", shown(&pl));
+    // without a mode, as before
+    pl.command(&json!({"cmd": "seek", "to": off + 3.55})).unwrap();
+    until("a picture", 10.0, || pl.frame().is_some());
+    assert!((shown(&pl) - 3.5).abs() < 1e-6, "showed {}", shown(&pl));
+    let e = pl.command(&json!({"cmd": "seek", "to": 1, "mode": "sloppy"})).unwrap_err();
+    assert_eq!(e.code, ironav_core::ErrorCode::InvalidArgument);
+    assert!(e.alternatives.iter().any(|a| a == "keyframe"));
+}
