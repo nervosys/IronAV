@@ -217,6 +217,8 @@ pub fn plan(job: &Job) -> Result<Plan> {
 
         let mut chain: Vec<FilterCall> = Vec::new();
         let mut params = s.params.clone();
+        // a filter that doubles the frame rate (field-rate deinterlacing) stamps its frames in half units
+        let mut time_scale = 1i64;
         for (i, fc) in job.filters.iter().enumerate() {
             let f = build_filter(&fc.name, &fc.args)?;
             let fspec = FILTERS.iter().find(|x| x.name == fc.name).expect("build_filter succeeded");
@@ -231,6 +233,7 @@ pub fn plan(job: &Job) -> Result<Plan> {
             }
             used[i] = true;
             params = f.output_params(&params);
+            time_scale *= f.time_scale();
             chain.push(fc.clone());
         }
 
@@ -537,6 +540,9 @@ pub fn plan(job: &Job) -> Result<Plan> {
             (StreamParams::Audio { sample_rate, .. }, Action::Transcode) if *sample_rate > 0 => {
                 let d = s.duration.map(|d| (d as i128 * s.time_base.num as i128 * *sample_rate as i128 + s.time_base.den as i128 / 2) / s.time_base.den as i128);
                 (ironav_core::Rational::new(1, *sample_rate as i64), d.map(|d| d as i64))
+            }
+            (StreamParams::Video { .. }, Action::Transcode) if time_scale > 1 => {
+                (ironav_core::Rational::new(s.time_base.num, s.time_base.den * time_scale), s.duration.map(|d| d * time_scale))
             }
             _ => (s.time_base, s.duration),
         };

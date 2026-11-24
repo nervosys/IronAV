@@ -234,6 +234,7 @@ mod tests {
         s.acodec = "pcm_f32le".into();
         s.filters.insert("volume".into(), FilterState { enabled: true, params: BTreeMap::from([("gain".to_string(), 0.5)]) });
         s.filters.insert("hflip".into(), FilterState { enabled: true, params: BTreeMap::new() }); // video filter: ignored for wav
+        s.filters.insert("deinterlace".into(), FilterState { enabled: true, params: BTreeMap::from([("mode".to_string(), 1.0)]) }); // likewise
         let j = s.job(&src);
         assert_eq!(j.audio.codec.as_deref(), Some("pcm_f32le"));
         assert!(j.video.codec.is_none());

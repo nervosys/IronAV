@@ -23,6 +23,8 @@ pub struct FilterSpec {
     pub output_pix_fmt: Option<PixelFormat>,
 }
 
+const YUV_AND_GRAY: &[PixelFormat] = &[PixelFormat::Gray8, PixelFormat::Yuv420p, PixelFormat::Yuv422p, PixelFormat::Yuv444p, PixelFormat::Yuv440p, PixelFormat::Yuv420p10, PixelFormat::Yuv422p10, PixelFormat::Yuv444p10, PixelFormat::Yuv440p10, PixelFormat::Yuv420p12, PixelFormat::Yuv422p12, PixelFormat::Yuv444p12, PixelFormat::Yuv440p12];
+
 pub static FILTERS: &[FilterSpec] = &[
     FilterSpec {
         name: "volume",
@@ -68,6 +70,19 @@ pub static FILTERS: &[FilterSpec] = &[
             ParamSpec { name: "height", ty: "integer", default: None, description: "output height in pixels (0 or omitted = derive from width)" },
         ],
         input_pix_fmts: &[],
+        output_pix_fmt: None,
+    },
+    FilterSpec {
+        name: "deinterlace",
+        media: MediaType::Video,
+        description: "Remove the combing from interlaced video (DVD and broadcast MPEG-2, interlaced H.264). method bwdif is motion-adaptive (it looks at the previous, current and next fields) and linear averages the lines above and below. mode frame gives one picture per picture, field one per field (twice the frame rate). parity says which field comes first (auto uses what the decoder reports, top first when it does not say), and deint interlaced leaves pictures the decoder does not flag as interlaced alone. Each option takes its name or its number.",
+        params: &[
+            ParamSpec { name: "method", ty: "integer", default: Some(0.0), description: "0 or bwdif (motion-adaptive), 1 or linear" },
+            ParamSpec { name: "mode", ty: "integer", default: Some(0.0), description: "0 or frame (one picture per picture), 1 or field (one per field, double the rate)" },
+            ParamSpec { name: "parity", ty: "integer", default: Some(0.0), description: "0 or auto, 1 or tff (top field first), 2 or bff (bottom field first)" },
+            ParamSpec { name: "deint", ty: "integer", default: Some(0.0), description: "0 or all pictures, 1 or interlaced (only those flagged as interlaced)" },
+        ],
+        input_pix_fmts: YUV_AND_GRAY,
         output_pix_fmt: None,
     },
     FilterSpec {
@@ -144,6 +159,29 @@ pub fn build_filter(name: &str, args: &Map<String, Value>) -> Result<Box<dyn Fil
             crate::scale::validate(width, height)?;
             Box::new(crate::scale::Scale { width, height })
         }
+        "deinterlace" => {
+            // each option is a name or its number (the GUI offers numbers)
+            let choice = |key: &str, names: &[&str]| -> Result<usize> {
+                match args.get(key) {
+                    None => Ok(0),
+                    Some(Value::String(s)) => names.iter().position(|n| n.eq_ignore_ascii_case(s)).ok_or_else(|| {
+                        Error::invalid_arg(format!("deinterlace.{key} must be one of the names below, got '{s}'")).alternatives(names.iter().copied())
+                    }),
+                    Some(v) => match v.as_f64() {
+                        Some(n) if n.fract() == 0.0 && n >= 0.0 && (n as usize) < names.len() => Ok(n as usize),
+                        _ => Err(Error::invalid_arg(format!("deinterlace.{key} must be a name or a number from 0 to {}", names.len() - 1)).alternatives(names.iter().copied())),
+                    },
+                }
+            };
+            use crate::deinterlace::{DeintMethod, DeintMode, DeintOptions, DeintParity, DeintSelect};
+            let opts = DeintOptions {
+                method: [DeintMethod::Bwdif, DeintMethod::Linear][choice("method", &["bwdif", "linear"])?],
+                mode: [DeintMode::Frame, DeintMode::Field][choice("mode", &["frame", "field"])?],
+                parity: [DeintParity::Auto, DeintParity::TopFirst, DeintParity::BottomFirst][choice("parity", &["auto", "tff", "bff"])?],
+                select: [DeintSelect::All, DeintSelect::Interlaced][choice("deint", &["all", "interlaced"])?],
+            };
+            Box::new(crate::deinterlace::DeinterlaceFilter::new(opts))
+        }
         "gray" => Box::new(Gray),
         "hflip" => Box::new(HFlip),
         _ => unreachable!("spec table and match are kept in sync"),
@@ -172,6 +210,9 @@ impl Filter for Volume {
 struct Gray;
 
 impl Filter for Gray {
+    fn keeps_field_order(&self) -> bool {
+        true
+    }
     fn output_params(&self, input: &StreamParams) -> StreamParams {
         match input {
             StreamParams::Video { width, height, frame_rate, .. } => {
@@ -197,6 +238,9 @@ impl Filter for Gray {
 struct HFlip;
 
 impl Filter for HFlip {
+    fn keeps_field_order(&self) -> bool {
+        true
+    }
     fn process(&mut self, frame: Frame) -> Result<Vec<Frame>> {
         let Frame::Video(mut v) = frame else { return Ok(vec![frame]) };
         let layout = v.pix_fmt.planes(v.width as usize, v.height as usize);
