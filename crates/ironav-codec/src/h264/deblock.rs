@@ -14,6 +14,217 @@ fn clip1(v: i32, bd: u32) -> u16 {
     v.clamp(0, (1 << bd) - 1) as u16
 }
 
+/// The loop filter for samples of at most 10 bits, eight sample lines at a time in 16-bit lanes
+/// (every sum in the filter fits 16 bits with up to 10-bit samples). SSE2 is part of x86_64, so
+/// this needs no run-time check. It computes what `filter_line` does, line for line.
+#[cfg(target_arch = "x86_64")]
+mod simd {
+    use super::TC0;
+    use std::arch::x86_64::*;
+
+    /// 8 samples of `b` from `o`; panics when they are not all there.
+    #[target_feature(enable = "sse2")]
+    #[inline]
+    fn ld(b: &[u16], o: usize) -> __m128i {
+        let a: &[u16; 8] = b[o..o + 8].try_into().unwrap();
+        // SAFETY: `a` is 8 readable samples, and an unaligned load needs nothing more
+        unsafe { _mm_loadu_si128(a.as_ptr().cast()) }
+    }
+
+    #[target_feature(enable = "sse2")]
+    #[inline]
+    fn st(b: &mut [u16], o: usize, v: __m128i) {
+        let a: &mut [u16; 8] = (&mut b[o..o + 8]).try_into().unwrap();
+        // SAFETY: `a` is 8 writable samples, and an unaligned store needs nothing more
+        unsafe { _mm_storeu_si128(a.as_mut_ptr().cast(), v) }
+    }
+
+    #[target_feature(enable = "sse2")]
+    #[inline]
+    fn abs(x: __m128i) -> __m128i {
+        _mm_max_epi16(x, _mm_sub_epi16(_mm_setzero_si128(), x))
+    }
+
+    /// `m` is all ones or all zeros per lane: `a` where it is set, else `b`.
+    #[target_feature(enable = "sse2")]
+    #[inline]
+    fn sel(m: __m128i, a: __m128i, b: __m128i) -> __m128i {
+        _mm_or_si128(_mm_and_si128(m, a), _mm_andnot_si128(m, b))
+    }
+
+    #[target_feature(enable = "sse2")]
+    #[inline]
+    fn sum(v: &[__m128i]) -> __m128i {
+        v.iter().fold(_mm_setzero_si128(), |a, &b| _mm_add_epi16(a, b))
+    }
+
+    #[target_feature(enable = "sse2")]
+    #[inline]
+    fn sh1(v: __m128i) -> __m128i {
+        _mm_slli_epi16(v, 1)
+    }
+
+    /// Transposes 8 rows of 8 samples.
+    #[target_feature(enable = "sse2")]
+    #[inline]
+    fn transpose(r: [__m128i; 8]) -> [__m128i; 8] {
+        let (t0, t1, t2, t3) = (_mm_unpacklo_epi16(r[0], r[1]), _mm_unpackhi_epi16(r[0], r[1]), _mm_unpacklo_epi16(r[2], r[3]), _mm_unpackhi_epi16(r[2], r[3]));
+        let (t4, t5, t6, t7) = (_mm_unpacklo_epi16(r[4], r[5]), _mm_unpackhi_epi16(r[4], r[5]), _mm_unpacklo_epi16(r[6], r[7]), _mm_unpackhi_epi16(r[6], r[7]));
+        let (u0, u1, u2, u3) = (_mm_unpacklo_epi32(t0, t2), _mm_unpackhi_epi32(t0, t2), _mm_unpacklo_epi32(t1, t3), _mm_unpackhi_epi32(t1, t3));
+        let (u4, u5, u6, u7) = (_mm_unpacklo_epi32(t4, t6), _mm_unpackhi_epi32(t4, t6), _mm_unpacklo_epi32(t5, t7), _mm_unpackhi_epi32(t5, t7));
+        [_mm_unpacklo_epi64(u0, u4), _mm_unpackhi_epi64(u0, u4), _mm_unpacklo_epi64(u1, u5), _mm_unpackhi_epi64(u1, u5), _mm_unpacklo_epi64(u2, u6), _mm_unpackhi_epi64(u2, u6), _mm_unpacklo_epi64(u3, u7), _mm_unpackhi_epi64(u3, u7)]
+    }
+
+    /// Per lane: the thresholds and strengths one group of eight lines is filtered with.
+    struct Lanes {
+        bs: __m128i,
+        tc0: __m128i,
+        alpha: __m128i,
+        beta: __m128i,
+        maxv: __m128i,
+    }
+
+    impl Lanes {
+        /// The lanes where the line is filtered at all (8.7.2.2).
+        #[target_feature(enable = "sse2")]
+    #[inline]
+        fn active(&self, p1: __m128i, p0: __m128i, q0: __m128i, q1: __m128i) -> __m128i {
+            let lt = _mm_cmplt_epi16;
+            let m = _mm_and_si128(_mm_cmpgt_epi16(self.bs, _mm_setzero_si128()), lt(abs(_mm_sub_epi16(p0, q0)), self.alpha));
+            _mm_and_si128(m, _mm_and_si128(lt(abs(_mm_sub_epi16(p1, p0)), self.beta), lt(abs(_mm_sub_epi16(q1, q0)), self.beta)))
+        }
+
+        #[target_feature(enable = "sse2")]
+    #[inline]
+        fn clip(&self, v: __m128i) -> __m128i {
+            _mm_min_epi16(_mm_max_epi16(v, _mm_setzero_si128()), self.maxv)
+        }
+
+        /// The new p0 and q0 of a line with strength below 4 and clipping threshold `tc`.
+        #[target_feature(enable = "sse2")]
+    #[inline]
+        fn weak(&self, tc: __m128i, p1: __m128i, p0: __m128i, q0: __m128i, q1: __m128i) -> (__m128i, __m128i) {
+            let d = _mm_srai_epi16(_mm_add_epi16(_mm_add_epi16(_mm_slli_epi16(_mm_sub_epi16(q0, p0), 2), _mm_sub_epi16(p1, q1)), _mm_set1_epi16(4)), 3);
+            let d = _mm_min_epi16(_mm_max_epi16(d, _mm_sub_epi16(_mm_setzero_si128(), tc)), tc);
+            (self.clip(_mm_add_epi16(p0, d)), self.clip(_mm_sub_epi16(q0, d)))
+        }
+
+        /// Luma lines `[p3, p2, p1, p0, q0, q1, q2, q3]`, filtered.
+        #[target_feature(enable = "sse2")]
+    #[inline]
+        fn luma(&self, v: [__m128i; 8]) -> [__m128i; 8] {
+            let [p3, p2, p1, p0, q0, q1, q2, q3] = v;
+            let mf = self.active(p1, p0, q0, q1);
+            if _mm_movemask_epi8(mf) == 0 {
+                return v;
+            }
+            let lt = _mm_cmplt_epi16;
+            let ap = lt(abs(_mm_sub_epi16(p2, p0)), self.beta);
+            let aq = lt(abs(_mm_sub_epi16(q2, q0)), self.beta);
+            let strong = _mm_cmpgt_epi16(self.bs, _mm_set1_epi16(3));
+            // bS < 4: tc is tc0 plus one for each side that is smooth (a set mask is -1)
+            let tc = _mm_sub_epi16(_mm_sub_epi16(self.tc0, ap), aq);
+            let (p0w, q0w) = self.weak(tc, p1, p0, q0, q1);
+            let avg = _mm_avg_epu16(p0, q0);
+            let ntc0 = _mm_sub_epi16(_mm_setzero_si128(), self.tc0);
+            let side = |s2: __m128i, s1: __m128i| _mm_add_epi16(s1, _mm_min_epi16(_mm_max_epi16(_mm_srai_epi16(_mm_sub_epi16(_mm_add_epi16(s2, avg), sh1(s1)), 1), ntc0), self.tc0));
+            let p1w = sel(ap, side(p2, p1), p1);
+            let q1w = sel(aq, side(q2, q1), q1);
+            // bS == 4
+            let small = lt(abs(_mm_sub_epi16(p0, q0)), _mm_add_epi16(_mm_srai_epi16(self.alpha, 2), _mm_set1_epi16(2)));
+            let (sp, sq) = (_mm_and_si128(ap, small), _mm_and_si128(aq, small));
+            let (c2, c4) = (_mm_set1_epi16(2), _mm_set1_epi16(4));
+            let p0a = _mm_srai_epi16(sum(&[p2, sh1(p1), sh1(p0), sh1(q0), q1, c4]), 3);
+            let p0b = _mm_srai_epi16(sum(&[sh1(p1), p0, q1, c2]), 2);
+            let p0s = sel(sp, p0a, p0b);
+            let p1s = sel(sp, _mm_srai_epi16(sum(&[p2, p1, p0, q0, c2]), 2), p1);
+            let p2s = sel(sp, _mm_srai_epi16(sum(&[sh1(p3), sh1(p2), p2, p1, p0, q0, c4]), 3), p2);
+            let q0a = _mm_srai_epi16(sum(&[p1, sh1(p0), sh1(q0), sh1(q1), q2, c4]), 3);
+            let q0b = _mm_srai_epi16(sum(&[sh1(q1), q0, p1, c2]), 2);
+            let q0s = sel(sq, q0a, q0b);
+            let q1s = sel(sq, _mm_srai_epi16(sum(&[p0, q0, q1, q2, c2]), 2), q1);
+            let q2s = sel(sq, _mm_srai_epi16(sum(&[sh1(q3), sh1(q2), q2, q1, q0, p0, c4]), 3), q2);
+            let pick = |w: __m128i, s: __m128i, orig: __m128i| sel(mf, sel(strong, s, w), orig);
+            [p3, pick(p2, p2s, p2), pick(p1w, p1s, p1), pick(p0w, p0s, p0), pick(q0w, q0s, q0), pick(q1w, q1s, q1), pick(q2, q2s, q2), q3]
+        }
+
+        /// Chroma lines `[p1, p0, q0, q1]`, filtered.
+        #[target_feature(enable = "sse2")]
+    #[inline]
+        fn chroma(&self, v: [__m128i; 4]) -> [__m128i; 4] {
+            let [p1, p0, q0, q1] = v;
+            let mf = self.active(p1, p0, q0, q1);
+            if _mm_movemask_epi8(mf) == 0 {
+                return v;
+            }
+            let strong = _mm_cmpgt_epi16(self.bs, _mm_set1_epi16(3));
+            let (p0w, q0w) = self.weak(_mm_add_epi16(self.tc0, _mm_set1_epi16(1)), p1, p0, q0, q1);
+            let c2 = _mm_set1_epi16(2);
+            let p0s = _mm_srai_epi16(sum(&[sh1(p1), p0, q1, c2]), 2);
+            let q0s = _mm_srai_epi16(sum(&[sh1(q1), q0, p1, c2]), 2);
+            [p1, sel(mf, sel(strong, p0s, p0w), p0), sel(mf, sel(strong, q0s, q0w), q0), q1]
+        }
+    }
+
+    /// `filter_edge` for a plane held as a slice, without I_PCM or lossless samples to put back and
+    /// with at most 10-bit samples.
+    #[target_feature(enable = "sse2")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn filter_edge(buf: &mut [u16], pos: usize, xs: usize, ys: usize, per_bs: usize, bs: &[u8; 4], alpha: i32, beta: i32, index_a: usize, chroma: bool, bd: u32) {
+        for g in 0..per_bs / 2 {
+            // the strength and clipping threshold of each of this group's eight lines
+            let (mut bsl, mut tcl) = ([0i16; 8], [0i16; 8]);
+            for l in 0..8 {
+                let b = bs[(g * 8 + l) / per_bs];
+                bsl[l] = b as i16;
+                if (1..4).contains(&b) {
+                    tcl[l] = ((TC0[index_a][b as usize].max(0) as i32) << (bd - 8)) as i16;
+                }
+            }
+            if bsl.iter().all(|&b| b == 0) {
+                continue;
+            }
+            let lanes = Lanes { bs: ld16(&bsl), tc0: ld16(&tcl), alpha: _mm_set1_epi16(alpha as i16), beta: _mm_set1_epi16(beta as i16), maxv: _mm_set1_epi16(((1u32 << bd) - 1) as i16) };
+            if xs == 1 {
+                // a vertical edge: the lines are rows, eight samples across the edge each
+                let at = |r: usize| pos + (g * 8 + r) * ys - 4;
+                let rows: [__m128i; 8] = std::array::from_fn(|r| ld(buf, at(r)));
+                let mut c = transpose(rows);
+                if chroma {
+                    let o = lanes.chroma([c[2], c[3], c[4], c[5]]);
+                    c[3] = o[1];
+                    c[4] = o[2];
+                } else {
+                    c = lanes.luma(c);
+                }
+                for (r, v) in transpose(c).into_iter().enumerate() {
+                    st(buf, at(r), v);
+                }
+            } else {
+                // a horizontal edge: the lines are columns, one row of eight per sample position
+                let at = |k: usize| pos + k * xs + g * 8 - 4 * xs;
+                if chroma {
+                    let o = lanes.chroma([ld(buf, at(2)), ld(buf, at(3)), ld(buf, at(4)), ld(buf, at(5))]);
+                    st(buf, at(3), o[1]);
+                    st(buf, at(4), o[2]);
+                } else {
+                    let o = lanes.luma(std::array::from_fn(|k| ld(buf, at(k))));
+                    for (k, v) in o.into_iter().enumerate().take(7).skip(1) {
+                        st(buf, at(k), v);
+                    }
+                }
+            }
+        }
+    }
+
+    #[target_feature(enable = "sse2")]
+    #[inline]
+    fn ld16(a: &[i16; 8]) -> __m128i {
+        // SAFETY: `a` is 8 readable lanes, and an unaligned load needs nothing more
+        unsafe { _mm_loadu_si128(a.as_ptr().cast()) }
+    }
+}
+
 /// Filters the sample lines across one edge: four segments of `per_bs` lines, each with its own
 /// boundary strength in `bs`. `pos` is the first q0 sample, `xs` the step across the edge and `ys`
 /// the step along it.
@@ -21,6 +232,14 @@ fn clip1(v: i32, bd: u32) -> u16 {
 fn filter_edge<P: Px + ?Sized>(pl: &mut P, pos: usize, xs: usize, ys: usize, per_bs: usize, bs: &[u8; 4], alpha: i32, beta: i32, index_a: usize, chroma: bool, bd: u32, keep: (bool, bool)) {
     if alpha == 0 || beta == 0 {
         return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if !(keep.0 || keep.1) && bd <= 10 {
+        if let Some(buf) = pl.slice_mut() {
+            // SAFETY: SSE2 is part of the x86_64 baseline
+            unsafe { simd::filter_edge(buf, pos, xs, ys, per_bs, bs, alpha, beta, index_a, chroma, bd) };
+            return;
+        }
     }
     let n = if chroma { 1 } else { 3 };
     // I_PCM and lossless samples are put back after filtering; only then are they read out
@@ -161,6 +380,12 @@ fn motion_differs(p: &MbInfo, pb: (usize, usize), q: &MbInfo, qb: (usize, usize)
     }
 }
 
+/// Whether every 4x4 block of the macroblock has the same vectors and every 8x8 block the same
+/// references.
+fn uniform_motion(m: &MbInfo) -> bool {
+    (0..2).all(|l| m.ref_idx[l].iter().all(|&r| r == m.ref_idx[l][0]) && m.ref_id[l].iter().all(|&r| r == m.ref_id[l][0]) && m.mv[l].iter().all(|&v| v == m.mv[l][0]))
+}
+
 /// Boundary strength of each 4-sample segment along edge `e` of the macroblock `m`; `other` is the
 /// macroblock on the far side of a macroblock edge (and `m` itself for inner edges).
 fn strength(m: &MbInfo, other: &MbInfo, dir: usize, e: usize, mvy: i32) -> [u8; 4] {
@@ -206,9 +431,17 @@ pub fn deblock_rows(pic: &mut Picture, bd: u32, rows: std::ops::Range<usize>) {
 trait Px {
     fn px(&self, i: usize) -> u16;
     fn set(&mut self, i: usize, v: u16);
+    /// The plane as a slice, when it is one (it is not when several threads share it).
+    fn slice_mut(&mut self) -> Option<&mut [u16]> {
+        None
+    }
 }
 
 impl Px for [u16] {
+    fn slice_mut(&mut self) -> Option<&mut [u16]> {
+        Some(self)
+    }
+
     #[inline]
     fn px(&self, i: usize) -> u16 {
         self[i]
@@ -221,6 +454,10 @@ impl Px for [u16] {
 }
 
 impl Px for Vec<u16> {
+    fn slice_mut(&mut self) -> Option<&mut [u16]> {
+        Some(self)
+    }
+
     #[inline]
     fn px(&self, i: usize) -> u16 {
         self[i]
@@ -388,8 +625,13 @@ fn deblock_mb<P: Px>(planes: &mut [P; 3], mbs: &[MbInfo], slices: &[SliceParams]
     let edge_mb = [if mbx > 0 { &mbs[idx - 1] } else { m }, if mby > 0 { &mbs[idx - w] } else { m }];
     // boundary strengths depend on the macroblocks only, so all planes and chroma share them
     let mut bs = [[[0u8; 4]; 4]; 2];
+    // inner edges of an inter macroblock that moves as a whole and has no coefficients are not filtered
+    let still = m.kind == Kind::Inter && uniform_motion(m) && m.nnz[..16].iter().all(|&n| n == 0);
     for dir in 0..2 {
         for e in 0..4usize {
+            if e > 0 && still {
+                continue;
+            }
             let other = if e == 0 { edge_mb[dir] } else { m };
             bs[dir][e] = strength(m, other, dir, e, 4);
         }
@@ -402,7 +644,7 @@ fn deblock_mb<P: Px>(planes: &mut [P; 3], mbs: &[MbInfo], slices: &[SliceParams]
                 if e == 0 && !(if dir == 0 { left_ok } else { top_ok }) {
                     continue;
                 }
-                if m.t8x8 && e & 1 == 1 {
+                if (m.t8x8 && e & 1 == 1) || bs[dir][e] == [0; 4] {
                     continue;
                 }
                 let other = if e == 0 { edge_mb[dir] } else { m };
@@ -429,7 +671,7 @@ fn deblock_mb<P: Px>(planes: &mut [P; 3], mbs: &[MbInfo], slices: &[SliceParams]
         for dir in 0..2 {
             let edges: &[usize] = if dir == 1 && chh == 16 { &[0, 1, 2, 3] } else { &[0, 2] };
             for &e in edges {
-                if e == 0 && !(if dir == 0 { left_ok } else { top_ok }) {
+                if (e == 0 && !(if dir == 0 { left_ok } else { top_ok })) || bs[dir][e] == [0; 4] {
                     continue;
                 }
                 let other = if e == 0 { edge_mb[dir] } else { m };
@@ -663,6 +905,53 @@ fn deblock_mbaff(pic: &mut Picture, bd: u32, pairs: std::ops::Range<usize>) {
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod simd_tests {
+    use super::*;
+
+    /// A plane that is read and written by index only, which takes `filter_edge` down its scalar path.
+    struct Scalar<'a>(&'a mut [u16]);
+    impl Px for Scalar<'_> {
+        fn px(&self, i: usize) -> u16 {
+            self.0[i]
+        }
+        fn set(&mut self, i: usize, v: u16) {
+            self.0[i] = v;
+        }
+    }
+
+    #[test]
+    fn simd_edges_match_scalar_ones() {
+        let (w, h) = (64usize, 64usize);
+        let mut seed = 77u32;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            (seed >> 8) as usize
+        };
+        for bd in [8u32, 10] {
+            let maxv = (1usize << bd) - 1;
+            for round in 0..4000 {
+                // smooth samples with some noise, so that most lines are filtered, else wild ones
+                let noise = [1, 3, 12, maxv][round % 4];
+                let base = rnd() % (maxv + 1);
+                let plane: Vec<u16> = (0..w * h).map(|_| (base + rnd() % (noise + 1)).min(maxv) as u16).collect();
+                let chroma = rnd() % 2 == 0;
+                let vertical = rnd() % 2 == 0;
+                let per_bs = if chroma { [2, 4][rnd() % 2] } else { 4 };
+                let bs: [u8; 4] = std::array::from_fn(|_| (rnd() % 5) as u8);
+                let index_a = rnd() % 52;
+                let (alpha, beta) = ((ALPHA[index_a] as i32) << (bd - 8), (BETA[rnd() % 52] as i32) << (bd - 8));
+                // an edge with room for four samples on each side and 16 lines
+                let (pos, xs, ys) = if vertical { (rnd() % 8 * 4 + 4 + (8 + rnd() % 4) * w, 1, w) } else { (4 * w + rnd() % 3 * 16 + rnd() % 4 * 4 * w, w, 1) };
+                let (mut a, mut b) = (plane.clone(), plane);
+                filter_edge(&mut a, pos, xs, ys, per_bs, &bs, alpha, beta, index_a, chroma, bd, (false, false));
+                filter_edge(&mut Scalar(&mut b), pos, xs, ys, per_bs, &bs, alpha, beta, index_a, chroma, bd, (false, false));
+                assert_eq!(a, b, "bd {bd} round {round} chroma {chroma} vertical {vertical} per_bs {per_bs} bs {bs:?} alpha {alpha} beta {beta}");
             }
         }
     }

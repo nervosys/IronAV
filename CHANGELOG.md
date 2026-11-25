@@ -29,6 +29,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Changed
 
+- The software H.264 decoder batches CABAC bit reads, uses SIMD for interpolation and deblocking on x86-64, and writes unweighted single-reference predictions directly into the picture. In three alternating Windows runs on a Ryzen 9 9900X using synthetic 1080p clips, median single-thread throughput rose from 66 to 93 fps on High profile and from 100 to 154 fps on Baseline. Default-thread throughput rose about 4% on both clips. The decoded pictures matched FFmpeg byte for byte.
 - ironav-gui: the player window no longer repaints every 8 ms. While playing it repaints when the next picture is due or a decoder thread queues one (20 Hz for the clock and seek bar at the most otherwise), and it stays idle when paused. The status JSON is built at most once per UI frame, and only when the Agent view is open or the file has no video; volume and mute are read directly.
 - ironav-player: `rgb_frame` converts in integer fixed point over row slices, with the chroma terms worked out once per chroma sample, and no longer clones a 10-bit picture to narrow it. The output is within 1 per channel of the old scalar converter (kept as `rgb_frame_reference` for the test and the benchmark); about 5 times faster at 1080p.
 - ironav-formats: a raw file of E-AC-3 frames is read as E-AC-3 instead of being refused as AC-3, whatever its extension. `ac3::frame_info` still reports an E-AC-3 frame as an `unsupported_codec` error: use `any_frame_info` for either.
