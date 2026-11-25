@@ -451,21 +451,37 @@ impl StreamDemuxer for AdtsStream {
                         self.pending.skip(1);
                         continue;
                     }
-                    self.locked = Some((h.sfi, h.channels));
-                    let rate = adts::RATES[h.sfi as usize];
-                    if let Some(t) = self.start_90k {
-                        self.pts = (t as i128 * rate as i128 / 90_000) as i64;
+                    // HE-AAC says nothing of SBR or parametric stereo in the ADTS header: look in the first
+                    // frames for it, which takes a few of them (the SBR header is not in every one)
+                    let mut frames: Vec<&[u8]> = Vec::new();
+                    let mut at = 0;
+                    while frames.len() < adts::PROBE_FRAMES {
+                        match d.get(at..at + 7).and_then(adts::parse) {
+                            Some(n) if (n.sfi, n.channels) == (h.sfi, h.channels) && d.len() >= at + n.frame => {
+                                frames.push(&d[at + n.len..at + n.frame]);
+                                at += n.frame;
+                            }
+                            _ => break,
+                        }
                     }
-                    let asc = ((h.profile as u16 + 1) << 11) | ((h.sfi as u16) << 7) | ((h.channels as u16) << 3);
+                    if frames.len() < adts::PROBE_FRAMES && !self.ended && d.len() < adts::PROBE_BYTES {
+                        return Ok(None);
+                    }
+                    let asc = (((h.profile as u16 + 1) << 11) | ((h.sfi as u16) << 7) | ((h.channels as u16) << 3)).to_be_bytes().to_vec();
+                    let (extradata, rate, channels) = adts::stream_config(&asc, adts::RATES[h.sfi as usize], h.channels, &frames);
+                    self.locked = Some((h.sfi, h.channels));
+                    if let Some(t) = self.start_90k {
+                        self.pts = (t as i128 * adts::RATES[h.sfi as usize] as i128 / 90_000) as i64;
+                    }
                     self.streams.push(StreamInfo {
                         index: 0,
                         codec: CodecId::Aac,
-                        time_base: Rational::new(1, rate as i64),
+                        time_base: Rational::new(1, adts::RATES[h.sfi as usize] as i64),
                         duration: None,
                         bits: None,
-                        extradata: asc.to_be_bytes().to_vec(),
+                        extradata,
                         lead_in: 0,
-                        params: StreamParams::Audio { sample_rate: rate, channels: if h.channels == 7 { 8 } else { h.channels as u16 } },
+                        params: StreamParams::Audio { sample_rate: rate, channels },
                     });
                 }
             }

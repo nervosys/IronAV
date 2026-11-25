@@ -710,6 +710,17 @@ fn parse_trak(trak: &[u8], index: usize, samples: &mut Vec<Sample>, movie_ts: u3
         }
         if codec == CodecId::Aac {
             extradata = aac_config(sound_child(kids, b"esds", "the mp4a entry")?)?;
+            // HE-AAC v2 is a mono core with parametric stereo: two channels out, whatever the entry says
+            // (many writers put the core's one there); SBR doubles the core's rate, which many
+            // writers leave in the entry as well
+            if ironav_codec::aac::parametric_stereo(&extradata) {
+                channels = 2;
+            }
+            if let Some((out_rate, _)) = ironav_codec::aac::output_params(&extradata) {
+                if out_rate == rate.saturating_mul(2) {
+                    rate = out_rate;
+                }
+            }
         }
         if codec == CodecId::Opus {
             // the dOps box carries the OpusHead's fields, big-endian and without its magic; the

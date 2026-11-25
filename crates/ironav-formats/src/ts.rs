@@ -724,15 +724,32 @@ impl TsParser {
             };
             let e = &mut self.es[k];
             if e.info.is_none() {
+                // an ADTS stream does not say whether it is HE-AAC: the frames of this PES that follow do
+                let (extradata, out_rate, out_channels) = if frame_codec == CodecId::Aac {
+                    let mut frames: Vec<&[u8]> = Vec::new();
+                    let mut at = i;
+                    while frames.len() < adts::PROBE_FRAMES {
+                        match adts::parse(&data[at..]) {
+                            Some(n) if at + n.frame <= data.len() => {
+                                frames.push(&data[at + n.len..at + n.frame]);
+                                at += n.frame;
+                            }
+                            _ => break,
+                        }
+                    }
+                    adts::stream_config(&asc, rate, channels as u8, &frames)
+                } else {
+                    (asc, rate, channels)
+                };
                 e.info = Some(StreamInfo {
                     index: 0,
                     codec: frame_codec,
                     time_base: Rational::new(1, rate as i64),
                     duration: None,
                     bits: None,
-                    extradata: asc,
+                    extradata,
                     lead_in: 0,
-                    params: StreamParams::Audio { sample_rate: rate, channels },
+                    params: StreamParams::Audio { sample_rate: out_rate, channels: out_channels },
                 });
             }
             let ticks = samples as i64 * CLOCK + e.rem;
