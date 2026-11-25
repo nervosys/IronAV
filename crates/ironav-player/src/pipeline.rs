@@ -3,8 +3,8 @@
 
 use crate::output::{AudioOutput, NullOutput};
 use crate::{AudioMode, Cmd, Inner, SeekMode, TimedFrame};
-use ironav_codec::is_implemented;
-use ironav_core::{Decoder, Demuxer, Error, ErrorCode, Frame, MediaType, Result, StreamInfo, StreamParams};
+use ironav_codec::{deinterlace_frame, is_implemented};
+use ironav_core::{Decoder, Demuxer, Error, ErrorCode, FieldOrder, Frame, MediaType, PixelFormat, Result, StreamInfo, StreamParams};
 use ironav_formats::open_demuxer_lazy;
 use ironav_hwaccel::{new_video_decoder, probe_all, select, Direction, HwPolicy};
 use std::path::Path;
@@ -130,7 +130,7 @@ fn video_loop(inner: &Inner, path: &str, stream: &StreamInfo, mut dec: Box<dyn D
     let mut fed = false;
     // The frame to show at the seek target is the last one at or before it, so one decoded
     // frame is held back until the next shows whether it is the one.
-    let mut held: Option<TimedFrame> = None;
+    let mut held = None;
     let mut seeking = start > 0.0;
     // A keyframe seek is over once its picture is queued: while paused nothing more is decoded, so a
     // burst of them (a seek bar being dragged) costs one picture each.
@@ -207,49 +207,47 @@ fn video_loop(inner: &Inner, path: &str, stream: &StreamInfo, mut dec: Box<dyn D
             }
         }
 
-        let mut frames: Vec<Frame> = Vec::new();
-        match demux.read_packet()? {
+        let frames = match demux.read_packet()? {
             Some(p) => {
                 fed = true;
-                frames.extend(dec.decode(&p)?);
+                let frames = dec.decode(&p)?;
                 if frames.is_empty() && keyframe_only && !asked {
                     // a keyframe seek wants the keyframe's picture now, not when the decoder has been given
                     // enough packets to fill its threads and its reordering
                     asked = true;
-                    frames.extend(dec.flush()?);
+                    let frames = dec.flush()?;
                     got = !frames.is_empty();
+                    frames
+                } else {
+                    frames
                 }
             }
             None => {
-                frames.extend(dec.flush()?);
                 draining = true;
                 fed = true;
+                dec.flush()?
             }
-        }
-        for f in frames {
+        };
+        // Field orders belong to the decoder's most recent batch, including a seek or EOF flush.
+        let orders = if frames.is_empty() { Vec::new() } else { dec.field_orders() };
+        for (i, f) in frames.into_iter().enumerate() {
             let Frame::Video(v) = f else { continue };
             let t = TimedFrame { time: v.pts as f64 * tb, frame: v };
-            let t_time = t.time;
-            let ready = if seeking && t.time <= target + 1e-6 {
-                held = Some(t);
-                None
-            } else {
-                seeking = false;
-                let mut out = Vec::new();
-                out.extend(held.take());
-                out.push(t);
-                Some(out)
-            };
-            if let Some(list) = ready {
-                for t in list {
-                    if !push_video(inner, gen, t) {
-                        break;
-                    }
-                    if keyframe_only {
-                        keyframe_only = false;
-                        parked = true;
-                        flushed_at = got.then_some(t_time);
-                    }
+            let order = orders.get(i).copied().unwrap_or_default();
+            if seeking && t.time <= target + 1e-6 {
+                held = Some((t, order));
+                continue;
+            }
+            seeking = false;
+            for (t, order) in held.take().into_iter().chain(std::iter::once((t, order))) {
+                let time = t.time;
+                if !push_video(inner, gen, t, order)? {
+                    break;
+                }
+                if keyframe_only {
+                    keyframe_only = false;
+                    parked = true;
+                    flushed_at = got.then_some(time);
                 }
             }
             if parked {
@@ -258,8 +256,8 @@ fn video_loop(inner: &Inner, path: &str, stream: &StreamInfo, mut dec: Box<dyn D
         }
         if draining {
             // End of input: whatever is held is the last frame at or before the target.
-            if let Some(t) = held.take() {
-                push_video(inner, gen, t);
+            if let Some((t, order)) = held.take() {
+                push_video(inner, gen, t, order)?;
             }
             let mut q = inner.video.lock().unwrap();
             if q.gen == gen {
@@ -271,18 +269,25 @@ fn video_loop(inner: &Inner, path: &str, stream: &StreamInfo, mut dec: Box<dyn D
     }
 }
 
-/// Queue a decoded frame unless a newer seek has made it stale. Returns false if it was dropped.
-fn push_video(inner: &Inner, gen: u64, t: TimedFrame) -> bool {
+/// Queue a picture for playback or a seek preview, unless a newer seek made it stale.
+fn push_video(inner: &Inner, gen: u64, mut t: TimedFrame, order: FieldOrder) -> Result<bool> {
+    if order.is_interlaced() && t.frame.pix_fmt != PixelFormat::Rgb24 {
+        if inner.video.lock().unwrap().gen != gen {
+            return Ok(false);
+        }
+        // Filter only pictures that may be shown. Spatial interpolation needs no lookahead.
+        t.frame = deinterlace_frame(&t.frame, order)?;
+    }
     let mut q = inner.video.lock().unwrap();
     if q.gen != gen {
-        return false;
+        return Ok(false);
     }
     q.bytes += t.frame.planes.iter().map(Vec::len).sum::<usize>();
     q.frames.push_back(Arc::new(t));
     q.ready = true;
     drop(q);
     inner.wake();
-    true
+    Ok(true)
 }
 
 // ---- audio ----------------------------------------------------------------------------------
