@@ -1843,6 +1843,13 @@ impl<'a> SliceDec<'a> {
         // (order count, long-term) of the picture each list predicts from
         let mut pics: [Option<(i32, bool)>; 2] = [None, None];
         let refs = self.refs;
+        let explicit = self.hdr.weights.as_ref();
+        // a block predicted from one list without weights is interpolated straight into the picture
+        let direct = (self.cur.ref_idx[0][b8] >= 0) != (self.cur.ref_idx[1][b8] >= 0) && explicit.is_none();
+        let (cbx, cby) = (if c444 { bx * 4 } else { bx * 2 }, if c422 || c444 { by * 4 } else { by * 2 });
+        let dl = self.org[0] + by * 4 * self.rs[0] + bx * 4;
+        let dc = self.org[1] + cby * self.rs[1] + cbx;
+        let (rsl, rsc) = (self.rs[0], self.rs[1]);
         for l in 0..2usize {
             let r = self.cur.ref_idx[l][b8];
             if r < 0 {
@@ -1862,11 +1869,28 @@ impl<'a> SliceDec<'a> {
             let rows = if fm { (2 * last + par) / 16 + 2 } else { last / 16 + 1 };
             // a field is every other row of its frame, from the first or the second
             let (st, cst, lo, co) = (pw << fm as u32, cpw << fm as u32, par * pw, par * cpw);
-            inter::luma_mc_st(&entry.pic.data.plane(0, rows)[lo..], st, pw, ph, x, y, mv[0] as i32, mv[1] as i32, bw, bh, &mut self.mcl[l], self.maxv);
+            let pl0 = &entry.pic.data.plane(0, rows)[lo..];
+            // a whole macroblock: fetch what the next one is likely to read, else this block's samples
+            let ahead = if bw == 16 && bh == 16 { 16 } else { 0 };
+            inter::prefetch(pl0, st, pw, ph, x + (mv[0] as i32 >> 2) - 2 + ahead, y + (mv[1] as i32 >> 2) - 2, bw + 5, bh + 5);
+            if !c444 && self.pic.cf != 0 {
+                for c in 0..2usize {
+                    inter::prefetch(&entry.pic.data.plane(1 + c, rows)[co..], cst, cpw, cph, x / 2 + (mv[0] as i32 >> 3) + ahead / 2, cy + (mv[1] as i32 >> 3), cw + 1, ch + 1);
+                }
+            }
+            if direct {
+                inter::luma_mc_st(pl0, st, pw, ph, x, y, mv[0] as i32, mv[1] as i32, bw, bh, &mut self.pic.planes[0][dl..], rsl, self.maxv);
+            } else {
+                inter::luma_mc_st(pl0, st, pw, ph, x, y, mv[0] as i32, mv[1] as i32, bw, bh, &mut self.mcl[l], bw, self.maxv);
+            }
             if c444 {
                 // 4:4:4 chroma is interpolated exactly like luma
                 for c in 0..2usize {
-                    inter::luma_mc_st(&entry.pic.data.plane(1 + c, rows)[co..], cst, cpw, cph, cx, cy, mv[0] as i32, mv[1] as i32, cw, ch, &mut self.mcc[l][c], self.maxv);
+                    if direct {
+                        inter::luma_mc_st(&entry.pic.data.plane(1 + c, rows)[co..], cst, cpw, cph, cx, cy, mv[0] as i32, mv[1] as i32, cw, ch, &mut self.pic.planes[1 + c][dc..], rsc, self.maxv);
+                    } else {
+                        inter::luma_mc_st(&entry.pic.data.plane(1 + c, rows)[co..], cst, cpw, cph, cx, cy, mv[0] as i32, mv[1] as i32, cw, ch, &mut self.mcc[l][c], cw, self.maxv);
+                    }
                 }
             } else if self.pic.cf != 0 {
                 // 4:2:2 chroma has full vertical resolution, so its vertical vector is in quarter
@@ -1879,7 +1903,11 @@ impl<'a> SliceDec<'a> {
                     mv[1] as i32
                 };
                 for c in 0..2usize {
-                    inter::chroma_mc_st(&entry.pic.data.plane(1 + c, rows)[co..], cst, cpw, cph, x / 2, cy, mv[0] as i32, my, cw, ch, &mut self.mcc[l][c]);
+                    if direct {
+                        inter::chroma_mc_st(&entry.pic.data.plane(1 + c, rows)[co..], cst, cpw, cph, x / 2, cy, mv[0] as i32, my, cw, ch, &mut self.pic.planes[1 + c][dc..], rsc);
+                    } else {
+                        inter::chroma_mc_st(&entry.pic.data.plane(1 + c, rows)[co..], cst, cpw, cph, x / 2, cy, mv[0] as i32, my, cw, ch, &mut self.mcc[l][c], cw);
+                    }
                 }
             }
             pics[l] = Some((if fm { entry.pic.field_poc[par] } else { entry.pic.poc }, entry.long));
@@ -1889,7 +1917,6 @@ impl<'a> SliceDec<'a> {
         }
         // a field macroblock's weights are those of the frame its field belongs to
         let (r0, r1) = ((self.cur.ref_idx[0][b8].max(0) as usize) >> fm as u32, (self.cur.ref_idx[1][b8].max(0) as usize) >> fm as u32);
-        let explicit = self.hdr.weights.as_ref();
         if pics[0].is_some() && pics[1].is_some() {
             // weights as (log2 denominator, w0, w1, offset) for luma and each chroma plane
             let mut wts: Option<[(u32, i32, i32, i32); 3]> = None;
@@ -1945,13 +1972,15 @@ impl<'a> SliceDec<'a> {
                 }
             }
         }
+        if direct {
+            return Ok(());
+        }
         // the prediction is in list 0's scratch, or in list 1's when only list 1 is used
         let o = usize::from(pics[0].is_none());
         for row in 0..bh {
             let d = self.org[0] + (by * 4 + row) * self.rs[0] + bx * 4;
             self.pic.planes[0][d..d + bw].copy_from_slice(&self.mcl[o][row * bw..row * bw + bw]);
         }
-        let (cbx, cby) = (if c444 { bx * 4 } else { bx * 2 }, if c422 || c444 { by * 4 } else { by * 2 });
         for c in 0..if self.pic.cf != 0 { 2usize } else { 0 } {
             for row in 0..ch {
                 let d = self.org[1] + (cby + row) * self.rs[1] + cbx;
