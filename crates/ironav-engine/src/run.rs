@@ -9,7 +9,7 @@ use ironav_codec::vp8::Vp8Encoder;
 use ironav_codec::vp9::Vp9Encoder;
 use ironav_codec::av1::enc::Av1Encoder;
 use ironav_codec::{build_filter, new_encoder_with_opts, VideoOptions};
-use ironav_core::{CodecId, Decoder, Encoder, Error, ErrorCode, Filter, Frame, MediaType, Packet, Rational, Result};
+use ironav_core::{CodecId, Decoder, Encoder, Error, ErrorCode, FieldOrder, Filter, Frame, MediaType, Packet, Rational, Result};
 use ironav_hwaccel::{new_video_decoder, new_video_encoder, Direction, RateControl};
 use ironav_formats::{create_muxer_new, open_demuxer};
 use serde::Serialize;
@@ -69,20 +69,26 @@ struct Runtime {
 }
 
 impl Runtime {
-    fn through(&mut self, frames: Vec<Frame>) -> Result<Vec<Packet>> {
-        self.through_from(0, frames)
+    fn through(&mut self, frames: Vec<Frame>, orders: Vec<FieldOrder>) -> Result<Vec<Packet>> {
+        self.through_from(0, frames, orders)
     }
 
-    /// Run `frames` through the filters from the `start`th on, then the encoder.
-    fn through_from(&mut self, start: usize, frames: Vec<Frame>) -> Result<Vec<Packet>> {
-        let mut cur = frames;
+    /// Run `frames` through the filters from the `start`th on, then the encoder. `orders` says how the
+    /// decoder laid out each frame's fields (frames past its end are `Unknown`); a filter that keeps the
+    /// lines as they are passes the order on to what it returns.
+    fn through_from(&mut self, start: usize, frames: Vec<Frame>, orders: Vec<FieldOrder>) -> Result<Vec<Packet>> {
+        let mut cur: Vec<(Frame, FieldOrder)> = frames.into_iter().enumerate().map(|(i, f)| (f, orders.get(i).copied().unwrap_or_default())).collect();
         for f in &mut self.filters[start..] {
             let mut next = Vec::with_capacity(cur.len());
-            for fr in cur {
-                next.extend(f.process(fr)?);
+            for (fr, order) in cur {
+                let kept = if f.keeps_field_order() { order } else { FieldOrder::Unknown };
+                for o in f.process_interlaced(fr, order)? {
+                    next.push((o, kept));
+                }
             }
             cur = next;
         }
+        let cur: Vec<Frame> = cur.into_iter().map(|(f, _)| f).collect();
         let enc = self.encoder.as_mut().expect("transcode steps have an encoder");
         let mut out = Vec::new();
         for fr in &cur {
@@ -423,8 +429,10 @@ fn process(
         let out = match rt.action {
             Action::Copy => vec![p],
             Action::Transcode => {
-                let frames = rt.decoder.as_mut().expect("transcode steps have a decoder").decode(&p)?;
-                rt.through(frames)?
+                let dec = rt.decoder.as_mut().expect("transcode steps have a decoder");
+                let frames = dec.decode(&p)?;
+                let orders = dec.field_orders();
+                rt.through(frames, orders)?
             }
         };
         emit!(rt, out);
@@ -436,12 +444,14 @@ fn process(
 
     for rt in runtimes.iter_mut() {
         if rt.action == Action::Transcode {
-            let frames = rt.decoder.as_mut().expect("decoder").flush()?;
-            let mut out = rt.through(frames)?;
+            let dec = rt.decoder.as_mut().expect("decoder");
+            let frames = dec.flush()?;
+            let orders = dec.field_orders();
+            let mut out = rt.through(frames, orders)?;
             // a filter with look-ahead hands over what it held back, for the filters after it
             for i in 0..rt.filters.len() {
                 let held = rt.filters[i].flush()?;
-                out.extend(rt.through_from(i + 1, held)?);
+                out.extend(rt.through_from(i + 1, held, Vec::new())?);
             }
             out.extend(rt.encoder.as_mut().expect("encoder").flush()?);
             emit!(rt, out);
