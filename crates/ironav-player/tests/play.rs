@@ -229,6 +229,89 @@ fn first_after_seek(pl: &Player, to: f64, mode: ironav_player::SeekMode) -> f64 
 }
 
 #[test]
+fn playback_and_seek_previews_use_the_reported_field_order() {
+    use ironav_core::{FieldOrder, Frame};
+    use ironav_player::SeekMode::{Accurate, Keyframe};
+    use std::process::Command;
+
+    if !Command::new("ffmpeg").arg("-version").output().is_ok_and(|o| o.status.success()) {
+        eprintln!("skipped: ffmpeg is not on PATH");
+        return;
+    }
+    let root = dir("field-order");
+    let top = "testsrc2=s=160x96:r=50,interlace=scan=tff";
+    let bottom = "testsrc2=s=160x96:r=50,interlace=scan=bff";
+    let progressive = "testsrc2=s=160x96:r=25";
+    let mut cases = vec![
+        ("top", top, "mpeg2video", "off", FieldOrder::TopFirst),
+        ("bottom", bottom, "mpeg2video", "off", FieldOrder::BottomFirst),
+        ("progressive", progressive, "mpeg2video", "off", FieldOrder::Progressive),
+    ];
+    // Opt in on a machine with the NVDEC driver and FFmpeg's libx264 encoder.
+    if std::env::var_os("IRONAV_TEST_NVDEC").is_some() {
+        cases.push(("nvdec-bottom", bottom, "libx264", "cuda", FieldOrder::BottomFirst));
+    }
+    for (name, source, encoder, hwaccel, want) in cases {
+        let path = root.join(format!("{name}.mkv"));
+        let mut ffmpeg = Command::new("ffmpeg");
+        let flags = if want.is_interlaced() { "+ildct+ilme" } else { "-ildct-ilme" };
+        ffmpeg.args(["-v", "error", "-y", "-nostdin", "-f", "lavfi", "-i", source, "-frames:v", "12", "-c:v", encoder,
+            "-pix_fmt", "yuv420p", "-flags", flags, "-g", "24", "-bf", "2", "-threads", "1"]);
+        if encoder == "libx264" {
+            ffmpeg.args(["-x264-params", "interlaced=1:bff=1"]);
+        }
+        let status = ffmpeg.arg(&path).status().unwrap();
+        assert!(status.success(), "encode {name}");
+
+        let mut demux = ironav_formats::open_demuxer_lazy(&path).unwrap();
+        let stream = &demux.streams()[0];
+        let time_base = stream.time_base.as_f64();
+        let (mut decoder, _) = ironav_player::open_video_decoder(stream, hwaccel).unwrap();
+        let mut expected = Vec::new();
+        let mut take = |batch: Vec<Frame>, orders: Vec<FieldOrder>| {
+            assert_eq!(batch.len(), orders.len());
+            for (frame, order) in batch.into_iter().zip(orders) {
+                assert_eq!(order, want, "{name}");
+                let Frame::Video(frame) = frame else { panic!("expected a video picture") };
+                let frame = if order.is_interlaced() {
+                    let filtered = ironav_codec::deinterlace_frame(&frame, order).unwrap();
+                    assert!(filtered.planes != frame.planes, "the {name} fixture must exercise filtering");
+                    filtered
+                } else {
+                    frame
+                };
+                expected.push(frame);
+            }
+        };
+        while let Some(packet) = demux.read_packet().unwrap() {
+            let frames = decoder.decode(&packet).unwrap();
+            take(frames, decoder.field_orders());
+        }
+        let frames = decoder.flush().unwrap();
+        assert!(!frames.is_empty(), "the {name} fixture must exercise decoder flush");
+        take(frames, decoder.field_orders());
+        assert_eq!(expected.len(), 12);
+        drop(decoder);
+
+        let pl = Player::open(path.to_str().unwrap(), &OpenOptions { autoplay: false, hwaccel: hwaccel.into(), ..silent() }).unwrap();
+        let check = |index: usize| {
+            let shown = pl.frame().unwrap();
+            assert_eq!(shown.time, expected[index].pts as f64 * time_base, "{name}, picture {index}");
+            assert!(shown.frame.planes == expected[index].planes, "{name}, picture {index}: displayed pixels differ");
+        };
+        until("first picture", 10.0, || pl.frame().is_some());
+        check(0);
+        let target = expected[5].pts as f64 * time_base + 0.01;
+        first_after_seek(&pl, target, Keyframe);
+        check(0);
+        first_after_seek(&pl, target, Accurate);
+        check(5);
+        first_after_seek(&pl, expected[11].pts as f64 * time_base + 0.01, Accurate);
+        check(11);
+    }
+}
+
+#[test]
 fn accurate_seeks_land_on_the_frame_at_the_target_and_keyframe_seeks_on_the_keyframe_before_it() {
     use ironav_player::SeekMode::{Accurate, Keyframe};
     for format in ["mp4", "mkv"] {

@@ -678,6 +678,9 @@ of audio frames the output device has taken (so a stalled device stalls the cloc
 used for video-only files or once the audio runs out. Seeking is exact: audio is trimmed to the target and video decodes
 forward from the previous keyframe and shows the last picture at or before it. Late pictures are dropped, not queued.
 
+The player deinterlaces planar pictures that the decoder marks as interlaced. It keeps the first field and interpolates
+the missing lines, so playback, seek previews and snapshots all use the same picture at the original timestamp.
+
 What was and was not checked, on one machine (Windows, RTX 3090 Ti):
 - Real-time pacing, pause, exact seeks, ordering, looping, end detection and the JSON commands are covered by tests on
   generated WAV and Y4M files, against the silent clock (`--audio silent`).

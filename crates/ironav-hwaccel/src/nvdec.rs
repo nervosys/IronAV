@@ -14,7 +14,7 @@
 // `c_ulong` is 32 bits on Windows and 64 on Linux: conversions into it are needed on one only
 #![allow(clippy::useless_conversion)]
 
-use ironav_core::{CodecId, Decoder, Error, ErrorCode, Frame, Packet, PixelFormat, Result, StreamParams, VideoFrame};
+use ironav_core::{CodecId, Decoder, Error, ErrorCode, FieldOrder, Frame, Packet, PixelFormat, Result, StreamParams, VideoFrame};
 use crate::driver::load;
 use libloading::Library;
 use std::collections::VecDeque;
@@ -259,7 +259,7 @@ struct State {
     /// Coded height of the current decoder, for locating the chroma plane in a mapped frame.
     coded_height: u32,
     display: [i32; 4],
-    out: VecDeque<Frame>,
+    out: VecDeque<(Frame, FieldOrder)>,
     /// Host copy of the interleaved chroma plane, kept between pictures.
     uv_scratch: Vec<u8>,
     error: Option<Error>,
@@ -408,7 +408,17 @@ impl State {
     fn on_display(&mut self, d: &DispInfo) -> i32 {
         match self.fetch(d) {
             Ok(f) => {
-                self.out.push_back(f);
+                // Weave leaves both fields in the output. Keep their order with the picture.
+                let order = if d.progressive_frame != 0 {
+                    FieldOrder::Progressive
+                } else if d.repeat_first_field < 0 {
+                    FieldOrder::Unknown
+                } else if d.top_field_first != 0 {
+                    FieldOrder::TopFirst
+                } else {
+                    FieldOrder::BottomFirst
+                };
+                self.out.push_back((f, order));
                 1
             }
             Err(e) => self.fail(e),
@@ -548,6 +558,7 @@ pub struct NvdecDecoder {
     parser: *mut c_void,
     set_ctx: FnSetCtx,
     flushed: bool,
+    last_orders: Vec<FieldOrder>,
     /// The parser's codec id, kept so `reset` can make a new parser.
     parser_codec: u32,
     /// AV1 configuration OBUs given to the parser; it may read them after creation.
@@ -639,7 +650,7 @@ impl NvdecDecoder {
                 error: None,
             }));
             // From here on the struct owns everything, so Drop cleans up on any error path.
-            let mut this = NvdecDecoder { _cuvid: cuvid, cuda, ctx, dev, state, parser: ptr::null_mut(), set_ctx, flushed: false, parser_codec, _seqhdr: seqhdr };
+            let mut this = NvdecDecoder { _cuvid: cuvid, cuda, ctx, dev, state, parser: ptr::null_mut(), set_ctx, flushed: false, last_orders: Vec::new(), parser_codec, _seqhdr: seqhdr };
             this.create_parser()?;
             Ok(this)
         }
@@ -680,6 +691,7 @@ impl NvdecDecoder {
     }
 
     fn feed(&mut self, data: &[u8], pts: i64, flags: u32) -> Result<Vec<Frame>> {
+        self.last_orders.clear();
         // SAFETY: binds the context we retained to this thread.
         unsafe { (self.set_ctx)(self.ctx) };
         let mut pkt = SourcePacket { flags: flags.into(), payload_size: data.len() as u32 as c_ulong, payload: if data.is_empty() { ptr::null() } else { data.as_ptr() }, timestamp: pts };
@@ -689,7 +701,9 @@ impl NvdecDecoder {
             return Err(e);
         }
         cu(r, "cuvidParseVideoData")?;
-        Ok(self.state().out.drain(..).collect())
+        let (frames, orders) = self.state().out.drain(..).unzip();
+        self.last_orders = orders;
+        Ok(frames)
     }
 }
 
@@ -703,6 +717,7 @@ impl Decoder for NvdecDecoder {
 
     fn flush(&mut self) -> Result<Vec<Frame>> {
         if self.flushed {
+            self.last_orders.clear();
             return Ok(Vec::new());
         }
         self.flushed = true;
@@ -713,6 +728,7 @@ impl Decoder for NvdecDecoder {
     /// parser is ended, its pictures dropped, and a new one made. The decoder is rebuilt by the
     /// next sequence header.
     fn reset(&mut self) -> bool {
+        self.last_orders.clear();
         // SAFETY: binds the context we retained to this thread; the parser is ours and idle.
         unsafe {
             (self.set_ctx)(self.ctx);
@@ -734,6 +750,10 @@ impl Decoder for NvdecDecoder {
         }
         self.flushed = false;
         true
+    }
+
+    fn field_orders(&self) -> Vec<FieldOrder> {
+        self.last_orders.clone()
     }
 }
 
