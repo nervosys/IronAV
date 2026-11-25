@@ -18,7 +18,7 @@ pub use enc::Mpeg2Encoder;
 mod tables;
 
 use crate::mpeg4::bits::{Bits, Vlc};
-use ironav_core::{Decoder, Error, ErrorCode, Frame as OutFrame, Packet, PixelFormat, Result, VideoFrame};
+use ironav_core::{Decoder, Error, ErrorCode, FieldOrder, Frame as OutFrame, Packet, PixelFormat, Result, VideoFrame};
 use mc::Plane;
 use std::sync::Arc;
 use tables as T;
@@ -54,6 +54,8 @@ impl Geo {
 pub(crate) struct Frame {
     pub p: [Plane; 3],
     pub pts: i64,
+    /// How the fields are laid out, known once the picture is whole.
+    pub order: FieldOrder,
 }
 
 impl Frame {
@@ -61,6 +63,7 @@ impl Frame {
         Frame {
             p: [Plane::new(g.mbw * 16, g.mbh * 16, fill), Plane::new(g.mbw * 8, g.chroma_rows(), fill), Plane::new(g.mbw * 8, g.chroma_rows(), fill)],
             pts,
+            order: FieldOrder::Unknown,
         }
     }
 
@@ -118,6 +121,7 @@ pub(crate) struct PicHdr {
     pub intra_vlc_format: bool,
     pub alternate_scan: bool,
     pub progressive_sequence: bool,
+    pub progressive_frame: bool,
 }
 
 impl PicHdr {
@@ -136,6 +140,7 @@ impl PicHdr {
             intra_vlc_format: false,
             alternate_scan: false,
             progressive_sequence: true,
+            progressive_frame: true,
         }
     }
 }
@@ -280,6 +285,8 @@ pub struct Mpeg2Decoder {
     gray: Option<Arc<Frame>>,
     /// Slices that did not decode, for the debug trace.
     slice_errors: u64,
+    /// The field order of each frame the last `decode` or `flush` returned.
+    orders: Vec<FieldOrder>,
 }
 
 impl Mpeg2Decoder {
@@ -308,6 +315,7 @@ impl Mpeg2Decoder {
             next: None,
             gray: None,
             slice_errors: 0,
+            orders: Vec::new(),
         };
         let mut sink = Vec::new();
         let _ = d.feed(extradata, 0, &mut sink);
@@ -428,6 +436,7 @@ impl Mpeg2Decoder {
                 let _rff = br.bit();
                 let _chroma_420_type = br.bit();
                 let progressive_frame = br.bit();
+                h.progressive_frame = progressive_frame;
                 // the stream may not contradict itself
                 if h.structure == 0 || (progressive_frame && h.structure != 3) {
                     h.structure = 3;
@@ -586,8 +595,17 @@ impl Mpeg2Decoder {
         let Some(cur) = self.cur.take() else { return };
         let Some(g) = self.geo else { return };
         self.same = None;
+        let mut cur = cur;
+        cur.order = if !self.mpeg2 || st.h.progressive_sequence || (st.h.structure == 3 && st.h.progressive_frame) {
+            FieldOrder::Progressive
+        } else if st.h.tff {
+            FieldOrder::TopFirst
+        } else {
+            FieldOrder::BottomFirst
+        };
         let arc = Arc::new(cur);
         if st.h.ptype == 3 || self.low_delay {
+            self.orders.push(arc.order);
             out.push(OutFrame::Video(arc.video(&g)));
             if st.h.ptype != 3 {
                 self.next = Some(arc);
@@ -595,6 +613,7 @@ impl Mpeg2Decoder {
         } else {
             // an anchor goes out when the next one has come: the pictures between them follow it
             if let Some(l) = &self.last {
+                self.orders.push(l.order);
                 out.push(OutFrame::Video(l.video(&g)));
             }
             self.next = Some(arc);
@@ -606,6 +625,7 @@ impl Mpeg2Decoder {
         self.end_picture(out);
         if !self.low_delay {
             if let (Some(n), Some(g)) = (self.next.take(), self.geo) {
+                self.orders.push(n.order);
                 out.push(OutFrame::Video(n.video(&g)));
             }
         }
@@ -637,6 +657,7 @@ fn load_matrix(br: &mut Bits, m: &mut [u8; 64], mut also: Option<&mut [u8; 64]>,
 
 impl Decoder for Mpeg2Decoder {
     fn decode(&mut self, packet: &Packet) -> Result<Vec<OutFrame>> {
+        self.orders.clear();
         let mut out = Vec::new();
         self.feed(&packet.data, packet.pts, &mut out)?;
         // a packet ends the picture in progress
@@ -645,13 +666,19 @@ impl Decoder for Mpeg2Decoder {
     }
 
     fn flush(&mut self) -> Result<Vec<OutFrame>> {
+        self.orders.clear();
         let mut out = Vec::new();
         self.end_picture(&mut out);
         if !self.low_delay {
             if let (Some(n), Some(g)) = (self.next.take(), self.geo) {
+                self.orders.push(n.order);
                 out.push(OutFrame::Video(n.video(&g)));
             }
         }
         Ok(out)
+    }
+
+    fn field_orders(&self) -> Vec<FieldOrder> {
+        self.orders.clone()
     }
 }

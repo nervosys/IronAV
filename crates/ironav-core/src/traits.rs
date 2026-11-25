@@ -1,4 +1,4 @@
-use crate::{Attachment, Chapter, Error, ErrorCode, Frame, Packet, Result, StreamInfo, StreamParams};
+use crate::{Attachment, Chapter, Error, ErrorCode, FieldOrder, Frame, Packet, Result, StreamInfo, StreamParams};
 
 // All stage traits are `Send` so the engine can run each stage on its own thread and
 // move packets/frames between stages without copying.
@@ -49,6 +49,12 @@ pub trait Decoder: Send {
     fn reset(&mut self) -> bool {
         false
     }
+
+    /// The field order of each frame the last `decode` or `flush` call returned, in the same order.
+    /// A decoder that does not track interlacing returns an empty list (every frame is then `Unknown`).
+    fn field_orders(&self) -> Vec<FieldOrder> {
+        Vec::new()
+    }
 }
 
 pub trait Encoder: Send {
@@ -64,6 +70,22 @@ pub trait Filter: Send {
         input.clone()
     }
     fn process(&mut self, frame: Frame) -> Result<Vec<Frame>>;
+    /// [`Filter::process`] with the field order the decoder reported for `frame`. Filters that do not
+    /// care about interlacing keep this default.
+    fn process_interlaced(&mut self, frame: Frame, _order: FieldOrder) -> Result<Vec<Frame>> {
+        self.process(frame)
+    }
+    /// Whether the frames this filter returns have the field order of the one it took (a filter that
+    /// touches each pixel alone, or flips along the lines, does; one that resizes vertically does not).
+    fn keeps_field_order(&self) -> bool {
+        false
+    }
+    /// The factor by which this filter multiplies the timestamps of the frames it returns (a filter that
+    /// doubles the frame rate stamps its frames in half units, so that the new ones fall exactly between
+    /// the old). The stream's time base is divided by it.
+    fn time_scale(&self) -> i64 {
+        1
+    }
     /// Frames still held back when the stream ends (a filter with look-ahead).
     fn flush(&mut self) -> Result<Vec<Frame>> {
         Ok(Vec::new())

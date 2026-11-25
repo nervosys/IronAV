@@ -371,6 +371,32 @@ impl AudioFrame {
     }
 }
 
+/// How the two fields of a decoded picture are laid out in time, as the decoder reports it.
+///
+/// It travels beside the frame (see `Decoder::field_orders` and `Filter::process_interlaced`) so that
+/// `VideoFrame` keeps its shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FieldOrder {
+    /// The decoder says nothing.
+    #[default]
+    Unknown,
+    /// One moment in time: no deinterlacing needed.
+    Progressive,
+    /// Interlaced; the top field (even lines) comes first in time.
+    TopFirst,
+    /// Interlaced; the bottom field (odd lines) comes first in time.
+    BottomFirst,
+    /// Interlaced, but the stream does not say which field is first.
+    Interlaced,
+}
+
+impl FieldOrder {
+    /// Whether the picture is known to hold two fields from different moments.
+    pub fn is_interlaced(self) -> bool {
+        matches!(self, FieldOrder::TopFirst | FieldOrder::BottomFirst | FieldOrder::Interlaced)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct VideoFrame {
     pub width: u32,
