@@ -2,6 +2,7 @@
 //! JSON an agent would get from the same player.
 
 use crate::gpu;
+use crate::subtitles::Subtitles;
 use eframe::egui::{self, Color32, RichText};
 use ironav_core::Error;
 use ironav_formats::FORMATS;
@@ -28,6 +29,7 @@ pub struct PlayerApp {
     /// the picture's format allows; otherwise they are converted on the CPU into `tex`.
     gpu: bool,
     player: Option<Player>,
+    subtitles: Subtitles,
     /// The file being opened; the result arrives here and replaces `player`.
     opening: Option<Opening>,
     /// The picture last shown, kept so a seek does not flash black while the next one decodes.
@@ -53,7 +55,7 @@ fn fmt_time(s: f64) -> String {
 
 impl PlayerApp {
     pub fn new(initial: Option<String>, gpu: bool, ctx: egui::Context) -> Self {
-        let mut a = Self { ctx, gpu, last: None, player: None, opening: None, path: String::new(), error: None, tex: None, shown: None, scrub: None, scrub_sent: None, show_agent: false, note: None, fullscreen: false };
+        let mut a = Self { ctx, gpu, last: None, player: None, subtitles: Subtitles::default(), opening: None, path: String::new(), error: None, tex: None, shown: None, scrub: None, scrub_sent: None, show_agent: false, note: None, fullscreen: false };
         if let Some(p) = initial {
             a.open(&p);
         }
@@ -62,6 +64,7 @@ impl PlayerApp {
 
     fn open(&mut self, path: &str) {
         self.player = None; // stop the old one first so two decoders never compete for the GPU
+        self.subtitles.clear();
         self.tex = None;
         self.shown = None;
         self.last = None;
@@ -290,6 +293,7 @@ impl eframe::App for PlayerApp {
         }
         self.finish_open();
         self.keys(&ctx);
+        self.subtitles.update(&ctx);
         // The status JSON is built at most once per UI frame, and only for what shows it: the Agent
         // view and the audio-only level meter.
         let status: Option<Value> = self.player.as_ref().filter(|p| self.show_agent || !p.has_video()).map(Player::status);
@@ -303,6 +307,9 @@ impl eframe::App for PlayerApp {
                 }
                 if ui.add_enabled(self.player.as_ref().is_some_and(Player::has_video), egui::Button::new("Snapshot")).clicked() {
                     self.snapshot();
+                }
+                if let Some(p) = self.player.as_ref().filter(|p| p.has_video()) {
+                    self.subtitles.menu(ui, p);
                 }
                 if let Some((m, t)) = &self.note {
                     if t.elapsed() < Duration::from_secs(4) {
@@ -334,14 +341,16 @@ impl eframe::App for PlayerApp {
             }
         });
 
+        let mut next_subtitle = None;
         egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::BLACK)).show(ui, |ui| {
             let avail = ui.available_size();
             let full = ui.max_rect();
             let fresh = self.player.as_ref().and_then(Player::frame);
-            if fresh.is_some() {
+            let is_fresh = fresh.is_some();
+            if is_fresh {
                 self.last.clone_from(&fresh);
             }
-            let mut drawn = false;
+            let mut picture_rect = None;
             if let Some(f) = fresh.or_else(|| self.last.clone()) {
                 if self.gpu && gpu::supported(&f.frame) {
                     // The planes go to the GPU as they are; the shader converts and scales.
@@ -350,7 +359,7 @@ impl eframe::App for PlayerApp {
                     ui.painter().add(gpu::VideoCallback::shape(rect, f));
                     self.tex = None;
                     self.shown = None;
-                    drawn = true;
+                    picture_rect = Some(rect);
                 } else {
                     self.update_texture(&ctx, &f, Arc::as_ptr(&f) as usize, avail);
                     if let Some(t) = &self.tex {
@@ -358,12 +367,14 @@ impl eframe::App for PlayerApp {
                         let scale = (avail.x / sz.x).min(avail.y / sz.y);
                         let rect = egui::Rect::from_center_size(full.center(), sz * scale);
                         ui.painter().image(t.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
-                        drawn = true;
+                        picture_rect = Some(rect);
                     }
                 }
             }
-            if drawn {
-                // the picture is up
+            if let Some(rect) = picture_rect {
+                if let Some(p) = self.player.as_ref().filter(|_| is_fresh) {
+                    next_subtitle = self.subtitles.paint(ui, rect, p.position());
+                }
             } else if let Some(p) = &self.player {
                 if !p.has_video() {
                     if let Some(st) = &status {
@@ -394,7 +405,7 @@ impl eframe::App for PlayerApp {
             }
         });
 
-        self.schedule_repaint(&ctx);
+        self.schedule_repaint(&ctx, next_subtitle);
     }
 }
 
@@ -403,7 +414,7 @@ impl PlayerApp {
     /// is due, the clock text and seek bar need a tick, or a message expires. A paused player, an
     /// ended one and an empty window ask for nothing and stay idle until input or a decoder
     /// thread wakes them.
-    fn schedule_repaint(&self, ctx: &egui::Context) {
+    fn schedule_repaint(&self, ctx: &egui::Context, next_subtitle: Option<f64>) {
         let mut wait: Option<Duration> = None;
         let mut soonest = |d: Duration| wait = Some(wait.map_or(d, |w| w.min(d)));
         if let Some(p) = &self.player {
@@ -413,6 +424,10 @@ impl PlayerApp {
                     soonest(Duration::from_millis(if p.has_video() { 50 } else { 33 }));
                     if let Some(due) = p.next_frame_due() {
                         soonest(Duration::from_secs_f64(due).max(Duration::from_millis(1)));
+                    }
+                    if let Some(t) = next_subtitle {
+                        let due = (t - p.position()).clamp(0.001, 0.05);
+                        soonest(Duration::from_secs_f64(due));
                     }
                 }
                 State::Buffering => soonest(Duration::from_millis(50)),
