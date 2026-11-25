@@ -12,7 +12,7 @@
 //! AudioSpecificConfig carries the signalling explicitly) and is decoded to f32 samples. Skipped
 //! without `ffmpeg` on PATH.
 
-use super::ps_tables::{HUFF, HUFF_OFFSETS, HUFF_SIZES};
+use super::ps_tables::HUFFMAN;
 use super::sbr_tables::{HUFF_COUNTS as SBR_COUNTS, HUFF_LENS as SBR_LENS, HUFF_OFFSETS as SBR_OFFS, HUFF_SYMBOLS as SBR_SYMS};
 use super::{output_params, sbr::Sbr, AacDecoder};
 use crate::aac::enc::AacEncoder;
@@ -82,8 +82,9 @@ fn sbr_code(table: usize, value: i32) -> (u32, u32) {
 }
 
 fn ps_code(table: usize, value: i32) -> (u32, u32) {
-    let at: usize = HUFF_SIZES[..table].iter().sum();
-    code_of(HUFF[at..at + HUFF_SIZES[table]].iter().map(|&(s, l)| (s as i32 + HUFF_OFFSETS[table], l as u32)), value)
+    let (first_delta, words) = HUFFMAN[table];
+    let (len, code) = words[(value - first_delta) as usize];
+    (code, u32::from(len))
 }
 
 // ---- the SBR side ----------------------------------------------------------------------------------
