@@ -115,11 +115,12 @@ fn attached_tools_follow_the_window_player_and_are_revoked_with_the_link() {
     assert_eq!(mcp.call("play_control", json!({ "cmd": "snapshot", "path": output }))["isError"], true);
     assert!(!output.exists());
 
-    link.set_player(None);
+    let finish_detach = link.detach_player();
     assert_eq!(mcp.call("play_status", json!({}))["isError"], true);
     drop(first);
     let second = player(&second_path, 128);
     link.set_player(Some(&second));
+    finish_detach();
     assert_eq!(mcp.call("play_status", json!({}))["structuredContent"]["path"], json!(second_path));
     drop(link);
     assert_eq!(mcp.call("play_status", json!({}))["isError"], true);

@@ -74,8 +74,13 @@ impl Subtitles {
         }
     }
 
-    pub(crate) fn menu(&mut self, ui: &mut egui::Ui, player: &Player) {
+    pub(crate) fn open_file(&mut self, path: PathBuf) {
+        self.select(Some(Source { path, index: None }));
+    }
+
+    pub(crate) fn menu(&mut self, ui: &mut egui::Ui, player: &Player, can_pick: bool) -> Option<rfd::AsyncFileDialog> {
         let path = Path::new(&player.info().path);
+        let mut picker = None;
         ui.menu_button("Subtitles", |ui| {
             if ui.selectable_label(self.source.is_none(), "Off").clicked() {
                 self.clear();
@@ -92,18 +97,15 @@ impl Subtitles {
             if let Some(source) = self.source.as_ref().filter(|s| s.index.is_none()) {
                 ui.label(source.path.file_name().unwrap_or_default().to_string_lossy());
             }
-            if ui.button("Open subtitle file…").clicked() {
+            if ui.add_enabled(can_pick, egui::Button::new("Open subtitle file…")).clicked() {
                 ui.close();
-                let mut dialog = rfd::FileDialog::new()
+                let mut dialog = rfd::AsyncFileDialog::new()
                     .set_title("Open subtitle file")
                     .add_filter("Subtitles", &["srt", "vtt", "ass", "ssa"]);
-                if let Some(dir) = path.parent().filter(|d| d.is_dir()) {
+                if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
                     dialog = dialog.set_directory(dir);
                 }
-                if let Some(path) = dialog.pick_file() {
-                    self.select(Some(Source { path, index: None }));
-                    ui.ctx().request_repaint();
-                }
+                picker = Some(dialog);
             }
         });
         match &self.result {
@@ -111,6 +113,7 @@ impl Subtitles {
             Some(Err(e)) => { ui.label("Subtitles unavailable").on_hover_text(&e.message); }
             _ => {}
         }
+        picker
     }
 
     /// Paint over the picture and return the next subtitle change on the playback clock.

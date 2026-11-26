@@ -69,6 +69,7 @@ impl Client {
 
 struct Shared {
     player: Mutex<Option<Weak<Player>>>,
+    available: AtomicBool,
     stopped: AtomicBool,
     policy: Policy,
     wake: Waker,
@@ -95,7 +96,7 @@ impl Link {
         let client = Client { port: listener.local_addr()?.port(), key };
         // The operator shares media selected in the window. Explicit file roots set in the
         // desktop process still apply.
-        let shared = Arc::new(Shared { player: Mutex::new(None), stopped: AtomicBool::new(false), policy: Policy::from_env(false), wake });
+        let shared = Arc::new(Shared { player: Mutex::new(None), available: AtomicBool::new(false), stopped: AtomicBool::new(false), policy: Policy::from_env(false), wake });
         let state = shared.clone();
         let worker = thread::Builder::new().name("ironav-desktop-link".into()).spawn(move || {
             while !state.stopped.load(Ordering::Acquire) {
@@ -111,7 +112,17 @@ impl Link {
     }
 
     pub fn set_player(&self, player: Option<&Arc<Player>>) {
-        *self.shared.player.lock().unwrap_or_else(|e| e.into_inner()) = player.map(Arc::downgrade);
+        let mut slot = self.shared.player.lock().unwrap_or_else(|e| e.into_inner());
+        *slot = player.map(Arc::downgrade);
+        self.shared.available.store(player.is_some(), Ordering::Release);
+    }
+
+    /// Stop admitting calls for this player. Run the returned closure on the media worker to
+    /// wait for any outstanding command to release its reference to the decoder.
+    pub fn detach_player(&self) -> impl FnOnce() + Send + 'static {
+        self.shared.available.store(false, Ordering::Release);
+        let shared = self.shared.clone();
+        move || drop(shared.player.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     pub fn connection_value(&self) -> String {
@@ -167,7 +178,8 @@ fn dispatch(state: &Shared, mut request: Request) -> Result<Value> {
     if state.stopped.load(Ordering::Acquire) {
         return Err(Error::new(ErrorCode::NotFound, "the desktop connection was disabled"));
     }
-    let p = player.as_ref().and_then(Weak::upgrade).ok_or_else(|| Error::new(ErrorCode::NotFound, "the desktop player has no open media").hint("open a media file in the desktop player"))?;
+    let p = player.as_ref().filter(|_| state.available.load(Ordering::Acquire)).and_then(Weak::upgrade)
+        .ok_or_else(|| Error::new(ErrorCode::NotFound, "the desktop player has no open media").hint("open a media file in the desktop player"))?;
     state.policy.read(&p.info().path)?;
     let mut status = if request.name == "play_status" {
         p.status()

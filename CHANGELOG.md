@@ -9,6 +9,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Added
 
+- The desktop player groups its commands into File, View, and Subtitles menus. File dialogs, decoder teardown, and snapshot saving run in the background. The newest selection wins when files are opened in quick succession.
 - The desktop player's Agent view can connect a local MCP client to the open window. Enable MCP and copy the configuration to inspect playback, send transport commands, or request inline video snapshots. Disable MCP to revoke the window's connection key.
 - The desktop player displays timed subtitles over the video. Choose an embedded Matroska or WebM text track or open an SRT, WebVTT, ASS or SSA file from the Subtitles menu. Tracks load in the background and display as plain text, including overlapping cues and cues already in progress at a seek target.
 - The player automatically deinterlaces planar video flagged by the decoder. It fills the missing lines of the first field with cubic interpolation and keeps one picture per timestamp for playback, seek previews and snapshots. NVDEC now reports field order for its woven output.

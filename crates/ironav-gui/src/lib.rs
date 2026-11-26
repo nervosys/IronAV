@@ -4,7 +4,9 @@
 
 mod app;
 mod gpu;
+mod picker;
 mod player;
+mod player_style;
 mod subtitles;
 pub mod model;
 
