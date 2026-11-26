@@ -6,6 +6,7 @@
 pub mod analyze;
 pub mod audit;
 pub mod chunk;
+pub mod desktop;
 pub mod job;
 mod limits;
 pub mod live;
