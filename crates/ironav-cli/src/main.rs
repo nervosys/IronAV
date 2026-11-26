@@ -67,7 +67,7 @@ fn help() -> Value {
             "hw probe | hw select --codec C --direction decode|encode [--policy P]": "hardware acceleration",
             "ontology summary | search [text] [--kind K] [--limit N] | describe ID | convert FROM TO | jsonld": "knowledge graph",
             "tools": "tool definitions with JSON Schemas (function-calling compatible)",
-            "mcp": "serve all tools over the Model Context Protocol on stdio",
+            "mcp": "serve tools over the Model Context Protocol on stdio, or use --attach for the desktop player",
             "play FILE [--audio auto|silent|off] [--start S] [--volume V] [--loop] [--paused] [--hwaccel P] [--tui|--json] [--until-end]": "play audio/video: a full-screen terminal player on a TTY, otherwise JSON lines on stdin/stdout ({\"cmd\":\"seek\",\"to\":30}); send {\"cmd\":\"help\"} for the commands",
             "gui [FILE] | gui --play [FILE] | gui --web [--port N] [--no-open]": "native desktop window (default), the player window (--play), or the browser-based UI"
         },
@@ -610,7 +610,8 @@ fn main() {
 
     match rest.first().map(String::as_str) {
         Some("mcp") => {
-            if let Err(e) = mcp::serve() {
+            let attach = rest.iter().skip(1).any(|arg| arg == "--attach");
+            if let Err(e) = mcp::serve(attach) {
                 eprintln!("{}", serde_json::to_string(&e).unwrap_or_default());
                 std::process::exit(e.code.exit_code());
             }

@@ -1,10 +1,10 @@
 #[cfg(feature = "serde")]
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Stable, machine-readable error classes. Agents branch on these, not on message text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(Serialize))]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
 pub enum ErrorCode {
     Io,
@@ -64,13 +64,13 @@ impl ErrorCode {
 /// An error that tells the caller how to recover: `hint` is a sentence of advice and
 /// `alternatives` lists concrete valid values the caller could retry with.
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(Serialize))]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 pub struct Error {
     pub code: ErrorCode,
     pub message: String,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub hint: Option<String>,
-    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Vec::is_empty"))]
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Vec::is_empty"))]
     pub alternatives: Vec<String>,
 }
 

@@ -33,6 +33,7 @@ ironav-ontology.workspace = true
 ironav-analyze.workspace = true
 ironav-live.workspace = true
 ironav-player.workspace = true
+ic-drbg = { version = "0.3.2", features = ["std"] }
 
 [target.'cfg(windows)'.dependencies]
 # sidecar resource limits: a job object per child (the same windows crate and version as ironav-live)

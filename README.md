@@ -673,6 +673,15 @@ Commands: `status play pause toggle seek{to|by|fraction} volume mute loop snapsh
 shows the effect. Over MCP the same player is `play_open`, `play_control`, `play_status` and `play_close`; snapshots come
 back as image blocks. `ironav gui --play` is the same player in a window, with an "Agent view" panel showing its live JSON.
 
+To connect an MCP client to that window, open **Agent view**, select **Enable MCP**, and use **Copy MCP configuration**.
+Add the copied server configuration to a local MCP client that supports stdio. It runs `ironav mcp --attach` with a
+window-specific key in `IRONAV_GUI_ATTACH`. `play_status` reports the current media and `play_control` can play, pause,
+seek, change volume, mute, repeat, or return an inline PNG of the current frame up to 640 pixels on a side. For example,
+call `play_control` with `{"cmd":"seek","to":12.5}`. The optional session id is `desktop`.
+
+The connection follows the file you select in the window and respects `IRONAV_ROOTS` when it is set for the desktop
+process. The window listens on loopback while MCP is enabled. **Disable MCP** or close the window to revoke its key.
+
 How it works: audio and video are decoded on separate threads, each with its own demuxer; the master clock is the number
 of audio frames the output device has taken (so a stalled device stalls the clock and video follows), with the wall clock
 used for video-only files or once the audio runs out. Seeking is exact: audio is trimmed to the target and video decodes

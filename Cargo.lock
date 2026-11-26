@@ -2250,6 +2250,7 @@ dependencies = [
 name = "ironav-engine"
 version = "0.1.10"
 dependencies = [
+ "ic-drbg",
  "ironav-analyze",
  "ironav-codec",
  "ironav-core",

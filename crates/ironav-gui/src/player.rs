@@ -5,6 +5,7 @@ use crate::gpu;
 use crate::subtitles::Subtitles;
 use eframe::egui::{self, Color32, RichText};
 use ironav_core::Error;
+use ironav_engine::desktop::{Link, CONNECTION_ENV};
 use ironav_formats::FORMATS;
 use ironav_player::{rgb_frame, to_png, AudioMode, OpenOptions, Player, SeekMode, State, TimedFrame};
 use serde_json::Value;
@@ -28,7 +29,8 @@ pub struct PlayerApp {
     /// Pictures are shown by the GPU (planes uploaded, converted in a shader) when this is set and
     /// the picture's format allows; otherwise they are converted on the CPU into `tex`.
     gpu: bool,
-    player: Option<Player>,
+    link: Option<Link>,
+    player: Option<Arc<Player>>,
     subtitles: Subtitles,
     /// The file being opened; the result arrives here and replaces `player`.
     opening: Option<Opening>,
@@ -55,7 +57,7 @@ fn fmt_time(s: f64) -> String {
 
 impl PlayerApp {
     pub fn new(initial: Option<String>, gpu: bool, ctx: egui::Context) -> Self {
-        let mut a = Self { ctx, gpu, last: None, player: None, subtitles: Subtitles::default(), opening: None, path: String::new(), error: None, tex: None, shown: None, scrub: None, scrub_sent: None, show_agent: false, note: None, fullscreen: false };
+        let mut a = Self { ctx, gpu, last: None, link: None, player: None, subtitles: Subtitles::default(), opening: None, path: String::new(), error: None, tex: None, shown: None, scrub: None, scrub_sent: None, show_agent: false, note: None, fullscreen: false };
         if let Some(p) = initial {
             a.open(&p);
         }
@@ -63,6 +65,9 @@ impl PlayerApp {
     }
 
     fn open(&mut self, path: &str) {
+        if let Some(link) = &self.link {
+            link.set_player(None);
+        }
         self.player = None; // stop the old one first so two decoders never compete for the GPU
         self.subtitles.clear();
         self.tex = None;
@@ -103,6 +108,10 @@ impl PlayerApp {
                 p.set_waker(Arc::new(move || ctx.request_repaint()));
                 self.path = path;
                 self.error = None;
+                let p = Arc::new(p);
+                if let Some(link) = &self.link {
+                    link.set_player(Some(&p));
+                }
                 self.player = Some(p);
             }
             Err(e) => self.error = Some(e),
@@ -122,6 +131,35 @@ impl PlayerApp {
 
     fn say(&mut self, m: impl Into<String>) {
         self.note = Some((m.into(), std::time::Instant::now()));
+    }
+
+    fn agent_connection(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if let Some(link) = &self.link {
+                if ui.button("Copy MCP configuration").clicked() {
+                    let name = if cfg!(windows) { "ironav.exe" } else { "ironav" };
+                    let command = std::env::current_exe().ok().map(|p| p.with_file_name(name))
+                        .filter(|p| p.is_file()).map_or_else(|| name.to_owned(), |p| p.to_string_lossy().into_owned());
+                    let config = serde_json::json!({ "mcpServers": { "ironav-player": {
+                        "command": command, "args": ["mcp", "--attach"], "env": { (CONNECTION_ENV): link.connection_value() }
+                    }}});
+                    ui.ctx().copy_text(serde_json::to_string_pretty(&config).unwrap_or_default());
+                    self.say("Copied MCP configuration");
+                }
+                if ui.button("Disable MCP").clicked() {
+                    self.link = None;
+                }
+            } else if ui.button("Enable MCP").on_hover_text("Let a local MCP client inspect and control this player").clicked() {
+                let ctx = self.ctx.clone();
+                match Link::start(Arc::new(move || ctx.request_repaint())) {
+                    Ok(link) => {
+                        link.set_player(self.player.as_ref());
+                        self.link = Some(link);
+                    }
+                    Err(e) => self.say(format!("Could not enable MCP ({})", e.message)),
+                }
+            }
+        });
     }
 
     fn snapshot(&mut self) {
@@ -272,9 +310,6 @@ impl PlayerApp {
             if ui.checkbox(&mut looping, "Repeat").changed() {
                 p.set_looping(looping);
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.checkbox(&mut self.show_agent, "Agent view");
-            });
         });
     }
 }
@@ -296,7 +331,7 @@ impl eframe::App for PlayerApp {
         self.subtitles.update(&ctx);
         // The status JSON is built at most once per UI frame, and only for what shows it: the Agent
         // view and the audio-only level meter.
-        let status: Option<Value> = self.player.as_ref().filter(|p| self.show_agent || !p.has_video()).map(Player::status);
+        let status: Option<Value> = self.player.as_deref().filter(|p| self.show_agent || !p.has_video()).map(Player::status);
 
         egui::Panel::top("bar").show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -305,12 +340,13 @@ impl eframe::App for PlayerApp {
                 if ui.button("Open…").clicked() {
                     self.pick();
                 }
-                if ui.add_enabled(self.player.as_ref().is_some_and(Player::has_video), egui::Button::new("Snapshot")).clicked() {
+                if ui.add_enabled(self.player.as_deref().is_some_and(Player::has_video), egui::Button::new("Snapshot")).clicked() {
                     self.snapshot();
                 }
                 if let Some(p) = self.player.as_ref().filter(|p| p.has_video()) {
                     self.subtitles.menu(ui, p);
                 }
+                ui.checkbox(&mut self.show_agent, if self.link.is_some() { "Agent view (MCP on)" } else { "Agent view" });
                 if let Some((m, t)) = &self.note {
                     if t.elapsed() < Duration::from_secs(4) {
                         ui.weak(m);
@@ -327,12 +363,9 @@ impl eframe::App for PlayerApp {
             self.controls(ui);
             ui.add_space(2.0);
             if self.show_agent {
-                if let (Some(_), Some(st)) = (&self.player, &status) {
-                    ui.separator();
-                    ui.horizontal_wrapped(|ui| {
-                        ui.weak("same player, as an agent sees it:");
-                        ui.monospace(format!("ironav play \"{}\" --json   then   {{\"cmd\":\"status\"}}", self.path));
-                    });
+                ui.separator();
+                self.agent_connection(ui);
+                if let Some(st) = &status {
                     let mut json = serde_json::to_string_pretty(st).unwrap_or_default();
                     egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
                         ui.add(egui::TextEdit::multiline(&mut json).code_editor().desired_width(f32::INFINITY).interactive(false));
@@ -345,7 +378,7 @@ impl eframe::App for PlayerApp {
         egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::BLACK)).show(ui, |ui| {
             let avail = ui.available_size();
             let full = ui.max_rect();
-            let fresh = self.player.as_ref().and_then(Player::frame);
+            let fresh = self.player.as_deref().and_then(Player::frame);
             let is_fresh = fresh.is_some();
             if is_fresh {
                 self.last.clone_from(&fresh);
