@@ -673,7 +673,7 @@ Commands: `status play pause toggle seek{to|by|fraction} volume mute loop snapsh
 shows the effect. Over MCP the same player is `play_open`, `play_control`, `play_status` and `play_close`; snapshots come
 back as image blocks. `ironav gui --play` is the same player in a window, with an "Agent view" panel showing its live JSON.
 
-To connect an MCP client to that window, open **Agent view**, select **Enable MCP**, and use **Copy MCP configuration**.
+To connect an MCP client to that window, choose **View → Agent view**, select **Enable MCP**, and use **Copy MCP configuration**.
 Add the copied server configuration to a local MCP client that supports stdio. It runs `ironav mcp --attach` with a
 window-specific key in `IRONAV_GUI_ATTACH`. `play_status` reports the current media and `play_control` can play, pause,
 seek, change volume, mute, repeat, or return an inline PNG of the current frame up to 640 pixels on a side. For example,

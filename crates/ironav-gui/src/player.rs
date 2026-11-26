@@ -2,6 +2,8 @@
 //! JSON an agent would get from the same player.
 
 use crate::gpu;
+use crate::picker::Picker;
+use crate::player_style::{self, transport, Icon, ACCENT};
 use crate::subtitles::Subtitles;
 use eframe::egui::{self, Color32, RichText};
 use ironav_core::Error;
@@ -10,11 +12,11 @@ use ironav_formats::FORMATS;
 use ironav_player::{rgb_frame, to_png, AudioMode, OpenOptions, Player, SeekMode, State, TimedFrame};
 use serde_json::Value;
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
-const ACCENT: Color32 = Color32::from_rgb(249, 115, 22);
 const BAD: Color32 = Color32::from_rgb(248, 81, 73);
+const OPEN_MEDIA: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::O);
 /// While the seek bar is dragged, a keyframe seek is sent at most this often.
 const SCRUB_EVERY: Duration = Duration::from_millis(40);
 
@@ -22,6 +24,11 @@ const SCRUB_EVERY: Duration = Duration::from_millis(40);
 struct Opening {
     path: String,
     rx: Receiver<ironav_core::Result<Player>>,
+}
+
+enum FilePurpose {
+    Media,
+    Subtitle(Weak<Player>),
 }
 
 pub struct PlayerApp {
@@ -34,6 +41,10 @@ pub struct PlayerApp {
     subtitles: Subtitles,
     /// The file being opened; the result arrives here and replaces `player`.
     opening: Option<Opening>,
+    /// A newer selection superseding the open in flight. Options overwrite rather than queue.
+    pending: Option<String>,
+    picker: Picker<FilePurpose>,
+    snapshot: Option<Receiver<ironav_core::Result<String>>>,
     /// The picture last shown, kept so a seek does not flash black while the next one decodes.
     last: Option<Arc<TimedFrame>>,
     path: String,
@@ -57,7 +68,8 @@ fn fmt_time(s: f64) -> String {
 
 impl PlayerApp {
     pub fn new(initial: Option<String>, gpu: bool, ctx: egui::Context) -> Self {
-        let mut a = Self { ctx, gpu, last: None, link: None, player: None, subtitles: Subtitles::default(), opening: None, path: String::new(), error: None, tex: None, shown: None, scrub: None, scrub_sent: None, show_agent: false, note: None, fullscreen: false };
+        player_style::install(&ctx);
+        let mut a = Self { ctx, gpu, last: None, link: None, player: None, subtitles: Subtitles::default(), opening: None, pending: None, picker: Picker::default(), snapshot: None, path: String::new(), error: None, tex: None, shown: None, scrub: None, scrub_sent: None, show_agent: false, note: None, fullscreen: false };
         if let Some(p) = initial {
             a.open(&p);
         }
@@ -65,10 +77,12 @@ impl PlayerApp {
     }
 
     fn open(&mut self, path: &str) {
-        if let Some(link) = &self.link {
-            link.set_player(None);
+        let path = path.to_owned();
+        if self.opening.is_some() {
+            self.pending = Some(path);
+            return;
         }
-        self.player = None; // stop the old one first so two decoders never compete for the GPU
+        let old = self.player.take();
         self.subtitles.clear();
         self.tex = None;
         self.shown = None;
@@ -76,17 +90,26 @@ impl PlayerApp {
         self.scrub = None;
         self.scrub_sent = None;
         self.error = None;
-        // Opening reads and indexes the file and starts the decoder, which can take a while for a
-        // large file or a slow disk: it runs on its own thread, and the window shows that it is working.
+        self.start_open(path, old);
+    }
+
+    fn start_open(&mut self, path: String, old: Option<Arc<Player>>) {
         let (tx, rx) = channel();
-        let (p, ctx) = (path.to_string(), self.ctx.clone());
+        let (p, ctx) = (path.clone(), self.ctx.clone());
+        let detach = self.link.as_ref().map(Link::detach_player);
         let spawned = std::thread::Builder::new().name("ironav-open".into()).spawn(move || {
-            let r = Player::open(&p, &OpenOptions { audio: AudioMode::Auto, ..Default::default() });
+            if let Some(finish) = detach {
+                finish();
+            }
+            // Joining the old decoder can wait on a disk or hardware. Finish it here before
+            // opening the next one so they never compete for the same device.
+            drop(old);
+            let r = Player::open(&p, &OpenOptions { audio: AudioMode::Auto, autoplay: false, ..Default::default() });
             let _ = tx.send(r);
             ctx.request_repaint();
         });
         match spawned {
-            Ok(_) => self.opening = Some(Opening { path: path.to_string(), rx }),
+            Ok(_) => self.opening = Some(Opening { path, rx }),
             Err(e) => self.error = Some(Error::new(ironav_core::ErrorCode::Internal, format!("cannot start the open: {e}"))),
         }
     }
@@ -101,6 +124,11 @@ impl PlayerApp {
         };
         let path = std::mem::take(&mut self.opening.as_mut().unwrap().path);
         self.opening = None;
+        if let Some(next) = self.pending.take() {
+            // A superseded result is never displayed. Dispose of its decoder on the worker.
+            self.start_open(next, r.ok().map(Arc::new));
+            return;
+        }
         match r {
             Ok(p) => {
                 // Repaint the moment a decoder thread queues a picture or fails, not on a timer.
@@ -109,6 +137,7 @@ impl PlayerApp {
                 self.path = path;
                 self.error = None;
                 let p = Arc::new(p);
+                p.play();
                 if let Some(link) = &self.link {
                     link.set_player(Some(&p));
                 }
@@ -120,13 +149,11 @@ impl PlayerApp {
 
     fn pick(&mut self) {
         let exts: Vec<&str> = FORMATS.iter().filter(|f| f.demux).flat_map(|f| f.extensions.iter().copied()).collect();
-        let mut d = rfd::FileDialog::new().set_title("Open media").add_filter("Media files", &exts).add_filter("All files", &["*"]);
-        if let Some(dir) = std::path::Path::new(&self.path).parent().filter(|d| d.is_dir()) {
+        let mut d = rfd::AsyncFileDialog::new().set_title("Open media").add_filter("Media files", &exts).add_filter("All files", &["*"]);
+        if let Some(dir) = std::path::Path::new(&self.path).parent().filter(|d| !d.as_os_str().is_empty()) {
             d = d.set_directory(dir);
         }
-        if let Some(p) = d.pick_file() {
-            self.open(&p.display().to_string());
-        }
+        self.picker.open(FilePurpose::Media, d, &self.ctx);
     }
 
     fn say(&mut self, m: impl Into<String>) {
@@ -164,25 +191,61 @@ impl PlayerApp {
 
     fn snapshot(&mut self) {
         let Some(p) = &self.player else { return };
-        let r = p.snapshot_png(None, None);
-        match r {
-            Ok((_, _, png)) => {
-                let stem = std::path::Path::new(&self.path).file_stem().and_then(|s| s.to_str()).unwrap_or("frame").to_string();
-                let name = format!("{stem}-{}s.png", p.position() as u64);
-                let dir = std::path::Path::new(&self.path).parent().filter(|d| d.is_dir()).map(|d| d.to_path_buf()).unwrap_or_default();
-                let target = dir.join(&name);
-                match std::fs::write(&target, png) {
-                    Ok(()) => self.say(format!("saved {}", target.display())),
-                    Err(e) => self.say(format!("cannot save: {e}")),
-                }
-            }
-            Err(e) => self.say(e.message),
+        if self.snapshot.is_some() {
+            return;
+        }
+        if !p.has_video() {
+            self.say("This file has no video");
+            return;
+        }
+        let Some(frame) = self.last.clone().or_else(|| p.frame()) else {
+            self.say("No video frame is available yet");
+            return;
+        };
+        let path = std::path::PathBuf::from(&self.path);
+        let (send, result) = channel();
+        let ctx = self.ctx.clone();
+        let spawned = std::thread::Builder::new().name("ironav-snapshot".into()).spawn(move || {
+            let saved = (|| -> ironav_core::Result<String> {
+                let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("frame");
+                let name = format!("{stem}-{}s.png", frame.time as u64);
+                let target = path.with_file_name(name);
+                let (w, h, rgb) = rgb_frame(&frame.frame, None, None);
+                std::fs::write(&target, to_png(w, h, &rgb)?)?;
+                Ok(format!("Saved {}", target.display()))
+            })();
+            let _ = send.send(saved);
+            ctx.request_repaint();
+        });
+        match spawned {
+            Ok(_) => self.snapshot = Some(result),
+            Err(e) => self.say(format!("Could not start the snapshot ({e})")),
         }
     }
 
+    fn finish_snapshot(&mut self) {
+        let Some(result) = &self.snapshot else { return };
+        let note = match result.try_recv() {
+            Ok(Ok(note)) => note,
+            Ok(Err(e)) => format!("Could not save the snapshot ({})", e.message),
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => "The snapshot stopped before it was saved".into(),
+        };
+        self.snapshot = None;
+        self.say(note);
+    }
+
+    fn toggle_fullscreen(&mut self) {
+        self.fullscreen = !self.fullscreen;
+        self.ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+    }
+
     fn keys(&mut self, ctx: &egui::Context) {
+        if ctx.input(|input| input.key_pressed(egui::Key::F)) {
+            self.toggle_fullscreen();
+        }
         let Some(p) = &self.player else { return };
-        let (toggle, left, right, up, down, mute, full, snap, home) = ctx.input(|i| {
+        let (toggle, left, right, up, down, mute, snap, home) = ctx.input(|i| {
             (
                 i.key_pressed(egui::Key::Space),
                 i.key_pressed(egui::Key::ArrowLeft),
@@ -190,7 +253,6 @@ impl PlayerApp {
                 i.key_pressed(egui::Key::ArrowUp),
                 i.key_pressed(egui::Key::ArrowDown),
                 i.key_pressed(egui::Key::M),
-                i.key_pressed(egui::Key::F),
                 i.key_pressed(egui::Key::S),
                 i.key_pressed(egui::Key::Home),
             )
@@ -217,13 +279,71 @@ impl PlayerApp {
         if mute {
             p.set_muted(!p.muted());
         }
-        if full {
-            self.fullscreen = !self.fullscreen;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
-        }
         if snap {
             self.snapshot();
         }
+    }
+
+    fn menu_bar(&mut self, ui: &mut egui::Ui) {
+        let frame = egui::Frame::new()
+            .fill(ui.visuals().panel_fill)
+            .stroke(ui.visuals().window_stroke)
+            .inner_margin(egui::Margin::symmetric(12, 6));
+        let menu = egui::MenuBar::new().style(|style: &mut egui::Style| {
+            style.spacing.button_padding = egui::vec2(10.0, 5.0);
+            style.visuals.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
+            style.visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+        });
+        egui::Panel::top("bar").frame(frame).show(ui, |ui| {
+            menu.ui(ui, |ui| {
+                ui.label(RichText::new("IronAV Player").size(17.0).strong());
+                ui.separator();
+                ui.menu_button("File", |ui| {
+                    ui.set_min_width(172.0);
+                    let shortcut = ui.ctx().format_shortcut(&OPEN_MEDIA);
+                    let open = egui::Button::new("Open…").shortcut_text(shortcut);
+                    if ui.add_enabled(!self.picker.busy(), open).clicked() {
+                        ui.close();
+                        self.pick();
+                    }
+
+                    let snapshot = egui::Button::new("Save snapshot").shortcut_text("S");
+                    let can_snapshot = self.snapshot.is_none() && self.player.as_deref().is_some_and(Player::has_video);
+                    if ui.add_enabled(can_snapshot, snapshot).clicked() {
+                        ui.close();
+                        self.snapshot();
+                    }
+                });
+                let view_label = if self.link.is_some() { "View (MCP on)" } else { "View" };
+                ui.menu_button(view_label, |ui| {
+                    ui.set_min_width(172.0);
+                    if ui.add(egui::Button::selectable(self.fullscreen, "Fullscreen").shortcut_text("F")).clicked() {
+                        ui.close();
+                        self.toggle_fullscreen();
+                    }
+                    if ui.add(egui::Button::selectable(self.show_agent, "Agent view")).clicked() {
+                        ui.close();
+                        self.show_agent = !self.show_agent;
+                        self.ctx.request_repaint();
+                    }
+                });
+                if let Some(p) = self.player.as_ref().filter(|p| p.has_video()) {
+                    if let Some(dialog) = self.subtitles.menu(ui, p, !self.picker.busy()) {
+                        self.picker.open(FilePurpose::Subtitle(Arc::downgrade(p)), dialog, ui.ctx());
+                    }
+                } else {
+                    ui.add_enabled(false, egui::Button::new("Subtitles"));
+                }
+
+                let note = self.note.as_ref().filter(|(_, t)| t.elapsed() < Duration::from_secs(4)).map(|(message, _)| message.as_str());
+                let file_name = std::path::Path::new(&self.path).file_name().and_then(|name| name.to_str());
+                if let Some(text) = note.or(file_name) {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add(egui::Label::new(RichText::new(text).weak()).truncate()).on_hover_text(text);
+                    });
+                }
+            });
+        });
     }
 
     /// CPU fallback: bring the texture up to date with the picture that should be on screen.
@@ -271,25 +391,26 @@ impl PlayerApp {
             self.scrub_sent = None;
         }
         let shown_frac = self.scrub.map(f64::from).or_else(|| dur.filter(|d| *d > 0.0).map(|d| (pos / d).clamp(0.0, 1.0))).unwrap_or(0.0) as f32;
-        let bar = egui::Rect::from_center_size(rect.center(), egui::vec2(rect.width(), 6.0));
+        let bar = egui::Rect::from_center_size(rect.center(), egui::vec2(rect.width(), 5.0));
         let painter = ui.painter();
         painter.rect_filled(bar, 3.0, ui.visuals().widgets.inactive.bg_fill);
         painter.rect_filled(egui::Rect::from_min_max(bar.min, egui::pos2(bar.left() + bar.width() * shown_frac, bar.bottom())), 3.0, ACCENT);
-        painter.circle_filled(egui::pos2(bar.left() + bar.width() * shown_frac, bar.center().y), 7.0, ACCENT);
+        let radius = if resp.hovered() || resp.dragged() { 6.5 } else { 5.0 };
+        painter.circle_filled(egui::pos2(bar.left() + bar.width() * shown_frac, bar.center().y), radius, ACCENT);
 
         ui.horizontal(|ui| {
-            let label = match state {
-                State::Playing => "⏸",
-                State::Ended => "⟲",
-                _ => "▶",
+            let (icon, label) = match state {
+                State::Playing => (Icon::Pause, "Pause"),
+                State::Ended => (Icon::Replay, "Replay"),
+                _ => (Icon::Play, "Play"),
             };
-            if ui.button(RichText::new(label).size(18.0)).clicked() {
+            if transport(ui, icon, label, true, false).clicked() {
                 p.toggle();
             }
-            if ui.button("⏪").on_hover_text("back 10 s").clicked() {
+            if transport(ui, Icon::Back, "Back 10 seconds", false, false).clicked() {
                 p.seek_by(-10.0);
             }
-            if ui.button("⏩").on_hover_text("forward 10 s").clicked() {
+            if transport(ui, Icon::Forward, "Forward 10 seconds", false, false).clicked() {
                 p.seek_by(10.0);
             }
             let shown = self.scrub.zip(dur).map_or(pos, |(f, d)| f as f64 * d);
@@ -300,15 +421,15 @@ impl PlayerApp {
             ui.separator();
             let mut vol = p.volume() * 100.0;
             let muted = p.muted();
-            if ui.selectable_label(muted, if muted { "🔇" } else { "🔊" }).clicked() {
+            if transport(ui, Icon::Speaker { muted }, if muted { "Unmute" } else { "Mute" }, false, muted).clicked() {
                 p.set_muted(!muted);
             }
             if ui.add(egui::Slider::new(&mut vol, 0.0..=200.0).suffix("%").integer().show_value(true)).changed() {
                 p.set_volume(vol / 100.0);
             }
-            let mut looping = p.looping();
-            if ui.checkbox(&mut looping, "Repeat").changed() {
-                p.set_looping(looping);
+            let looping = p.looping();
+            if ui.add(egui::Button::selectable(looping, "Repeat")).on_hover_text("Repeat playback").clicked() {
+                p.set_looping(!looping);
             }
         });
     }
@@ -323,40 +444,28 @@ fn picture(f: &TimedFrame, max_w: u32, max_h: u32) -> egui::ColorImage {
 impl eframe::App for PlayerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        if !self.picker.busy() && ctx.input_mut(|input| input.consume_shortcut(&OPEN_MEDIA)) {
+            self.pick();
+        }
         if let Some(p) = ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf())) {
             self.open(&p.display().to_string());
         }
+        if let Some((purpose, path)) = self.picker.poll() {
+            match purpose {
+                FilePurpose::Media => self.open(&path.display().to_string()),
+                FilePurpose::Subtitle(player) if self.player.as_ref().is_some_and(|p| Arc::as_ptr(p) == player.as_ptr()) => self.subtitles.open_file(path),
+                FilePurpose::Subtitle(_) => {}
+            }
+        }
         self.finish_open();
+        self.finish_snapshot();
         self.keys(&ctx);
         self.subtitles.update(&ctx);
         // The status JSON is built at most once per UI frame, and only for what shows it: the Agent
         // view and the audio-only level meter.
         let status: Option<Value> = self.player.as_deref().filter(|p| self.show_agent || !p.has_video()).map(Player::status);
 
-        egui::Panel::top("bar").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading(RichText::new("IronAV Player").color(ACCENT));
-                ui.separator();
-                if ui.button("Open…").clicked() {
-                    self.pick();
-                }
-                if ui.add_enabled(self.player.as_deref().is_some_and(Player::has_video), egui::Button::new("Snapshot")).clicked() {
-                    self.snapshot();
-                }
-                if let Some(p) = self.player.as_ref().filter(|p| p.has_video()) {
-                    self.subtitles.menu(ui, p);
-                }
-                ui.checkbox(&mut self.show_agent, if self.link.is_some() { "Agent view (MCP on)" } else { "Agent view" });
-                if let Some((m, t)) = &self.note {
-                    if t.elapsed() < Duration::from_secs(4) {
-                        ui.weak(m);
-                    }
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.weak(std::path::Path::new(&self.path).file_name().and_then(|n| n.to_str()).unwrap_or(""));
-                });
-            });
-        });
+        self.menu_bar(ui);
 
         egui::Panel::bottom("transport").show(ui, |ui| {
             ui.add_space(4.0);
@@ -415,7 +524,8 @@ impl eframe::App for PlayerApp {
                     }
                 }
             } else if let Some(o) = &self.opening {
-                let name = std::path::Path::new(&o.path).file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+                let path = self.pending.as_deref().unwrap_or(&o.path);
+                let name = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
                 ui.centered_and_justified(|ui| {
                     ui.vertical_centered(|ui| {
                         ui.add_space((avail.y / 2.0 - 30.0).max(0.0));
@@ -425,7 +535,7 @@ impl eframe::App for PlayerApp {
                 });
             } else {
                 ui.centered_and_justified(|ui| {
-                    ui.label(RichText::new("Drop a file here, or choose Open…").color(Color32::GRAY).size(18.0));
+                    ui.label(RichText::new("Drop a file here or choose File → Open…").color(Color32::GRAY).size(18.0));
                 });
             }
             if let Some(e) = &self.error {
@@ -468,7 +578,7 @@ impl PlayerApp {
                 _ => {}
             }
         }
-        if self.opening.is_some() {
+        if self.opening.is_some() || self.snapshot.is_some() {
             soonest(Duration::from_millis(50));
         }
         if let Some((_, t)) = &self.note {
@@ -504,3 +614,6 @@ fn audio_only(ui: &mut egui::Ui, rect: egui::Rect, p: &Player, st: &Value) {
 fn _uses(w: u32, h: u32, rgb: &[u8]) -> ironav_core::Result<Vec<u8>> {
     to_png(w, h, rgb)
 }
+
+#[cfg(test)]
+mod tests;
