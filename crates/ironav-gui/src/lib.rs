@@ -5,6 +5,7 @@
 mod app;
 mod gpu;
 mod player;
+mod subtitles;
 pub mod model;
 
 use ironav_core::{Error, ErrorCode, Result};

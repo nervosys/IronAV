@@ -1,8 +1,9 @@
 //! End-to-end playback on generated files, with no sound device (the silent clock).
 
-use ironav_player::{AudioMode, OpenOptions, Player, State};
+use ironav_player::{AudioMode, OpenOptions, Player, State, SubtitleTrack};
 use serde_json::json;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 fn dir(name: &str) -> PathBuf {
@@ -116,6 +117,66 @@ fn video_frames_come_out_in_order_and_seek_lands_on_the_right_picture() {
     pl.seek(0.0);
     until("buffered again", 5.0, || pl.state() != State::Buffering);
     assert_eq!(pl.frame().unwrap().frame.planes[0][0], 16, "seeking back works");
+}
+
+#[test]
+fn standalone_subtitles_follow_the_player_clock_through_paused_seeks() {
+    let folder = dir("sidecar");
+    let video = folder.join("video.y4m");
+    let captions = folder.join("captions.srt");
+    write_y4m(&video, 35);
+    std::fs::write(&captions, "1\n00:00:00,500 --> 00:00:02,500\n<i>First</i>\n\n2\n00:00:01,000 --> 00:00:01,250\nSecond\n").unwrap();
+
+    let p = Player::open(video.to_str().unwrap(), &OpenOptions { autoplay: false, ..silent() }).unwrap();
+    let track = SubtitleTrack::load(&captions, None, &AtomicBool::new(false)).unwrap();
+    until("first picture", 5.0, || p.frame().is_some());
+    assert_eq!(track.at(p.position()), (String::new(), Some(0.5)));
+    for (to, text, next) in [
+        (0.5, "First", Some(1.0)),
+        (1.125, "First\nSecond", Some(1.25)),
+        (1.25, "First", Some(2.5)),
+        (2.5, "", None),
+        (1.0, "First\nSecond", Some(1.25)),
+        (0.0, "", Some(0.5)),
+    ] {
+        p.seek(to);
+        until("paused after seek", 5.0, || p.state() == State::Paused);
+        assert_eq!(track.at(p.position()), (text.into(), next), "seek to {to}");
+    }
+}
+
+#[test]
+fn embedded_subtitles_keep_cues_that_begin_before_a_seek_window() {
+    use std::process::Command;
+
+    if !Command::new("ffmpeg").arg("-version").output().is_ok_and(|o| o.status.success()) {
+        eprintln!("skipped: ffmpeg is not on PATH");
+        return;
+    }
+    let folder = dir("embedded-subtitles");
+    let first = folder.join("first.srt");
+    let second = folder.join("second.srt");
+    let video = folder.join("video.mkv");
+    std::fs::write(&first, "1\n00:00:00,500 --> 00:00:16,000\nLong cue\n\n2\n00:00:12,000 --> 00:00:14,000\nLater cue\n").unwrap();
+    std::fs::write(&second, "1\n00:00:12,000 --> 00:00:14,000\n<i>Other track</i>\n").unwrap();
+    let result = Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-nostdin", "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=5:duration=24", "-i"])
+        .arg(&first).arg("-i").arg(&second)
+        .args(["-map", "0:v", "-map", "1:s", "-map", "2:s", "-c:v", "mpeg4", "-g", "5", "-c:s:0", "srt", "-c:s:1", "ass"])
+        .arg(&video).output().unwrap();
+    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+
+    let p = Player::open(video.to_str().unwrap(), &OpenOptions { autoplay: false, audio: AudioMode::Off, hwaccel: "off".into(), ..Default::default() }).unwrap();
+    let [first, second] = p.subtitle_tracks() else { panic!("expected two subtitle tracks") };
+    assert_eq!((first.codec, second.codec), (ironav_core::CodecId::SubRip, ironav_core::CodecId::Ass));
+    let cancelled = AtomicBool::new(false);
+    let srt = SubtitleTrack::load(&video, Some(first.index), &cancelled).unwrap();
+    let ass = SubtitleTrack::load(&video, Some(second.index), &cancelled).unwrap();
+    p.seek(13.0);
+    until("first picture after seek", 5.0, || p.frame().is_some());
+    assert_eq!(srt.at(p.position()), ("Long cue\nLater cue".into(), Some(14.0)));
+    assert_eq!(ass.at(p.position()), ("Other track".into(), Some(14.0)));
+    assert_eq!(srt.at(14.0), ("Long cue".into(), Some(16.0)));
 }
 
 #[test]

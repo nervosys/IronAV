@@ -681,6 +681,10 @@ forward from the previous keyframe and shows the last picture at or before it. L
 The player deinterlaces planar pictures that the decoder marks as interlaced. It keeps the first field and interpolates
 the missing lines, so playback, seek previews and snapshots all use the same picture at the original timestamp.
 
+In the desktop player's **Subtitles** menu, choose a Matroska or WebM text track, open an SRT, WebVTT, ASS or SSA file,
+or turn subtitles off. Subtitles start off for each video. The selected track loads in the background and displays
+as plain text over the video, following the playback clock through pauses and seeks.
+
 What was and was not checked, on one machine (Windows, RTX 3090 Ti):
 - Real-time pacing, pause, exact seeks, ordering, looping, end detection and the JSON commands are covered by tests on
   generated WAV and Y4M files, against the silent clock (`--audio silent`).
@@ -690,8 +694,7 @@ What was and was not checked, on one machine (Windows, RTX 3090 Ti):
   beyond building. The `level` meter reports what was handed to the device, not what came out of the speakers.
   Audio/video sync was not measured against a reference.
 - The TUI is tested by rendering to a test buffer; it has not been exercised in a real terminal emulator.
-- Players keep their position only in memory; there is no subtitle,
-  playlist or network-stream support, and no GPU rendering (pictures are converted to RGB on the CPU).
+- Players keep their position only in memory and open local media files individually.
 
 ## FLAC
 

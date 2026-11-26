@@ -15,6 +15,7 @@ mod command;
 mod output;
 mod pipeline;
 mod snapshot;
+mod subtitle;
 
 pub use output::{AudioOutput, NullOutput};
 #[cfg(feature = "audio")]
@@ -22,6 +23,7 @@ pub use output::{device_description, CpalOutput};
 pub use pipeline::{open_video_decoder, open_video_decoder_with};
 pub use color::{Colorimetry, Matrix, YuvToRgb};
 pub use snapshot::{base64, rgb_frame, rgb_frame_reference, to_png};
+pub use subtitle::SubtitleTrack;
 
 use ironav_core::{CodecId, Error, ErrorCode, MediaType, Result, StreamInfo, StreamParams, VideoFrame};
 use ironav_formats::open_demuxer_lazy;
@@ -338,6 +340,7 @@ impl Inner {
 
 pub struct Player {
     pub(crate) inner: Arc<Inner>,
+    subtitle_tracks: Vec<StreamInfo>,
     tx: Vec<Sender<Cmd>>,
     threads: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -469,11 +472,17 @@ impl Player {
             tx.push(t);
             threads.push(h);
         }
-        Ok(Player { inner, tx, threads: Mutex::new(threads) })
+        let subtitle_tracks = streams.into_iter().filter(|s| s.params == StreamParams::Subtitle).collect();
+        Ok(Player { inner, subtitle_tracks, tx, threads: Mutex::new(threads) })
     }
 
     pub fn info(&self) -> &MediaInfo {
         &self.inner.info
+    }
+
+    /// Embedded text tracks available for [`SubtitleTrack::load`], in container order.
+    pub fn subtitle_tracks(&self) -> &[StreamInfo] {
+        &self.subtitle_tracks
     }
 
     /// Current media position in seconds.
