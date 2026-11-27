@@ -897,6 +897,8 @@ fn audio_codec(id: &str) -> Option<CodecId> {
         "A_MPEG/L2" => CodecId::Mp2,
         "A_AC3" => CodecId::Ac3,
         "A_EAC3" => CodecId::Eac3,
+        // DTS and its DTS-HD forms (whose packets hold the core with the extension after it)
+        "A_DTS" | "A_DTS/EXPRESS" | "A_DTS/LOSSLESS" => CodecId::Dts,
         "A_ALAC" => CodecId::Alac,
         s if s == "A_AAC" || s.starts_with("A_AAC/") => CodecId::Aac,
         _ => return None,

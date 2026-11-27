@@ -83,6 +83,15 @@ fn child<'a>(data: &'a [u8], kind: &[u8; 4]) -> Result<Option<&'a [u8]>> {
     Ok(None)
 }
 
+/// The channels of the core described by the body of a `ddts` box (ETSI TS 102 114 annex E): the
+/// core layout (the audio mode) and the LFE flag, after the rates and the sample depth. `None` when
+/// the box has no core (size 0) or an unlisted layout.
+fn ddts_channels(b: &[u8]) -> Option<u16> {
+    const CHANNELS: [u16; 10] = [1, 2, 2, 2, 2, 3, 3, 4, 4, 5];
+    let (lfe, layout, core_size) = (b.get(13)? & 1, b.get(14)? >> 2, (u32::from(*b.get(14)? & 3) << 12) | (u32::from(*b.get(15)?) << 4) | u32::from(b.get(16)? >> 4));
+    (core_size > 0).then(|| CHANNELS.get(layout as usize).map(|c| c + u16::from(lfe)))?
+}
+
 fn need<'a>(data: &'a [u8], kind: &[u8; 4], within: &str) -> Result<&'a [u8]> {
     child(data, kind)?.ok_or_else(|| corrupt(format!("'{}' box missing from '{within}'", String::from_utf8_lossy(kind))))
 }
@@ -671,15 +680,24 @@ fn parse_trak(trak: &[u8], index: usize, samples: &mut Vec<Sample>, movie_ts: u3
             Some(e) if &fourcc == b"mp4a" => matches!(esds_parts(e)?.0, 0x69 | 0x6B),
             _ => false,
         };
+        // an mp4a entry whose object type is 0xA9 to 0xAC holds DTS (FFmpeg writes it so)
+        let mp4a_dts = match child(kids, b"esds")? {
+            Some(e) if &fourcc == b"mp4a" => matches!(esds_parts(e)?.0, 0xA9..=0xAC),
+            _ => false,
+        };
         let codec = match (&pcm, &fourcc) {
             (Some(p), _) => p.codec,
             (None, b"fLaC") => CodecId::Flac,
             (None, b"mp4a") if mpeg_audio => CodecId::Mp3,
+            (None, b"mp4a") if mp4a_dts => CodecId::Dts,
             (None, b"mp4a") => CodecId::Aac,
             (None, b"Opus") => CodecId::Opus,
             (None, b"alac") => CodecId::Alac,
             (None, b"ac-3") => CodecId::Ac3,
             (None, b"ec-3") => CodecId::Eac3,
+            // DTS with a core: core only, core and extension, and lossless with a core; `dtse` is an
+            // extension substream alone (DTS Express), which has no core to decode
+            (None, b"dtsc" | b"dtsh" | b"dtsl") => CodecId::Dts,
             (None, b".mp3") => CodecId::Mp3,
             _ => return Ok(None),
         };
@@ -705,6 +723,12 @@ fn parse_trak(trak: &[u8], index: usize, samples: &mut Vec<Sample>, movie_ts: u3
             // the dec3 box describes the independent substream, which is what the decoder outputs; the
             // entry's own count may include the channels of dependent substreams
             if let Some(c) = child(kids, b"dec3")?.and_then(ironav_codec::ac3::dec3_channels) {
+                channels = c;
+            }
+        }
+        if codec == CodecId::Dts {
+            // the ddts box says what the core is; the entry's own count may be of the whole stream
+            if let Some(c) = child(kids, b"ddts")?.and_then(ddts_channels) {
                 channels = c;
             }
         }

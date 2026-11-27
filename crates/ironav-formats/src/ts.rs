@@ -95,6 +95,10 @@ fn codec_of(stream_type: u8) -> Option<CodecId> {
         // E-AC-3: ATSC's stream type, and Blu-ray's primary and secondary audio (0x06 with a
         // descriptor is the DVB way)
         0x87 | 0x84 | 0xA1 => Some(CodecId::Eac3),
+        // DTS: 0x82 (Blu-ray and ATSC), 0x8A, and Blu-ray's DTS-HD primary (0x85) and secondary (0xA2)
+        // audio, whose core is what is decoded. 0x86, Blu-ray's DTS-HD Master Audio, is also SCTE-35's
+        // stream type, so it is left alone.
+        0x82 | 0x85 | 0x8A | 0xA2 => Some(CodecId::Dts),
         _ => None,
     }
 }
@@ -173,6 +177,21 @@ fn has_eac3_descriptor(desc: &[u8]) -> bool {
         let (tag, len) = (desc[i], desc[i + 1] as usize);
         let Some(body) = desc.get(i + 2..i + 2 + len) else { return false };
         if tag == 0x7A || (tag == 0x05 && body.starts_with(b"EAC3")) {
+            return true;
+        }
+        i += 2 + len;
+    }
+    false
+}
+
+/// Whether a private (0x06) stream's PMT descriptors say it is DTS: the DVB DTS descriptor (tag
+/// 0x7B) or a registration descriptor (tag 0x05) of `DTS1`, `DTS2` or `DTS3`.
+fn has_dts_descriptor(desc: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 2 <= desc.len() {
+        let (tag, len) = (desc[i], desc[i + 1] as usize);
+        let Some(body) = desc.get(i + 2..i + 2 + len) else { return false };
+        if tag == 0x7B || (tag == 0x05 && [&b"DTS1"[..], b"DTS2", b"DTS3"].iter().any(|s| body.starts_with(s))) {
             return true;
         }
         i += 2 + len;
@@ -534,7 +553,8 @@ impl TsParser {
                 let opus = if ty == 0x06 { body.get(i + 5..i + 5 + es_len).and_then(opus_head_from_descriptors) } else { None };
                 let ac3 = ty == 0x06 && body.get(i + 5..i + 5 + es_len).is_some_and(has_ac3_descriptor);
                 let eac3 = ty == 0x06 && body.get(i + 5..i + 5 + es_len).is_some_and(has_eac3_descriptor);
-                if let Some(codec) = if opus.is_some() { Some(CodecId::Opus) } else if eac3 { Some(CodecId::Eac3) } else if ac3 { Some(CodecId::Ac3) } else { codec_of(ty) } {
+                let dts = ty == 0x06 && body.get(i + 5..i + 5 + es_len).is_some_and(has_dts_descriptor);
+                if let Some(codec) = if opus.is_some() { Some(CodecId::Opus) } else if dts { Some(CodecId::Dts) } else if eac3 { Some(CodecId::Eac3) } else if ac3 { Some(CodecId::Ac3) } else { codec_of(ty) } {
                     self.es.push(Es {
                         pid,
                         codec,
@@ -662,6 +682,20 @@ impl TsParser {
                         continue;
                     }
                 }
+            } else if codec == CodecId::Dts {
+                // the frame starts here, or at the sync word the codec finds a few bytes on
+                match ironav_codec::dts::frame_info(&data[i..data.len().min(i + 64)]) {
+                    Ok(f) if f.offset > 0 => {
+                        i += f.offset;
+                        continue;
+                    }
+                    Ok(f) => (f.frame_size, 0, f.sample_rate, f.channels, f.samples, Vec::new(), CodecId::Dts),
+                    _ if data.len() - i < 64 && !last => break,
+                    _ => {
+                        i += 1;
+                        continue;
+                    }
+                }
             } else if codec == CodecId::Eac3 {
                 match ironav_codec::ac3::eac3_frame_info(&data[i..]) {
                     // a dependent frame with no independent frame before it is dropped
@@ -756,8 +790,8 @@ impl TsParser {
             e.next = Some(t + ticks / rate as i64);
             e.rem = ticks % rate as i64;
             let frame = data[i + hdr..i + len].to_vec();
-            // E-AC-3 frames have 1, 2, 3 or 6 blocks
-            let dur = (frame_codec == CodecId::Eac3).then_some(samples as i64);
+            // E-AC-3 frames have 1, 2, 3 or 6 blocks, and DTS frames 8 to 128 blocks of 32 samples
+            let dur = matches!(frame_codec, CodecId::Eac3 | CodecId::Dts).then_some(samples as i64);
             self.unit(k, Unit { pts: t, data: frame, key: true, dur });
             i += len;
         }
@@ -994,6 +1028,7 @@ impl<R: Read + Seek + Send> TsDemuxer<R> {
                 StreamParams::Audio { sample_rate, .. } => span * sample_rate as i64 / CLOCK + match e.codec {
                     CodecId::Aac => 1024,
                     CodecId::Ac3 | CodecId::Eac3 => 1536,
+                    CodecId::Dts => 512,
                     CodecId::Opus => 960,
                     _ => 1152,
                 },

@@ -6,6 +6,57 @@ use std::io::{Read, Seek, SeekFrom};
 /// to keep end-to-end latency in the single-digit-millisecond range at 48 kHz.
 const FRAMES_PER_PACKET: usize = 4096;
 
+/// Opens a WAV file: as PCM, or, when its data is DTS (format tag 0x2001, or 16-bit stereo PCM whose
+/// data starts with a DTS sync word, as DTS CDs are ripped), as a DTS stream.
+pub fn open_any<R: Read + Seek + Send + 'static>(mut r: R) -> Result<Box<dyn Demuxer>> {
+    if let Some((start, len)) = dts_payload(&mut r)? {
+        return Ok(Box::new(crate::dts::open_range(r, start, len, "wav")?));
+    }
+    r.seek(SeekFrom::Start(0))?;
+    Ok(Box::new(WavDemuxer::open(r)?))
+}
+
+/// Where the data chunk is, if the file holds DTS.
+fn dts_payload<R: Read + Seek>(r: &mut R) -> Result<Option<(u64, u64)>> {
+    let total = r.seek(SeekFrom::End(0))?;
+    r.seek(SeekFrom::Start(12))?;
+    let mut fmt = None;
+    loop {
+        let mut h = [0u8; 8];
+        if r.read_exact(&mut h).is_err() {
+            return Ok(None);
+        }
+        let size = u32::from_le_bytes([h[4], h[5], h[6], h[7]]) as u64;
+        match &h[..4] {
+            b"fmt " if size <= 1 << 16 => {
+                let mut b = vec![0u8; size as usize];
+                if r.read_exact(&mut b).is_err() {
+                    return Ok(None);
+                }
+                fmt = fmt_fields(&b).ok();
+                if size % 2 == 1 {
+                    r.seek(SeekFrom::Current(1))?;
+                }
+            }
+            b"data" => {
+                let Some((tag, channels, _, _, bits)) = fmt else { return Ok(None) };
+                let start = r.stream_position()?;
+                let avail = total.saturating_sub(start);
+                let len = if size == 0 || size > avail { avail } else { size };
+                let dts = tag == 0x2001 || (tag == 1 && bits == 16 && channels == 2 && {
+                    let mut magic = [0u8; 64];
+                    let n = r.read(&mut magic)?;
+                    crate::dts::looks_like_dts(&magic[..n])
+                });
+                return Ok(dts.then_some((start, len)));
+            }
+            _ => {
+                r.seek(SeekFrom::Current((size + (size & 1)) as i64))?;
+            }
+        }
+    }
+}
+
 pub struct WavDemuxer<R: Read + Seek + Send> {
     r: R,
     streams: Vec<StreamInfo>,

@@ -5,7 +5,7 @@ A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so 
 
 > **Status: foundation (v0.1.10).** The architecture, agent interface, ontology, hardware model, CLI, MCP server
 > and both GUIs are working and tested. Containers: **WAV, FLAC, Y4M, MP4, QuickTime MOV (read and write), Matroska/WebM (read and write), Ogg, ADTS, MP3, JPEG and MPEG transport streams (read and write); AVI (read, with OpenDML), MPEG program streams (`.mpg`, `.vob`, read) and raw MPEG-1/2 video (`.m2v`, read; MPEG-2 also written); subtitles as streams (`.srt`, `.vtt`, `.ass`/`.ssa` files and Matroska text tracks, read); `probe` also lists the entries of M3U and PLS playlists and the chapters and attachments of Matroska files; raw H.264 and HEVC (Annex B: read and written as files, and read as live sources).**
-> Audio codecs, each decoded and encoded: **PCM, FLAC, ALAC, AAC-LC (plus HE-AAC v1 and v2 decode), MP3, MP2, AC-3, Opus and Vorbis.** E-AC-3 is decoded only.
+> Audio codecs, each decoded and encoded: **PCM, FLAC, ALAC, AAC-LC (plus HE-AAC v1 and v2 decode), MP3, MP2, AC-3, Opus and Vorbis.** E-AC-3 and the DTS core are decoded only.
 > Video: **software decoders for H.264, HEVC (including 4:2:2 and 4:4:4), VP8 and VP9; a software H.264 encoder (High profile: CABAC and the 8x8 transform), a software HEVC encoder (Main profile, 8-bit 4:2:0, merge and skip, SAO), a software VP8 encoder, and a software VP9 encoder (key and inter frames), and a software AV1 encoder (key and inter frames, profile 0, 8-bit 4:2:0); JPEG/Motion-JPEG and Apple ProRes decoded and encoded in software; MPEG-4 Part 2 (Simple and Advanced Simple profiles) decoded in software, and Simple profile I and P pictures encoded in software, with Advanced Simple B pictures as an option (MP4 and Matroska); MPEG-1 and MPEG-2 video (frame and field pictures, 4:2:0 and 4:2:2) decoded in software, and MPEG-2 video (Main profile, 4:2:0, progressive frames, optional B pictures) encoded in software.**
 > NVIDIA GPUs encode H.264 and HEVC (NVENC, preferred when usable) and decode H.264, HEVC and AV1 (NVDEC).
 > AV1 is decoded on NVIDIA GPUs (NVDEC) or in software (key, intra-only and inter frames, superres included). VP9 and AV1 copy between WebM, Matroska and MP4.
@@ -1413,7 +1413,7 @@ AC-3 (Dolby Digital, ATSC A/52) is decoded as the `ac3` codec, a translation of 
 channel mode from mono to 3/2 with the LFE channel decodes, with coupling, rematrixing, delta bit allocation, block switching and
 dynamic range at FFmpeg's default (`drc_scale` 1). The output is float, in FFmpeg's channel order. It is read from raw `.ac3`
 files, Matroska (`A_AC3`), MPEG-TS (stream type 0x81, or 0x06 with the AC-3 descriptor) and MP4 (`ac-3` with `dac3`). The encoder
-writes the same containers (see "AC-3 encoder" below). E-AC-3 is decoded too (see "E-AC-3" below).
+writes the same containers (see "AC-3 encoder" below). E-AC-3 is decoded too (see "E-AC-3" below), and so is the DTS core (see "DTS" below).
 
 Measured against `ffmpeg -c:a ac3 -f f32le` on FFmpeg-encoded streams (3 seconds each, tones with noise bursts):
 
@@ -1485,6 +1485,31 @@ adaptive quantisation mode, spectral extension with custom bands and attenuation
 transient data, each decoded by FFmpeg and by IronAV: 124 to 134 dB SNR in all 19 cases. The tests are `crates/ironav-codec/tests/eac3_ffmpeg.rs`,
 the synthetic streams in `crates/ironav-codec/src/ac3/eac3_synth.rs`, and `crates/ironav-formats/tests/eac3_containers.rs`; all skip
 without `ffmpeg` on the PATH.
+
+## DTS
+
+The DTS core (Coherent Acoustics, ETSI TS 102 114) is decoded as the `dts` codec, by `ironav_codec::dts::DtsDecoder`, a translation of
+FFmpeg's `dca_core.c`. It accepts the four stream forms (16-bit and 14-bit words, big- and little-endian), audio modes of up to 5
+channels with the LFE channel, the fixed-point subband decoding (Huffman and block codes, ADPCM prediction, high-frequency VQ, joint
+intensity, sum-difference), the 32-band QMF synthesis (perfect and non-perfect reconstruction) and the 64 times and 128 times LFE
+interpolation. The output is float, in the same channel order as AC-3 (L R C LFE Cs Ls Rs).
+
+Not decoded: the extensions inside the core (XCH, X96, XXCH) and the **DTS-HD extension substream** that follows a core frame
+(sync word 0x64582025: High Resolution, Master Audio, Express) are skipped, so a DTS-HD file plays as its core; a stream that is
+only an extension substream has no core and is refused. Frames with a sample deficit or a block count that is not a multiple of 8
+are refused. DTS is not encoded.
+
+It is read from raw `.dts` files (a core frame and the extension substream after it are one packet), Matroska (`A_DTS`,
+`A_DTS/EXPRESS`, `A_DTS/LOSSLESS`), MP4 (`dtsc`, `dtsh`, `dtsl` with `ddts`, and `mp4a` with object type 0xA9 to 0xAC), MPEG-TS
+(stream types 0x82, 0x85, 0x8A and 0xA2, or 0x06 with the DTS descriptor) and WAV (format tag 0x2001, or 16-bit stereo PCM holding
+DTS, as DTS CDs are ripped).
+
+Measured against `ffmpeg -f f32le` on streams made with FFmpeg's DTS encoder (3 seconds each: mono, stereo, quad, 5.0 and 5.1 with
+LFE, at 24, 32, 44.1 and 48 kHz, 192 to 1536 kb/s, with and without ADPCM): 136 to 137 dB SNR in all 14 cases, and 137 dB through
+raw, Matroska, MP4, MPEG-TS and WAV files. FFmpeg's encoder writes only the core, so the extension handling is checked with
+substreams the tests append. The tests are `crates/ironav-codec/tests/dts_ffmpeg.rs` and
+`crates/ironav-formats/tests/dts_containers.rs` (with a 15 KB fixture); the FFmpeg comparisons skip without `ffmpeg` on the PATH.
+The tables in `crates/ironav-codec/src/dts/tables.rs` are generated from FFmpeg's by `tools/gen_dca_tables.py`.
 
 ## Matroska output
 
