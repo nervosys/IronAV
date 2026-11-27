@@ -1,7 +1,7 @@
 //! HEVC parameter sets and slice segment headers (ITU-T H.265 7.3).
 
 use crate::h264::bits::BitReader;
-use ironav_core::{Error, Result};
+use ironav_core::{ColorInfo, Error, Result};
 
 fn bad(msg: &str) -> Error {
     Error::invalid_input(format!("HEVC: {msg}"))
@@ -235,8 +235,9 @@ fn skip_hrd(r: &mut BitReader, max_sub_layers_minus1: u32) -> Result<()> {
 }
 
 /// Reads past vui_parameters() (E.2.1): nothing in it changes decoding, but the timing info
-/// (`vui_num_units_in_tick`, `vui_time_scale`) is returned when the VUI states it.
-fn skip_vui(r: &mut BitReader, max_sub_layers_minus1: u32) -> Result<Option<(u32, u32)>> {
+/// (`vui_num_units_in_tick`, `vui_time_scale`) is returned when the VUI states it. The colour
+/// description, which comes before anything that can fail to parse, goes to `color`.
+fn skip_vui(r: &mut BitReader, max_sub_layers_minus1: u32, color: &mut Option<ColorInfo>) -> Result<Option<(u32, u32)>> {
     if r.flag()? && r.bits(8)? == 255 {
         r.skip(32); // sar_width, sar_height
     }
@@ -244,10 +245,7 @@ fn skip_vui(r: &mut BitReader, max_sub_layers_minus1: u32) -> Result<Option<(u32
         r.skip(1); // overscan_appropriate_flag
     }
     if r.flag()? {
-        r.skip(4); // video_format, video_full_range_flag
-        if r.flag()? {
-            r.skip(24); // colour_primaries, transfer_characteristics, matrix_coeffs
-        }
+        *color = Some(crate::h264::ps::read_video_signal(r)?);
     }
     if r.flag()? {
         r.ue()?; // chroma_sample_loc_type_top_field
@@ -371,6 +369,8 @@ pub struct Sps {
     pub range_tool: Option<&'static str>,
     /// `vui_num_units_in_tick` and `vui_time_scale`, when the VUI states them.
     pub timing: Option<(u32, u32)>,
+    /// The VUI's colour description (H.273 code points) and range, when it has a video signal type.
+    pub color: Option<ColorInfo>,
 }
 
 impl Sps {
@@ -484,8 +484,9 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps> {
     let temporal_mvp = r.flag()?;
     let strong_intra_smoothing = r.flag()?;
     // a VUI that does not parse (some encoders write it wrongly) leaves the extensions unread
+    let mut color = None;
     let (timing, vui_ok) = if r.flag()? {
-        match skip_vui(&mut r, max_sub_layers_minus1) {
+        match skip_vui(&mut r, max_sub_layers_minus1, &mut color) {
             Ok(t) => (t, true),
             Err(_) => (None, false),
         }
@@ -539,6 +540,7 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps> {
         ctb_h: height.div_ceil(ctb),
         range_tool,
         timing,
+        color,
     })
 }
 
@@ -1086,7 +1088,69 @@ mod tests {
         }
         let bytes: Vec<u8> = bits.as_bytes().chunks(8).map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap(), 2).unwrap()).collect();
         let mut r = BitReader::new(&bytes);
-        assert_eq!(skip_vui(&mut r, 0).unwrap(), Some((1, 25)));
+        let mut color = None;
+        assert_eq!(skip_vui(&mut r, 0, &mut color).unwrap(), Some((1, 25)));
+        assert_eq!(color, Some(ColorInfo { primaries: 1, transfer: 1, matrix: 1, full_range: false }));
         assert_eq!(r.pos(), at);
+    }
+}
+
+#[cfg(test)]
+mod color_tests {
+    use super::super::enc::syntax;
+    use super::*;
+
+    /// The encoder's SPS with a VUI that holds only a video signal type (or nothing), put in place of
+    /// the encoder's absent VUI and extension flags.
+    fn sps_with(signal: Option<(bool, Option<(u8, u8, u8)>)>) -> Vec<u8> {
+        let rbsp = syntax::sps(64, 64, [0; 4], 90, 0);
+        let mut bits: String = rbsp.iter().map(|b| format!("{b:08b}")).collect();
+        // drop the stop bit and the two zero flags before it (vui_parameters_present_flag, sps_extension_present_flag)
+        let stop = bits.rfind('1').unwrap();
+        bits.truncate(stop - 2);
+        match signal {
+            None => bits.push('0'),
+            Some((full, desc)) => {
+                bits.push('1'); // vui_parameters_present_flag
+                bits.push('0'); // aspect_ratio_info_present_flag
+                bits.push('0'); // overscan_info_present_flag
+                bits.push('1'); // video_signal_type_present_flag
+                bits.push_str("101"); // video_format: unspecified
+                bits.push(if full { '1' } else { '0' });
+                match desc {
+                    Some((p, t, m)) => bits.push_str(&format!("1{p:08b}{t:08b}{m:08b}")),
+                    None => bits.push('0'),
+                }
+                bits.push('0'); // chroma_loc_info_present_flag
+                bits.push_str("000"); // neutral_chroma, field_seq, frame_field_info
+                bits.push('0'); // default_display_window_flag
+                bits.push('0'); // vui_timing_info_present_flag
+                bits.push('0'); // bitstream_restriction_flag
+            }
+        }
+        bits.push('0'); // sps_extension_present_flag
+        bits.push('1');
+        while !bits.len().is_multiple_of(8) {
+            bits.push('0');
+        }
+        bits.as_bytes().chunks(8).map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap(), 2).unwrap()).collect()
+    }
+
+    #[test]
+    fn vui_colour_description_is_read() {
+        let pq = parse_sps(&sps_with(Some((false, Some((9, 16, 9)))))).unwrap();
+        assert_eq!(pq.color, Some(ColorInfo { primaries: 9, transfer: 16, matrix: 9, full_range: false }));
+        assert!(pq.color.unwrap().is_hdr());
+        let hlg = parse_sps(&sps_with(Some((true, Some((9, 18, 9)))))).unwrap();
+        assert_eq!(hlg.color, Some(ColorInfo { primaries: 9, transfer: 18, matrix: 9, full_range: true }));
+        assert_eq!(hlg.width, 64);
+    }
+
+    #[test]
+    fn range_without_a_description_is_unspecified_codes_and_no_vui_is_none() {
+        let full = parse_sps(&sps_with(Some((true, None)))).unwrap();
+        assert_eq!(full.color, Some(ColorInfo { full_range: true, ..ColorInfo::UNSPECIFIED }));
+        assert_eq!(parse_sps(&sps_with(None)).unwrap().color, None);
+        assert_eq!(parse_sps(&syntax::sps(64, 64, [0; 4], 90, 0)).unwrap().color, None);
     }
 }

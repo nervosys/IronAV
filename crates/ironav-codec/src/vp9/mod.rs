@@ -24,7 +24,7 @@ pub use enc::Vp9Encoder;
 
 use std::sync::Arc;
 
-use ironav_core::{Decoder, Error, ErrorCode, Frame as OutFrame, Packet, PixelFormat, Result, VideoFrame};
+use ironav_core::{ColorInfo, Decoder, Error, ErrorCode, Frame as OutFrame, Packet, PixelFormat, Result, VideoFrame};
 
 use dec::*;
 use header::*;
@@ -49,6 +49,8 @@ pub struct Vp9Decoder {
     segmap_ref: Option<Vec<u8>>,
     prev_seg: (bool, bool),
     last_keyframe: bool,
+    /// The colour of the latest key or intra-only frame, which is where VP9 states it.
+    color: Option<ColorInfo>,
     out: Vec<OutFrame>,
     /// Picture buffers for the threads that decode tile columns, reused from frame to frame.
     pool: Vec<Pic>,
@@ -63,6 +65,7 @@ impl Vp9Decoder {
             segmap_ref: None,
             prev_seg: (false, false),
             last_keyframe: false,
+            color: None,
             out: Vec::new(),
             pool: Vec::new(),
         }
@@ -112,6 +115,9 @@ impl Vp9Decoder {
         }
         let retain_segmap = self.segmap_ref.is_some() && (!self.prev_seg.0 || !self.prev_seg.1);
         let mut h = parse_uncompressed(data, &mut self.st, &infos).map_err(bad)?;
+        if h.keyframe || h.intraonly {
+            self.color = color_of(h.color_space, h.full_range);
+        }
         if h.show_existing {
             let p = self.refs[h.show_existing_idx].clone().ok_or_else(|| Error::new(ErrorCode::InvalidInput, "requested reference not available".to_string()))?;
             return self.emit(&p);
@@ -225,6 +231,21 @@ fn split_superframe(data: &[u8]) -> Vec<&[u8]> {
     vec![data]
 }
 
+/// The H.273 code points for a VP9 color_space. VP9 has no transfer field, so BT.2020 is given the
+/// 10-bit SDR transfer (14): VP9 streams signal PQ or HLG in the container only. `None` for an
+/// unknown or reserved colour space.
+fn color_of(color_space: u8, full_range: bool) -> Option<ColorInfo> {
+    let (primaries, transfer, matrix) = match color_space {
+        1 | 3 => (6, 6, 6),
+        2 => (1, 1, 1),
+        4 => (7, 7, 7),
+        5 => (9, 14, 9),
+        7 => (1, 13, 0),
+        _ => return None,
+    };
+    Some(ColorInfo { primaries, transfer, matrix, full_range })
+}
+
 impl Decoder for Vp9Decoder {
     fn decode(&mut self, packet: &Packet) -> Result<Vec<OutFrame>> {
         for f in split_superframe(&packet.data) {
@@ -235,6 +256,10 @@ impl Decoder for Vp9Decoder {
 
     fn flush(&mut self) -> Result<Vec<OutFrame>> {
         Ok(std::mem::take(&mut self.out))
+    }
+
+    fn color_info(&self) -> Option<ColorInfo> {
+        self.color
     }
 
     fn reset(&mut self) -> bool {
@@ -429,5 +454,20 @@ impl Dec {
         }
         self.counts.partition[bl][c][bp] += 1;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod color_tests {
+    use super::*;
+
+    #[test]
+    fn color_spaces_map_to_code_points() {
+        assert_eq!(color_of(2, false), Some(ColorInfo { primaries: 1, transfer: 1, matrix: 1, full_range: false }));
+        assert_eq!(color_of(5, true), Some(ColorInfo { primaries: 9, transfer: 14, matrix: 9, full_range: true }));
+        assert_eq!(color_of(7, true), Some(ColorInfo { primaries: 1, transfer: 13, matrix: 0, full_range: true }));
+        assert_eq!(color_of(1, false).map(|c| c.matrix), Some(6));
+        assert_eq!(color_of(0, true), None);
+        assert_eq!(color_of(6, true), None);
     }
 }

@@ -30,7 +30,7 @@ pub mod tables;
 
 use std::sync::Arc;
 
-use ironav_core::{Decoder, Error, ErrorCode, Frame, Packet, PixelFormat, Result, VideoFrame};
+use ironav_core::{ColorInfo, Decoder, Error, ErrorCode, Frame, Packet, PixelFormat, Result, VideoFrame};
 
 use block::{FrameDec, Picture};
 use ipred::Plane;
@@ -455,5 +455,9 @@ impl Decoder for Av1Decoder {
         self.cur = None;
         self.out.clear();
         true
+    }
+
+    fn color_info(&self) -> Option<ColorInfo> {
+        self.seq.as_ref().map(|s| s.color)
     }
 }

@@ -28,7 +28,7 @@ pub(crate) mod tables;
 use bits::{split_annexb, unescape};
 pub use enc::H264Encoder;
 use dpb::{DecodedPic, Pending, RefList};
-use ironav_core::{Decoder, Error, ErrorCode, FieldOrder, Frame, Packet, PixelFormat, Result, VideoFrame};
+use ironav_core::{ColorInfo, Decoder, Error, ErrorCode, FieldOrder, Frame, Packet, PixelFormat, Result, VideoFrame};
 use mb::{LevelScale, Picture, SliceDec, SliceParams};
 use ps::{parse_pps, parse_slice_header, parse_sps, Pps, SliceHeader, SliceType, Sps};
 use shared::{Published, Publisher};
@@ -53,6 +53,8 @@ pub struct H264Decoder {
     /// The field order of each frame in `out`, and of those the last call returned.
     out_orders: Vec<FieldOrder>,
     last_orders: Vec<FieldOrder>,
+    /// The colour description of the sequence parameter set the latest picture used.
+    color: Option<ColorInfo>,
 }
 
 struct Current {
@@ -187,7 +189,7 @@ impl H264Decoder {
         let mut dpb = Dpb::default();
         // a picture in flight holds two buffers: the one it is decoded in and the one it is shared in
         dpb.spare_extra = if n > 1 { n } else { 0 };
-        H264Decoder { sps: vec![None; 32], pps: vec![None; 256], cur: None, dpb, out: Vec::new(), threads: n, running: VecDeque::new(), ready: VecDeque::new(), failed: None, out_orders: Vec::new(), last_orders: Vec::new() }
+        H264Decoder { sps: vec![None; 32], pps: vec![None; 256], cur: None, dpb, out: Vec::new(), threads: n, running: VecDeque::new(), ready: VecDeque::new(), failed: None, out_orders: Vec::new(), last_orders: Vec::new(), color: None }
     }
 
     /// For live sources: when the stream does not declare how deep its reordering goes (VUI
@@ -320,6 +322,7 @@ impl H264Decoder {
             let sps = self.sps[sps_id].as_ref().unwrap();
             let pps = self.pps[hdr.pps_id as usize].as_ref().unwrap();
             let poc = self.dpb.compute_poc(sps, &hdr);
+            self.color = sps.color;
             let pic = (self.threads == 1).then(|| {
                 let mut p = Picture::with_spare(sps.mb_width, sps.mb_height, sps.chroma_format_idc as u8, sps.bit_depth_luma, self.dpb.spare.pop());
                 p.mbaff = sps.mb_adaptive_frame_field;
@@ -429,5 +432,9 @@ impl Decoder for H264Decoder {
 
     fn field_orders(&self) -> Vec<FieldOrder> {
         self.last_orders.clone()
+    }
+
+    fn color_info(&self) -> Option<ColorInfo> {
+        self.color
     }
 }

@@ -805,6 +805,8 @@ mod tests {
             out.extend(dec.decode(p).unwrap());
         }
         out.extend(dec.flush().unwrap());
+        // the encoder's VUI has no video signal type
+        assert_eq!(dec.color_info(), None);
         let out: Vec<VideoFrame> = out.into_iter().map(|f| match f { Frame::Video(v) => v, _ => unreachable!() }).collect();
         // the decoder rebuilds each picture as the encoder reconstructed it, in display order
         assert_eq!(out.len(), frames);

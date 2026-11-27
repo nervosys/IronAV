@@ -2,7 +2,7 @@
 
 use super::bits::BitReader;
 use super::tables::{DEFAULT_SCALING4, DEFAULT_SCALING8};
-use ironav_core::{Error, ErrorCode, Result};
+use ironav_core::{ColorInfo, Error, ErrorCode, Result};
 
 fn unsupported(msg: impl Into<String>) -> Error {
     Error::new(ErrorCode::UnsupportedCodec, msg.into())
@@ -54,6 +54,8 @@ pub struct Sps {
     pub num_reorder_frames: Option<u32>,
     /// `num_units_in_tick` and `time_scale` from the VUI timing, when the stream states them.
     pub timing: Option<(u32, u32)>,
+    /// The VUI's colour description (H.273 code points) and range, when it has a video signal type.
+    pub color: Option<ColorInfo>,
 }
 
 fn flat_lists() -> ([[u8; 16]; 6], [[u8; 64]; 6]) {
@@ -212,9 +214,9 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps> {
         return Err(Error::invalid_input("H.264 cropping leaves no picture"));
     }
     // the VUI is optional; only the reordering depth is of interest
-    let (mut num_reorder_frames, mut timing) = (None, None);
+    let (mut num_reorder_frames, mut timing, mut color) = (None, None, None);
     if r.flag().unwrap_or(false) {
-        num_reorder_frames = parse_vui(&mut r, &mut timing).unwrap_or(None);
+        num_reorder_frames = parse_vui(&mut r, &mut timing, &mut color).unwrap_or(None);
     }
     Ok(Sps {
         profile_idc,
@@ -244,12 +246,13 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps> {
         crop,
         num_reorder_frames,
         timing,
+        color,
     })
 }
 
 /// Walks the VUI far enough to read bitstream_restriction's max_num_reorder_frames. The timing info,
-/// which comes earlier, goes to `timing`.
-fn parse_vui(r: &mut BitReader, timing: &mut Option<(u32, u32)>) -> Result<Option<u32>> {
+/// which comes earlier, goes to `timing`, and the colour description to `color`.
+fn parse_vui(r: &mut BitReader, timing: &mut Option<(u32, u32)>, color: &mut Option<ColorInfo>) -> Result<Option<u32>> {
     if r.flag()? && r.bits(8)? == 255 {
         r.bits(32)?; // sar width and height
     }
@@ -257,10 +260,7 @@ fn parse_vui(r: &mut BitReader, timing: &mut Option<(u32, u32)>) -> Result<Optio
         r.flag()?; // overscan_appropriate
     }
     if r.flag()? {
-        r.bits(4)?; // video_format, full range
-        if r.flag()? {
-            r.bits(24)?;
-        }
+        *color = Some(read_video_signal(r)?);
     }
     if r.flag()? {
         r.ue()?;
@@ -294,6 +294,20 @@ fn parse_vui(r: &mut BitReader, timing: &mut Option<(u32, u32)>) -> Result<Optio
         return Ok(Some(reorder));
     }
     Ok(None)
+}
+
+/// Reads the body of a VUI's video signal type (video_format, video_full_range_flag and the
+/// optional colour description), after its present flag. Shared by H.264 and HEVC, whose layouts match.
+pub(crate) fn read_video_signal(r: &mut BitReader) -> Result<ColorInfo> {
+    r.bits(3)?; // video_format
+    let full_range = r.flag()?;
+    let mut c = ColorInfo { full_range, ..ColorInfo::UNSPECIFIED };
+    if r.flag()? {
+        c.primaries = r.bits(8)? as u8;
+        c.transfer = r.bits(8)? as u8;
+        c.matrix = r.bits(8)? as u8;
+    }
+    Ok(c)
 }
 
 fn skip_hrd(r: &mut BitReader) -> Result<()> {
@@ -624,4 +638,67 @@ pub fn parse_slice_header(rbsp: &[u8], nal_type: u8, nal_ref_idc: u32, spss: &[O
         beta_offset,
         data_pos: r.pos(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::enc::bitw::BitWriter;
+    use super::*;
+
+    /// A Constrained Baseline SPS for 32x32 pictures whose VUI holds `signal`: the video signal type
+    /// (full range, colour description) or none.
+    fn sps(signal: Option<(bool, Option<(u8, u8, u8)>)>) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        w.put(8, 66);
+        w.put(8, 0xC0);
+        w.put(8, 30);
+        w.ue(0); // seq_parameter_set_id
+        w.ue(0); // log2_max_frame_num_minus4
+        w.ue(0); // pic_order_cnt_type
+        w.ue(0); // log2_max_pic_order_cnt_lsb_minus4
+        w.ue(1); // max_num_ref_frames
+        w.flag(false); // gaps_in_frame_num_value_allowed_flag
+        w.ue(1); // pic_width_in_mbs_minus1
+        w.ue(1); // pic_height_in_map_units_minus1
+        w.flag(true); // frame_mbs_only_flag
+        w.flag(true); // direct_8x8_inference_flag
+        w.flag(false); // frame_cropping_flag
+        w.flag(true); // vui_parameters_present_flag
+        w.flag(false); // aspect_ratio_info_present_flag
+        w.flag(false); // overscan_info_present_flag
+        w.flag(signal.is_some());
+        if let Some((full, desc)) = signal {
+            w.put(3, 5); // video_format: unspecified
+            w.flag(full);
+            w.flag(desc.is_some());
+            if let Some((p, t, m)) = desc {
+                w.put(8, p as u32);
+                w.put(8, t as u32);
+                w.put(8, m as u32);
+            }
+        }
+        w.flag(false); // chroma_loc_info_present_flag
+        w.flag(false); // timing_info_present_flag
+        w.flag(false); // nal_hrd_parameters_present_flag
+        w.flag(false); // vcl_hrd_parameters_present_flag
+        w.flag(false); // pic_struct_present_flag
+        w.flag(false); // bitstream_restriction_flag
+        w.finish()
+    }
+
+    #[test]
+    fn vui_colour_description_is_read() {
+        let pq = parse_sps(&sps(Some((false, Some((9, 16, 9)))))).unwrap();
+        assert_eq!(pq.color, Some(ColorInfo { primaries: 9, transfer: 16, matrix: 9, full_range: false }));
+        assert!(pq.color.unwrap().is_hdr());
+        let hlg = parse_sps(&sps(Some((true, Some((9, 18, 9)))))).unwrap();
+        assert_eq!(hlg.color, Some(ColorInfo { primaries: 9, transfer: 18, matrix: 9, full_range: true }));
+    }
+
+    #[test]
+    fn range_without_a_description_is_unspecified_codes_and_no_signal_is_none() {
+        let full = parse_sps(&sps(Some((true, None)))).unwrap();
+        assert_eq!(full.color, Some(ColorInfo { full_range: true, ..ColorInfo::UNSPECIFIED }));
+        assert_eq!(parse_sps(&sps(None)).unwrap().color, None);
+    }
 }

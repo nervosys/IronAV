@@ -180,6 +180,8 @@ pub struct SequenceHeader {
     pub subsampling_x: bool,
     pub subsampling_y: bool,
     pub color_range: bool,
+    /// The colour description (H.273 code points) and range, unspecified (2) when the header has none.
+    pub color: ironav_core::ColorInfo,
     pub separate_uv_delta_q: bool,
     /// matrix_coefficients is identity: the planes are G, B and R.
     pub rgb: bool,
@@ -318,8 +320,10 @@ fn parse_color_config(b: &mut Bits, s: &mut SequenceHeader) -> Result<()> {
         tc = b.f(8)?;
         mc = b.f(8)?;
     }
+    s.color = ironav_core::ColorInfo { primaries: cp as u8, transfer: tc as u8, matrix: mc as u8, full_range: false };
     if s.mono_chrome {
         s.color_range = b.flag()?;
+        s.color.full_range = s.color_range;
         s.subsampling_x = true;
         s.subsampling_y = true;
         return Ok(());
@@ -329,8 +333,10 @@ fn parse_color_config(b: &mut Bits, s: &mut SequenceHeader) -> Result<()> {
         s.color_range = true;
         s.subsampling_x = false;
         s.subsampling_y = false;
+        s.color.full_range = true;
     } else {
         s.color_range = b.flag()?;
+        s.color.full_range = s.color_range;
         match s.profile {
             0 => {
                 s.subsampling_x = true;
@@ -1208,3 +1214,85 @@ fn lr_params(b: &mut Bits, seq: &SequenceHeader, h: &mut FrameHeader) -> Result<
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::av1::Av1Decoder;
+
+    /// A reduced still-picture sequence header (the shortest form) with the given colour config bits.
+    fn header(profile: u32, color_bits: &str) -> Vec<u8> {
+        let mut bits = format!("{profile:03b}");
+        bits.push_str("11"); // still_picture, reduced_still_picture_header
+        bits.push_str("00000"); // seq_level_idx_0
+        bits.push_str("0111"); // frame_width_bits_minus_1 = 7
+        bits.push_str("0111"); // frame_height_bits_minus_1 = 7
+        bits.push_str("00111111"); // max_frame_width_minus_1 = 63
+        bits.push_str("00111111"); // max_frame_height_minus_1 = 63
+        bits.push_str("000"); // 128x128 superblock, filter intra, intra edge filter
+        bits.push_str("000"); // superres, cdef, restoration
+        bits.push_str(color_bits);
+        bits.push('0'); // film_grain_params_present
+        bits.push('1'); // trailing bit
+        while !bits.len().is_multiple_of(8) {
+            bits.push('0');
+        }
+        bits.as_bytes().chunks(8).map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap(), 2).unwrap()).collect()
+    }
+
+    fn code(v: u8) -> String {
+        format!("{v:08b}")
+    }
+
+    /// Profile 0 colour config bits for a 4:2:0 stream: bit depth, not mono, the description if any,
+    /// the range, chroma sample position 0 and no separate UV deltas.
+    fn color_420(high: bool, desc: Option<(u8, u8, u8)>, full: bool) -> String {
+        let mut s = format!("{}0", u8::from(high));
+        match desc {
+            Some((p, t, m)) => s += &format!("1{}{}{}", code(p), code(t), code(m)),
+            None => s.push('0'),
+        }
+        s + &format!("{}000", u8::from(full))
+    }
+
+    #[test]
+    fn pq_bt2020_limited_range_is_reported() {
+        let s = parse_sequence_header(&header(0, &color_420(true, Some((9, 16, 9)), false))).unwrap();
+        assert_eq!(s.bit_depth, 10);
+        assert_eq!(s.color, ironav_core::ColorInfo { primaries: 9, transfer: 16, matrix: 9, full_range: false });
+        assert!(s.color.is_hdr());
+    }
+
+    #[test]
+    fn full_range_flag_and_missing_description() {
+        let s = parse_sequence_header(&header(0, &color_420(false, None, true))).unwrap();
+        assert_eq!(s.color, ironav_core::ColorInfo { full_range: true, ..ironav_core::ColorInfo::UNSPECIFIED });
+        let s = parse_sequence_header(&header(0, &color_420(false, None, false))).unwrap();
+        assert_eq!(s.color, ironav_core::ColorInfo::UNSPECIFIED);
+    }
+
+    #[test]
+    fn srgb_is_full_range_and_mono_reads_its_range() {
+        // profile 1, 8-bit, description (1, 13, 0): the range bit is absent and the range is full
+        let c = format!("01{}{}{}0", code(1), code(13), code(0));
+        let s = parse_sequence_header(&header(1, &c)).unwrap();
+        assert_eq!(s.color, ironav_core::ColorInfo { primaries: 1, transfer: 13, matrix: 0, full_range: true });
+        // profile 0, 8-bit, mono, no description, full range
+        let s = parse_sequence_header(&header(0, "0101")).unwrap();
+        assert!(s.mono_chrome);
+        assert_eq!(s.color, ironav_core::ColorInfo { full_range: true, ..ironav_core::ColorInfo::UNSPECIFIED });
+    }
+
+    #[test]
+    fn decoder_reports_the_sequence_color() {
+        let mut d = Av1Decoder::with_threads(&[], 1);
+        assert_eq!(ironav_core::Decoder::color_info(&d), None);
+        let payload = header(0, &color_420(true, Some((9, 18, 9)), false));
+        let mut data = vec![(OBU_SEQUENCE_HEADER << 3) | 2, payload.len() as u8];
+        data.extend(&payload);
+        let packet = ironav_core::Packet { stream: 0, pts: 0, duration: 0, data };
+        ironav_core::Decoder::decode(&mut d, &packet).unwrap();
+        let info = ironav_core::Decoder::color_info(&d).unwrap();
+        assert_eq!((info.primaries, info.transfer, info.matrix, info.full_range), (9, 18, 9, false));
+        assert!(info.is_hdr());
+    }
+}

@@ -20,7 +20,7 @@ mod transform;
 
 use crate::h264::bits::{split_annexb, unescape};
 use frame::{CurPic, Frame, Geometry, SliceInfo};
-use ironav_core::{Decoder, Error, ErrorCode, Frame as OutFrame, Packet, PixelFormat, Result, VideoFrame};
+use ironav_core::{ColorInfo, Decoder, Error, ErrorCode, Frame as OutFrame, Packet, PixelFormat, Result, VideoFrame};
 use ps::{parse_pps, parse_slice_header, parse_sps, Pps, SliceHeader, SliceType, Sps};
 use slice::{active_scaling_list, Carry, Dec, SliceCtx};
 use std::sync::Arc;
@@ -82,6 +82,8 @@ pub struct HevcDecoder {
     last_hdr: Option<SliceHeader>,
     carry: Carry,
     geo_cache: Option<(usize, usize, Arc<Geometry>)>,
+    /// The colour description of the sequence parameter set the latest picture used.
+    color: Option<ColorInfo>,
 }
 
 impl Default for HevcDecoder {
@@ -106,6 +108,7 @@ impl HevcDecoder {
             last_hdr: None,
             carry: Carry::default(),
             geo_cache: None,
+            color: None,
         }
     }
 
@@ -374,6 +377,7 @@ impl HevcDecoder {
         };
         let scaling = active_scaling_list(&sps, &pps).map(|l| Arc::new(ScalingFactors::new(&l)));
         let output = hdr.pic_output;
+        self.color = sps.color;
         self.cur = Some(Cur {
             pic: CurPic::new(&sps, pts, poc),
             sps,
@@ -494,5 +498,9 @@ impl Decoder for HevcDecoder {
         self.last_hdr = None;
         self.carry = Carry::default();
         true
+    }
+
+    fn color_info(&self) -> Option<ColorInfo> {
+        self.color
     }
 }

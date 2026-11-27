@@ -14,7 +14,7 @@
 // `c_ulong` is 32 bits on Windows and 64 on Linux: conversions into it are needed on one only
 #![allow(clippy::useless_conversion)]
 
-use ironav_core::{CodecId, Decoder, Error, ErrorCode, FieldOrder, Frame, Packet, PixelFormat, Result, StreamParams, VideoFrame};
+use ironav_core::{CodecId, ColorInfo, Decoder, Error, ErrorCode, FieldOrder, Frame, Packet, PixelFormat, Result, StreamParams, VideoFrame};
 use crate::driver::load;
 use libloading::Library;
 use std::collections::VecDeque;
@@ -120,6 +120,15 @@ struct VideoFormat {
     aspect: [i32; 2],
     signal: [u8; 4],
     seqhdr_data_length: u32,
+}
+
+/// The colour description in a CUVIDEOFORMAT's video_signal_description: byte 0 holds video_format
+/// in its low 3 bits and video_full_range_flag in bit 3, then the three H.273 code points.
+/// A 0 code point is treated as unspecified; `None` when the stream says nothing at all.
+fn color_of(signal: [u8; 4]) -> Option<ColorInfo> {
+    let code = |v: u8| if v == 0 { 2 } else { v };
+    let c = ColorInfo { primaries: code(signal[1]), transfer: code(signal[2]), matrix: code(signal[3]), full_range: signal[0] & 8 != 0 };
+    (c != ColorInfo::UNSPECIFIED).then_some(c)
 }
 
 /// CUVIDEOFORMATEX: the format followed by raw sequence header bytes (the union with
@@ -259,6 +268,8 @@ struct State {
     /// Coded height of the current decoder, for locating the chroma plane in a mapped frame.
     coded_height: u32,
     display: [i32; 4],
+    /// The colour description of the current sequence, as the parser reports it.
+    color: Option<ColorInfo>,
     out: VecDeque<(Frame, FieldOrder)>,
     /// Host copy of the interleaved chroma plane, kept between pictures.
     uv_scratch: Vec<u8>,
@@ -390,6 +401,7 @@ impl State {
         self.coded_width = f.coded_width;
         self.coded_height = f.coded_height;
         self.display = f.display_area;
+        self.color = color_of(f.signal);
         surfaces as i32
     }
 
@@ -645,6 +657,7 @@ impl NvdecDecoder {
                 coded_width: 0,
                 coded_height: 0,
                 display: [0; 4],
+                color: None,
                 out: VecDeque::new(),
                 uv_scratch: Vec::new(),
                 error: None,
@@ -755,6 +768,11 @@ impl Decoder for NvdecDecoder {
     fn field_orders(&self) -> Vec<FieldOrder> {
         self.last_orders.clone()
     }
+
+    fn color_info(&self) -> Option<ColorInfo> {
+        // SAFETY: allocated in `new`, freed only in Drop; the callbacks that write it run only inside `feed`.
+        unsafe { (*self.state).color }
+    }
 }
 
 impl Drop for NvdecDecoder {
@@ -791,6 +809,18 @@ pub fn accepts(params: &StreamParams) -> std::result::Result<(), String> {
 mod tests {
     use super::*;
     use std::mem::size_of;
+
+    #[test]
+    fn signal_description_maps_to_color_info() {
+        // video_format 5, full range, BT.2020 primaries, PQ, BT.2020 matrix
+        assert_eq!(color_of([5 | 8, 9, 16, 9]), Some(ColorInfo { primaries: 9, transfer: 16, matrix: 9, full_range: true }));
+        assert!(color_of([5, 9, 18, 9]).unwrap().is_hdr());
+        // only a range flag: code points are unspecified
+        assert_eq!(color_of([8, 2, 2, 2]), Some(ColorInfo { full_range: true, ..ColorInfo::UNSPECIFIED }));
+        // nothing stated
+        assert_eq!(color_of([5, 2, 2, 2]), None);
+        assert_eq!(color_of([0, 0, 0, 0]), None);
+    }
 
     #[test]
     fn display_rect_must_lie_inside_the_coded_picture() {

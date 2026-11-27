@@ -20,7 +20,7 @@
 mod cabac;
 mod cu;
 mod sao;
-mod syntax;
+pub(super) mod syntax;
 
 use super::filter;
 use super::frame::{CurPic, Frame, Geometry, SliceInfo};
@@ -459,6 +459,7 @@ mod tests {
                     out.extend(dec.decode(p).unwrap());
                 }
                 out.extend(dec.flush().unwrap());
+                assert_eq!(dec.color_info(), None, "the encoder writes no VUI");
                 assert_eq!(out.len(), frames as usize, "{w}x{h} with {bframes} B pictures");
                 // the planes as the encoder reconstructed them, cropped to the window
                 let crop = |p: &[u16], stride: usize, cw: usize, ch: usize| -> Vec<u8> { (0..ch).flat_map(|r| p[r * stride..r * stride + cw].iter().map(|&s| s as u8)).collect() };

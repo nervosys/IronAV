@@ -1658,6 +1658,8 @@ mod tests {
             assert_eq!(bytes, crop(recon), "frame {t} of {w}x{h}: decoder differs from the encoder's reconstruction");
             out.push(bytes);
         }
+        // the encoder writes an unknown colour space
+        assert_eq!(dec.color_info(), None);
         (out, sizes)
     }
 
