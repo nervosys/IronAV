@@ -694,6 +694,25 @@ In the desktop player's **Subtitles** menu, choose a Matroska or WebM text track
 or turn subtitles off. Subtitles start off for each video. The selected track loads in the background and displays
 as plain text over the video, following the playback clock through pauses and seeks.
 
+Use **Forward** or **Reverse** in the transport bar to choose 0.5×, 1×, 1.5×, 2×, or 4× playback. Forward rates
+resample the audio to keep it synchronized, so pitch follows speed. Reverse plays video silently.
+Press **J** for reverse, **K** to pause, or **L** for forward. Press the current direction again during playback
+to step up to the next speed.
+
+The player defaults to Rodeo's **Monochrome** palette. Choose any of the 16 desktop palettes in **View → Theme**.
+The player remembers your selection.
+
+Audio files show live plots, a peak meter, five-band equalizer, compression, and echo.
+For video with sound, open **View → Audio tools** to dock the same controls beside the picture.
+The plot picker offers **Waterfall**, **Spectral decay**, **Waveform**, **Spectrum**, and **EQ response**.
+Use the expand button beside the plot pickers or **View → Full screen audio plot** to fill the window with the selected plot.
+Press **Esc** or click the exit button to return to the player.
+Spectral decay shows how the spectrum changes as progressively more of one recent playback window is omitted.
+On compatible graphics devices, the player computes and renders the audio plots on the GPU. Other devices use the software plots.
+GPU spectral decay refreshes up to 60 times per second during playback.
+Waterfall and **Jet** are the starting defaults. The color picker also offers Parula, Spectral, Turbo, Viridis,
+Plasma, Inferno, Magma, Cividis, and Greyscale. The player remembers the plot and colors when you close it.
+
 What was and was not checked, on one machine (Windows, RTX 3090 Ti):
 - Real-time pacing, pause, exact seeks, ordering, looping, end detection and the JSON commands are covered by tests on
   generated WAV and Y4M files, against the silent clock (`--audio silent`).

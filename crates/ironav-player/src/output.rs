@@ -16,6 +16,11 @@ pub trait AudioOutput: Send + Sync {
     fn consumed_frames(&self) -> u64;
     /// Queue interleaved samples (already at `rate()` and `channels()`).
     fn write(&self, interleaved: &[f32]);
+    /// Queue samples and report the number of whole frames accepted.
+    fn write_frames(&self, interleaved: &[f32]) -> usize {
+        self.write(interleaved);
+        interleaved.len() / self.channels() as usize
+    }
     /// Throw away everything queued (used when seeking).
     fn clear(&self);
     fn set_playing(&self, on: bool);
@@ -97,7 +102,7 @@ impl Ring {
     }
 
     /// Queue interleaved samples (whole frames). What does not fit is dropped.
-    pub fn write(&self, data: &[f32]) {
+    pub fn write(&self, data: &[f32]) -> usize {
         let head = self.head.load(Ordering::Relaxed);
         let free = self.buf.len() - head.saturating_sub(self.read_at()) as usize;
         let n = data.len().min(free) / self.channels * self.channels;
@@ -106,6 +111,7 @@ impl Ring {
             self.buf[((head + i as u64) % cap) as usize].store(s.to_bits(), Ordering::Relaxed);
         }
         self.head.store(head + n as u64, Ordering::Release);
+        n / self.channels
     }
 
     /// Throw away everything queued. The writer must not be writing at the same time (a seek takes its
@@ -199,6 +205,9 @@ impl AudioOutput for NullOutput {
     }
     fn write(&self, interleaved: &[f32]) {
         self.ring.write(interleaved);
+    }
+    fn write_frames(&self, interleaved: &[f32]) -> usize {
+        self.ring.write(interleaved)
     }
     fn clear(&self) {
         self.ring.clear();
@@ -331,6 +340,9 @@ mod device {
         }
         fn write(&self, interleaved: &[f32]) {
             self.ring.write(interleaved);
+        }
+        fn write_frames(&self, interleaved: &[f32]) -> usize {
+            self.ring.write(interleaved)
         }
         fn clear(&self) {
             self.ring.clear();

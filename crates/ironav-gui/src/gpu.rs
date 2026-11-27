@@ -326,7 +326,7 @@ impl CallbackTrait for VideoCallback {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use ironav_player::rgb_frame;
     use std::future::Future;
@@ -356,7 +356,7 @@ mod tests {
         assert!(supported(&ok));
     }
 
-    fn block_on<T>(f: impl Future<Output = T>) -> T {
+    pub(crate) fn block_on<T>(f: impl Future<Output = T>) -> T {
         let mut f = std::pin::pin!(f);
         let mut cx = Context::from_waker(Waker::noop());
         loop {

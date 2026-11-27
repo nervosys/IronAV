@@ -1,22 +1,24 @@
 //! The player window: picture, transport bar, and an "Agent" panel showing the live status
 //! JSON an agent would get from the same player.
 
+use crate::audio_tools::AudioTools;
 use crate::gpu;
 use crate::picker::Picker;
-use crate::player_style::{self, transport, Icon, ACCENT};
+use crate::player_style::{self, transport, Icon, Theme, CONTROL_SIZE, MENU_WIDTH, PANE_PADDING, PLAY_WIDTH, THEMES};
 use crate::subtitles::Subtitles;
 use eframe::egui::{self, Color32, RichText};
 use ironav_core::Error;
 use ironav_engine::desktop::{Link, CONNECTION_ENV};
 use ironav_formats::FORMATS;
 use ironav_player::{rgb_frame, to_png, AudioMode, OpenOptions, Player, SeekMode, State, TimedFrame};
-use serde_json::Value;
+use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
-const BAD: Color32 = Color32::from_rgb(248, 81, 73);
 const OPEN_MEDIA: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::O);
+const PLAYBACK_SPEEDS: &[f64] = &[0.5, 1.0, 1.5, 2.0, 4.0];
+const SEEK_HEIGHT: f32 = 16.0;
 /// While the seek bar is dragged, a keyframe seek is sent at most this often.
 const SCRUB_EVERY: Duration = Duration::from_millis(40);
 
@@ -57,8 +59,14 @@ pub struct PlayerApp {
     /// When and where the last keyframe seek of a drag was sent.
     scrub_sent: Option<(Instant, f32)>,
     show_agent: bool,
+    show_audio_tools: bool,
+    audio_tools: AudioTools,
     note: Option<(String, std::time::Instant)>,
     fullscreen: bool,
+    plot_fullscreen: bool,
+    theme: &'static Theme,
+    theme_file: Option<PathBuf>,
+    theme_changed: bool,
 }
 
 fn fmt_time(s: f64) -> String {
@@ -67,9 +75,22 @@ fn fmt_time(s: f64) -> String {
 }
 
 impl PlayerApp {
-    pub fn new(initial: Option<String>, gpu: bool, ctx: egui::Context) -> Self {
-        player_style::install(&ctx);
-        let mut a = Self { ctx, gpu, last: None, link: None, player: None, subtitles: Subtitles::default(), opening: None, pending: None, picker: Picker::default(), snapshot: None, path: String::new(), error: None, tex: None, shown: None, scrub: None, scrub_sent: None, show_agent: false, note: None, fullscreen: false };
+    pub(crate) fn with_audio_gpu(mut self, enabled: bool) -> Self {
+        self.audio_tools.enable_gpu(enabled);
+        self
+    }
+
+    pub fn new(initial: Option<String>, gpu: bool, ctx: egui::Context, theme_file: Option<PathBuf>) -> Self {
+        let theme = player_style::load_theme(theme_file.as_deref());
+        let audio_tools = AudioTools::new(theme_file.as_ref().map(|file| file.with_file_name("audio-visualizer")));
+        player_style::install(&ctx, theme);
+        let mut a = Self {
+            ctx, gpu, last: None, link: None, player: None, subtitles: Subtitles::default(),
+            opening: None, pending: None, picker: Picker::default(), snapshot: None, path: String::new(),
+            error: None, tex: None, shown: None, scrub: None, scrub_sent: None, show_agent: false,
+            show_audio_tools: false, audio_tools, note: None, fullscreen: false, plot_fullscreen: false,
+            theme, theme_file, theme_changed: false,
+        };
         if let Some(p) = initial {
             a.open(&p);
         }
@@ -82,6 +103,7 @@ impl PlayerApp {
             self.pending = Some(path);
             return;
         }
+        self.set_plot_fullscreen(false);
         let old = self.player.take();
         self.subtitles.clear();
         self.tex = None;
@@ -137,6 +159,7 @@ impl PlayerApp {
                 self.path = path;
                 self.error = None;
                 let p = Arc::new(p);
+                self.audio_tools.attach(&p, self.show_audio_tools || !p.has_video());
                 p.play();
                 if let Some(link) = &self.link {
                     link.set_player(Some(&p));
@@ -161,7 +184,8 @@ impl PlayerApp {
     }
 
     fn agent_connection(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            player_style::raised_controls(ui, self.theme);
             if let Some(link) = &self.link {
                 if ui.button("Copy MCP configuration").clicked() {
                     let name = if cfg!(windows) { "ironav.exe" } else { "ironav" };
@@ -240,9 +264,50 @@ impl PlayerApp {
         self.ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
     }
 
+    fn set_plot_fullscreen(&mut self, fullscreen: bool) {
+        if fullscreen == self.plot_fullscreen {
+            return;
+        }
+        let player = self.player.as_deref().filter(|p| p.has_audio());
+        if fullscreen && player.is_none() {
+            return;
+        }
+        self.plot_fullscreen = fullscreen;
+        if let Some(player) = player {
+            self.audio_tools.set_visible(player, fullscreen || self.show_audio_tools || !player.has_video());
+        }
+        self.ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(fullscreen || self.fullscreen));
+    }
+
+    fn toggle_agent_view(&mut self) {
+        self.show_agent = !self.show_agent;
+        self.ctx.request_repaint();
+    }
+
+    fn set_color_theme(&mut self, theme: &'static Theme) {
+        self.theme_changed |= self.theme.name != theme.name;
+        self.theme = theme;
+        player_style::install(&self.ctx, theme);
+        self.ctx.request_repaint();
+    }
+
     fn keys(&mut self, ctx: &egui::Context) {
+        if self.picker.busy() || egui::Popup::is_any_open(ctx) {
+            return;
+        }
+        if self.plot_fullscreen && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            self.set_plot_fullscreen(false);
+            return;
+        }
+        if ctx.egui_wants_keyboard_input() {
+            return;
+        }
         if ctx.input(|input| input.key_pressed(egui::Key::F)) {
-            self.toggle_fullscreen();
+            if self.plot_fullscreen {
+                self.set_plot_fullscreen(false);
+            } else {
+                self.toggle_fullscreen();
+            }
         }
         let Some(p) = &self.player else { return };
         let (toggle, left, right, up, down, mute, snap, home) = ctx.input(|i| {
@@ -285,21 +350,15 @@ impl PlayerApp {
     }
 
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
-        let frame = egui::Frame::new()
-            .fill(ui.visuals().panel_fill)
-            .stroke(ui.visuals().window_stroke)
-            .inner_margin(egui::Margin::symmetric(12, 6));
-        let menu = egui::MenuBar::new().style(|style: &mut egui::Style| {
-            style.spacing.button_padding = egui::vec2(10.0, 5.0);
-            style.visuals.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
-            style.visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
-        });
-        egui::Panel::top("bar").frame(frame).show(ui, |ui| {
+        let frame = player_style::bar_frame(ui);
+        let height = frame.total_margin().sum().y + ui.spacing().interact_size.y;
+        let config = egui::containers::menu::MenuConfig::new().style(player_style::menu_style);
+        let menu = egui::MenuBar::new().style(player_style::menu_style).config(config);
+        egui::Panel::top("bar").exact_size(height).resizable(false).frame(frame).show(ui, |ui| {
             menu.ui(ui, |ui| {
-                ui.label(RichText::new("IronAV Player").size(17.0).strong());
-                ui.separator();
+                let can_snapshot = self.snapshot.is_none() && self.player.as_deref().is_some_and(Player::has_video);
                 ui.menu_button("File", |ui| {
-                    ui.set_min_width(172.0);
+                    ui.set_min_width(MENU_WIDTH);
                     let shortcut = ui.ctx().format_shortcut(&OPEN_MEDIA);
                     let open = egui::Button::new("Open…").shortcut_text(shortcut);
                     if ui.add_enabled(!self.picker.busy(), open).clicked() {
@@ -308,7 +367,6 @@ impl PlayerApp {
                     }
 
                     let snapshot = egui::Button::new("Save snapshot").shortcut_text("S");
-                    let can_snapshot = self.snapshot.is_none() && self.player.as_deref().is_some_and(Player::has_video);
                     if ui.add_enabled(can_snapshot, snapshot).clicked() {
                         ui.close();
                         self.snapshot();
@@ -316,16 +374,41 @@ impl PlayerApp {
                 });
                 let view_label = if self.link.is_some() { "View (MCP on)" } else { "View" };
                 ui.menu_button(view_label, |ui| {
-                    ui.set_min_width(172.0);
+                    ui.set_min_width(MENU_WIDTH);
                     if ui.add(egui::Button::selectable(self.fullscreen, "Fullscreen").shortcut_text("F")).clicked() {
                         ui.close();
                         self.toggle_fullscreen();
                     }
                     if ui.add(egui::Button::selectable(self.show_agent, "Agent view")).clicked() {
                         ui.close();
-                        self.show_agent = !self.show_agent;
-                        self.ctx.request_repaint();
+                        self.toggle_agent_view();
                     }
+                    let video_with_audio = self.player.as_deref().filter(|p| p.has_video() && p.has_audio());
+                    let audio_tools = egui::Button::selectable(self.show_audio_tools, "Audio tools");
+                    if ui.add_enabled(video_with_audio.is_some(), audio_tools).clicked() {
+                        self.show_audio_tools = !self.show_audio_tools;
+                        if let Some(player) = video_with_audio {
+                            self.audio_tools.set_visible(player, self.show_audio_tools);
+                        }
+                        ui.close();
+                    }
+                    let has_audio = self.player.as_deref().is_some_and(Player::has_audio);
+                    if ui.add_enabled(has_audio, egui::Button::new("Full screen audio plot")).clicked() {
+                        ui.close();
+                        self.set_plot_fullscreen(true);
+                    }
+                    ui.menu_button("Theme", |ui| {
+                        ui.set_min_width(MENU_WIDTH);
+                        let height = (ui.ctx().content_rect().height() * 0.58).clamp(100.0, 460.0);
+                        egui::ScrollArea::vertical().max_height(height).show(ui, |ui| {
+                            for theme in THEMES {
+                                if ui.add(egui::Button::selectable(self.theme.name == theme.name, theme.name)).clicked() {
+                                    self.set_color_theme(theme);
+                                    ui.close();
+                                }
+                            }
+                        });
+                    });
                 });
                 if let Some(p) = self.player.as_ref().filter(|p| p.has_video()) {
                     if let Some(dialog) = self.subtitles.menu(ui, p, !self.picker.busy()) {
@@ -335,11 +418,27 @@ impl PlayerApp {
                     ui.add_enabled(false, egui::Button::new("Subtitles"));
                 }
 
-                let note = self.note.as_ref().filter(|(_, t)| t.elapsed() < Duration::from_secs(4)).map(|(message, _)| message.as_str());
+                ui.add_space(8.0);
+                ui.scope(|ui| {
+                    ui.spacing_mut().button_padding.x = 8.0;
+                    player_style::raised_controls(ui, self.theme);
+                    if ui.add_enabled(!self.picker.busy(), egui::Button::new("Open…")).clicked() {
+                        self.pick();
+                    }
+                    if ui.add_enabled(can_snapshot, egui::Button::new("Snapshot")).clicked() {
+                        self.snapshot();
+                    }
+                    if ui.add(egui::Button::selectable(self.show_agent, "Agent view")).clicked() {
+                        self.toggle_agent_view();
+                    }
+                });
+
+                let note = self.note.as_ref().filter(|(_, t)| t.elapsed() < Duration::from_secs(4)).map(|(message, _)| (message.as_str(), message.as_str()));
                 let file_name = std::path::Path::new(&self.path).file_name().and_then(|name| name.to_str());
-                if let Some(text) = note.or(file_name) {
+                let detail = note.or_else(|| self.subtitles.notice()).or_else(|| file_name.map(|name| (name, name)));
+                if let Some((text, tooltip)) = detail {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add(egui::Label::new(RichText::new(text).weak()).truncate()).on_hover_text(text);
+                        ui.add(egui::Label::new(RichText::new(text).weak()).truncate()).on_hover_text(tooltip);
                     });
                 }
             });
@@ -362,76 +461,236 @@ impl PlayerApp {
         self.shown = Some(key);
     }
 
-    fn controls(&mut self, ui: &mut egui::Ui) {
-        let Some(p) = &self.player else { return };
-        let (pos, dur, state) = (p.position(), p.info().duration, p.state());
-
-        // Seek bar.
-        let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 18.0), egui::Sense::click_and_drag());
-        let frac_at = |x: f32| ((x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-        if let Some(pt) = resp.interact_pointer_pos() {
-            if resp.dragged() || resp.clicked() {
-                self.scrub = Some(frac_at(pt.x));
+    fn set_playback_rate(&mut self, rate: f64) {
+        if let Some(player) = &self.player {
+            if let Err(error) = player.play_at_rate(rate) {
+                self.say(error.message);
             }
         }
-        // While the bar is dragged, show the keyframe at the pointer (quick); on release, seek to the exact frame.
-        if resp.dragged() {
-            if let (Some(f), Some(d)) = (self.scrub, dur) {
-                let due = self.scrub_sent.is_none_or(|(t, last)| last != f && t.elapsed() >= SCRUB_EVERY);
-                if due {
-                    p.seek_mode(f as f64 * d, SeekMode::Keyframe);
-                    self.scrub_sent = Some((Instant::now(), f));
+    }
+
+    fn playback_shortcuts(&mut self, ctx: &egui::Context) {
+        if self.player.is_none() || self.picker.busy() || ctx.egui_wants_keyboard_input() || egui::Popup::is_any_open(ctx) {
+            return;
+        }
+        let keys = ctx.input_mut(|input| {
+            let mut keys = Vec::new();
+            input.events.retain(|event| {
+                if let egui::Event::Key { key, pressed: true, repeat, modifiers, .. } = event {
+                    if *modifiers == egui::Modifiers::NONE && matches!(key, egui::Key::J | egui::Key::K | egui::Key::L) {
+                        if !repeat {
+                            keys.push(*key);
+                        }
+                        return false;
+                    }
                 }
-            }
+                true
+            });
+            keys
+        });
+        if !keys.is_empty() {
+            ctx.request_repaint();
         }
-        if (resp.drag_stopped() || resp.clicked()) && self.scrub.is_some() {
-            if let (Some(f), Some(d)) = (self.scrub.take(), dur) {
-                p.seek(f as f64 * d);
-            }
-            self.scrub_sent = None;
-        }
-        let shown_frac = self.scrub.map(f64::from).or_else(|| dur.filter(|d| *d > 0.0).map(|d| (pos / d).clamp(0.0, 1.0))).unwrap_or(0.0) as f32;
-        let bar = egui::Rect::from_center_size(rect.center(), egui::vec2(rect.width(), 5.0));
-        let painter = ui.painter();
-        painter.rect_filled(bar, 3.0, ui.visuals().widgets.inactive.bg_fill);
-        painter.rect_filled(egui::Rect::from_min_max(bar.min, egui::pos2(bar.left() + bar.width() * shown_frac, bar.bottom())), 3.0, ACCENT);
-        let radius = if resp.hovered() || resp.dragged() { 6.5 } else { 5.0 };
-        painter.circle_filled(egui::pos2(bar.left() + bar.width() * shown_frac, bar.center().y), radius, ACCENT);
-
-        ui.horizontal(|ui| {
-            let (icon, label) = match state {
-                State::Playing => (Icon::Pause, "Pause"),
-                State::Ended => (Icon::Replay, "Replay"),
-                _ => (Icon::Play, "Play"),
+        for key in keys {
+            let Some(player) = &self.player else { return };
+            let direction = match key {
+                egui::Key::J if player.has_video() => -1.0,
+                egui::Key::L => 1.0,
+                egui::Key::K => {
+                    player.pause();
+                    continue;
+                }
+                _ => continue,
             };
-            if transport(ui, icon, label, true, false).clicked() {
-                p.toggle();
-            }
-            if transport(ui, Icon::Back, "Back 10 seconds", false, false).clicked() {
-                p.seek_by(-10.0);
-            }
-            if transport(ui, Icon::Forward, "Forward 10 seconds", false, false).clicked() {
-                p.seek_by(10.0);
-            }
-            let shown = self.scrub.zip(dur).map_or(pos, |(f, d)| f as f64 * d);
-            ui.monospace(format!("{} / {}", fmt_time(shown), dur.map_or("?".into(), fmt_time)));
-            if state == State::Buffering {
-                ui.weak("buffering…");
-            }
-            ui.separator();
-            let mut vol = p.volume() * 100.0;
-            let muted = p.muted();
-            if transport(ui, Icon::Speaker { muted }, if muted { "Unmute" } else { "Mute" }, false, muted).clicked() {
-                p.set_muted(!muted);
-            }
-            if ui.add(egui::Slider::new(&mut vol, 0.0..=200.0).suffix("%").integer().show_value(true)).changed() {
-                p.set_volume(vol / 100.0);
-            }
-            let looping = p.looping();
-            if ui.add(egui::Button::selectable(looping, "Repeat")).on_hover_text("Repeat playback").clicked() {
-                p.set_looping(!looping);
+            let rate = player.playback_rate();
+            let speed = if rate * direction < 0.0 {
+                1.0
+            } else if matches!(player.state(), State::Paused | State::Ended) {
+                rate.abs()
+            } else {
+                PLAYBACK_SPEEDS.iter().copied().find(|&speed| speed > rate.abs()).unwrap_or(rate.abs())
+            };
+            self.set_playback_rate(speed * direction);
+        }
+    }
+
+    fn agent_panel(&mut self, ui: &mut egui::Ui) {
+        let frame = player_style::bar_frame(ui);
+        let status = self.player.as_deref().map(Player::status);
+        // Keep the status to a compact scrollable row when space is needed by the plot and transport.
+        let status_height = (ui.available_height() - 256.0).clamp(24.0, 160.0);
+        let mut height = frame.total_margin().sum().y + ui.spacing().interact_size.y;
+        if status.is_some() {
+            height += ui.spacing().item_spacing.y + status_height;
+        }
+        egui::Panel::bottom("agent").exact_size(height).resizable(false).frame(frame).show(ui, |ui| {
+            self.agent_connection(ui);
+            if let Some(status) = &status {
+                let mut json = serde_json::to_string_pretty(status).unwrap_or_default();
+                ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+                egui::ScrollArea::vertical().min_scrolled_height(0.0).show(ui, |ui| {
+                    ui.add(egui::TextEdit::multiline(&mut json).code_editor().desired_width(f32::INFINITY).interactive(false));
+                });
             }
         });
+    }
+
+    fn transport_panel(&self, ui: &egui::Ui) -> egui::Panel {
+        let frame = player_style::bar_frame(ui);
+        let spacing = ui.spacing();
+        let height = if self.player.is_some() {
+            let timeline_height = SEEK_HEIGHT.max(spacing.interact_size.y);
+            frame.total_margin().sum().y + timeline_height + spacing.item_spacing.y + CONTROL_SIZE
+        } else {
+            0.0
+        };
+        egui::Panel::bottom("transport").exact_size(height).resizable(false).frame(frame)
+    }
+
+    fn audio_dock(&mut self, ui: &mut egui::Ui) {
+        let Some(player) = self.player.as_deref().filter(|p| self.show_audio_tools && p.has_video() && p.has_audio()) else { return };
+        let theme = self.theme;
+        let frame = egui::Frame::new().fill(theme.surface).inner_margin(egui::Margin::same(PANE_PADDING));
+        // Even a dock widened on a larger window leaves room for the picture after a resize.
+        let max_width = (ui.available_width() - 190.0).clamp(270.0, 430.0);
+        let expand = egui::Panel::right("video audio tools").default_size(314.0).size_range(270.0..=max_width)
+            .frame(frame).show(ui, |ui| self.audio_tools.show(ui, player, theme, true));
+        if expand.inner {
+            self.set_plot_fullscreen(true);
+        }
+    }
+
+    fn controls(&mut self, ui: &mut egui::Ui) {
+        let Some(p) = &self.player else { return };
+        let theme = self.theme;
+        let (pos, dur, state) = (p.position(), p.info().duration, p.state());
+        let rate = p.playback_rate();
+
+        let shown = self.scrub.zip(dur).map_or(pos, |(f, d)| f as f64 * d);
+        let time = format!("{} / {}", fmt_time(shown), dur.map_or("?".into(), fmt_time));
+        ui.horizontal(|ui| {
+            ui.add(egui::Label::new(RichText::new(time).monospace()).truncate());
+            if state == State::Buffering {
+                ui.add(egui::Label::new(RichText::new("Buffering…").small().weak()).truncate());
+            }
+
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), SEEK_HEIGHT), egui::Sense::click_and_drag());
+            let track = egui::Rect::from_center_size(rect.center(), egui::vec2((rect.width() - 10.0).max(1.0), 4.0));
+            let frac_at = |x: f32| ((x - track.left()) / track.width()).clamp(0.0, 1.0);
+            let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+            if let Some(pt) = resp.interact_pointer_pos() {
+                if resp.dragged() || resp.clicked() {
+                    self.scrub = Some(frac_at(pt.x));
+                }
+            }
+            // Throttle drag previews, then seek to the exact position on release.
+            if resp.dragged() {
+                if let (Some(f), Some(d)) = (self.scrub, dur) {
+                    let due = self.scrub_sent.is_none_or(|(t, last)| last != f && t.elapsed() >= SCRUB_EVERY);
+                    if due {
+                        let mode = if rate < 0.0 { SeekMode::Accurate } else { SeekMode::Keyframe };
+                        p.seek_mode(f as f64 * d, mode);
+                        self.scrub_sent = Some((Instant::now(), f));
+                    }
+                }
+            }
+            if (resp.drag_stopped() || resp.clicked()) && self.scrub.is_some() {
+                if let (Some(f), Some(d)) = (self.scrub.take(), dur) {
+                    p.seek(f as f64 * d);
+                }
+                self.scrub_sent = None;
+            }
+            let shown_frac = self.scrub.map(f64::from).or_else(|| dur.filter(|d| *d > 0.0).map(|d| (pos / d).clamp(0.0, 1.0))).unwrap_or(0.0) as f32;
+            let painter = ui.painter();
+            painter.rect_filled(track, 2.0, ui.visuals().widgets.inactive.bg_fill);
+            let playhead = track.left() + track.width() * shown_frac;
+            if shown_frac > 0.0 {
+                painter.rect_filled(egui::Rect::from_min_max(track.min, egui::pos2(playhead, track.bottom())), 2.0, theme.accent);
+            }
+            if resp.hovered() || resp.dragged() || resp.has_focus() {
+                painter.circle_filled(egui::pos2(playhead, track.center().y), 5.0, theme.accent);
+            }
+        });
+
+        let gap = ui.spacing().item_spacing.x;
+        let middle = PLAY_WIDTH + 2.0 * (CONTROL_SIZE + gap);
+        let side = ((ui.available_width() - middle - 2.0 * gap) / 2.0).max(0.0);
+        let side_group = egui::vec2(side, CONTROL_SIZE);
+        let middle_group = egui::vec2(middle, CONTROL_SIZE);
+        let left_to_right = egui::Layout::left_to_right(egui::Align::Center);
+        let mut selected_rate = None;
+        ui.horizontal(|ui| {
+            ui.allocate_ui_with_layout(side_group, left_to_right, |ui| {
+                ui.set_min_size(side_group);
+                ui.spacing_mut().item_spacing.x = 4.0;
+                player_style::raised_controls(ui, theme);
+                for direction in [-1.0, 1.0] {
+                    let reverse = direction < 0.0;
+                    let multiplier = (rate * direction > 0.0).then_some(rate.abs());
+                    ui.add_enabled_ui(!reverse || p.has_video(), |ui| {
+                        let response = player_style::speed_button(ui, theme, reverse, multiplier);
+                        egui::Popup::menu(&response).show(|ui| {
+                            for &speed in PLAYBACK_SPEEDS {
+                                let signed_rate = speed * direction;
+                                let item = egui::Button::selectable(rate == signed_rate, format!("{speed}×"));
+                                if ui.add(item).clicked() {
+                                    selected_rate = Some(signed_rate);
+                                    ui.close();
+                                }
+                            }
+                        });
+                    });
+                }
+            });
+            ui.allocate_ui_with_layout(middle_group, left_to_right, |ui| {
+                ui.set_min_size(middle_group);
+                player_style::raised_controls(ui, theme);
+                if transport(ui, theme, Icon::Back, "Back 10 seconds").clicked() {
+                    p.seek_by(-10.0);
+                }
+                let (icon, label) = match state {
+                    State::Playing => (Icon::Pause, "Pause (K)"),
+                    State::Ended => (Icon::Replay, "Replay"),
+                    _ => (Icon::Play, "Play"),
+                };
+                if transport(ui, theme, icon, label).clicked() {
+                    p.toggle();
+                }
+                if transport(ui, theme, Icon::Forward, "Forward 10 seconds").clicked() {
+                    p.seek_by(10.0);
+                }
+            });
+            let right_to_left = egui::Layout::right_to_left(egui::Align::Center);
+            ui.allocate_ui_with_layout(side_group, right_to_left, |ui| {
+                ui.set_min_size(side_group);
+                player_style::raised_controls(ui, theme);
+                let repeat_width = 54.0;
+                let spacing = ui.spacing_mut();
+                spacing.button_padding.x = 6.0;
+                spacing.item_spacing.x = 4.0;
+                // Reserve room for the editable percentage as well as Mute and Repeat.
+                spacing.slider_width = (side - CONTROL_SIZE - repeat_width - 44.0 - 3.0 * spacing.item_spacing.x).clamp(32.0, 82.0);
+                let enabled = p.looping();
+                let repeat = egui::Button::selectable(enabled, "Repeat").min_size(egui::vec2(repeat_width, CONTROL_SIZE));
+                if ui.add(repeat).clicked() {
+                    p.set_looping(!enabled);
+                }
+                let mut vol = p.volume() * 100.0;
+                let slider = ui.add(egui::Slider::new(&mut vol, 0.0..=200.0).suffix("%").integer().show_value(true));
+                slider.widget_info(|| egui::WidgetInfo::slider(slider.enabled(), f64::from(vol), "Volume"));
+                if slider.changed() {
+                    p.set_volume(vol / 100.0);
+                }
+                slider.on_hover_text("Volume");
+                let muted = p.muted();
+                if transport(ui, theme, Icon::Speaker { muted }, if muted { "Unmute" } else { "Mute" }).clicked() {
+                    p.set_muted(!muted);
+                }
+            });
+        });
+        if let Some(rate) = selected_rate {
+            self.set_playback_rate(rate);
+        }
     }
 }
 
@@ -439,6 +698,17 @@ impl PlayerApp {
 fn picture(f: &TimedFrame, max_w: u32, max_h: u32) -> egui::ColorImage {
     let (w, h, rgb) = rgb_frame(&f.frame, Some(max_w), Some(max_h));
     egui::ColorImage::from_rgb([w as usize, h as usize], &rgb)
+}
+
+impl Drop for PlayerApp {
+    fn drop(&mut self) {
+        if self.theme_changed {
+            if let Some(file) = &self.theme_file {
+                // Save once at shutdown, outside the playback and paint paths.
+                let _ = player_style::save_preference(file, self.theme.name);
+            }
+        }
+    }
 }
 
 impl eframe::App for PlayerApp {
@@ -460,31 +730,46 @@ impl eframe::App for PlayerApp {
         self.finish_open();
         self.finish_snapshot();
         self.keys(&ctx);
+        if let Some(player) = self.player.as_deref().filter(|_| self.plot_fullscreen) {
+            // Advance the same playback clock and release stale video frames while the plot fills the window.
+            if let Some(frame) = player.frame() {
+                self.last = Some(frame);
+            }
+            let frame = egui::Frame::new().fill(self.theme.background).inner_margin(egui::Margin::same(PANE_PADDING));
+            let exit = egui::CentralPanel::default().frame(frame).show(ui, |ui| {
+                self.audio_tools.show_fullscreen(ui, player, self.theme)
+            });
+            if exit.inner {
+                self.set_plot_fullscreen(false);
+            }
+            self.playback_shortcuts(&ctx);
+            self.schedule_repaint(&ctx, None);
+            return;
+        }
         self.subtitles.update(&ctx);
-        // The status JSON is built at most once per UI frame, and only for what shows it: the Agent
-        // view and the audio-only level meter.
-        let status: Option<Value> = self.player.as_deref().filter(|p| self.show_agent || !p.has_video()).map(Player::status);
 
         self.menu_bar(ui);
+        if self.show_agent {
+            self.agent_panel(ui);
+        }
+        if self.player.is_some() {
+            self.transport_panel(ui).show(ui, |ui| self.controls(ui));
+        }
 
-        egui::Panel::bottom("transport").show(ui, |ui| {
-            ui.add_space(4.0);
-            self.controls(ui);
-            ui.add_space(2.0);
-            if self.show_agent {
-                ui.separator();
-                self.agent_connection(ui);
-                if let Some(st) = &status {
-                    let mut json = serde_json::to_string_pretty(st).unwrap_or_default();
-                    egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
-                        ui.add(egui::TextEdit::multiline(&mut json).code_editor().desired_width(f32::INFINITY).interactive(false));
-                    });
-                }
-            }
-        });
+        // Let menus and text fields claim focus before handling the letter keys.
+        self.playback_shortcuts(&ctx);
+
+        self.audio_dock(ui);
 
         let mut next_subtitle = None;
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::BLACK)).show(ui, |ui| {
+        let theme = self.theme;
+        let frame = if self.player.as_deref().is_some_and(Player::has_video) {
+            egui::Frame::new().fill(Color32::BLACK)
+        } else {
+            egui::Frame::new().fill(theme.background).inner_margin(egui::Margin::same(PANE_PADDING))
+        };
+        let expand = egui::CentralPanel::default().frame(frame).show(ui, |ui| {
+            let mut expand = false;
             let avail = ui.available_size();
             let full = ui.max_rect();
             let fresh = self.player.as_deref().and_then(Player::frame);
@@ -518,10 +803,8 @@ impl eframe::App for PlayerApp {
                     next_subtitle = self.subtitles.paint(ui, rect, p.position());
                 }
             } else if let Some(p) = &self.player {
-                if !p.has_video() {
-                    if let Some(st) = &status {
-                        audio_only(ui, full, p, st);
-                    }
+                if !p.has_video() && p.has_audio() {
+                    expand = self.audio_tools.show(ui, p, theme, false);
                 }
             } else if let Some(o) = &self.opening {
                 let path = self.pending.as_deref().unwrap_or(&o.path);
@@ -529,24 +812,28 @@ impl eframe::App for PlayerApp {
                 ui.centered_and_justified(|ui| {
                     ui.vertical_centered(|ui| {
                         ui.add_space((avail.y / 2.0 - 30.0).max(0.0));
-                        ui.add(egui::Spinner::new().size(28.0).color(ACCENT));
-                        ui.label(RichText::new(format!("Opening {name}…")).color(Color32::GRAY).size(16.0));
+                        ui.add(egui::Spinner::new().size(28.0).color(theme.accent));
+                        ui.label(RichText::new(format!("Opening {name}…")).weak().size(16.0));
                     });
                 });
             } else {
                 ui.centered_and_justified(|ui| {
-                    ui.label(RichText::new("Drop a file here or choose File → Open…").color(Color32::GRAY).size(18.0));
+                    ui.label(RichText::new("Drop a file here or choose File → Open…").weak().size(18.0));
                 });
             }
             if let Some(e) = &self.error {
-                ui.painter().text(full.center_bottom() - egui::vec2(0.0, 24.0), egui::Align2::CENTER_BOTTOM, format!("{} — {}", e.message, e.hint.clone().unwrap_or_default()), egui::FontId::proportional(14.0), BAD);
+                ui.painter().text(full.center_bottom() - egui::vec2(0.0, 24.0), egui::Align2::CENTER_BOTTOM, format!("{} — {}", e.message, e.hint.clone().unwrap_or_default()), egui::FontId::proportional(14.0), theme.danger);
             }
             if let Some(p) = &self.player {
                 if let Some(e) = p.error() {
-                    ui.painter().text(full.center_bottom() - egui::vec2(0.0, 24.0), egui::Align2::CENTER_BOTTOM, e.message, egui::FontId::proportional(14.0), BAD);
+                    ui.painter().text(full.center_bottom() - egui::vec2(0.0, 24.0), egui::Align2::CENTER_BOTTOM, e.message, egui::FontId::proportional(14.0), theme.danger);
                 }
             }
+            expand
         });
+        if expand.inner {
+            self.set_plot_fullscreen(true);
+        }
 
         self.schedule_repaint(&ctx, next_subtitle);
     }
@@ -563,13 +850,14 @@ impl PlayerApp {
         if let Some(p) = &self.player {
             match p.state() {
                 State::Playing => {
-                    // The clock and seek bar move at 20 Hz; audio-only files also drive a level meter.
-                    soonest(Duration::from_millis(if p.has_video() { 50 } else { 33 }));
+                    let audio_tools = p.has_audio() && (self.plot_fullscreen || self.show_audio_tools || !p.has_video());
+                    soonest(if audio_tools { self.audio_tools.repaint_interval() } else { Duration::from_millis(50) });
                     if let Some(due) = p.next_frame_due() {
                         soonest(Duration::from_secs_f64(due).max(Duration::from_millis(1)));
                     }
-                    if let Some(t) = next_subtitle {
-                        let due = (t - p.position()).clamp(0.001, 0.05);
+                    let rate = p.playback_rate();
+                    if let Some(t) = next_subtitle.filter(|_| rate > 0.0) {
+                        let due = ((t - p.position()) / rate).clamp(0.001, 0.05);
                         soonest(Duration::from_secs_f64(due));
                     }
                 }
@@ -590,24 +878,6 @@ impl PlayerApp {
             ctx.request_repaint_after(w);
         }
     }
-}
-
-/// A level meter for files with no picture.
-fn audio_only(ui: &mut egui::Ui, rect: egui::Rect, p: &Player, st: &Value) {
-    let level = st["audio"]["level"].as_f64().unwrap_or(0.0).clamp(0.0, 1.0).sqrt() as f32;
-    let meter = egui::Rect::from_center_size(rect.center(), egui::vec2((rect.width() * 0.6).max(40.0), 14.0));
-    let painter = ui.painter();
-    painter.rect_filled(meter, 4.0, Color32::from_gray(40));
-    painter.rect_filled(egui::Rect::from_min_size(meter.min, egui::vec2(meter.width() * level, meter.height())), 4.0, Color32::from_rgb(63, 185, 80));
-    let name = std::path::Path::new(&p.info().path).file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
-    painter.text(meter.center_top() - egui::vec2(0.0, 12.0), egui::Align2::CENTER_BOTTOM, name, egui::FontId::proportional(18.0), Color32::LIGHT_GRAY);
-    painter.text(
-        meter.center_bottom() + egui::vec2(0.0, 12.0),
-        egui::Align2::CENTER_TOP,
-        format!("{} Hz · {} ch · {}", st["audio"]["sample_rate"], st["audio"]["channels"], st["audio"]["device"].as_str().unwrap_or("")),
-        egui::FontId::proportional(13.0),
-        Color32::GRAY,
-    );
 }
 
 #[allow(dead_code)]

@@ -10,19 +10,27 @@
 //! The same object serves every front end: the terminal player, the GUI, and the JSON
 //! command interface agents use ([`Player::command`]). Nothing here draws or reads input.
 
+mod audio_fx;
 mod color;
 mod command;
 mod output;
 mod pipeline;
 mod snapshot;
+mod spectrum;
 mod subtitle;
 
+pub use audio_fx::{AudioEffects, EQ_FREQUENCIES};
 pub use output::{AudioOutput, NullOutput};
 #[cfg(feature = "audio")]
 pub use output::{device_description, CpalOutput};
 pub use pipeline::{open_video_decoder, open_video_decoder_with};
 pub use color::{Colorimetry, Matrix, YuvToRgb};
 pub use snapshot::{base64, rgb_frame, rgb_frame_reference, to_png};
+pub use spectrum::{
+    AudioAnalysis, AudioPcm, SpectralDecay, SpectrumFrame, Waveform, DECAY_FFT_SIZE, DECAY_REFRESH_HZ, DECAY_SLICES,
+    DECAY_STEP, SPECTRUM_BANDS, SPECTRUM_BATCH, SPECTRUM_FFT_SIZE, SPECTRUM_HISTORY,
+    SPECTRUM_MAX_HZ, SPECTRUM_MIN_HZ, WAVEFORM_BINS,
+};
 pub use subtitle::SubtitleTrack;
 
 use ironav_core::{CodecId, Error, ErrorCode, MediaType, Result, StreamInfo, StreamParams, VideoFrame};
@@ -120,7 +128,7 @@ pub enum SeekMode {
 }
 
 pub(crate) enum Cmd {
-    Seek { to: f64, gen: u64, mode: SeekMode },
+    Seek { to: f64, gen: u64, mode: SeekMode, rate: f64 },
     Stop,
 }
 
@@ -161,6 +169,7 @@ pub(crate) struct AudioState {
 #[derive(Default)]
 pub(crate) struct VideoQueue {
     pub gen: u64,
+    pub reverse: bool,
     pub frames: VecDeque<Arc<TimedFrame>>,
     pub bytes: usize,
     pub ended: bool,
@@ -184,7 +193,11 @@ impl VideoQueue {
     /// Drop pictures whose successor is already due at `pos`. Pictures nobody looked at count
     /// as skipped.
     pub fn discard_stale(&mut self, pos: f64) {
-        while self.frames.len() >= 2 && self.frames[1].time <= pos + 1e-4 {
+        while self.frames.len() >= 2 && if self.reverse {
+            self.frames[0].time > pos + 1e-4
+        } else {
+            self.frames[1].time <= pos + 1e-4
+        } {
             if !self.front_shown {
                 self.skipped += 1;
             }
@@ -207,6 +220,14 @@ pub(crate) struct Clock {
     pub volume: f32,
     pub muted: bool,
     pub looping: bool,
+    pub rate: f64,
+    reverse_restart: f64,
+}
+
+impl Clock {
+    fn at_end(&self, pos: f64, end: f64) -> bool {
+        if self.rate < 0.0 { pos <= 1e-3 } else { pos >= end - 1e-3 }
+    }
 }
 
 pub(crate) struct Inner {
@@ -218,6 +239,8 @@ pub(crate) struct Inner {
     pub hwaccel: String,
     pub clock: Mutex<Clock>,
     pub audio: Mutex<AudioState>,
+    pub audio_effects: Mutex<AudioEffects>,
+    pub spectrum: spectrum::Spectrum,
     pub video: Mutex<VideoQueue>,
     pub error: Mutex<Option<Error>>,
     pub shutdown: AtomicBool,
@@ -253,17 +276,17 @@ impl Inner {
         if c.audio_driven {
             if let Some(out) = &self.out {
                 let played = out.consumed_frames().saturating_sub(c.anchor_consumed);
-                return c.anchor_media + played as f64 / out.rate() as f64;
+                return c.anchor_media + played as f64 / out.rate() as f64 * c.rate;
             }
         }
-        c.anchor_media + c.anchor_wall.elapsed().as_secs_f64()
+        (c.anchor_media + c.anchor_wall.elapsed().as_secs_f64() * c.rate).max(0.0)
     }
 
     /// Start (or restart) the clock from `c.anchor_media` right now.
     fn start_clock(&self, c: &mut Clock) {
         c.anchor_wall = Instant::now();
         c.audio_driven = false;
-        if let Some(out) = &self.out {
+        if let Some(out) = self.out.as_ref().filter(|_| c.rate > 0.0) {
             let drained = {
                 let a = self.audio.lock().unwrap();
                 a.ended && out.queued_frames() == 0
@@ -321,9 +344,9 @@ impl Inner {
         }
         let pos = self.position_locked(&c);
         if c.ready && a_ended && v_ended {
-            let end = a_end.max(v_end);
+            let end = if c.rate < 0.0 { 0.0 } else { a_end.max(v_end) };
             let drained = self.out.as_ref().is_none_or(|o| !c.audio_driven || o.queued_frames() == 0);
-            if drained && pos >= end - 1e-3 {
+            if drained && c.at_end(pos, end) {
                 c.anchor_media = end;
                 if c.running {
                     c.running = false;
@@ -451,8 +474,12 @@ impl Player {
                 volume: opts.volume,
                 muted: false,
                 looping: opts.looping,
+                rate: 1.0,
+                reverse_restart: 0.0,
             }),
             audio: Mutex::new(AudioState { gen: 1, ..Default::default() }),
+            audio_effects: Mutex::new(AudioEffects::default()),
+            spectrum: spectrum::Spectrum::default(),
             video: Mutex::new(VideoQueue { gen: 1, ..Default::default() }),
             error: Mutex::new(None),
             shutdown: AtomicBool::new(false),
@@ -502,7 +529,7 @@ impl Player {
         let (a_ended, v_ended) = (self.inner.audio.lock().unwrap().ended, self.inner.video.lock().unwrap().ended);
         let all_ended = (a_ended || !self.inner.has_audio) && (v_ended || !self.inner.has_video);
         let end = self.inner.audio.lock().unwrap().end_time.max(self.inner.video.lock().unwrap().end_time);
-        if all_ended && !c.running && pos.is_some_and(|p| p >= end - 1e-3) {
+        if all_ended && !c.running && pos.is_some_and(|p| c.at_end(p, end)) {
             return State::Ended;
         }
         if c.playing { State::Playing } else { State::Paused }
@@ -510,7 +537,7 @@ impl Player {
 
     pub fn play(&self) {
         if self.state() == State::Ended {
-            self.seek(0.0);
+            self.seek(self.restart_position());
         }
         let mut c = self.inner.clock.lock().unwrap();
         c.playing = true;
@@ -520,6 +547,56 @@ impl Player {
         drop(c);
         // a decoder that stopped after a keyframe seek carries on
         self.inner.video_bell.ring();
+    }
+
+    fn restart_position(&self) -> f64 {
+        let c = self.inner.clock.lock().unwrap();
+        if c.rate < 0.0 { self.info().duration.unwrap_or(c.reverse_restart) } else { 0.0 }
+    }
+
+    /// Signed playback speed. Negative values play video backwards with audio paused.
+    pub fn playback_rate(&self) -> f64 {
+        self.inner.clock.lock().unwrap().rate
+    }
+
+    /// Start playback at a signed speed between 0.5× and 4×, keeping the current media time.
+    /// If that time is at the end in the requested direction, restart at the other end.
+    pub fn play_at_rate(&self, rate: f64) -> Result<()> {
+        if !(0.5..=4.0).contains(&rate.abs()) {
+            return Err(Error::invalid_arg("playback speed must be between 0.5× and 4×"));
+        }
+        if rate < 0.0 && !self.has_video() {
+            return Err(Error::invalid_arg("reverse playback requires a video stream"));
+        }
+        let state = self.state();
+        if let Some(error) = self.error() {
+            return Err(error);
+        }
+        let mut c = self.inner.clock.lock().unwrap();
+        let pos = self.inner.position_locked(&c);
+        let target = if rate < 0.0 {
+            let end = self.info().duration.unwrap_or_else(|| {
+                c.reverse_restart.max(pos).max(self.inner.video.lock().unwrap().end_time)
+            });
+            if end <= 0.0 {
+                return Err(Error::invalid_arg("seek forward before reversing a file of unknown duration"));
+            }
+            c.reverse_restart = end;
+            if pos <= 1e-3 { end } else { pos }
+        } else if state == State::Ended && c.rate > 0.0 {
+            0.0
+        } else {
+            pos
+        };
+        if rate == c.rate && target == pos {
+            drop(c);
+            self.play();
+        } else {
+            c.rate = rate;
+            c.playing = true;
+            self.seek_locked(target, SeekMode::Accurate, &mut c);
+        }
+        Ok(())
     }
 
     pub fn pause(&self) {
@@ -543,12 +620,16 @@ impl Player {
     /// [`Player::seek`] with a choice of how exactly to land: [`SeekMode::Keyframe`] shows the
     /// keyframe at or before `seconds` at once, without decoding up to it.
     pub fn seek_mode(&self, seconds: f64, mode: SeekMode) {
+        let mut c = self.inner.clock.lock().unwrap();
+        self.seek_locked(seconds, mode, &mut c);
+    }
+
+    fn seek_locked(&self, seconds: f64, mode: SeekMode, c: &mut Clock) {
         let inner = &self.inner;
         let mut target = if seconds.is_finite() { seconds.max(0.0) } else { 0.0 };
         if let Some(d) = inner.info.duration {
             target = target.min(d);
         }
-        let mut c = inner.clock.lock().unwrap();
         if c.running {
             if let Some(out) = &inner.out {
                 out.set_playing(false);
@@ -569,10 +650,11 @@ impl Player {
         {
             let mut v = inner.video.lock().unwrap();
             let (shown, skipped) = (v.shown, v.skipped);
-            *v = VideoQueue { gen, shown, skipped, ..Default::default() };
+            *v = VideoQueue { gen, reverse: c.rate < 0.0, shown, skipped, ..Default::default() };
         }
+        inner.spectrum.reset(gen);
         for t in &self.tx {
-            let _ = t.send(Cmd::Seek { to: target, gen, mode });
+            let _ = t.send(Cmd::Seek { to: target, gen, mode, rate: c.rate });
         }
         inner.video_bell.ring();
         inner.audio_bell.ring();
@@ -608,7 +690,7 @@ impl Player {
     pub fn frame(&self) -> Option<Arc<TimedFrame>> {
         let pos = self.inner.update()?;
         if self.inner.clock.lock().unwrap().looping && self.state() == State::Ended {
-            self.seek(0.0);
+            self.seek(self.restart_position());
         }
         let mut q = self.inner.video.lock().unwrap();
         if !q.ready {
@@ -622,7 +704,7 @@ impl Player {
         }
         let front = q.frames.front().cloned();
         match front {
-            Some(f) if f.time <= pos + 1e-4 || q.last.is_none() => {
+            Some(f) if q.reverse || f.time <= pos + 1e-4 || q.last.is_none() => {
                 if !q.front_shown {
                     q.front_shown = true;
                     q.shown += 1;
@@ -640,12 +722,17 @@ impl Player {
         *self.inner.waker.lock().unwrap() = Some(wake);
     }
 
-    /// Seconds of media time until the next queued picture is due, or None if none is queued
-    /// beyond the one on show. At normal speed this is also wall time.
+    /// Wall-clock seconds until the next queued picture is due, if a successor is queued.
     pub fn next_frame_due(&self) -> Option<f64> {
         let pos = self.inner.update()?;
+        let rate = self.playback_rate();
         let q = self.inner.video.lock().unwrap();
-        q.frames.iter().find(|f| f.time > pos + 1e-4).map(|f| f.time - pos)
+        if q.reverse {
+            q.frames.iter().take(q.frames.len().saturating_sub(1))
+                .find(|f| f.time <= pos + 1e-4).map(|f| (pos - f.time).max(0.0) / rate.abs())
+        } else {
+            q.frames.iter().find(|f| f.time > pos + 1e-4).map(|f| (f.time - pos) / rate.abs())
+        }
     }
 
     /// The volume (0..2), whether it is muted, and whether it repeats; cheaper than [`Player::status`].
@@ -667,6 +754,72 @@ impl Player {
 
     pub fn has_video(&self) -> bool {
         self.inner.has_video
+    }
+
+    pub fn has_audio(&self) -> bool {
+        self.inner.has_audio
+    }
+
+    /// Apply effects to the next audio decoded, ahead of the master volume.
+    pub fn set_audio_effects(&self, effects: AudioEffects) {
+        *self.inner.audio_effects.lock().unwrap() = effects.clamped();
+        self.inner.audio_bell.ring();
+    }
+
+    /// Analyze audio on the decoder worker while a visualizer is open.
+    pub fn set_audio_visualization(&self, enabled: bool) {
+        self.inner.spectrum.set_mode(if enabled && self.has_audio() { spectrum::CaptureMode::Analysis } else { spectrum::CaptureMode::Off });
+        self.inner.audio_bell.ring();
+    }
+
+    /// Capture PCM instead of performing spectral analysis on the decoder worker.
+    pub fn set_audio_visualization_pcm(&self, enabled: bool) {
+        self.inner.spectrum.set_mode(if enabled && self.has_audio() { spectrum::CaptureMode::Pcm } else { spectrum::CaptureMode::Off });
+        self.inner.audio_bell.ring();
+    }
+
+    /// Copy the bounded spectrum history up to the playback clock. Keeps the previous result
+    /// if the decoder is publishing a row at the same moment.
+    pub fn audio_spectrum(&self, rows: &mut Vec<SpectrumFrame>) {
+        self.inner.spectrum.collect(self.position(), rows);
+    }
+
+    /// Update the analysis of audio the playback clock has reached.
+    pub fn audio_analysis(&self, analysis: &mut AudioAnalysis) {
+        self.inner.spectrum.collect_analysis(self.position(), analysis);
+    }
+
+    /// Update the analysis input without exposing samples that have not been played yet.
+    pub fn audio_visualization_pcm(&self, window: &mut Arc<AudioPcm>) {
+        self.inner.spectrum.collect_pcm(self.position(), window, false);
+    }
+
+    /// Update a CSD preview window at up to 60 Hz while preserving the spectrum history grid.
+    pub fn audio_decay_pcm(&self, window: &mut Arc<AudioPcm>) {
+        self.inner.spectrum.collect_pcm(self.position(), window, true);
+    }
+
+    pub fn audio_output_rate(&self) -> Option<u32> {
+        self.inner.out.as_ref().map(|out| out.rate())
+    }
+
+    /// Evaluate the equalizer's response at these frequencies on the active output device.
+    /// Frequencies outside the output's range have no response and are reported as NaN.
+    pub fn equalizer_response(&self, effects: AudioEffects, frequencies: &[f32], db: &mut [f32]) {
+        db.fill(f32::NAN);
+        if let Some(rate) = self.audio_output_rate() {
+            audio_fx::equalizer_response(rate, effects, frequencies, db);
+        }
+    }
+
+    /// EQ cascade coefficients, with numerator and denominator separately padded to four floats.
+    pub fn equalizer_coefficients(&self, effects: AudioEffects) -> [[f32; 8]; EQ_FREQUENCIES.len()] {
+        audio_fx::equalizer_coefficients(self.audio_output_rate().unwrap_or_default(), effects)
+    }
+
+    /// Peak amplitude of the audio recently played, after volume and mute.
+    pub fn audio_level(&self) -> f32 {
+        self.inner.out.as_ref().map_or(0.0, |out| out.level())
     }
 }
 

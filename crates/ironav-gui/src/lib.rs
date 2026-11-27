@@ -3,6 +3,7 @@
 //! sockets), and its "Agent" tab shows the exact `ironav` command and job JSON behind the form.
 
 mod app;
+mod audio_tools;
 mod gpu;
 mod picker;
 mod player;
@@ -48,7 +49,10 @@ pub fn run_player(initial_file: Option<String>) -> Result<()> {
     let make = move |cc: &eframe::CreationContext<'_>| {
         // The GPU video path needs a wgpu render state; without one the player converts on the CPU.
         let gpu = cc.wgpu_render_state.as_ref().map(gpu::install).is_some();
-        Ok(Box::new(player::PlayerApp::new(initial_file.clone(), gpu, cc.egui_ctx.clone())) as Box<dyn eframe::App>)
+        let audio_gpu = cc.wgpu_render_state.as_ref().is_some_and(audio_tools::install_gpu);
+        let app = player::PlayerApp::new(initial_file.clone(), gpu, cc.egui_ctx.clone(), player_style::theme_file())
+            .with_audio_gpu(audio_gpu);
+        Ok(Box::new(app) as Box<dyn eframe::App>)
     };
     eframe::run_native("IronAV Player", options, Box::new(make))
         .map_err(|e| Error::new(ErrorCode::Internal, format!("could not start the player window: {e}")).hint("on a headless machine use `ironav play`, which has a terminal and a JSON mode"))

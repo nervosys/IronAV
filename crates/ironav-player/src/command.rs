@@ -33,9 +33,9 @@ impl Player {
         let state = self.state();
         let pos = self.position();
         let info = self.info();
-        let (volume, muted, looping) = {
+        let (volume, muted, looping, rate) = {
             let c = self.inner.clock.lock().unwrap();
-            (c.volume, c.muted, c.looping)
+            (c.volume, c.muted, c.looping, c.rate)
         };
         let q = self.inner.video.lock().unwrap();
         let (shown, skipped, queued) = (q.shown, q.skipped, q.frames.len());
@@ -55,7 +55,7 @@ impl Player {
         json!({
             "path": info.path, "format": info.format,
             "state": state, "position": round3(pos), "duration": info.duration,
-            "volume": volume, "muted": muted, "looping": looping,
+            "volume": volume, "muted": muted, "looping": looping, "rate": rate,
             "audio": audio, "video": video,
             "warnings": info.warnings,
             "error": self.error().map(|e| json!({ "code": e.code, "message": e.message, "hint": e.hint })),

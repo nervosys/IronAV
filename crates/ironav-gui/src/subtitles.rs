@@ -1,3 +1,4 @@
+use crate::player_style::MENU_WIDTH;
 use eframe::egui::{self, Color32};
 use ironav_core::{Error, ErrorCode, Result};
 use ironav_player::{Player, SubtitleTrack};
@@ -82,6 +83,7 @@ impl Subtitles {
         let path = Path::new(&player.info().path);
         let mut picker = None;
         ui.menu_button("Subtitles", |ui| {
+            ui.set_min_width(MENU_WIDTH);
             if ui.selectable_label(self.source.is_none(), "Off").clicked() {
                 self.clear();
                 ui.close();
@@ -95,8 +97,9 @@ impl Subtitles {
                 }
             }
             if let Some(source) = self.source.as_ref().filter(|s| s.index.is_none()) {
-                ui.label(source.path.file_name().unwrap_or_default().to_string_lossy());
+                ui.add(egui::Label::new(source.path.file_name().unwrap_or_default().to_string_lossy()).truncate());
             }
+            ui.separator();
             if ui.add_enabled(can_pick, egui::Button::new("Open subtitle file…")).clicked() {
                 ui.close();
                 let mut dialog = rfd::AsyncFileDialog::new()
@@ -108,12 +111,15 @@ impl Subtitles {
                 picker = Some(dialog);
             }
         });
-        match &self.result {
-            None if self.source.is_some() => { ui.weak("Loading subtitles…"); }
-            Some(Err(e)) => { ui.label("Subtitles unavailable").on_hover_text(&e.message); }
-            _ => {}
-        }
         picker
+    }
+
+    pub(crate) fn notice(&self) -> Option<(&str, &str)> {
+        match &self.result {
+            None if self.source.is_some() => Some(("Loading subtitles…", "Loading subtitles…")),
+            Some(Err(e)) => Some(("Subtitles unavailable", &e.message)),
+            _ => None,
+        }
     }
 
     /// Paint over the picture and return the next subtitle change on the playback clock.

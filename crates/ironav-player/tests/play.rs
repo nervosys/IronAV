@@ -1,6 +1,6 @@
 //! End-to-end playback on generated files, with no sound device (the silent clock).
 
-use ironav_player::{AudioMode, OpenOptions, Player, State, SubtitleTrack};
+use ironav_player::{AudioEffects, AudioMode, OpenOptions, Player, State, SubtitleTrack};
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -117,6 +117,144 @@ fn video_frames_come_out_in_order_and_seek_lands_on_the_right_picture() {
     pl.seek(0.0);
     until("buffered again", 5.0, || pl.state() != State::Buffering);
     assert_eq!(pl.frame().unwrap().frame.planes[0][0], 16, "seeking back works");
+}
+
+#[test]
+fn reverse_playback_shows_descending_frames_across_decode_windows() {
+    let path = dir("reverse").join("reverse.y4m");
+    write_y4m(&path, 30);
+    let p = Player::open(path.to_str().unwrap(), &OpenOptions { autoplay: false, ..silent() }).unwrap();
+    p.play_at_rate(-2.0).unwrap();
+    assert_eq!(p.playback_rate(), -2.0);
+
+    let mut last = f64::INFINITY;
+    let mut pictures = 0;
+    let mut observe = || {
+        if let Some(f) = p.frame() {
+            assert!(f.time <= last, "reverse pictures advanced from {last} to {}", f.time);
+            if f.time < last {
+                pictures += 1;
+                last = f.time;
+            }
+            let index = (f.time * 10.0).round() as usize;
+            assert_eq!(usize::from(f.frame.planes[0][0]), 16 + 8 * index);
+        }
+    };
+    until("reverse advances from the end", 5.0, || {
+        observe();
+        p.state() == State::Playing && p.position() < 2.45
+    });
+    p.pause();
+    let position = p.position();
+    std::thread::sleep(Duration::from_millis(60));
+    assert_eq!(p.position(), position);
+    p.play();
+    until("reverse reaches the beginning", 5.0, || {
+        observe();
+        p.state() == State::Ended
+    });
+    assert!(pictures >= 6, "only {pictures} distinct reverse pictures observed");
+    assert_eq!(p.position(), 0.0);
+    assert_eq!(p.frame().unwrap().time, 0.0);
+
+    p.play_at_rate(1.0).unwrap();
+    until("forward playback after reversing", 5.0, || p.frame().is_some_and(|f| f.time >= 0.2));
+    assert_eq!(p.playback_rate(), 1.0);
+}
+
+#[test]
+fn forward_speed_keeps_audio_and_the_playback_clock_in_sync() {
+    let path = dir("rate").join("tone.wav");
+    write_wav(&path, 8000, 4);
+    let p = Player::open(path.to_str().unwrap(), &OpenOptions { autoplay: false, ..silent() }).unwrap();
+    p.play_at_rate(2.0).unwrap();
+    until("playing twice as fast", 5.0, || p.state() == State::Playing);
+    let (wall, pos) = (Instant::now(), p.position());
+    std::thread::sleep(Duration::from_millis(250));
+    let speed = (p.position() - pos) / wall.elapsed().as_secs_f64();
+    assert!((1.5..2.5).contains(&speed), "media clock advanced {speed:.2}× wall time");
+    assert!(p.status()["audio"]["level"].as_f64().unwrap() > 0.05);
+    assert!(p.play_at_rate(-1.0).is_err(), "an audio-only file cannot play silent reverse video");
+    assert_eq!(p.playback_rate(), 2.0);
+}
+
+#[test]
+fn waterfall_tracks_playback_and_discards_old_rows_on_seek() {
+    let path = dir("waterfall").join("tone.wav");
+    write_wav(&path, 8000, 4);
+    let p = Player::open(path.to_str().unwrap(), &OpenOptions { autoplay: false, ..silent() }).unwrap();
+    p.set_audio_visualization(true);
+    p.set_audio_effects(AudioEffects { compression: 1.0, ..Default::default() });
+    p.seek(0.0);
+    let mut rows = Vec::new();
+    p.audio_spectrum(&mut rows);
+    assert!(rows.is_empty(), "preroll is hidden before the clock reaches it");
+    p.play();
+    until("audible spectrum rows", 5.0, || {
+        p.audio_spectrum(&mut rows);
+        rows.len() >= 3
+    });
+    assert!(rows.windows(2).all(|rows| rows[0].time < rows[1].time));
+    assert!(rows.last().unwrap().time <= p.position());
+    assert!(rows.last().unwrap().bands.iter().any(|&band| band > 100));
+    assert!((0.02..0.2).contains(&p.audio_level()), "compression is audible at the output");
+    p.pause();
+    p.seek(2.0);
+    p.audio_spectrum(&mut rows);
+    assert!(rows.is_empty());
+    p.play();
+    until("spectrum rows at the new position", 5.0, || {
+        p.audio_spectrum(&mut rows);
+        rows.first().is_some_and(|row| row.time >= 2.0)
+    });
+}
+
+#[test]
+fn reverse_flushes_reordered_video_and_forward_restores_audio() {
+    use std::process::Command;
+
+    if !Command::new("ffmpeg").arg("-version").output().is_ok_and(|o| o.status.success()) {
+        eprintln!("skipped: ffmpeg is not on PATH");
+        return;
+    }
+    let path = dir("reverse-av").join("reverse.mp4");
+    let result = Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-nostdin",
+            "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=15",
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
+            "-t", "3", "-c:v", "libx264", "-g", "15", "-bf", "2", "-c:a", "aac"])
+        .arg(&path).status().unwrap();
+    assert!(result.success(), "could not create the H.264/AAC test file");
+    let p = Player::open(path.to_str().unwrap(), &OpenOptions {
+        autoplay: false, hwaccel: "off".into(), ..silent()
+    }).unwrap();
+    until("the opening H.264 frame", 5.0, || p.frame().is_some());
+    let first = p.frame().unwrap().time;
+    p.play_at_rate(-1.5).unwrap();
+    let mut last = f64::INFINITY;
+    let mut pictures = 0;
+    until("reverse reaches the first H.264 frame", 7.0, || {
+        assert!(p.error().is_none(), "{:?}", p.error());
+        if let Some(f) = p.frame() {
+            assert!(f.time <= last, "reverse pictures advanced from {last} to {}", f.time);
+            if f.time < last {
+                pictures += 1;
+                last = f.time;
+            }
+        }
+        p.state() == State::Ended
+    });
+    assert!(pictures >= 10, "only {pictures} distinct reverse pictures observed");
+    assert_eq!(p.frame().unwrap().time, first);
+    assert_eq!(p.status()["audio"]["level"].as_f64(), Some(0.0));
+    p.set_audio_visualization(true);
+    p.set_audio_effects(AudioEffects { echo: 0.3, ..Default::default() });
+    p.play_at_rate(2.0).unwrap();
+    let mut rows = Vec::new();
+    until("forward video, processed audio and the waterfall advance together", 5.0, || {
+        p.audio_spectrum(&mut rows);
+        p.state() == State::Playing && p.audio_level() > 0.01 && !rows.is_empty() && p.frame().is_some_and(|f| f.time > first)
+    });
 }
 
 #[test]

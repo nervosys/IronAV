@@ -1,12 +1,15 @@
 //! The decoding threads. Each owns a demuxer opened on the same file, so audio and video are
 //! read, decoded and queued independently; the clock in `lib.rs` decides what is shown.
 
+use crate::audio_fx::EffectsProcessor;
 use crate::output::{AudioOutput, NullOutput};
+use crate::spectrum::{Analyzer, CaptureMode, PcmTiming};
 use crate::{AudioMode, Cmd, Inner, SeekMode, TimedFrame};
 use ironav_codec::{deinterlace_frame, is_implemented};
 use ironav_core::{Decoder, Demuxer, Error, ErrorCode, FieldOrder, Frame, MediaType, PixelFormat, Result, StreamInfo, StreamParams};
 use ironav_formats::open_demuxer_lazy;
 use ironav_hwaccel::{new_video_decoder, probe_all, select, Direction, HwPolicy};
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
@@ -15,11 +18,16 @@ use std::time::Duration;
 
 /// Audio kept queued ahead of the device, in seconds.
 const AUDIO_AHEAD: f64 = 0.5;
+const AUDIO_TOOLS_AHEAD: f64 = 0.14;
 /// Audio needed before playback may start, in seconds.
 const AUDIO_READY: f64 = 0.1;
 /// Decoded pictures kept ahead of the clock.
 const VIDEO_FRAMES_AHEAD: usize = 16;
 const VIDEO_BYTES_AHEAD: usize = 256 << 20;
+/// Reverse playback decodes from a preceding keyframe and keeps a bounded tail of pictures.
+const REVERSE_WINDOW: f64 = 1.0;
+const REVERSE_FRAMES: usize = 96;
+const REVERSE_BYTES: usize = 128 << 20;
 
 /// A decoder for the video stream: software if one exists, otherwise a GPU decoder.
 pub fn open_video_decoder(s: &StreamInfo, hwaccel: &str) -> Result<(Box<dyn Decoder>, &'static str)> {
@@ -119,10 +127,71 @@ fn poll(rx: &Receiver<Cmd>) -> Wake {
 
 // ---- video ----------------------------------------------------------------------------------
 
+struct ReverseWindow {
+    cursor: f64,
+    first: bool,
+    at_start: bool,
+    frames: VecDeque<(TimedFrame, FieldOrder)>,
+}
+
+impl ReverseWindow {
+    fn new(cursor: f64) -> Self {
+        Self { cursor, first: true, at_start: false, frames: VecDeque::new() }
+    }
+
+    /// Read towards the cursor from a preceding keyframe. Return those pictures from latest to
+    /// earliest. The next window ends just before the oldest picture kept in this one.
+    fn load(&mut self, inner: &Inner, stream: &StreamInfo, dec: &mut Box<dyn Decoder>, demux: &mut dyn Demuxer, gen: u64) -> Result<()> {
+        let from = (self.cursor - REVERSE_WINDOW).max(0.0);
+        demux.seek(from)?;
+        if !dec.reset() {
+            *dec = open_video_decoder(stream, &inner.hwaccel)?.0;
+        }
+        let tb = stream.time_base.as_f64();
+        let (mut bytes, mut trimmed) = (0, false);
+        'decode: loop {
+            if inner.shutdown.load(std::sync::atomic::Ordering::Relaxed) || inner.video.lock().unwrap().gen != gen {
+                self.frames.clear();
+                return Ok(());
+            }
+            let packet = demux.read_packet()?;
+            let frames = match &packet {
+                Some(packet) => dec.decode(packet)?,
+                None => dec.flush()?,
+            };
+            let orders = if frames.is_empty() { Vec::new() } else { dec.field_orders() };
+            for (index, frame) in frames.into_iter().enumerate() {
+                let Frame::Video(frame) = frame else { continue };
+                let time = frame.pts as f64 * tb;
+                if time > self.cursor + 1e-6 || !self.first && time >= self.cursor - 1e-6 {
+                    break 'decode;
+                }
+                bytes += frame.planes.iter().map(Vec::len).sum::<usize>();
+                self.frames.push_back((TimedFrame { time, frame }, orders.get(index).copied().unwrap_or_default()));
+                while self.frames.len() > 1 && (self.frames.len() > REVERSE_FRAMES || bytes > REVERSE_BYTES) {
+                    if let Some((old, _)) = self.frames.pop_front() {
+                        bytes -= old.frame.planes.iter().map(Vec::len).sum::<usize>();
+                        trimmed = true;
+                    }
+                }
+            }
+            if packet.is_none() {
+                break;
+            }
+        }
+        self.at_start = from == 0.0 && !trimmed;
+        self.cursor = self.frames.front().map_or(from, |(frame, _)| frame.time);
+        self.first = false;
+        Ok(())
+    }
+}
+
 fn video_loop(inner: &Inner, path: &str, stream: &StreamInfo, mut dec: Box<dyn Decoder>, demux: Option<Box<dyn Demuxer>>, start: f64, rx: Receiver<Cmd>) -> Result<()> {
     let tb = stream.time_base.as_f64();
     let mut demux = demuxer_for(path, stream, demux)?;
     let mut gen = 1u64;
+    let mut rate: f64 = 1.0;
+    let mut reverse: Option<ReverseWindow> = None;
     let mut target = start;
     let mut need_seek = start > 0.0;
     let mut draining = false; // end of input reached and decoder flushed
@@ -149,8 +218,10 @@ fn video_loop(inner: &Inner, path: &str, stream: &StreamInfo, mut dec: Box<dyn D
         let seen = inner.video_bell.count();
         match poll(&rx) {
             Wake::Cmd(Cmd::Stop) | Wake::Closed => return Ok(()),
-            Wake::Cmd(Cmd::Seek { to, gen: g, mode }) => {
+            Wake::Cmd(Cmd::Seek { to, gen: g, mode, rate: speed }) => {
                 gen = g;
+                rate = speed;
+                reverse = (rate < 0.0).then(|| ReverseWindow::new(to));
                 target = to;
                 need_seek = true;
                 seeking = mode == SeekMode::Accurate;
@@ -186,12 +257,35 @@ fn video_loop(inner: &Inner, path: &str, stream: &StreamInfo, mut dec: Box<dyn D
                     let mut q = inner.video.lock().unwrap();
                     q.discard_stale(pos);
                     // the next picture falls due: look again then (a display that takes pictures rings sooner)
-                    if let Some(f) = q.frames.get(1) {
-                        wait = Duration::from_secs_f64((f.time - pos).clamp(0.001, 0.25));
+                    if q.frames.len() >= 2 {
+                        let distance = if q.reverse { pos - q.frames[0].time } else { q.frames[1].time - pos };
+                        wait = Duration::from_secs_f64((distance / rate.abs()).clamp(0.001, 0.25));
                     }
                 }
             }
             inner.video_bell.wait(seen, wait);
+            continue;
+        }
+        if let Some(window) = &mut reverse {
+            if window.frames.is_empty() && !window.at_start {
+                fed = true;
+                let result = window.load(inner, stream, &mut dec, &mut *demux, gen);
+                if inner.video.lock().unwrap().gen != gen {
+                    continue;
+                }
+                result?;
+            }
+            if let Some((t, order)) = window.frames.pop_back() {
+                push_video(inner, gen, t, order)?;
+            } else if window.at_start {
+                let mut q = inner.video.lock().unwrap();
+                if q.gen == gen {
+                    q.ended = true;
+                    q.ready = true;
+                    q.end_time = 0.0;
+                }
+                draining = true;
+            }
             continue;
         }
         if need_seek {
@@ -368,7 +462,14 @@ fn audio_loop(inner: &Inner, path: &str, stream: &StreamInfo, mut dec: Box<dyn D
     let tb = stream.time_base.as_f64();
     let mut demux = demuxer_for(path, stream, demux)?;
     let mut conv = Convert::new(sample_rate, channels as usize, out.rate(), out.channels() as usize);
-    let (ahead, ready_at) = ((AUDIO_AHEAD * out.rate() as f64) as usize, (AUDIO_READY * out.rate() as f64) as usize);
+    let output_rate = f64::from(out.rate());
+    let output_channels = usize::from(out.channels());
+    let ready_at = (AUDIO_READY * output_rate) as usize;
+    let mut effects = EffectsProcessor::new(out.rate(), output_channels);
+    let mut analyzer = None;
+    let mut analysis_start = start;
+    let mut queued_total = 0u64;
+    let mut play_rate = 1.0;
     let mut gen = 1u64;
     let mut trim_before = start;
     let mut need_seek = start > 0.0;
@@ -382,15 +483,32 @@ fn audio_loop(inner: &Inner, path: &str, stream: &StreamInfo, mut dec: Box<dyn D
         let seen = inner.audio_bell.count();
         match poll(&rx) {
             Wake::Cmd(Cmd::Stop) | Wake::Closed => return Ok(()),
-            Wake::Cmd(Cmd::Seek { to, gen: g, .. }) => {
+            Wake::Cmd(Cmd::Seek { to, gen: g, rate, .. }) => {
                 gen = g;
                 trim_before = to;
-                need_seek = true;
-                finished = false;
+                last_end = to;
+                analysis_start = to;
+                queued_total = 0;
+                play_rate = rate;
+                analyzer = None;
+                effects.reset();
+                need_seek = rate > 0.0;
+                finished = rate < 0.0;
+                if finished {
+                    let mut audio = inner.audio.lock().unwrap();
+                    if audio.gen == gen {
+                        audio.ready = true;
+                        audio.ended = true;
+                    }
+                } else {
+                    conv.ratio = sample_rate as f64 / out.rate() as f64 * rate;
+                }
                 continue;
             }
             Wake::Nothing => {}
         }
+        let capture = inner.spectrum.mode();
+        let ahead = ((if capture != CaptureMode::Off { AUDIO_TOOLS_AHEAD } else { AUDIO_AHEAD }) * output_rate) as usize;
         let queued = out.queued_frames();
         if finished || queued >= ahead {
             // The device drains the queue at its own rate, so look again when a quarter of it is gone
@@ -422,18 +540,41 @@ fn audio_loop(inner: &Inner, path: &str, stream: &StreamInfo, mut dec: Box<dyn D
             // Drop the part of the first packet that lies before the wanted position.
             let skip = ((trim_before - pkt_time) * sample_rate as f64).round().max(0.0) as usize;
             let skip = skip.min(a.frames()) * channels as usize;
-            let samples = conv.process(&a.samples[skip..]);
+            let mut samples = conv.process(&a.samples[skip..]);
             if samples.is_empty() {
                 continue;
             }
-            let mut st = inner.audio.lock().unwrap();
-            if st.gen != gen {
-                break; // a seek happened while decoding: this audio is stale
+            let settings = *inner.audio_effects.lock().unwrap();
+            effects.process(&mut samples, settings);
+            let accepted = {
+                let mut st = inner.audio.lock().unwrap();
+                if st.gen != gen {
+                    break; // a seek happened while decoding: this audio is stale
+                }
+                let count = out.write_frames(&samples);
+                if out.queued_frames() >= ready_at {
+                    st.ready = true;
+                }
+                count
+            };
+            match capture {
+                CaptureMode::Analysis => {
+                    let analyzer = analyzer.get_or_insert_with(|| Analyzer::new(out.rate()));
+                    for (i, frame) in samples.chunks_exact(output_channels).take(accepted).enumerate() {
+                        if let Some(analysis) = analyzer.add_frame(frame) {
+                            let time = analysis_start + (queued_total + i as u64 + 1) as f64 / output_rate * play_rate;
+                            inner.spectrum.push(gen, time, analysis);
+                        }
+                    }
+                }
+                CaptureMode::Pcm => {
+                    analyzer = None;
+                    let timing = PcmTiming { start: analysis_start, playback_rate: play_rate, sample_rate: out.rate(), channels: output_channels };
+                    inner.spectrum.push_pcm(gen, queued_total, timing, &samples[..accepted * output_channels]);
+                }
+                CaptureMode::Off => analyzer = None,
             }
-            out.write(&samples);
-            if out.queued_frames() >= ready_at {
-                st.ready = true;
-            }
+            queued_total += accepted as u64;
         }
         if pkt_time >= trim_before {
             trim_before = 0.0;

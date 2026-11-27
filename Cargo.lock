@@ -2280,6 +2280,7 @@ dependencies = [
 name = "ironav-gui"
 version = "0.1.10"
 dependencies = [
+ "bytemuck",
  "eframe",
  "ironav-codec",
  "ironav-core",
@@ -2290,6 +2291,7 @@ dependencies = [
  "ironav-player",
  "rfd",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
