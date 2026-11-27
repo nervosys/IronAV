@@ -1,4 +1,4 @@
-use crate::{Attachment, Chapter, ColorInfo, Error, ErrorCode, FieldOrder, Frame, Packet, Result, StreamInfo, StreamParams};
+use crate::{Attachment, Chapter, ColorInfo, Error, ErrorCode, FieldOrder, Frame, HdrMetadata, Packet, Result, StreamInfo, StreamParams};
 
 // All stage traits are `Send` so the engine can run each stage on its own thread and
 // move packets/frames between stages without copying.
@@ -30,6 +30,15 @@ pub trait Demuxer: Send {
     fn attachments(&self) -> Vec<Attachment> {
         Vec::new()
     }
+    /// The colour description the container records for a video stream (Matroska `Colour`, MP4
+    /// `colr`), or `None`. A fallback for streams whose bitstream does not say (VP9 cannot signal PQ).
+    fn color_info(&self, _stream: usize) -> Option<ColorInfo> {
+        None
+    }
+    /// The HDR mastering metadata the container records for a video stream, or `None`.
+    fn hdr_metadata(&self, _stream: usize) -> Option<HdrMetadata> {
+        None
+    }
 }
 
 pub trait Muxer: Send {
@@ -60,6 +69,12 @@ pub trait Decoder: Send {
     /// parameter set in use), or `None` if the decoder does not read it or the stream says nothing.
     /// Valid after the first `decode` that returned a frame.
     fn color_info(&self) -> Option<ColorInfo> {
+        None
+    }
+
+    /// The HDR mastering metadata the stream carries (SEI messages or metadata OBUs), or `None`.
+    /// Valid after the first `decode` that returned a frame.
+    fn hdr_metadata(&self) -> Option<HdrMetadata> {
         None
     }
 }

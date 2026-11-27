@@ -73,6 +73,6 @@ pub fn open_range<R: Read + Seek + Send>(mut r: R, start: u64, len: u64, name: &
         lead_in: 0,
         params: StreamParams::Audio { sample_rate: rate, channels },
     };
-    let track = TrackInfo { stream, config: Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma: 1 }, convert: false, swap: 0, unwrap: Vec::new() };
+    let track = TrackInfo { stream, config: Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma: 1 }, convert: false, swap: 0, unwrap: Vec::new(), meta: Default::default() };
     Ok(Mp4Demuxer::from_parts(r, name, vec![track], samples))
 }

@@ -826,6 +826,36 @@ mod tests {
         (src, out, bytes)
     }
 
+    /// SEI NAL units spliced before the first picture give the decoder the HDR metadata; a
+    /// truncated message does not stop decoding.
+    #[test]
+    fn decoder_reports_sei_hdr_metadata() {
+        use crate::hdr::{mdcv_payload, sei_message, sei_nal};
+        let params = StreamParams::Video { width: 64, height: 64, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational::new(25, 1) };
+        let mut enc = H264Encoder::new(&params, Some(26), None).unwrap();
+        let mut pkts = Vec::new();
+        for t in 0..2 {
+            pkts.extend(enc.encode(&Frame::Video(scene(64, 64, t))).unwrap());
+        }
+        pkts.extend(enc.flush().unwrap());
+        let mdcv = mdcv_payload([(8500, 39850), (6550, 2300), (35400, 14600)], (15635, 16450), 10_000_000, 1);
+        let mut sei = sei_nal(&[6], &[sei_message(137, &mdcv), sei_message(144, &[0x03, 0xE8, 0x01, 0x90])]);
+        sei.extend(sei_nal(&[6], &[sei_message(144, &[1, 2, 3, 4])[..4].to_vec()]));
+        sei.extend(&pkts[0].data);
+        pkts[0].data = sei;
+        let mut dec = H264Decoder::new();
+        assert_eq!(dec.hdr_metadata(), None);
+        let mut frames = 0;
+        for p in &pkts {
+            frames += dec.decode(p).unwrap().len();
+        }
+        frames += dec.flush().unwrap().len();
+        assert_eq!(frames, 2);
+        let m = dec.hdr_metadata().expect("metadata");
+        assert_eq!((m.max_cll, m.max_fall), (Some(1000), Some(400)));
+        assert_eq!(m.mastering.unwrap().max_luminance, 1000.0);
+    }
+
     #[test]
     fn decoder_rebuilds_the_encoders_reference() {
         for (w, h, slices, mode) in [(64, 48, 1, 2), (200, 120, 3, 2), (16, 16, 1, 2), (34, 18, 2, 2), (96, 80, 5, 2), (64, 48, 1, 3), (64, 48, 1, 1), (200, 120, 3, 1), (64, 48, 1, 0), (200, 120, 3, 0)] {

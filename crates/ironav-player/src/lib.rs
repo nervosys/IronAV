@@ -24,7 +24,7 @@ pub use output::{AudioOutput, NullOutput};
 #[cfg(feature = "audio")]
 pub use output::{device_description, CpalOutput};
 pub use pipeline::{open_video_decoder, open_video_decoder_with};
-pub use color::{Colorimetry, Matrix, Primaries, ToneMap, Transfer, YuvToRgb};
+pub use color::{tone_map_peak, Colorimetry, Matrix, Primaries, ToneMap, Transfer, YuvToRgb};
 pub use snapshot::{base64, rgb_frame, rgb_frame_reference, rgb_frame_with, to_png};
 pub use spectrum::{
     AudioAnalysis, AudioPcm, SpectralDecay, SpectrumFrame, Waveform, DECAY_FFT_SIZE, DECAY_REFRESH_HZ, DECAY_SLICES,
@@ -33,7 +33,7 @@ pub use spectrum::{
 };
 pub use subtitle::SubtitleTrack;
 
-use ironav_core::{CodecId, ColorInfo, Error, ErrorCode, MediaType, Result, StreamInfo, StreamParams, VideoFrame};
+use ironav_core::{CodecId, ColorInfo, Error, ErrorCode, HdrMetadata, MediaType, Result, StreamInfo, StreamParams, VideoFrame};
 use ironav_formats::open_demuxer_lazy;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -114,6 +114,8 @@ pub struct TimedFrame {
     pub frame: VideoFrame,
     /// The decoder's colour description for this picture, when it gave one.
     pub color: Option<ColorInfo>,
+    /// The stream's HDR mastering metadata (SEI or container), when it has any.
+    pub hdr: Option<HdrMetadata>,
 }
 
 /// How exactly a seek lands.

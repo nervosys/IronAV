@@ -560,7 +560,7 @@ pub fn open<R: Read + Seek + Send>(mut r: R) -> Result<AviDemuxer<R>> {
                 let pix_fmt = config.pix_fmt();
                 let duration = slot;
                 let stream = StreamInfo { index, codec, time_base, duration: Some(duration), bits: None, extradata, lead_in: 0, params: StreamParams::Video { width: *width, height: *height, pix_fmt, frame_rate } };
-                tracks.push(TrackInfo { stream, config, convert, swap: 0, unwrap: Vec::new() });
+                tracks.push(TrackInfo { stream, config, convert, swap: 0, unwrap: Vec::new(), meta: Default::default() });
             }
             Kind::Audio { codec, w } => {
                 let codec = *codec;
@@ -602,7 +602,7 @@ pub fn open<R: Read + Seek + Send>(mut r: R) -> Result<AviDemuxer<R>> {
                 let extradata = if codec == CodecId::Aac { w.extra.clone() } else { Vec::new() };
                 let bits = pcm.then_some(w.bits as u8);
                 let stream = StreamInfo { index, codec, time_base, duration: Some(total), bits, extradata, lead_in: 0, params: StreamParams::Audio { sample_rate: w.rate, channels: w.channels } };
-                tracks.push(TrackInfo { stream, config: Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma: 1 }, convert: false, swap: 0, unwrap: Vec::new() });
+                tracks.push(TrackInfo { stream, config: Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma: 1 }, convert: false, swap: 0, unwrap: Vec::new(), meta: Default::default() });
             }
         }
     }

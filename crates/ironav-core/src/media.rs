@@ -418,6 +418,43 @@ impl ColorInfo {
     }
 }
 
+/// The mastering display's colour volume (SMPTE ST 2086): where its primaries and white point sit
+/// on the CIE 1931 chromaticity diagram and the luminance range it could show.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MasteringDisplay {
+    /// Chromaticity (x, y) of the red, green and blue primaries, in that order.
+    pub primaries: [(f32, f32); 3],
+    /// Chromaticity (x, y) of the white point.
+    pub white_point: (f32, f32),
+    /// Peak luminance in cd/m² (nits).
+    pub max_luminance: f32,
+    /// Black level in cd/m².
+    pub min_luminance: f32,
+}
+
+/// HDR metadata a stream or container carries: the mastering display and the content light level.
+/// Each part is optional; a zero light level in the stream means "unknown" and is stored as `None`.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct HdrMetadata {
+    pub mastering: Option<MasteringDisplay>,
+    /// Maximum content light level (MaxCLL): the brightest single pixel of the content, in cd/m².
+    pub max_cll: Option<u32>,
+    /// Maximum frame-average light level (MaxFALL), in cd/m².
+    pub max_fall: Option<u32>,
+}
+
+impl HdrMetadata {
+    /// Whether nothing is known.
+    pub fn is_empty(&self) -> bool {
+        self.mastering.is_none() && self.max_cll.is_none() && self.max_fall.is_none()
+    }
+
+    /// `self` with each part it lacks taken from `other`.
+    pub fn or(self, other: HdrMetadata) -> HdrMetadata {
+        HdrMetadata { mastering: self.mastering.or(other.mastering), max_cll: self.max_cll.or(other.max_cll), max_fall: self.max_fall.or(other.max_fall) }
+    }
+}
+
 impl Default for ColorInfo {
     fn default() -> Self {
         Self::UNSPECIFIED

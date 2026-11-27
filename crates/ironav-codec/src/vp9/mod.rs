@@ -231,15 +231,16 @@ fn split_superframe(data: &[u8]) -> Vec<&[u8]> {
     vec![data]
 }
 
-/// The H.273 code points for a VP9 color_space. VP9 has no transfer field, so BT.2020 is given the
-/// 10-bit SDR transfer (14): VP9 streams signal PQ or HLG in the container only. `None` for an
+/// The H.273 code points for a VP9 color_space. VP9 has no transfer field, so BT.2020 leaves it
+/// unspecified (2): the stream could be SDR, PQ or HLG, and only the container says (the player
+/// takes the container's description when the transfer is unspecified). `None` for an
 /// unknown or reserved colour space.
 fn color_of(color_space: u8, full_range: bool) -> Option<ColorInfo> {
     let (primaries, transfer, matrix) = match color_space {
         1 | 3 => (6, 6, 6),
         2 => (1, 1, 1),
         4 => (7, 7, 7),
-        5 => (9, 14, 9),
+        5 => (9, 2, 9),
         7 => (1, 13, 0),
         _ => return None,
     };
@@ -464,7 +465,7 @@ mod color_tests {
     #[test]
     fn color_spaces_map_to_code_points() {
         assert_eq!(color_of(2, false), Some(ColorInfo { primaries: 1, transfer: 1, matrix: 1, full_range: false }));
-        assert_eq!(color_of(5, true), Some(ColorInfo { primaries: 9, transfer: 14, matrix: 9, full_range: true }));
+        assert_eq!(color_of(5, true), Some(ColorInfo { primaries: 9, transfer: 2, matrix: 9, full_range: true }));
         assert_eq!(color_of(7, true), Some(ColorInfo { primaries: 1, transfer: 13, matrix: 0, full_range: true }));
         assert_eq!(color_of(1, false).map(|c| c.matrix), Some(6));
         assert_eq!(color_of(0, true), None);

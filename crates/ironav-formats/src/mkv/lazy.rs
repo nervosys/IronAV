@@ -197,6 +197,8 @@ struct Lazy<R: Read + Seek + Send> {
     next: u64,
     exhausted: bool,
     discarded: Vec<bool>,
+    /// Each stream's colour description and HDR metadata, from the track list.
+    meta: Vec<(Option<ironav_core::ColorInfo>, Option<ironav_core::HdrMetadata>)>,
     vp9: Option<(u8, u8)>,
     /// A window covers this many ticks at least.
     span: i64,
@@ -253,6 +255,7 @@ impl<R: Read + Seek + Send + Clone> Lazy<R> {
             next: first_cluster,
             exhausted: false,
             discarded: Vec::new(),
+            meta: Vec::new(),
             vp9: None,
             span,
             scale,
@@ -269,6 +272,7 @@ impl<R: Read + Seek + Send + Clone> Lazy<R> {
             s
         }).collect();
         l.discarded = vec![false; l.streams.len()];
+        l.meta = (0..l.streams.len()).map(|i| (inner.color_info(i), inner.hdr_metadata(i))).collect();
         Some(l)
     }
 
@@ -298,6 +302,14 @@ impl<R: Read + Seek + Send + Clone> Demuxer for Lazy<R> {
 
     fn streams(&self) -> &[StreamInfo] {
         &self.streams
+    }
+
+    fn color_info(&self, stream: usize) -> Option<ironav_core::ColorInfo> {
+        self.meta.get(stream)?.0
+    }
+
+    fn hdr_metadata(&self, stream: usize) -> Option<ironav_core::HdrMetadata> {
+        self.meta.get(stream)?.1
     }
 
     fn discard(&mut self, stream: usize) {

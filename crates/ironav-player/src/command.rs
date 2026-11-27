@@ -2,8 +2,8 @@
 //! with. Every command returns the player's status afterwards, so one call both acts and shows
 //! the effect.
 
-use crate::{base64, rgb_frame_with, to_png, Player, SeekMode, State};
-use ironav_core::ColorInfo;
+use crate::{base64, rgb_frame_with, to_png, tone_map_peak, Player, SeekMode, State, Transfer};
+use ironav_core::{ColorInfo, HdrMetadata};
 use ironav_core::{Error, ErrorCode, Result};
 use serde_json::{json, Value};
 
@@ -29,15 +29,33 @@ fn num(v: &Value, key: &str) -> Result<Option<f64>> {
 }
 
 /// The colour description of the active picture, compactly: the H.273 primaries and matrix codes,
-/// the transfer by name, the range, and whether it is HDR (tone mapped to SDR for display).
-fn color_json(c: ColorInfo) -> Value {
+/// the transfer by name, the range, and whether it is HDR (tone mapped to SDR for display). For HDR
+/// the stream's metadata follows when it has any: `max_cll` and `max_fall` (nits), `mastering`
+/// (`max_nits`, `min_nits`), and `tone_map_peak`, the source peak in nits the tone mapping uses.
+pub(crate) fn color_json(c: ColorInfo, hdr: Option<HdrMetadata>) -> Value {
     let transfer = match c.transfer {
         ColorInfo::TRANSFER_PQ => "pq",
         ColorInfo::TRANSFER_HLG => "hlg",
         2 => "unspecified",
         _ => "sdr",
     };
-    json!({ "primaries": c.primaries, "transfer": transfer, "matrix": c.matrix, "full_range": c.full_range, "hdr": c.is_hdr() })
+    let mut v = json!({ "primaries": c.primaries, "transfer": transfer, "matrix": c.matrix, "full_range": c.full_range, "hdr": c.is_hdr() });
+    if c.is_hdr() {
+        let kind = if c.transfer == ColorInfo::TRANSFER_PQ { Transfer::Pq } else { Transfer::Hlg };
+        v["tone_map_peak"] = json!(tone_map_peak(kind, hdr));
+        if let Some(h) = hdr {
+            if let Some(n) = h.max_cll {
+                v["max_cll"] = json!(n);
+            }
+            if let Some(n) = h.max_fall {
+                v["max_fall"] = json!(n);
+            }
+            if let Some(m) = h.mastering {
+                v["mastering"] = json!({ "max_nits": round3(f64::from(m.max_luminance)), "min_nits": (f64::from(m.min_luminance) * 1e4).round() / 1e4 });
+            }
+        }
+    }
+    v
 }
 
 impl Player {
@@ -52,7 +70,7 @@ impl Player {
         };
         let q = self.inner.video.lock().unwrap();
         let (shown, skipped, queued) = (q.shown, q.skipped, q.frames.len());
-        let color = q.last.as_ref().and_then(|f| f.color);
+        let color = q.last.as_ref().and_then(|f| f.color.map(|c| (c, f.hdr)));
         drop(q);
         let audio = info.audio.as_ref().map(|a| {
             let out = self.inner.out.as_ref();
@@ -65,7 +83,7 @@ impl Player {
         let video = info.video.as_ref().map(|v| {
             json!({ "codec": v.codec, "width": v.width, "height": v.height, "fps": v.fps, "decoder": v.decoder,
                     "frames_shown": shown, "frames_skipped": skipped, "frames_queued": queued,
-                    "color": color.map(color_json) })
+                    "color": color.map(|(c, h)| color_json(c, h)) })
         });
         json!({
             "path": info.path, "format": info.format,
@@ -83,7 +101,7 @@ impl Player {
             return Err(Error::new(ErrorCode::InvalidArgument, "this file has no video to take a picture of"));
         }
         let f = self.frame().ok_or_else(|| Error::new(ErrorCode::NotFound, "no picture is available yet").hint("wait for the state to leave \"buffering\""))?;
-        let (w, h, rgb) = rgb_frame_with(&f.frame, f.color, max_w, max_h);
+        let (w, h, rgb) = rgb_frame_with(&f.frame, f.color, f.hdr, max_w, max_h);
         Ok((w, h, to_png(w, h, &rgb)?))
     }
 
@@ -178,4 +196,34 @@ impl Player {
 
 fn round3(x: f64) -> f64 {
     (x * 1000.0).round() / 1000.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ironav_core::MasteringDisplay;
+
+    #[test]
+    fn the_status_colour_reports_the_hdr_metadata_and_the_tone_map_peak() {
+        let pq = ColorInfo { primaries: 9, transfer: 16, matrix: 9, full_range: false };
+        let hdr = HdrMetadata {
+            mastering: Some(MasteringDisplay { primaries: [(0.708, 0.292), (0.17, 0.797), (0.131, 0.046)], white_point: (0.3127, 0.329), max_luminance: 4000.0, min_luminance: 0.005 }),
+            max_cll: Some(3000),
+            max_fall: Some(500),
+        };
+        let v = color_json(pq, Some(hdr));
+        assert_eq!(v["transfer"], "pq");
+        assert_eq!((v["max_cll"].as_u64(), v["max_fall"].as_u64()), (Some(3000), Some(500)));
+        assert_eq!((v["mastering"]["max_nits"].as_f64(), v["mastering"]["min_nits"].as_f64()), (Some(4000.0), Some(0.005)));
+        assert_eq!(v["tone_map_peak"], 3000);
+        // without metadata the peak is the 1000 nit default and no metadata keys appear
+        let v = color_json(pq, None);
+        assert_eq!(v["tone_map_peak"], 1000);
+        assert!(v.get("max_cll").is_none() && v.get("mastering").is_none());
+        // HLG keeps its nominal peak; SDR reports no HDR fields at all
+        let hlg = ColorInfo { transfer: 18, ..pq };
+        assert_eq!(color_json(hlg, Some(hdr))["tone_map_peak"], 1000);
+        let sdr = color_json(ColorInfo { primaries: 1, transfer: 1, matrix: 1, full_range: false }, Some(hdr));
+        assert!(sdr.get("tone_map_peak").is_none() && sdr.get("max_cll").is_none());
+    }
 }

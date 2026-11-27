@@ -350,7 +350,7 @@ impl GpuVideo {
         for (i, &(pw, ph, bpp)) in layout.iter().enumerate().take(if v.pix_fmt == PixelFormat::Gray8 { 1 } else { 3 }) {
             write_plane(queue, &t.planes[i], &v.planes[i], pw, ph, bpp);
         }
-        let color = Colorimetry::with_info(v, f.color);
+        let color = Colorimetry::with_hdr(v, f.color, f.hdr);
         if self.color != Some(color) {
             queue.write_buffer(&self.params, 0, &params_bytes(color, self.srgb_target));
             self.color = Some(color);
@@ -413,14 +413,14 @@ impl CallbackTrait for VideoCallback {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use ironav_core::ColorInfo;
+    use ironav_core::{ColorInfo, HdrMetadata};
     use ironav_player::{rgb_frame_with, Primaries, Transfer};
     use std::future::Future;
     use std::task::{Context, Poll, Waker};
 
     #[test]
     fn what_the_shader_gets_in_its_uniform_is_the_cpu_matrix() {
-        let c = Colorimetry { matrix: ironav_player::Matrix::Bt709, full_range: false, bits: 10, transfer: Transfer::Sdr, primaries: Primaries::Bt709 };
+        let c = Colorimetry { matrix: ironav_player::Matrix::Bt709, full_range: false, bits: 10, transfer: Transfer::Sdr, primaries: Primaries::Bt709, peak: 1000 };
         let b = params_bytes(c, true);
         assert_eq!(b.len() as u64, PARAMS_SIZE, "the WGSL `Params` block is ten vec4<f32>");
         let f = |i: usize| f32::from_ne_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
@@ -447,6 +447,14 @@ pub(crate) mod tests {
         assert_eq!([f(28), f(29), f(30)], t.gamut[2]);
         assert_eq!([f(32), f(33), f(34), f(35), f(36)], [1.0, t.e_black, t.e_range, t.max_lum, t.target_white]);
         assert_eq!(f(17), 0.0);
+        // the stream's peak rides in the same uniform: no shader change is needed for it
+        let hdr = HdrMetadata { max_cll: Some(4000), ..Default::default() };
+        let c4 = Colorimetry::with_hdr(&v, Some(info), Some(hdr));
+        let t4 = ToneMap::new(c4);
+        assert_ne!(t4.e_range, t.e_range);
+        let b = params_bytes(c4, false);
+        let f = |i: usize| f32::from_ne_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
+        assert_eq!([f(32), f(33), f(34), f(35), f(36)], [1.0, t4.e_black, t4.e_range, t4.max_lum, t4.target_white]);
     }
 
     /// The WGSL must parse and validate; this needs no GPU.
@@ -489,11 +497,11 @@ pub(crate) mod tests {
     }
 
     /// Render `f` offscreen at its own size and return RGBA bytes.
-    fn render(device: &wgpu::Device, queue: &wgpu::Queue, f: VideoFrame, color: Option<ColorInfo>) -> Vec<u8> {
+    fn render(device: &wgpu::Device, queue: &wgpu::Queue, f: VideoFrame, color: Option<ColorInfo>, hdr: Option<HdrMetadata>) -> Vec<u8> {
         let (w, h) = (f.width, f.height);
         assert_eq!(w * 4 % 256, 0, "the readback needs 256-byte rows");
         let mut g = GpuVideo::new(device, wgpu::TextureFormat::Rgba8Unorm);
-        g.upload(device, queue, &Arc::new(TimedFrame { time: 0.0, frame: f, color }));
+        g.upload(device, queue, &Arc::new(TimedFrame { time: 0.0, frame: f, color, hdr }));
         let target = device.create_texture(&wgpu::TextureDescriptor {
             label: None,
             size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
@@ -574,8 +582,8 @@ pub(crate) mod tests {
             (PixelFormat::Yuv420p10, 64, 48, [90 << 2, 240 << 2]),
         ] {
             let f = noise_planes(fmt, w, h, chroma);
-            let gpu = render(&device, &queue, f.clone(), None);
-            let (_, _, cpu) = rgb_frame_with(&f, None, None, None);
+            let gpu = render(&device, &queue, f.clone(), None, None);
+            let (_, _, cpu) = rgb_frame_with(&f, None, None, None, None);
             let worst = cpu.as_chunks::<3>().0.iter().zip(gpu.as_chunks::<4>().0.iter()).flat_map(|(c, g)| (0..3).map(move |i| (i32::from(c[i]) - i32::from(g[i])).abs())).max().unwrap();
             assert!(worst <= 2, "{fmt:?} {w}x{h}: the GPU and CPU differ by {worst}");
         }
@@ -587,13 +595,15 @@ pub(crate) mod tests {
             eprintln!("no GPU adapter here; the offscreen shader test is skipped");
             return;
         };
-        for (transfer, chroma) in [(16u8, [512u16, 512]), (18, [400, 600]), (16, [300, 700])] {
+        let hdr = |cll: u32| Some(HdrMetadata { max_cll: Some(cll), ..Default::default() });
+        // the last two have a source peak of 4000 and of 600 nits (HLG ignores it)
+        for (transfer, chroma, meta) in [(16u8, [512u16, 512], None), (18, [400, 600], None), (16, [300, 700], None), (16, [512, 512], hdr(4000)), (16, [300, 700], hdr(600)), (18, [400, 600], hdr(4000))] {
             let info = ColorInfo { primaries: 9, transfer, matrix: 9, full_range: false };
             let f = noise_planes(PixelFormat::Yuv420p10, 64, 48, chroma);
-            let gpu = render(&device, &queue, f.clone(), Some(info));
-            let (_, _, cpu) = rgb_frame_with(&f, Some(info), None, None);
+            let gpu = render(&device, &queue, f.clone(), Some(info), meta);
+            let (_, _, cpu) = rgb_frame_with(&f, Some(info), meta, None, None);
             let worst = cpu.as_chunks::<3>().0.iter().zip(gpu.as_chunks::<4>().0.iter()).flat_map(|(c, g)| (0..3).map(move |i| (i32::from(c[i]) - i32::from(g[i])).abs())).max().unwrap();
-            assert!(worst <= 3, "transfer {transfer}: the GPU and CPU differ by {worst}");
+            assert!(worst <= 3, "transfer {transfer}, metadata {meta:?}: the GPU and CPU differ by {worst}");
         }
     }
 }

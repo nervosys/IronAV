@@ -28,7 +28,7 @@ pub(crate) mod tables;
 use bits::{split_annexb, unescape};
 pub use enc::H264Encoder;
 use dpb::{DecodedPic, Pending, RefList};
-use ironav_core::{ColorInfo, Decoder, Error, ErrorCode, FieldOrder, Frame, Packet, PixelFormat, Result, VideoFrame};
+use ironav_core::{ColorInfo, Decoder, Error, ErrorCode, FieldOrder, Frame, HdrMetadata, Packet, PixelFormat, Result, VideoFrame};
 use mb::{LevelScale, Picture, SliceDec, SliceParams};
 use ps::{parse_pps, parse_slice_header, parse_sps, Pps, SliceHeader, SliceType, Sps};
 use shared::{Published, Publisher};
@@ -55,6 +55,8 @@ pub struct H264Decoder {
     last_orders: Vec<FieldOrder>,
     /// The colour description of the sequence parameter set the latest picture used.
     color: Option<ColorInfo>,
+    /// HDR metadata from the SEI messages seen so far.
+    hdr: HdrMetadata,
 }
 
 struct Current {
@@ -189,7 +191,7 @@ impl H264Decoder {
         let mut dpb = Dpb::default();
         // a picture in flight holds two buffers: the one it is decoded in and the one it is shared in
         dpb.spare_extra = if n > 1 { n } else { 0 };
-        H264Decoder { sps: vec![None; 32], pps: vec![None; 256], cur: None, dpb, out: Vec::new(), threads: n, running: VecDeque::new(), ready: VecDeque::new(), failed: None, out_orders: Vec::new(), last_orders: Vec::new(), color: None }
+        H264Decoder { sps: vec![None; 32], pps: vec![None; 256], cur: None, dpb, out: Vec::new(), threads: n, running: VecDeque::new(), ready: VecDeque::new(), failed: None, out_orders: Vec::new(), last_orders: Vec::new(), color: None, hdr: HdrMetadata::default() }
     }
 
     /// For live sources: when the stream does not declare how deep its reordering goes (VUI
@@ -374,6 +376,10 @@ impl Decoder for H264Decoder {
                     let id = p.id as usize;
                     self.pps[id] = Some(p);
                 }),
+                6 => {
+                    crate::hdr::parse_sei(&rbsp, &mut self.hdr);
+                    Ok(())
+                }
                 1 | 5 => self.slice(ty, ref_idc, &rbsp, packet.pts),
                 _ => Ok(()),
             };
@@ -432,6 +438,10 @@ impl Decoder for H264Decoder {
 
     fn field_orders(&self) -> Vec<FieldOrder> {
         self.last_orders.clone()
+    }
+
+    fn hdr_metadata(&self) -> Option<HdrMetadata> {
+        Some(self.hdr).filter(|h| !h.is_empty())
     }
 
     fn color_info(&self) -> Option<ColorInfo> {

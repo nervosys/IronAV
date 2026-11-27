@@ -748,11 +748,21 @@ Plasma, Inferno, Magma, Cividis, and Greyscale. The player remembers the plot an
 
 HDR video (PQ and HLG, as the decoder reports them with its colour description) is tone mapped to an SDR BT.709 display: the
 shader linearizes the picture (ST 2084, or BT.2100 HLG with its system gamma), maps BT.2020 primaries to BT.709, rolls the
-highlights off with the ITU-R BT.2390 curve (a 1000 nit source down to 203 nit reference white) and encodes the result for the
-screen. Snapshots and the CPU fallback use the same maths in f32 at the picture's own bit depth. The `video` object of the JSON
-status has a `color` field (`primaries`, `transfer`, `matrix`, `full_range`, `hdr`). SDR pictures are untouched. This is checked by
-unit tests only (curve values, gamut matrix, CPU against the shader formula, shader validation, and a GPU offscreen comparison
-when an adapter exists); no HDR display and no HDR file was viewed, so how it looks is unjudged.
+highlights off with the ITU-R BT.2390 curve (the source peak down to 203 nit reference white) and encodes the result for the
+screen. Snapshots and the CPU fallback use the same maths in f32 at the picture's own bit depth. The source peak of a PQ picture
+comes from the stream's HDR metadata: the content light level (MaxCLL) if it is plausible (100 to 10 000 nits), else the mastering
+display's peak luminance, else 1000 nits, clamped to 400 to 10 000, so content mastered at 4000 nits is rolled off from 4000 and
+not clipped at 1000. The metadata is read from HEVC and H.264 SEI messages (mastering display colour volume and content light
+level), AV1 metadata OBUs, the Matroska `Colour` element and the MP4 `colr`, `mdcv` and `clli` boxes; the container's colour
+description also stands in when the decoder gives none or leaves the transfer unspecified (a VP9 stream cannot signal PQ, a WebM
+file can). HLG is scene-referred, so it keeps its nominal 1000 nit peak whatever the metadata says. Hardware (NVDEC) decoding
+reports the container's metadata only, not the SEI. The `video` object of the JSON status has a `color` field (`primaries`,
+`transfer`, `matrix`, `full_range`, `hdr`, and for HDR `tone_map_peak`, `max_cll`, `max_fall` and `mastering` with `max_nits` and
+`min_nits`), and `ironav probe` lists a video stream's container `color` and `hdr_metadata`. SDR pictures are untouched. This is
+checked by tests (SEI, OBU, box and element parsing including damaged data, decoders fed spliced SEI, real FFmpeg-made HEVC and VP9
+files in MP4, Matroska and WebM, curve values, gamut matrix, CPU against the shader formula with and without a custom
+peak, shader validation, and a GPU offscreen comparison when an adapter exists); no HDR display and no HDR file from the wild was
+viewed, so how it looks is unjudged.
 
 What was and was not checked, on one machine (Windows, RTX 3090 Ti):
 - Real-time pacing, pause, exact seeks, ordering, looping, end detection and the JSON commands are covered by tests on

@@ -20,7 +20,7 @@ mod transform;
 
 use crate::h264::bits::{split_annexb, unescape};
 use frame::{CurPic, Frame, Geometry, SliceInfo};
-use ironav_core::{ColorInfo, Decoder, Error, ErrorCode, Frame as OutFrame, Packet, PixelFormat, Result, VideoFrame};
+use ironav_core::{ColorInfo, Decoder, Error, ErrorCode, Frame as OutFrame, HdrMetadata, Packet, PixelFormat, Result, VideoFrame};
 use ps::{parse_pps, parse_slice_header, parse_sps, Pps, SliceHeader, SliceType, Sps};
 use slice::{active_scaling_list, Carry, Dec, SliceCtx};
 use std::sync::Arc;
@@ -84,6 +84,8 @@ pub struct HevcDecoder {
     geo_cache: Option<(usize, usize, Arc<Geometry>)>,
     /// The colour description of the sequence parameter set the latest picture used.
     color: Option<ColorInfo>,
+    /// HDR metadata from the SEI messages seen so far.
+    hdr: HdrMetadata,
 }
 
 impl Default for HevcDecoder {
@@ -109,6 +111,7 @@ impl HevcDecoder {
             carry: Carry::default(),
             geo_cache: None,
             color: None,
+            hdr: HdrMetadata::default(),
         }
     }
 
@@ -456,6 +459,11 @@ impl Decoder for HevcDecoder {
                     self.pps[id] = Some(Arc::new(p));
                     self.geo_cache = None;
                 }),
+                // prefix and suffix SEI: a malformed message is ignored, never an error
+                39 | 40 => {
+                    crate::hdr::parse_sei(&rbsp, &mut self.hdr);
+                    Ok(())
+                }
                 36 | 37 => {
                     self.finish_picture();
                     self.after_eos = true;
@@ -502,5 +510,9 @@ impl Decoder for HevcDecoder {
 
     fn color_info(&self) -> Option<ColorInfo> {
         self.color
+    }
+
+    fn hdr_metadata(&self) -> Option<HdrMetadata> {
+        Some(self.hdr).filter(|h| !h.is_empty())
     }
 }

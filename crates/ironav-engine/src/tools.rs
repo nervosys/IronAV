@@ -3,7 +3,7 @@
 
 use crate::job::Job;
 use ironav_codec::{implemented, is_implemented, FILTERS};
-use ironav_core::{CodecId, Error, ErrorCode, MediaType, Result};
+use ironav_core::{CodecId, Error, ErrorCode, MediaType, Result, StreamParams};
 use ironav_formats::{open_demuxer, FORMATS};
 use ironav_hwaccel::{linked_backends, probe_all, provider_codecs, select, Backend, Direction, HwPolicy, Platform, BACKENDS, PROVIDERS};
 use ironav_ontology::{entity, Kind, Ontology, Predicate, Status};
@@ -275,6 +275,17 @@ fn h_probe(args: &Value) -> Result<Value> {
     let size = std::fs::metadata(path).map(|m| m.len()).ok();
     let duration = d.streams().iter().filter_map(|s| s.duration_secs()).fold(None, |a: Option<f64>, x| Some(a.map_or(x, |a| a.max(x))));
     let mut out = json!({ "path": path, "format": d.format_name(), "size_bytes": size, "duration_seconds": duration, "streams": d.streams() });
+    // what the container says about a video stream's colour (the bitstream is not decoded here)
+    for (i, s) in d.streams().iter().enumerate() {
+        if let Some(entry) = out["streams"].get_mut(i).filter(|_| matches!(s.params, StreamParams::Video { .. })) {
+            if let Some(c) = d.color_info(i) {
+                entry["color"] = color_json(c);
+            }
+            if let Some(h) = d.hdr_metadata(i) {
+                entry["hdr_metadata"] = hdr_json(h);
+            }
+        }
+    }
     let unsupported = d.unsupported_streams();
     if !unsupported.is_empty() {
         out["unsupported_streams"] = json!(unsupported);
@@ -291,6 +302,32 @@ fn h_probe(args: &Value) -> Result<Value> {
         crate::untrusted::mark(&mut out);
     }
     Ok(out)
+}
+
+/// A colour description for `probe`: the H.273 codes, the transfer by name, the range and whether it is HDR.
+fn color_json(c: ironav_core::ColorInfo) -> Value {
+    let transfer = match c.transfer {
+        ironav_core::ColorInfo::TRANSFER_PQ => "pq",
+        ironav_core::ColorInfo::TRANSFER_HLG => "hlg",
+        2 => "unspecified",
+        _ => "sdr",
+    };
+    json!({ "primaries": c.primaries, "transfer": transfer, "matrix": c.matrix, "full_range": c.full_range, "hdr": c.is_hdr() })
+}
+
+/// HDR metadata for `probe`: `max_cll` and `max_fall` in nits, and the mastering display's luminance range.
+fn hdr_json(h: ironav_core::HdrMetadata) -> Value {
+    let mut v = json!({});
+    if let Some(n) = h.max_cll {
+        v["max_cll"] = json!(n);
+    }
+    if let Some(n) = h.max_fall {
+        v["max_fall"] = json!(n);
+    }
+    if let Some(m) = h.mastering {
+        v["mastering"] = json!({ "max_nits": (f64::from(m.max_luminance) * 1e3).round() / 1e3, "min_nits": (f64::from(m.min_luminance) * 1e4).round() / 1e4 });
+    }
+    v
 }
 
 /// What `probe` says of an M3U or PLS playlist file: its entries. Nothing in it is opened, and no URL

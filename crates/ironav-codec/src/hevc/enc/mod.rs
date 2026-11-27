@@ -441,6 +441,35 @@ mod tests {
         pkts
     }
 
+    /// SEI NAL units spliced before the first picture give the decoder the HDR metadata; a
+    /// truncated message does not stop decoding.
+    #[test]
+    fn decoder_reports_sei_hdr_metadata() {
+        use crate::hdr::{mdcv_payload, sei_message, sei_nal};
+        let params = StreamParams::Video { width: 64, height: 64, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational::new(25, 1) };
+        let mut enc = HevcEncoder::new(&params, Some(27), None).unwrap();
+        let mut pkts = encode_all(&mut enc, 64, 64, 2);
+        let mdcv = mdcv_payload([(8500, 39850), (6550, 2300), (35400, 14600)], (15635, 16450), 40_000_000, 50);
+        let mut sei = sei_nal(&[39 << 1, 1], &[sei_message(137, &mdcv), sei_message(144, &[0x0F, 0xA0, 0x03, 0xE8])]);
+        // a prefix SEI cut short in the middle of its payload, after the good one
+        sei.extend(sei_nal(&[39 << 1, 1], &[sei_message(144, &[1, 2, 3, 4])[..4].to_vec()]));
+        sei.extend(&pkts[0].data);
+        pkts[0].data = sei;
+        let mut dec = HevcDecoder::new();
+        assert_eq!(dec.hdr_metadata(), None);
+        let mut frames = 0;
+        for p in &pkts {
+            frames += dec.decode(p).unwrap().len();
+        }
+        frames += dec.flush().unwrap().len();
+        assert_eq!(frames, 2);
+        let m = dec.hdr_metadata().expect("metadata");
+        assert_eq!((m.max_cll, m.max_fall), (Some(4000), Some(1000)));
+        let d = m.mastering.unwrap();
+        assert_eq!((d.max_luminance, d.min_luminance), (4000.0, 0.005));
+        assert!((d.primaries[0].0 - 0.708).abs() < 1e-4);
+    }
+
     /// The encoder's reconstruction is what the decoder produces, in display order: for an odd size
     /// whose window crops the padding, for a picture tall enough for two slices, and with and without
     /// B pictures. The packets come in decoding order and the decoder's pictures carry their time stamps.

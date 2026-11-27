@@ -99,7 +99,7 @@ pub fn open<R: Read + Seek + Send>(mut r: R) -> Result<Mp4Demuxer<R>> {
         lead_in: 0,
         params: StreamParams::Audio { sample_rate: rate, channels },
     };
-    let track = TrackInfo { stream, config: Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma: 1 }, convert: false, swap: 0, unwrap: Vec::new() };
+    let track = TrackInfo { stream, config: Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma: 1 }, convert: false, swap: 0, unwrap: Vec::new(), meta: Default::default() };
     Ok(Mp4Demuxer::from_parts(r, if eac3 { "eac3" } else { "ac3" }, vec![track], samples))
 }
 

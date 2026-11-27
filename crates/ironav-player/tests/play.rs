@@ -602,3 +602,101 @@ fn the_seek_command_takes_an_optional_mode() {
     assert_eq!(e.code, ironav_core::ErrorCode::InvalidArgument);
     assert!(e.alternatives.iter().any(|a| a == "keyframe"));
 }
+
+/// Encodes a short 10-bit clip with FFmpeg into `path`; `codec_args` pick the encoder and its HDR
+/// signalling. `None` when FFmpeg or the encoder is missing (the test is skipped).
+fn encode_hdr(path: &std::path::Path, codec_args: &[&str]) -> Option<()> {
+    use std::process::Command;
+    let out = Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-nostdin", "-f", "lavfi", "-i", "testsrc2=size=128x72:rate=10", "-t", "1", "-pix_fmt", "yuv420p10le"])
+        .args(codec_args)
+        .args(["-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc", "-color_range", "tv"])
+        .arg(path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        eprintln!("skipped: FFmpeg could not encode: {}", String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or(""));
+        return None;
+    }
+    Some(())
+}
+
+fn status_color(path: &std::path::Path) -> serde_json::Value {
+    let p = Player::open(path.to_str().unwrap(), &OpenOptions { autoplay: false, hwaccel: "off".into(), ..silent() }).unwrap();
+    until("a picture", 10.0, || {
+        assert!(p.error().is_none(), "{:?}", p.error());
+        p.frame().is_some()
+    });
+    p.status()["video"]["color"].clone()
+}
+
+#[test]
+fn hevc_sei_mastering_metadata_reaches_the_status_and_sets_the_tone_map_peak() {
+    // x265 writes the mastering display and content light level SEI messages itself
+    let x265 = "colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:hdr10=1:repeat-headers=1:log-level=error:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(40000000,50):max-cll=4000,1000";
+    for name in ["hdr.mkv", "hdr.mp4"] {
+        let path = dir("hdr-sei").join(name);
+        if encode_hdr(&path, &["-c:v", "libx265", "-preset", "ultrafast", "-x265-params", x265]).is_none() {
+            return;
+        }
+        let c = status_color(&path);
+        assert_eq!(c["transfer"], "pq", "{name}: {c}");
+        assert_eq!(c["hdr"], true);
+        assert_eq!((c["max_cll"].as_u64(), c["max_fall"].as_u64()), (Some(4000), Some(1000)), "{name}: {c}");
+        assert_eq!(c["mastering"]["max_nits"].as_f64(), Some(4000.0), "{name}: {c}");
+        assert_eq!(c["tone_map_peak"], 4000, "{name}: {c}");
+    }
+}
+
+#[test]
+fn a_webm_container_colour_makes_vp9_pq_without_the_bitstream_saying_so() {
+    // a VP9 bitstream cannot signal PQ; the WebM Colour element (written from the tags) does
+    let raw = dir("hdr-vp9").join("raw.webm");
+    if encode_hdr(&raw, &["-c:v", "libvpx-vp9", "-profile:v", "2", "-b:v", "500k", "-deadline", "realtime", "-cpu-used", "8"]).is_none() {
+        return;
+    }
+    // libvpx's wrapper drops the transfer and primaries, so a copy with the tags writes them
+    let path = dir("hdr-vp9").join("pq.webm");
+    let copied = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-nostdin", "-i"])
+        .arg(&raw)
+        .args(["-c", "copy", "-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc", "-color_range", "tv"])
+        .arg(&path)
+        .status()
+        .unwrap();
+    assert!(copied.success());
+    let c = status_color(&path);
+    assert_eq!(c["transfer"], "pq", "{c}");
+    assert_eq!(c["primaries"], 9, "{c}");
+    assert_eq!(c["hdr"], true);
+    assert_eq!(c["tone_map_peak"], 1000, "no metadata: the default peak: {c}");
+}
+
+#[test]
+fn container_mastering_metadata_alone_sets_the_tone_map_peak() {
+    use std::process::Command;
+    // x265 puts the metadata in SEI; FFmpeg carries it to the container (MP4 mdcv and clli, Matroska
+    // MasteringMetadata and MaxCLL) when it re-encodes, and the second encode writes no SEI itself
+    let x265 = "colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:hdr10=1:repeat-headers=1:log-level=error:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(40000000,50):max-cll=4000,1000";
+    let d = dir("hdr-container");
+    let first = d.join("sei.mkv");
+    if encode_hdr(&first, &["-c:v", "libx265", "-preset", "ultrafast", "-x265-params", x265]).is_none() {
+        return;
+    }
+    for name in ["container.mkv", "container.mp4"] {
+        let path = d.join(name);
+        let status = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-nostdin", "-i"])
+            .arg(&first)
+            .args(["-c:v", "libx265", "-preset", "ultrafast", "-x265-params", "log-level=error"])
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "{name}: re-encode");
+        let c = status_color(&path);
+        assert_eq!(c["transfer"], "pq", "{name}: {c}");
+        assert_eq!((c["max_cll"].as_u64(), c["max_fall"].as_u64()), (Some(4000), Some(1000)), "{name}: {c}");
+        assert_eq!(c["mastering"]["max_nits"].as_f64(), Some(4000.0), "{name}: {c}");
+        assert_eq!(c["tone_map_peak"], 4000, "{name}: {c}");
+    }
+}

@@ -13,7 +13,9 @@
 use ironav_core::{CodecId, Demuxer, Error, ErrorCode, Packet, PixelFormat, Rational, Result, StreamInfo, StreamParams};
 use std::io::{Read, Seek, SeekFrom};
 
+mod colour;
 pub(crate) mod live;
+pub(crate) use colour::VideoMeta;
 
 /// Sanity cap on the size of the index we are willing to hold in memory.
 const MAX_MOOV: u64 = 1 << 30;
@@ -195,6 +197,8 @@ pub(crate) struct TrackInfo {
     pub swap: usize,
     /// Undoes the frame's Matroska content encodings (header stripping, zlib), in order; empty for MP4.
     pub unwrap: Vec<Unwrap>,
+    /// The colour description and HDR metadata the container gives a video track.
+    pub meta: VideoMeta,
 }
 
 #[derive(Clone, Copy)]
@@ -777,7 +781,9 @@ fn parse_trak(trak: &[u8], index: usize, samples: &mut Vec<Sample>, movie_ts: u3
         duration = span;
     }
     let stream = StreamInfo { index, codec, time_base, duration: Some(duration), bits, extradata, lead_in, params };
-    Ok(Some(TrackInfo { stream, config, convert, swap, unwrap: Vec::new() }))
+    // a visual entry has 78 bytes of fields (94 for a version 1 QuickTime one) before its child boxes
+    let meta = if is_video { colour::visual_meta(e.get(if be16(e, 8)? == 1 { 94 } else { 78 }..).unwrap_or(&[])) } else { VideoMeta::default() };
+    Ok(Some(TrackInfo { stream, config, convert, swap, unwrap: Vec::new(), meta }))
 }
 
 /// The OpusHead for a `dOps` box (RFC 7845 section 5.1 in ISO BMFF form): the same fields, with
@@ -1053,6 +1059,14 @@ impl<R: Read + Seek + Send> Demuxer for Mp4Demuxer<R> {
 
     fn streams(&self) -> &[StreamInfo] {
         &self.streams
+    }
+
+    fn color_info(&self, stream: usize) -> Option<ironav_core::ColorInfo> {
+        self.tracks.get(stream)?.meta.color
+    }
+
+    fn hdr_metadata(&self, stream: usize) -> Option<ironav_core::HdrMetadata> {
+        self.tracks.get(stream)?.meta.hdr
     }
 
     fn discard(&mut self, stream: usize) {

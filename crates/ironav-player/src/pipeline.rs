@@ -6,7 +6,7 @@ use crate::output::{AudioOutput, NullOutput};
 use crate::spectrum::{Analyzer, CaptureMode, PcmTiming};
 use crate::{AudioMode, Cmd, Inner, SeekMode, TimedFrame};
 use ironav_codec::{deinterlace_frame, is_implemented};
-use ironav_core::{Decoder, Demuxer, Error, ErrorCode, FieldOrder, Frame, MediaType, PixelFormat, Result, StreamInfo, StreamParams};
+use ironav_core::{ColorInfo, Decoder, Demuxer, Error, ErrorCode, FieldOrder, Frame, HdrMetadata, MediaType, PixelFormat, Result, StreamInfo, StreamParams};
 use ironav_formats::open_demuxer_lazy;
 use ironav_hwaccel::{new_video_decoder, probe_all, select, Direction, HwPolicy};
 use std::collections::VecDeque;
@@ -127,6 +127,28 @@ fn poll(rx: &Receiver<Cmd>) -> Wake {
 
 // ---- video ----------------------------------------------------------------------------------
 
+/// What the stream says about its pictures' colour: the decoder's description and HDR metadata,
+/// with the container's filling in what the decoder lacks. The container's description replaces the
+/// decoder's when the decoder has none or leaves the transfer unspecified (2): a VP9 bitstream cannot
+/// signal PQ, but a WebM file can.
+fn resolve_color(dec: (Option<ColorInfo>, Option<HdrMetadata>), container: (Option<ColorInfo>, Option<HdrMetadata>)) -> (Option<ColorInfo>, Option<HdrMetadata>) {
+    let color = match (dec.0, container.0) {
+        (Some(d), Some(c)) if d.transfer == 2 && c.transfer != 2 => Some(c),
+        (Some(d), _) if d.transfer != 2 => Some(d),
+        (d, c) => d.or(c),
+    };
+    let hdr = match (dec.1, container.1) {
+        (Some(d), Some(c)) => Some(d.or(c)),
+        (d, c) => d.or(c),
+    };
+    (color, hdr)
+}
+
+/// [`resolve_color`] for the decoder and demuxer of one stream, once a picture has come out.
+fn picture_color(dec: &dyn Decoder, demux: &dyn Demuxer, stream: usize) -> (Option<ColorInfo>, Option<HdrMetadata>) {
+    resolve_color((dec.color_info(), dec.hdr_metadata()), (demux.color_info(stream), demux.hdr_metadata(stream)))
+}
+
 struct ReverseWindow {
     cursor: f64,
     first: bool,
@@ -160,7 +182,7 @@ impl ReverseWindow {
                 None => dec.flush()?,
             };
             let orders = if frames.is_empty() { Vec::new() } else { dec.field_orders() };
-            let color = if frames.is_empty() { None } else { dec.color_info() };
+            let (color, hdr) = if frames.is_empty() { (None, None) } else { picture_color(dec.as_ref(), &*demux, stream.index) };
             for (index, frame) in frames.into_iter().enumerate() {
                 let Frame::Video(frame) = frame else { continue };
                 let time = frame.pts as f64 * tb;
@@ -168,7 +190,7 @@ impl ReverseWindow {
                     break 'decode;
                 }
                 bytes += frame.planes.iter().map(Vec::len).sum::<usize>();
-                self.frames.push_back((TimedFrame { time, frame, color }, orders.get(index).copied().unwrap_or_default()));
+                self.frames.push_back((TimedFrame { time, frame, color, hdr }, orders.get(index).copied().unwrap_or_default()));
                 while self.frames.len() > 1 && (self.frames.len() > REVERSE_FRAMES || bytes > REVERSE_BYTES) {
                     if let Some((old, _)) = self.frames.pop_front() {
                         bytes -= old.frame.planes.iter().map(Vec::len).sum::<usize>();
@@ -325,10 +347,10 @@ fn video_loop(inner: &Inner, path: &str, stream: &StreamInfo, mut dec: Box<dyn D
         };
         // Field orders belong to the decoder's most recent batch, including a seek or EOF flush.
         let orders = if frames.is_empty() { Vec::new() } else { dec.field_orders() };
-        let color = if frames.is_empty() { None } else { dec.color_info() };
+        let (color, hdr) = if frames.is_empty() { (None, None) } else { picture_color(dec.as_ref(), &*demux, stream.index) };
         for (i, f) in frames.into_iter().enumerate() {
             let Frame::Video(v) = f else { continue };
-            let t = TimedFrame { time: v.pts as f64 * tb, frame: v, color };
+            let t = TimedFrame { time: v.pts as f64 * tb, frame: v, color, hdr };
             let order = orders.get(i).copied().unwrap_or_default();
             if seeking && t.time <= target + 1e-6 {
                 held = Some((t, order));
@@ -592,6 +614,33 @@ fn media_of(s: &StreamInfo) -> MediaType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn info(transfer: u8, primaries: u8) -> Option<ColorInfo> {
+        Some(ColorInfo { primaries, transfer, matrix: primaries, full_range: false })
+    }
+
+    fn cll(n: u32) -> Option<HdrMetadata> {
+        Some(HdrMetadata { max_cll: Some(n), ..Default::default() })
+    }
+
+    #[test]
+    fn the_container_fills_in_what_the_decoder_does_not_say() {
+        let pq = info(16, 9);
+        // a VP9 stream: the decoder reports BT.2020 with an unspecified transfer, or nothing at all
+        assert_eq!(resolve_color((info(2, 9), None), (pq, None)).0, pq);
+        assert_eq!(resolve_color((None, None), (pq, None)).0, pq);
+        // the decoder's description stands when it names a transfer, even against the container's
+        assert_eq!(resolve_color((info(18, 9), None), (pq, None)).0, info(18, 9));
+        assert_eq!(resolve_color((info(1, 1), None), (pq, None)).0, info(1, 1));
+        // nothing from the container: the decoder's, even unspecified
+        assert_eq!(resolve_color((info(2, 2), None), (None, None)).0, info(2, 2));
+        assert_eq!(resolve_color((None, None), (None, None)), (None, None));
+        // metadata: the decoder's first, the container's where the decoder has none
+        assert_eq!(resolve_color((pq, cll(4000)), (pq, cll(1000))).1, cll(4000));
+        assert_eq!(resolve_color((pq, None), (pq, cll(1000))).1, cll(1000));
+        let both = resolve_color((pq, Some(HdrMetadata { max_fall: Some(300), ..Default::default() })), (pq, cll(2000))).1.unwrap();
+        assert_eq!((both.max_cll, both.max_fall), (Some(2000), Some(300)));
+    }
 
     #[test]
     fn channel_mapping_duplicates_mono_and_averages_to_mono() {

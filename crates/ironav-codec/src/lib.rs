@@ -56,6 +56,8 @@ pub mod h264;
 mod pool;
 #[cfg(feature = "hevc")]
 pub mod hevc;
+#[cfg(any(feature = "h264", feature = "hevc"))]
+mod hdr;
 #[cfg(feature = "vp9")]
 pub mod vp9;
 #[cfg(feature = "jpeg")]

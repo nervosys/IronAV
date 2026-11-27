@@ -21,8 +21,8 @@
 pub(crate) mod lazy;
 pub(crate) mod live;
 
-use crate::mp4demux::{av1c_config, gcd, parse_avcc, parse_hvcc, unwrap_frame, Config, Mp4Demuxer, Sample, TrackInfo, Unwrap};
-use ironav_core::{Attachment, Chapter, CodecId, Error, ErrorCode, Rational, Result, StreamInfo, StreamParams};
+use crate::mp4demux::{av1c_config, gcd, parse_avcc, parse_hvcc, unwrap_frame, Config, Mp4Demuxer, Sample, TrackInfo, Unwrap, VideoMeta};
+use ironav_core::{Attachment, Chapter, CodecId, ColorInfo, Error, ErrorCode, HdrMetadata, MasteringDisplay, Rational, Result, StreamInfo, StreamParams};
 use std::io::{BufReader, Read, Seek, SeekFrom};
 
 const EBML: u32 = 0x1A45_DFA3;
@@ -51,6 +51,18 @@ const DEFAULT_DURATION: u32 = 0x23_E383;
 const VIDEO: u32 = 0xE0;
 const PIXEL_WIDTH: u32 = 0xB0;
 const PIXEL_HEIGHT: u32 = 0xBA;
+const COLOUR: u32 = 0x55B0;
+const MATRIX_COEFFICIENTS: u32 = 0x55B1;
+const COLOUR_RANGE: u32 = 0x55B9;
+const TRANSFER_CHARACTERISTICS: u32 = 0x55BA;
+const PRIMARIES: u32 = 0x55BB;
+const MAX_CLL: u32 = 0x55BC;
+const MAX_FALL: u32 = 0x55BD;
+const MASTERING_METADATA: u32 = 0x55D0;
+// PrimaryRChromaticityX, then Y, G, B and the white point in the same order (0x55D1..=0x55D8), and the luminance
+const MASTERING_CHROMATICITY: std::ops::RangeInclusive<u32> = 0x55D1..=0x55D8;
+const LUMINANCE_MAX: u32 = 0x55D9;
+const LUMINANCE_MIN: u32 = 0x55DA;
 const AUDIO: u32 = 0xE1;
 const SAMPLING_FREQUENCY: u32 = 0xB5;
 const CHANNELS: u32 = 0x9F;
@@ -660,6 +672,47 @@ struct MkTrack {
     encoded: bool,
     /// The steps that undo its content encodings, first step first (empty when it has none).
     encodings: Vec<Unwrap>,
+    /// What a video track's Colour element says (nothing for other tracks).
+    meta: VideoMeta,
+}
+
+/// A video track's Colour element: the colour description, with the range and the code points the
+/// element leaves out unspecified, and the HDR metadata (MaxCLL, MaxFALL and MasteringMetadata).
+/// A damaged element, or a value of the wrong size, is skipped: the file still plays.
+fn parse_colour(body: &[u8]) -> VideoMeta {
+    let (mut c, mut seen) = (ColorInfo::UNSPECIFIED, false);
+    let mut hdr = HdrMetadata::default();
+    for (id, v) in Elems(body).map_while(Result::ok) {
+        let n = be_uint(v).ok();
+        match id {
+            MATRIX_COEFFICIENTS => (c.matrix, seen) = (n.map_or(2, |n| n as u8), true),
+            TRANSFER_CHARACTERISTICS => (c.transfer, seen) = (n.map_or(2, |n| n as u8), true),
+            PRIMARIES => (c.primaries, seen) = (n.map_or(2, |n| n as u8), true),
+            // 1 broadcast (limited), 2 full; 0 and 3 leave it to the matrix and transfer
+            COLOUR_RANGE => (c.full_range, seen) = (n == Some(2), true),
+            MAX_CLL => hdr.max_cll = n.map(|n| n as u32).filter(|&n| n > 0),
+            MAX_FALL => hdr.max_fall = n.map(|n| n as u32).filter(|&n| n > 0),
+            MASTERING_METADATA => hdr.mastering = parse_mastering(v),
+            _ => {}
+        }
+    }
+    VideoMeta { color: seen.then_some(c), hdr: Some(hdr).filter(|h| !h.is_empty()) }
+}
+
+/// MasteringMetadata: the chromaticities and luminances are floats. All of them are needed.
+fn parse_mastering(body: &[u8]) -> Option<MasteringDisplay> {
+    let mut f = [None::<f64>; 10];
+    for (id, v) in Elems(body).map_while(Result::ok) {
+        let slot = match id {
+            LUMINANCE_MAX => 8,
+            LUMINANCE_MIN => 9,
+            id if MASTERING_CHROMATICITY.contains(&id) => (id - 0x55D1) as usize,
+            _ => continue,
+        };
+        f[slot] = be_float(v).ok().filter(|x| x.is_finite() && *x >= 0.0);
+    }
+    let [rx, ry, gx, gy, bx, by, wx, wy, max, min] = f.map(|x| x.map(|x| x as f32));
+    Some(MasteringDisplay { primaries: [(rx?, ry?), (gx?, gy?), (bx?, by?)], white_point: (wx?, wy?), max_luminance: max?, min_luminance: min? })
 }
 
 /// The content encodings of a track's frames, as the steps that undo them in the order a reader applies
@@ -725,7 +778,7 @@ fn parse_tracks(body: &[u8]) -> Result<Vec<MkTrack>> {
         if id != TRACK_ENTRY {
             continue;
         }
-        let mut t = MkTrack { number: 0, kind: 0, codec: String::new(), private: Vec::new(), default_ns: 0, delay_ns: 0, width: 0, height: 0, rate: 8000.0, channels: 1, bits: None, encoded: false, encodings: Vec::new() };
+        let mut t = MkTrack { number: 0, kind: 0, codec: String::new(), private: Vec::new(), default_ns: 0, delay_ns: 0, width: 0, height: 0, rate: 8000.0, channels: 1, bits: None, encoded: false, encodings: Vec::new(), meta: VideoMeta::default() };
         for e in Elems(entry) {
             let (id, v) = e?;
             match id {
@@ -745,6 +798,7 @@ fn parse_tracks(body: &[u8]) -> Result<Vec<MkTrack>> {
                         match id {
                             PIXEL_WIDTH => t.width = be_uint(v)? as u32,
                             PIXEL_HEIGHT => t.height = be_uint(v)? as u32,
+                            COLOUR => t.meta = parse_colour(v),
                             _ => {}
                         }
                     }
@@ -870,7 +924,7 @@ fn build_subtitle(t: &MkTrack, codec: CodecId, index: usize, frames: &[&Frame], 
     }
     let extradata = t.private[..t.private.len().min(crate::subtitle::MAX_CUE_BYTES * 32)].to_vec();
     let stream = StreamInfo { index, codec, time_base: tick, duration: Some(end), bits: None, extradata, lead_in: 0, params: StreamParams::Subtitle };
-    TrackInfo { stream, config: Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma: 1 }, convert: false, swap: 0, unwrap: t.encodings.clone() }
+    TrackInfo { stream, config: Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma: 1 }, convert: false, swap: 0, unwrap: t.encodings.clone(), meta: t.meta }
 }
 
 fn video_codec(id: &str) -> Option<CodecId> {
@@ -1117,7 +1171,7 @@ fn build_track(t: &MkTrack, index: usize, frames: &[&Frame], scale: u64, samples
     }
     let duration: i64 = samples[first..].iter().map(|s| s.duration as i64).sum::<i64>() - trim;
     let stream = StreamInfo { index, codec, time_base, duration: Some(duration.max(0)), bits, extradata, lead_in, params };
-    Ok(Some(TrackInfo { stream, config, convert, swap, unwrap: t.encodings.clone() }))
+    Ok(Some(TrackInfo { stream, config, convert, swap, unwrap: t.encodings.clone(), meta: t.meta }))
 }
 
 impl<R: Read + Seek> Scan<R> {
@@ -1316,6 +1370,78 @@ mod tests {
         assert_eq!(audio.iter().map(|a| (a.0, a.1)).collect::<Vec<_>>(), vec![(44100, 1024), (45124, 1024), (46148, 1024)]);
         assert_eq!(audio.iter().map(|a| a.2.len()).collect::<Vec<_>>(), vec![4, 5, 6]);
         assert_eq!(s[0].duration, Some(120));
+    }
+
+    fn flt(id: u32, v: f32) -> Vec<u8> {
+        el(id, &v.to_be_bytes())
+    }
+
+    /// A Colour element of a PQ BT.2020 limited range track mastered at 4000 nits.
+    fn hdr_colour() -> Vec<u8> {
+        let mastering = [
+            flt(0x55D1, 0.708),
+            flt(0x55D2, 0.292),
+            flt(0x55D3, 0.170),
+            flt(0x55D4, 0.797),
+            flt(0x55D5, 0.131),
+            flt(0x55D6, 0.046),
+            flt(0x55D7, 0.3127),
+            flt(0x55D8, 0.3290),
+            flt(LUMINANCE_MAX, 4000.0),
+            flt(LUMINANCE_MIN, 0.005),
+        ]
+        .concat();
+        el(
+            COLOUR,
+            &[uint(MATRIX_COEFFICIENTS, 9), uint(COLOUR_RANGE, 1), uint(TRANSFER_CHARACTERISTICS, 16), uint(PRIMARIES, 9), uint(MAX_CLL, 3000), uint(MAX_FALL, 600), el(MASTERING_METADATA, &mastering)].concat(),
+        )
+    }
+
+    #[test]
+    fn colour_and_mastering_metadata_reach_the_demuxer() {
+        let video = [
+            uint(TRACK_NUMBER, 1),
+            uint(TRACK_TYPE, 1),
+            el(CODEC_ID, b"V_VP9"),
+            uint(DEFAULT_DURATION, 40_000_000),
+            el(VIDEO, &[uint(PIXEL_WIDTH, 64), uint(PIXEL_HEIGHT, 48), hdr_colour()].concat()),
+        ]
+        .concat();
+        let plain = [uint(TRACK_NUMBER, 2), uint(TRACK_TYPE, 1), el(CODEC_ID, b"V_VP9"), el(VIDEO, &[uint(PIXEL_WIDTH, 64), uint(PIXEL_HEIGHT, 48)].concat())].concat();
+        let cluster = el(CLUSTER, &[uint(CLUSTER_TIMECODE, 0), simple(1, 0, true, &[1; 4]), simple(2, 0, true, &[2; 4])].concat());
+        let body = [el(INFO, &uint(TIMECODE_SCALE, 1_000_000)), el(TRACKS, &[el(TRACK_ENTRY, &video), el(TRACK_ENTRY, &plain)].concat()), cluster].concat();
+        let mut bytes = el(EBML, &el(DOC_TYPE, b"webm"));
+        bytes.extend(SEGMENT.to_be_bytes());
+        bytes.extend(size(body.len()));
+        bytes.extend(body);
+        let d = open(Cursor::new(bytes)).unwrap();
+        let c = d.color_info(0).expect("the Colour element");
+        assert_eq!(c, ColorInfo { primaries: 9, transfer: 16, matrix: 9, full_range: false });
+        let h = d.hdr_metadata(0).expect("the metadata");
+        assert_eq!((h.max_cll, h.max_fall), (Some(3000), Some(600)));
+        let m = h.mastering.unwrap();
+        assert_eq!((m.max_luminance, m.min_luminance), (4000.0, 0.005));
+        assert!((m.primaries[0].0 - 0.708).abs() < 1e-6 && (m.primaries[1].1 - 0.797).abs() < 1e-6 && (m.primaries[2].0 - 0.131).abs() < 1e-6);
+        assert!((m.white_point.0 - 0.3127).abs() < 1e-6);
+        // a track without a Colour element has nothing
+        assert!(d.color_info(1).is_none() && d.hdr_metadata(1).is_none());
+        assert!(d.color_info(9).is_none());
+    }
+
+    #[test]
+    fn colour_element_edge_cases() {
+        // range 2 is full; missing code points are unspecified
+        let m = parse_colour(&[uint(COLOUR_RANGE, 2), uint(TRANSFER_CHARACTERISTICS, 18)].concat());
+        assert_eq!(m.color, Some(ColorInfo { primaries: 2, transfer: 18, matrix: 2, full_range: true }));
+        assert!(m.hdr.is_none());
+        // a mastering element missing a field is dropped, the light levels stay
+        let m = parse_colour(&[uint(MAX_CLL, 1200), el(MASTERING_METADATA, &flt(LUMINANCE_MAX, 1000.0))].concat());
+        let h = m.hdr.unwrap();
+        assert_eq!((h.max_cll, h.mastering), (Some(1200), None));
+        assert!(m.color.is_none());
+        // garbage inside the element is not an error
+        assert!(parse_colour(&[0x55, 0xB9, 0x85, 1]).color.is_none());
+        assert!(parse_colour(&[]).color.is_none());
     }
 
     #[test]

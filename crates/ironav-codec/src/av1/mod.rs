@@ -30,7 +30,7 @@ pub mod tables;
 
 use std::sync::Arc;
 
-use ironav_core::{ColorInfo, Decoder, Error, ErrorCode, Frame, Packet, PixelFormat, Result, VideoFrame};
+use ironav_core::{ColorInfo, Decoder, Error, ErrorCode, Frame, HdrMetadata, Packet, PixelFormat, Result, VideoFrame};
 
 use block::{FrameDec, Picture};
 use ipred::Plane;
@@ -114,6 +114,8 @@ pub struct Av1Decoder {
     out: Vec<Frame>,
     /// The threads the tiles and the post filters may use (1: the caller's thread).
     threads: usize,
+    /// HDR metadata from the metadata OBUs seen so far.
+    hdr: HdrMetadata,
 }
 
 impl Av1Decoder {
@@ -127,7 +129,7 @@ impl Av1Decoder {
     /// As `new`, with the tiles and post filters on up to `threads` threads; 1 runs them on the
     /// caller's thread. The output is the same either way.
     pub fn with_threads(extradata: &[u8], threads: usize) -> Self {
-        let mut d = Av1Decoder { seq: None, refs: Default::default(), cur: None, out: Vec::new(), threads: threads.max(1) };
+        let mut d = Av1Decoder { seq: None, refs: Default::default(), cur: None, out: Vec::new(), threads: threads.max(1), hdr: HdrMetadata::default() };
         if extradata.len() > 4 && extradata[0] & 0x80 != 0 {
             if let Ok(obus) = split_obus(&extradata[4..]) {
                 for o in obus.iter().filter(|o| o.kind == OBU_SEQUENCE_HEADER) {
@@ -199,6 +201,7 @@ impl Av1Decoder {
                     }
                 }
                 OBU_TILE_GROUP => self.tile_group(o.payload, pts)?,
+                OBU_METADATA => parse_metadata_obu(o.payload, &mut self.hdr),
                 _ => {}
             }
         }
@@ -459,5 +462,9 @@ impl Decoder for Av1Decoder {
 
     fn color_info(&self) -> Option<ColorInfo> {
         self.seq.as_ref().map(|s| s.color)
+    }
+
+    fn hdr_metadata(&self) -> Option<HdrMetadata> {
+        Some(self.hdr).filter(|h| !h.is_empty())
     }
 }

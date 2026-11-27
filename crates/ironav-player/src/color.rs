@@ -9,7 +9,7 @@
 //! matrix into SDR BT.709 display code values. The shader runs the same maths, with its numbers
 //! taken from [`ToneMap::new`].
 
-use ironav_core::{ColorInfo, VideoFrame};
+use ironav_core::{ColorInfo, HdrMetadata, VideoFrame};
 
 /// The YUV to RGB matrix a picture is coded with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +58,28 @@ pub struct Colorimetry {
     pub bits: u8,
     pub transfer: Transfer,
     pub primaries: Primaries,
+    /// The light level in nits the tone mapping treats as the source's peak (see [`tone_map_peak`]).
+    /// It matters for PQ; HLG always uses its nominal [`SOURCE_PEAK`].
+    pub peak: u32,
+}
+
+/// The source peak the tone mapper rolls off from, in nits (a whole number).
+///
+/// PQ is display-referred, so the stream's own numbers decide: the content light level `max_cll` if
+/// it is plausible (100 to 10 000 nits; a zero or a 65 535 is "unknown" in practice), else the
+/// mastering display's `max_luminance` under the same test, else [`SOURCE_PEAK`]. The result is
+/// clamped to 400..=10 000 so a stray value cannot make the picture dark or flat.
+///
+/// HLG is scene-referred: its peak is the nominal 1000 nits of the BT.2100 reference display, and
+/// the metadata (rarely present for HLG) is ignored. SDR has no tone mapping, so it gets 1000 too.
+pub fn tone_map_peak(transfer: Transfer, hdr: Option<HdrMetadata>) -> u32 {
+    let nominal = SOURCE_PEAK as u32;
+    if transfer != Transfer::Pq {
+        return nominal;
+    }
+    let plausible = |nits: f32| (100.0..=PQ_PEAK).contains(&nits).then_some(nits);
+    let from_stream = hdr.and_then(|h| h.max_cll.and_then(|c| plausible(c as f32)).or_else(|| h.mastering.and_then(|m| plausible(m.max_luminance))));
+    from_stream.map_or(nominal, |p| p.round().clamp(400.0, PQ_PEAK) as u32)
 }
 
 impl Colorimetry {
@@ -70,10 +92,20 @@ impl Colorimetry {
     /// The decoder's colour description when it gave one, with [`Colorimetry::of`]'s guesses for
     /// whatever it leaves unspecified (the matrix, when it is not one of BT.601, 709 or 2020).
     pub fn with_info(v: &VideoFrame, info: Option<ColorInfo>) -> Self {
+        Self::with_hdr(v, info, None)
+    }
+
+    /// [`Colorimetry::with_info`] with the stream's HDR metadata, which sets the tone mapping's source peak.
+    pub fn with_hdr(v: &VideoFrame, info: Option<ColorInfo>, hdr: Option<HdrMetadata>) -> Self {
         let guess = if v.height >= 720 { Matrix::Bt709 } else { Matrix::Bt601 };
         let bits = v.pix_fmt.bit_depth();
         let Some(i) = info else {
-            return Self { matrix: guess, full_range: false, bits, transfer: Transfer::Sdr, primaries: Primaries::Bt709 };
+            return Self { matrix: guess, full_range: false, bits, transfer: Transfer::Sdr, primaries: Primaries::Bt709, peak: SOURCE_PEAK as u32 };
+        };
+        let transfer = match i.transfer {
+            ColorInfo::TRANSFER_PQ => Transfer::Pq,
+            ColorInfo::TRANSFER_HLG => Transfer::Hlg,
+            _ => Transfer::Sdr,
         };
         Self {
             matrix: match i.matrix {
@@ -85,12 +117,9 @@ impl Colorimetry {
             },
             full_range: i.full_range,
             bits,
-            transfer: match i.transfer {
-                ColorInfo::TRANSFER_PQ => Transfer::Pq,
-                ColorInfo::TRANSFER_HLG => Transfer::Hlg,
-                _ => Transfer::Sdr,
-            },
+            transfer,
             primaries: if i.primaries == 9 { Primaries::Bt2020 } else { Primaries::Bt709 },
+            peak: tone_map_peak(transfer, hdr),
         }
     }
 
@@ -108,8 +137,8 @@ const PQ_C2: f32 = 18.851_563;
 const PQ_C3: f32 = 18.6875;
 /// The light level PQ code value 1.0 stands for, in nits.
 pub const PQ_PEAK: f32 = 10_000.0;
-/// What the source is assumed to reach, in nits: the usual mastering level when nothing says (PQ),
-/// and the nominal display peak (HLG).
+/// What the source is assumed to reach, in nits: the usual mastering level when the stream gives no
+/// metadata (PQ), and the nominal display peak (HLG).
 pub const SOURCE_PEAK: f32 = 1000.0;
 /// The SDR reference white (ITU-R BT.2408), in nits. After tone mapping it is the brightest
 /// output, 1.0.
@@ -166,7 +195,8 @@ pub fn display_encode(l: f32) -> f32 {
 ///    cannot push a channel above 1);
 /// 4. divide by the SDR reference white and encode with the sRGB curve.
 ///
-/// `eetf` is the ITU-R BT.2390-3 (section 5.4.1) EETF: a PQ-domain Hermite spline that leaves
+/// The source peak is `Colorimetry::peak` (see [`tone_map_peak`]): the stream's MaxCLL or mastering
+/// luminance when it has them, 1000 nits otherwise. `eetf` is the ITU-R BT.2390-3 (section 5.4.1) EETF: a PQ-domain Hermite spline that leaves
 /// values below the knee `ks = 1.5 * max_lum - 0.5` alone and rolls the rest off so the source peak
 /// lands on the target peak (the same curve libplacebo and mpv use for `bt.2390`). Source and
 /// target black are 0.
@@ -189,7 +219,7 @@ pub struct ToneMap {
 impl ToneMap {
     pub fn new(c: Colorimetry) -> Self {
         let e_black = pq_inverse(0.0);
-        let e_range = pq_inverse(SOURCE_PEAK / PQ_PEAK) - e_black;
+        let e_range = pq_inverse(c.peak as f32 / PQ_PEAK) - e_black;
         Self {
             mode: match c.transfer {
                 Transfer::Sdr => 0.0,
@@ -204,7 +234,7 @@ impl ToneMap {
         }
     }
 
-    /// The BT.2390 EETF on a light level in nits, for a source of [`SOURCE_PEAK`].
+    /// The BT.2390 EETF on a light level in nits, for the source peak the map was made with.
     pub fn eetf(&self, nits: f32) -> f32 {
         let e1 = ((pq_inverse(nits.max(1e-6) / PQ_PEAK) - self.e_black) / self.e_range).clamp(0.0, 1.0);
         let ks = 1.5 * self.max_lum - 0.5;
@@ -290,7 +320,7 @@ mod tests {
     use ironav_core::PixelFormat;
 
     fn sdr() -> Colorimetry {
-        Colorimetry { matrix: Matrix::Bt709, full_range: false, bits: 8, transfer: Transfer::Sdr, primaries: Primaries::Bt709 }
+        Colorimetry { matrix: Matrix::Bt709, full_range: false, bits: 8, transfer: Transfer::Sdr, primaries: Primaries::Bt709, peak: 1000 }
     }
 
     fn yuv420(w: u32, h: u32, y: u8, u: u8, v: u8) -> VideoFrame {
@@ -403,6 +433,76 @@ mod tests {
         for nits in [0.1f32, 1.0, 10.0, 50.0] {
             assert!((t.eetf(nits) / nits - 1.0).abs() < 1e-2, "{nits} nits gave {}", t.eetf(nits));
         }
+    }
+
+    fn pq_info() -> Option<ColorInfo> {
+        Some(ColorInfo { primaries: 9, transfer: 16, matrix: 9, full_range: false })
+    }
+
+    fn hdr(max_cll: Option<u32>, max_luminance: Option<f32>) -> Option<HdrMetadata> {
+        Some(HdrMetadata {
+            mastering: max_luminance.map(|m| ironav_core::MasteringDisplay { primaries: [(0.708, 0.292), (0.17, 0.797), (0.131, 0.046)], white_point: (0.3127, 0.329), max_luminance: m, min_luminance: 0.005 }),
+            max_cll,
+            max_fall: None,
+        })
+    }
+
+    #[test]
+    fn the_source_peak_comes_from_the_stream_when_it_is_plausible() {
+        let pq = Transfer::Pq;
+        assert_eq!(tone_map_peak(pq, None), 1000);
+        assert_eq!(tone_map_peak(pq, hdr(None, None)), 1000);
+        // MaxCLL wins over the mastering display
+        assert_eq!(tone_map_peak(pq, hdr(Some(4000), Some(1000.0))), 4000);
+        assert_eq!(tone_map_peak(pq, hdr(None, Some(1000.0))), 1000);
+        assert_eq!(tone_map_peak(pq, hdr(None, Some(4000.0))), 4000);
+        // implausible values fall through: 0 and 65535 mean unknown; below 100 is nonsense
+        assert_eq!(tone_map_peak(pq, hdr(Some(65535), Some(2000.0))), 2000);
+        assert_eq!(tone_map_peak(pq, hdr(Some(50), None)), 1000);
+        assert_eq!(tone_map_peak(pq, hdr(None, Some(0.0))), 1000);
+        // a low but plausible peak is clamped up, a PQ-maximum one is allowed
+        assert_eq!(tone_map_peak(pq, hdr(Some(250), None)), 400);
+        assert_eq!(tone_map_peak(pq, hdr(Some(10_000), None)), 10_000);
+        // HLG and SDR keep the nominal peak whatever the metadata says
+        assert_eq!(tone_map_peak(Transfer::Hlg, hdr(Some(4000), Some(4000.0))), 1000);
+        assert_eq!(tone_map_peak(Transfer::Sdr, hdr(Some(4000), None)), 1000);
+    }
+
+    #[test]
+    fn a_4000_nit_source_maps_its_peak_to_the_target_peak() {
+        let f = yuv420(64, 48, 100, 128, 128);
+        let c = Colorimetry::with_hdr(&f, pq_info(), hdr(Some(4000), None));
+        assert_eq!(c.peak, 4000);
+        let t = ToneMap::new(c);
+        assert!((t.eetf(4000.0) - TARGET_WHITE).abs() < 0.5, "{}", t.eetf(4000.0));
+        assert!(t.eetf(10_000.0) <= TARGET_WHITE + 0.5);
+        // 1000 nits is no longer the peak, so it comes out darker than with the default map
+        let default = ToneMap::new(Colorimetry::with_info(&f, pq_info()));
+        assert!(t.eetf(1000.0) < default.eetf(1000.0) - 5.0);
+        let mut last = 0.0;
+        for i in 1..=4000 {
+            let out = t.eetf(i as f32 * 2.5);
+            assert!(out >= last - 1e-3);
+            last = out;
+        }
+        // the full-scale white of the picture reaches display white
+        let white = t.apply([pq_inverse(4000.0 / PQ_PEAK); 3]);
+        assert!(white.iter().all(|c| (c - 1.0).abs() < 0.02), "{white:?}");
+    }
+
+    #[test]
+    fn without_metadata_the_map_is_the_old_1000_nit_one() {
+        let f = yuv420(64, 48, 100, 128, 128);
+        let c = Colorimetry::with_info(&f, pq_info());
+        assert_eq!(c.peak, 1000);
+        assert_eq!(c, Colorimetry::with_hdr(&f, pq_info(), None));
+        // metadata that holds nothing usable changes nothing either
+        assert_eq!(c, Colorimetry::with_hdr(&f, pq_info(), hdr(None, None)));
+        let t = ToneMap::new(c);
+        let e_black = pq_inverse(0.0);
+        let e_range = pq_inverse(SOURCE_PEAK / PQ_PEAK) - e_black;
+        assert_eq!((t.e_black.to_bits(), t.e_range.to_bits()), (e_black.to_bits(), e_range.to_bits()));
+        assert_eq!(t.max_lum.to_bits(), ((pq_inverse(TARGET_WHITE / PQ_PEAK) - e_black) / e_range).to_bits());
     }
 
     #[test]

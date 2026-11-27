@@ -317,7 +317,7 @@ pub fn open<R: Read>(mut r: R) -> Result<Mp4Demuxer<Cursor<Vec<u8>>>> {
     }
     let tracks_out: Vec<TrackInfo> = infos
         .into_iter()
-        .map(|stream| TrackInfo { stream, config: Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma: 1 }, convert: false, swap: 0, unwrap: Vec::new() })
+        .map(|stream| TrackInfo { stream, config: Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma: 1 }, convert: false, swap: 0, unwrap: Vec::new(), meta: Default::default() })
         .collect();
     Ok(Mp4Demuxer::from_parts(Cursor::new(data), "ogg", tracks_out, samples))
 }

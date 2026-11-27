@@ -1,12 +1,13 @@
 //! OBU framing, the sequence header and the frame header of AV1 (spec sections 5.3 to 5.9).
 
 use super::film_grain;
-use ironav_core::{Error, ErrorCode, Result};
+use ironav_core::{Error, ErrorCode, HdrMetadata, MasteringDisplay, Result};
 
 pub const OBU_SEQUENCE_HEADER: u8 = 1;
 pub const OBU_TEMPORAL_DELIMITER: u8 = 2;
 pub const OBU_FRAME_HEADER: u8 = 3;
 pub const OBU_TILE_GROUP: u8 = 4;
+pub const OBU_METADATA: u8 = 5;
 pub const OBU_FRAME: u8 = 6;
 pub const OBU_REDUNDANT_FRAME_HEADER: u8 = 7;
 
@@ -137,6 +138,34 @@ pub fn split_obus(data: &[u8]) -> Result<Vec<Obu<'_>>> {
         p = end;
     }
     Ok(out)
+}
+
+/// Reads a metadata OBU and records its HDR content light level (type 1) or mastering display
+/// colour volume (type 2) into `out`. Any other type, or a truncated payload, changes nothing.
+pub fn parse_metadata_obu(payload: &[u8], out: &mut HdrMetadata) {
+    let Ok((kind, n)) = leb128(payload) else { return };
+    let mut b = Bits::new(&payload[n..]);
+    match kind {
+        1 => {
+            if let (Ok(cll), Ok(fall)) = (b.f(16), b.f(16)) {
+                out.max_cll = Some(cll).filter(|&v| v > 0);
+                out.max_fall = Some(fall).filter(|&v| v > 0);
+            }
+        }
+        2 => {
+            // primaries (x, y) and white point in 0.16 fixed point, luminance max 24.8 and min 18.14
+            let mut read = || -> Result<MasteringDisplay> {
+                let mut pt = || Ok::<_, Error>((b.f(16)? as f32 / 65536.0, b.f(16)? as f32 / 65536.0));
+                let primaries = [pt()?, pt()?, pt()?];
+                let white_point = pt()?;
+                Ok(MasteringDisplay { primaries, white_point, max_luminance: b.f(32)? as f32 / 256.0, min_luminance: b.f(32)? as f32 / 16384.0 })
+            };
+            if let Ok(m) = read() {
+                out.mastering = Some(m);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1280,6 +1309,67 @@ mod tests {
         let s = parse_sequence_header(&header(0, "0101")).unwrap();
         assert!(s.mono_chrome);
         assert_eq!(s.color, ironav_core::ColorInfo { full_range: true, ..ironav_core::ColorInfo::UNSPECIFIED });
+    }
+
+    fn metadata_payload(kind: u8, body: &[u8]) -> Vec<u8> {
+        let mut v = vec![kind];
+        v.extend_from_slice(body);
+        v
+    }
+
+    fn mdcv_body() -> Vec<u8> {
+        let mut v = Vec::new();
+        // R, G, B, white in 0.16 fixed point: BT.2020 and D65
+        for (x, y) in [(0.708f32, 0.292f32), (0.170, 0.797), (0.131, 0.046), (0.3127, 0.3290)] {
+            v.extend_from_slice(&((x * 65536.0).round() as u16).to_be_bytes());
+            v.extend_from_slice(&((y * 65536.0).round() as u16).to_be_bytes());
+        }
+        v.extend_from_slice(&(4000u32 * 256).to_be_bytes());
+        v.extend_from_slice(&((0.005f32 * 16384.0).round() as u32).to_be_bytes());
+        v
+    }
+
+    #[test]
+    fn metadata_obus_hdr_cll_and_mdcv() {
+        let mut m = HdrMetadata::default();
+        parse_metadata_obu(&metadata_payload(1, &[0x03, 0xE8, 0x00, 0xC8]), &mut m);
+        assert_eq!((m.max_cll, m.max_fall), (Some(1000), Some(200)));
+        parse_metadata_obu(&metadata_payload(2, &mdcv_body()), &mut m);
+        let d = m.mastering.unwrap();
+        assert!((d.primaries[0].0 - 0.708).abs() < 1e-4 && (d.primaries[1].1 - 0.797).abs() < 1e-4 && (d.primaries[2].0 - 0.131).abs() < 1e-4);
+        assert!((d.white_point.0 - 0.3127).abs() < 1e-4);
+        assert_eq!(d.max_luminance, 4000.0);
+        assert!((d.min_luminance - 0.005).abs() < 1e-4);
+    }
+
+    #[test]
+    fn malformed_metadata_obus_change_nothing() {
+        let mut m = HdrMetadata::default();
+        parse_metadata_obu(&[], &mut m);
+        parse_metadata_obu(&metadata_payload(1, &[1, 2, 3]), &mut m);
+        parse_metadata_obu(&metadata_payload(2, &mdcv_body()[..20]), &mut m);
+        parse_metadata_obu(&metadata_payload(4, &[0; 30]), &mut m); // ITU-T T.35: not HDR
+        assert!(m.is_empty());
+    }
+
+    #[test]
+    fn decoder_reports_metadata_obus() {
+        let mut d = Av1Decoder::with_threads(&[], 1);
+        assert_eq!(ironav_core::Decoder::hdr_metadata(&d), None);
+        let seq = header(0, &color_420(true, Some((9, 16, 9)), false));
+        let mut data = vec![(OBU_SEQUENCE_HEADER << 3) | 2, seq.len() as u8];
+        data.extend(&seq);
+        for p in [metadata_payload(1, &[0x0F, 0xA0, 0x03, 0xE8]), metadata_payload(2, &mdcv_body())] {
+            data.extend([(OBU_METADATA << 3) | 2, p.len() as u8]);
+            data.extend(p);
+        }
+        // a truncated metadata OBU in the same unit must not fail the packet
+        data.extend([(OBU_METADATA << 3) | 2, 2, 2, 7]);
+        let packet = ironav_core::Packet { stream: 0, pts: 0, duration: 0, data };
+        ironav_core::Decoder::decode(&mut d, &packet).unwrap();
+        let h = ironav_core::Decoder::hdr_metadata(&d).unwrap();
+        assert_eq!((h.max_cll, h.max_fall), (Some(4000), Some(1000)));
+        assert_eq!(h.mastering.unwrap().max_luminance, 4000.0);
     }
 
     #[test]
