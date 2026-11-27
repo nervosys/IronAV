@@ -21,6 +21,11 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[path = "live_chunks.rs"]
+pub(crate) mod chunks;
+pub(crate) use chunks::Retained;
+pub use chunks::ChunkQuery;
+
 /// Live sessions open at once.
 pub const MAX_SESSIONS: usize = 8;
 /// Observations kept per session; older ones are dropped.
@@ -241,6 +246,18 @@ pub struct Session {
     /// When a call last asked about the session, and how many long polls are waiting on it.
     touched: Mutex<Instant>,
     polling: std::sync::atomic::AtomicUsize,
+    /// The chunk tables of `stream_chunks`, one per set of parameters (see the `chunks` module).
+    chunk_tables: Mutex<Vec<chunks::Table>>,
+}
+
+/// Marks a long poll as waiting on a session, so its idle timeout does not run meanwhile.
+struct Polling<'a>(&'a Session);
+
+impl Drop for Polling<'_> {
+    fn drop(&mut self) {
+        self.0.touch();
+        self.0.polling.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 fn sessions() -> &'static Mutex<(u64, HashMap<String, Arc<Session>>)> {
@@ -427,6 +444,7 @@ pub fn open_with_taps(args: &OpenArgs, taps: Vec<TapConfig>) -> Result<(Arc<Sess
         idle: (args.idle_timeout_seconds > 0.0).then(|| Duration::from_secs_f64(args.idle_timeout_seconds.min(1e9))),
         touched: Mutex::new(Instant::now()),
         polling: std::sync::atomic::AtomicUsize::new(0),
+        chunk_tables: Mutex::new(Vec::new()),
     });
     let worker = session.clone();
     let transcode = args.transcode.clone();
@@ -1105,13 +1123,6 @@ impl Session {
 
     /// Observations after `after`, filtered, waiting up to `wait` for the first one.
     pub fn events(&self, after: u64, kinds: &[String], level: Level, max: usize, wait: Duration) -> Value {
-        struct Polling<'a>(&'a Session);
-        impl Drop for Polling<'_> {
-            fn drop(&mut self) {
-                self.0.touch();
-                self.0.polling.fetch_sub(1, Ordering::Relaxed);
-            }
-        }
         self.polling.fetch_add(1, Ordering::Relaxed);
         let _polling = Polling(self);
         self.touch();

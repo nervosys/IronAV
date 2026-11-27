@@ -55,7 +55,7 @@ impl Fnv {
     }
 }
 
-fn hash_str(s: &str) -> u64 {
+pub(crate) fn hash_str(s: &str) -> u64 {
     let mut h = Fnv::new();
     h.write(s.as_bytes());
     h.0
@@ -241,15 +241,15 @@ impl Have {
 
 /// What a response carries beyond the chunk's place.
 #[derive(Debug, Clone, Copy)]
-struct Flags {
-    thumbnail: bool,
-    audio: bool,
-    transcript: bool,
-    stats: bool,
+pub(crate) struct Flags {
+    pub(crate) thumbnail: bool,
+    pub(crate) audio: bool,
+    pub(crate) transcript: bool,
+    pub(crate) stats: bool,
 }
 
 impl Flags {
-    fn parse(include: &Option<Vec<String>>) -> Result<Flags> {
+    pub(crate) fn parse(include: &Option<Vec<String>>) -> Result<Flags> {
         let mut f = Flags { thumbnail: false, audio: false, transcript: false, stats: false };
         let default = ["audio".to_string(), "transcript".to_string(), "stats".to_string()];
         for name in include.as_deref().unwrap_or(&default) {
@@ -267,7 +267,7 @@ impl Flags {
         Have { thumbnail: self.thumbnail, audio: self.audio, stats: self.stats }
     }
     /// Turns off the most expendable field still on: the order a budget trims them in.
-    fn drop_next(&mut self) -> Option<&'static str> {
+    pub(crate) fn drop_next(&mut self) -> Option<&'static str> {
         if std::mem::take(&mut self.thumbnail) {
             Some("thumbnail")
         } else if std::mem::take(&mut self.stats) {
@@ -362,15 +362,15 @@ fn parse_id(id: &str) -> Option<(&str, f64, f64)> {
     Some((fp, t.parse::<u64>().ok()? as f64 / 1000.0, t_end.parse::<u64>().ok()? as f64 / 1000.0))
 }
 
-fn round3(x: f64) -> f64 {
+pub(crate) fn round3(x: f64) -> f64 {
     (x * 1000.0).round() / 1000.0
 }
 
 /// One digest window: when it was, and each stream's figures.
-struct Digest<'a> {
-    t: f64,
-    t_end: f64,
-    data: &'a Map<String, Value>,
+pub(crate) struct Digest<'a> {
+    pub(crate) t: f64,
+    pub(crate) t_end: f64,
+    pub(crate) data: &'a Map<String, Value>,
 }
 
 const AUDIO_ANALYZERS: &[&str] = &["levels", "loudness", "silence", "voice_activity"];
@@ -396,7 +396,7 @@ fn fold(key: &str, v: &[(f64, f64)]) -> Option<f64> {
 
 /// The figures of the windows in `group` as one: audio levels and the rest, and the text a sidecar
 /// made of them.
-fn merge(group: &[&Digest], len: f64) -> (Option<Value>, Option<Value>, Option<Value>) {
+pub(crate) fn merge(group: &[&Digest], len: f64) -> (Option<Value>, Option<Value>, Option<Value>) {
     // label -> key -> (weight, value) in time order; a key present with no number (a null) is kept as null
     let mut audio: BTreeMap<String, BTreeMap<String, Vec<(f64, f64)>>> = BTreeMap::new();
     let mut stats: BTreeMap<String, BTreeMap<String, Vec<(f64, f64)>>> = BTreeMap::new();
@@ -817,6 +817,9 @@ fn page(t: &Table, a: &ChunkArgs, mut flags: Flags, was_cached: bool) -> Result<
 /// in memory, with everything the table holds and no pixels.
 pub fn resource(uri: &str) -> Result<Value> {
     let id = uri.strip_prefix(URI_PREFIX).filter(|i| !i.is_empty() && !i.contains('/')).ok_or_else(|| Error::invalid_arg(format!("'{uri}' is not a chunk URI")).hint(format!("a chunk's URI is {URI_TEMPLATE}")))?;
+    if id.starts_with(crate::live::chunks::ID_PREFIX) {
+        return crate::live::chunks::resource(id);
+    }
     let Some((t, i)) = find(id) else {
         return Err(Error::new(ErrorCode::NotFound, format!("chunk '{id}' is not in memory"))
             .hint("call the `chunk` tool on the file first (chunk tables are kept in memory, a few at a time, and are lost when the server restarts); then read the uri it returns"));
@@ -837,7 +840,8 @@ pub fn resource(uri: &str) -> Result<Value> {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MediaArgs {
-    input: String,
+    #[serde(default)]
+    input: Option<String>,
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
@@ -862,22 +866,48 @@ struct MediaArgs {
     hwaccel: Option<String>,
 }
 
+/// Opens the media a chunk's pictures, sound and clip are taken from, afresh on each call: a file, or a
+/// live session's retained packets.
+pub(crate) type Opener<'a> = &'a dyn Fn() -> Result<Box<dyn Demuxer>>;
+
+fn check_range(t: f64, t_end: f64) -> Result<()> {
+    // NaN and infinities fail this too
+    if !(t >= 0.0 && t_end > t && t_end.is_finite()) {
+        return Err(Error::invalid_arg("the range must have 0 <= t < t_end"));
+    }
+    Ok(())
+}
+
 /// The `chunk_media` tool.
 pub fn chunk_media(args: &Value, ctx: &Ctx) -> Result<Value> {
     let a: MediaArgs = serde_json::from_value(args.clone()).map_err(|e| Error::invalid_arg(format!("invalid chunk_media arguments: {e}")).hint("the schema is in `ironav tools` (tool 'chunk_media')"))?;
-    crate::policy::check_read(&a.input)?;
+    // a live chunk: the session is in the id, and the media is what it still retains
+    if let Some(id) = a.id.as_deref().filter(|i| i.starts_with(crate::live::chunks::ID_PREFIX)) {
+        if a.input.is_some() || a.t.is_some() || a.t_end.is_some() {
+            return Err(Error::invalid_arg("a live chunk id is given alone").hint("drop `input`, `t` and `t_end`: the id names the session and the range"));
+        }
+        let (session, t, t_end) = crate::live::chunks::parse_id(id).ok_or_else(|| Error::invalid_arg(format!("'{id}' is not a chunk id")).hint("live chunk ids come from `stream_chunks`"))?;
+        check_range(t, t_end)?;
+        let (streams, packets) = crate::live::get(session)?.retained(t, t_end)?;
+        let open = move || -> Result<Box<dyn Demuxer>> { Ok(Box::new(crate::live::Retained::new(streams.clone(), packets.clone()))) };
+        let mut r = json!({ "session": session, "id": id, "uri": format!("{URI_PREFIX}{id}"), "t": t, "t_end": t_end });
+        fetch(&open, &a, t, t_end, ctx, &mut r)?;
+        return Ok(r);
+    }
+    let input = a.input.clone().ok_or_else(|| Error::invalid_arg("missing required argument 'input'").hint("give the file; a live chunk id from `stream_chunks` needs no input"))?;
+    crate::policy::check_read(&input)?;
     let (t, t_end) = match (&a.id, a.t, a.t_end) {
         (Some(id), None, None) => {
             match find(id) {
                 Some((table, i)) => {
-                    if table.input != a.input {
-                        return Err(Error::invalid_arg(format!("chunk '{id}' belongs to '{}', not '{}'", table.input, a.input)));
+                    if table.input != input {
+                        return Err(Error::invalid_arg(format!("chunk '{id}' belongs to '{}', not '{input}'", table.input)));
                     }
                     (table.chunks[i].t, table.chunks[i].t_end)
                 }
                 // not cached: the id carries its range, and says which file content it is for
                 None => match parse_id(id) {
-                    Some((fp, t, t_end)) if fp == fingerprint(&a.input)? => (t, t_end),
+                    Some((fp, t, t_end)) if fp == fingerprint(&input)? => (t, t_end),
                     Some(_) => {
                         return Err(Error::new(ErrorCode::NotFound, format!("chunk '{id}' is not of this file as it is now"))
                             .hint("the id names another file, or this one has changed since; call `chunk` again, or give t and t_end"))
@@ -889,10 +919,20 @@ pub fn chunk_media(args: &Value, ctx: &Ctx) -> Result<Value> {
         (None, Some(t), Some(t_end)) => (t, t_end),
         _ => return Err(Error::invalid_arg("give `id` (from `chunk`), or both `t` and `t_end`")),
     };
-    // NaN and infinities fail this too
-    if !(t >= 0.0 && t_end > t && t_end.is_finite()) {
-        return Err(Error::invalid_arg("the range must have 0 <= t < t_end"));
+    check_range(t, t_end)?;
+    let mut r = json!({ "input": input, "t": t, "t_end": t_end });
+    if let Some(id) = &a.id {
+        r["id"] = json!(id);
+        r["uri"] = json!(format!("{URI_PREFIX}{id}"));
     }
+    let open = || open_demuxer(Path::new(&input));
+    fetch(&open, &a, t, t_end, ctx, &mut r)?;
+    Ok(r)
+}
+
+/// The pictures, sound and clip of `t..t_end` that `a` asks for, added to `r`.
+fn fetch(open: Opener, a: &MediaArgs, t: f64, t_end: f64, ctx: &Ctx, r: &mut Value) -> Result<()> {
+    check_range(t, t_end)?;
     let png = match a.format.as_deref().unwrap_or("jpeg") {
         "jpeg" => false,
         "png" => true,
@@ -907,23 +947,18 @@ pub fn chunk_media(args: &Value, ctx: &Ctx) -> Result<Value> {
     }
     let hwaccel = a.hwaccel.clone().unwrap_or_else(|| "auto".into());
     let mut warnings = Vec::new();
-    let mut r = json!({ "input": a.input, "t": t, "t_end": t_end });
-    if let Some(id) = &a.id {
-        r["id"] = json!(id);
-        r["uri"] = json!(format!("{URI_PREFIX}{id}"));
-    }
     if frames > 0 {
-        r["frames"] = Value::Array(grab_frames(&a.input, t, t_end, frames, max_side, png, &hwaccel, ctx)?);
+        r["frames"] = Value::Array(grab_frames(open, t, t_end, frames, max_side, png, &hwaccel, ctx)?);
     }
     if a.audio {
         let secs = a.audio_seconds.unwrap_or(10.0).clamp(0.1, MAX_AUDIO_SECONDS);
-        match grab_audio(&a.input, t, t_end, secs, max_bytes, ctx)? {
+        match grab_audio(open, t, t_end, secs, max_bytes, ctx)? {
             Some(v) => r["audio"] = v,
             None => warnings.push("audio: the file has no audio stream".into()),
         }
     }
     if a.clip {
-        match grab_clip(&a.input, t, t_end, max_bytes, ctx) {
+        match grab_clip(open, t, t_end, max_bytes, ctx) {
             Ok(v) => r["clip"] = v,
             Err(e) if e.code == ErrorCode::Cancelled => return Err(e),
             Err(e) => warnings.push(format!("clip: {}", e.message)),
@@ -932,7 +967,7 @@ pub fn chunk_media(args: &Value, ctx: &Ctx) -> Result<Value> {
     if !warnings.is_empty() {
         r["warnings"] = json!(warnings);
     }
-    Ok(r)
+    Ok(())
 }
 
 fn video_stream(d: &dyn Demuxer) -> Result<StreamInfo> {
@@ -948,14 +983,14 @@ fn cancelled(ctx: &Ctx) -> Result<()> {
 
 /// `n` pictures at the middles of `n` equal parts of `t..t_end`.
 #[allow(clippy::too_many_arguments)]
-fn grab_frames(input: &str, t: f64, t_end: f64, n: usize, max_side: u32, png: bool, hwaccel: &str, ctx: &Ctx) -> Result<Vec<Value>> {
-    let info = video_stream(open_demuxer(Path::new(input))?.as_ref())?;
+fn grab_frames(open: Opener, t: f64, t_end: f64, n: usize, max_side: u32, png: bool, hwaccel: &str, ctx: &Ctx) -> Result<Vec<Value>> {
+    let info = video_stream(open()?.as_ref())?;
     crate::policy::current().check_decode(&info)?;
     let mut out = Vec::new();
     for k in 0..n {
         cancelled(ctx)?;
         let target = t + (k as f64 + 0.5) * (t_end - t) / n as f64;
-        let Some((at, pic)) = picture_at(input, &info, target, hwaccel, ctx)? else { continue };
+        let Some((at, pic)) = picture_at(open, &info, target, hwaccel, ctx)? else { continue };
         let (w, h, bytes) = if png {
             let (w, h, rgb) = ironav_player::rgb_frame(&pic, Some(max_side), Some(max_side));
             (w, h, ironav_player::to_png(w, h, &rgb)?)
@@ -970,7 +1005,7 @@ fn grab_frames(input: &str, t: f64, t_end: f64, n: usize, max_side: u32, png: bo
     Ok(out)
 }
 
-fn jpeg_of(v: &VideoFrame, max_side: u32) -> Result<(u32, u32, Vec<u8>)> {
+pub(crate) fn jpeg_of(v: &VideoFrame, max_side: u32) -> Result<(u32, u32, Vec<u8>)> {
     use ironav_core::PixelFormat as P;
     let s = (max_side as f64 / v.width.max(v.height) as f64).min(1.0);
     let mut pic = if s < 1.0 {
@@ -987,8 +1022,8 @@ fn jpeg_of(v: &VideoFrame, max_side: u32) -> Result<(u32, u32, Vec<u8>)> {
 }
 
 /// The decoded picture shown at `target` (the nearer of the two around it), and its time.
-fn picture_at(input: &str, info: &StreamInfo, target: f64, hwaccel: &str, ctx: &Ctx) -> Result<Option<(f64, VideoFrame)>> {
-    let mut d = open_demuxer(Path::new(input))?;
+fn picture_at(open: Opener, info: &StreamInfo, target: f64, hwaccel: &str, ctx: &Ctx) -> Result<Option<(f64, VideoFrame)>> {
+    let mut d = open()?;
     for s in d.streams().to_vec() {
         if s.index != info.index {
             d.discard(s.index);
@@ -1036,8 +1071,8 @@ fn picture_at(input: &str, info: &StreamInfo, target: f64, hwaccel: &str, ctx: &
 }
 
 /// A WAV of `t..t_end` (at most `seconds` and `max_bytes` of it), mixed down to mono 16-bit.
-fn grab_audio(input: &str, t: f64, t_end: f64, seconds: f64, max_bytes: usize, ctx: &Ctx) -> Result<Option<Value>> {
-    let mut d = open_demuxer(Path::new(input))?;
+fn grab_audio(open: Opener, t: f64, t_end: f64, seconds: f64, max_bytes: usize, ctx: &Ctx) -> Result<Option<Value>> {
+    let mut d = open()?;
     let Some(info) = d.streams().iter().find(|s| s.params.media_type() == MediaType::Audio).cloned() else { return Ok(None) };
     for s in d.streams().to_vec() {
         if s.index != info.index {
@@ -1140,8 +1175,8 @@ fn wav_bytes(samples: &[i16], rate: u32) -> Vec<u8> {
 }
 
 /// The packets of `t..t_end` (from the keyframe at or before `t`), copied into a fragmented MP4 in memory.
-fn grab_clip(input: &str, t: f64, t_end: f64, max_bytes: usize, ctx: &Ctx) -> Result<Value> {
-    let mut d = open_demuxer(Path::new(input))?;
+fn grab_clip(open: Opener, t: f64, t_end: f64, max_bytes: usize, ctx: &Ctx) -> Result<Value> {
+    let mut d = open()?;
     let streams = d.streams().to_vec();
     let video = streams.iter().find(|s| s.params.media_type() == MediaType::Video).cloned();
     let audio = streams.iter().find(|s| s.params.media_type() == MediaType::Audio).cloned();

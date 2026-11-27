@@ -157,6 +157,39 @@ Over MCP, `resources/templates/list` offers `ironav://chunks/{id}`, and `resourc
 cached descriptor with everything the table holds (and where the chunk came from). A chunk that is not cached
 is an error whose hint says to call `chunk` first.
 
+### A live session in chunks (`stream_chunks`)
+
+`stream_chunks {session}` is the same idea for a running live session (see below): it cuts the session into chunks
+that close as media time passes their end, so an agent can follow a stream a piece at a time instead of reading its
+event log. It only reads (`readOnlyHint: true`) and writes nothing. `mode` is `time` (windows of `seconds`, 10 by
+default, on the media clock) or `scene` (from one scene cut to the next, using the session's `scene_cut` events; it
+needs the scene analyzer. A cut closer than `min_seconds` to the chunk's start is not one, and a scene is cut every
+`max_seconds`, since its length is not known until it ends). A chunk has the same shape as a file chunk: `id`, `index`,
+`t`, `t_end`, `scene_id`, `uri`, and what `include` asks for: `thumbnail` (a small JPEG, from the session's keyframe
+pictures when they fit `thumbnail_width`, otherwise decoded from the retained media), `audio` and `stats` (figures from
+the session's digest windows, so keep `digest_seconds` no longer than a chunk; a chunk closes once the digest covering
+its end is logged), and `transcript` (text from captions and sidecars that overlaps the chunk, `untrusted`
+as in `stream_events`). It also has `final`: true on the last chunk once the source has ended, which closes what is
+left of the media as a shorter chunk.
+
+Pass the response's `next_after` back as `after` (0 for everything still held). No chunk comes twice and none is
+skipped; chunks that fell out of the table (the newest 2000 of each set of parameters are kept) before they were read
+are counted in `missed`. With `wait_ms` (30 s at most) the call waits for a chunk to close, and on a timeout returns
+an empty list with the same cursor. `limit` and `budget_tokens` page and trim as for `chunk`. The response also gives
+the session's `state` and `live_edge`, the media time of its newest data.
+
+```json
+{"session":"s1","mode":"time","chunks":[{"id":"live-s1-5d7a03b1-0-0-10000","index":0,"t":0,"t_end":10,"final":false,
+ "uri":"ironav://chunks/live-s1-5d7a03b1-0-0-10000","audio":{"audio1":{"rms_dbfs":-31.2}}}],"next_after":1,"missed":0,
+ "state":"running","live_edge":14.6}
+```
+
+An id is `live-SESSION-PARAMS-INDEX-T-TEND`. In time mode the index is the window's place on the media clock, so the same
+session and parameters give the same ids on every call; in scene mode it counts the scenes from the first one seen.
+`ironav://chunks/{id}` reads a live chunk's descriptor while the session's table holds it, and `chunk_media` takes a
+live id alone (no `input`) and returns its pictures, sound or clip from the media the session still retains
+(`retain_seconds`); an id whose media has been dropped is an error that says so.
+
 ## Watching live sources (`watch`, `stream_*`)
 
 The same analyzers run on media as it arrives. A source is a path, `path?follow` (a file that is still growing),
