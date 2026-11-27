@@ -2,7 +2,8 @@
 //! with. Every command returns the player's status afterwards, so one call both acts and shows
 //! the effect.
 
-use crate::{base64, rgb_frame, to_png, Player, SeekMode, State};
+use crate::{base64, rgb_frame_with, to_png, Player, SeekMode, State};
+use ironav_core::ColorInfo;
 use ironav_core::{Error, ErrorCode, Result};
 use serde_json::{json, Value};
 
@@ -27,6 +28,18 @@ fn num(v: &Value, key: &str) -> Result<Option<f64>> {
     }
 }
 
+/// The colour description of the active picture, compactly: the H.273 primaries and matrix codes,
+/// the transfer by name, the range, and whether it is HDR (tone mapped to SDR for display).
+fn color_json(c: ColorInfo) -> Value {
+    let transfer = match c.transfer {
+        ColorInfo::TRANSFER_PQ => "pq",
+        ColorInfo::TRANSFER_HLG => "hlg",
+        2 => "unspecified",
+        _ => "sdr",
+    };
+    json!({ "primaries": c.primaries, "transfer": transfer, "matrix": c.matrix, "full_range": c.full_range, "hdr": c.is_hdr() })
+}
+
 impl Player {
     /// Everything an agent needs to know about the player right now.
     pub fn status(&self) -> Value {
@@ -39,6 +52,7 @@ impl Player {
         };
         let q = self.inner.video.lock().unwrap();
         let (shown, skipped, queued) = (q.shown, q.skipped, q.frames.len());
+        let color = q.last.as_ref().and_then(|f| f.color);
         drop(q);
         let audio = info.audio.as_ref().map(|a| {
             let out = self.inner.out.as_ref();
@@ -50,7 +64,8 @@ impl Player {
         });
         let video = info.video.as_ref().map(|v| {
             json!({ "codec": v.codec, "width": v.width, "height": v.height, "fps": v.fps, "decoder": v.decoder,
-                    "frames_shown": shown, "frames_skipped": skipped, "frames_queued": queued })
+                    "frames_shown": shown, "frames_skipped": skipped, "frames_queued": queued,
+                    "color": color.map(color_json) })
         });
         json!({
             "path": info.path, "format": info.format,
@@ -68,7 +83,7 @@ impl Player {
             return Err(Error::new(ErrorCode::InvalidArgument, "this file has no video to take a picture of"));
         }
         let f = self.frame().ok_or_else(|| Error::new(ErrorCode::NotFound, "no picture is available yet").hint("wait for the state to leave \"buffering\""))?;
-        let (w, h, rgb) = rgb_frame(&f.frame, max_w, max_h);
+        let (w, h, rgb) = rgb_frame_with(&f.frame, f.color, max_w, max_h);
         Ok((w, h, to_png(w, h, &rgb)?))
     }
 

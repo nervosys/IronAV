@@ -160,6 +160,7 @@ impl ReverseWindow {
                 None => dec.flush()?,
             };
             let orders = if frames.is_empty() { Vec::new() } else { dec.field_orders() };
+            let color = if frames.is_empty() { None } else { dec.color_info() };
             for (index, frame) in frames.into_iter().enumerate() {
                 let Frame::Video(frame) = frame else { continue };
                 let time = frame.pts as f64 * tb;
@@ -167,7 +168,7 @@ impl ReverseWindow {
                     break 'decode;
                 }
                 bytes += frame.planes.iter().map(Vec::len).sum::<usize>();
-                self.frames.push_back((TimedFrame { time, frame }, orders.get(index).copied().unwrap_or_default()));
+                self.frames.push_back((TimedFrame { time, frame, color }, orders.get(index).copied().unwrap_or_default()));
                 while self.frames.len() > 1 && (self.frames.len() > REVERSE_FRAMES || bytes > REVERSE_BYTES) {
                     if let Some((old, _)) = self.frames.pop_front() {
                         bytes -= old.frame.planes.iter().map(Vec::len).sum::<usize>();
@@ -324,9 +325,10 @@ fn video_loop(inner: &Inner, path: &str, stream: &StreamInfo, mut dec: Box<dyn D
         };
         // Field orders belong to the decoder's most recent batch, including a seek or EOF flush.
         let orders = if frames.is_empty() { Vec::new() } else { dec.field_orders() };
+        let color = if frames.is_empty() { None } else { dec.color_info() };
         for (i, f) in frames.into_iter().enumerate() {
             let Frame::Video(v) = f else { continue };
-            let t = TimedFrame { time: v.pts as f64 * tb, frame: v };
+            let t = TimedFrame { time: v.pts as f64 * tb, frame: v, color };
             let order = orders.get(i).copied().unwrap_or_default();
             if seeking && t.time <= target + 1e-6 {
                 held = Some((t, order));

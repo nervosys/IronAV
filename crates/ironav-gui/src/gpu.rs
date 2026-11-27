@@ -14,13 +14,14 @@
 //!
 //! The colour maths is [`ironav_player::YuvToRgb`]: the shader evaluates `rgb = m * (yuv - offset)`
 //! with the matrix and offsets passed in a uniform, and a unit test checks the same function
-//! against the CPU converter. A second test renders a picture offscreen on a real adapter, when
+//! against the CPU converter. PQ and HLG pictures are then tone mapped to SDR by the shader's copy
+//! of [`ironav_player::ToneMap::apply`], whose constants ride in the same uniform. A second test renders a picture offscreen on a real adapter, when
 //! the machine has one, and compares it with the CPU result.
 
 use eframe::egui;
 use eframe::egui_wgpu::{self, wgpu, CallbackResources, CallbackTrait, ScreenDescriptor};
 use ironav_core::{PixelFormat, VideoFrame};
-use ironav_player::{Colorimetry, TimedFrame, YuvToRgb};
+use ironav_player::{Colorimetry, TimedFrame, ToneMap, YuvToRgb};
 use std::sync::Arc;
 
 /// Can the shader show this picture? Everything the player decodes except packed RGB.
@@ -36,6 +37,11 @@ struct Params {
     m2: vec4<f32>,
     off: vec4<f32>,
     info: vec4<f32>, // x: 1 / (2^bits - 1) for integer textures, y: 1 when the target is sRGB
+    g0: vec4<f32>, // BT.2020 to BT.709 rows (identity for BT.709 pictures)
+    g1: vec4<f32>,
+    g2: vec4<f32>,
+    hdr0: vec4<f32>, // x: 0 SDR, 1 PQ, 2 HLG; y: PQ code of black; z: PQ range of the source; w: max_lum
+    hdr1: vec4<f32>, // x: nits that map to 1.0
 };
 @group(0) @binding(4) var<uniform> p: Params;
 
@@ -54,9 +60,63 @@ fn vs_main(@builtin(vertex_index) i: u32) -> VOut {
     return o;
 }
 
+// The HDR to SDR tone mapping: a copy of `ironav_player::ToneMap::apply` (see its documentation).
+fn pq_eotf(e: f32) -> f32 {
+    let q = pow(max(e, 1e-7), 1.0 / 78.84375);
+    return pow(max(q - 0.8359375, 0.0) / (18.851563 - 18.6875 * q), 1.0 / 0.15930176);
+}
+
+fn pq_inverse(y: f32) -> f32 {
+    let q = pow(max(y, 0.0), 0.15930176);
+    return pow((0.8359375 + 18.851563 * q) / (1.0 + 18.6875 * q), 78.84375);
+}
+
+fn hlg_inverse_oetf(e: vec3<f32>) -> vec3<f32> {
+    return select((exp((e - vec3<f32>(0.5599107)) / 0.17883277) + vec3<f32>(0.28466892)) / 12.0, e * e / 3.0, e <= vec3<f32>(0.5));
+}
+
+fn eetf(nits: f32) -> f32 {
+    let e1 = clamp((pq_inverse(max(nits, 1e-6) / 10000.0) - p.hdr0.y) / p.hdr0.z, 0.0, 1.0);
+    let max_lum = p.hdr0.w;
+    let ks = 1.5 * max_lum - 0.5;
+    var e2 = e1;
+    if (e1 >= ks) {
+        let t = (e1 - ks) / (1.0 - ks);
+        let t2 = t * t;
+        let t3 = t2 * t;
+        e2 = (2.0 * t3 - 3.0 * t2 + 1.0) * ks + (t3 - 2.0 * t2 + t) * (1.0 - ks) + (-2.0 * t3 + 3.0 * t2) * max_lum;
+    }
+    return 10000.0 * pq_eotf(e2 * p.hdr0.z + p.hdr0.y);
+}
+
+fn display_encode(l: vec3<f32>) -> vec3<f32> {
+    return select(1.055 * pow(l, vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055), l * 12.92, l <= vec3<f32>(0.0031308));
+}
+
+fn tone_map(rgb: vec3<f32>) -> vec3<f32> {
+    var nits: vec3<f32>;
+    if (p.hdr0.x < 1.5) {
+        nits = 10000.0 * vec3<f32>(pq_eotf(rgb.x), pq_eotf(rgb.y), pq_eotf(rgb.z));
+    } else {
+        let s = hlg_inverse_oetf(rgb);
+        let ys = 0.2627 * s.x + 0.678 * s.y + 0.0593 * s.z;
+        nits = s * (1000.0 * pow(max(ys, 1e-6), 0.2));
+    }
+    let lin = max(vec3<f32>(dot(p.g0.xyz, nits), dot(p.g1.xyz, nits), dot(p.g2.xyz, nits)), vec3<f32>(0.0));
+    let m = max(lin.x, max(lin.y, lin.z));
+    if (m <= 0.0) {
+        return vec3<f32>(0.0);
+    }
+    let k = eetf(m) / m / p.hdr1.x;
+    return display_encode(clamp(lin * k, vec3<f32>(0.0), vec3<f32>(1.0)));
+}
+
 fn finish(yuv: vec3<f32>) -> vec4<f32> {
     let d = yuv - p.off.xyz;
     var rgb = clamp(vec3<f32>(dot(p.m0.xyz, d), dot(p.m1.xyz, d), dot(p.m2.xyz, d)), vec3<f32>(0.0), vec3<f32>(1.0));
+    if (p.hdr0.x > 0.5) {
+        rgb = tone_map(rgb);
+    }
     if (p.info.y > 0.5) {
         rgb = select(pow((rgb + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4)), rgb / 12.92, rgb <= vec3<f32>(0.04045));
     }
@@ -103,11 +163,16 @@ fn fs_main(v: VOut) -> @location(0) vec4<f32> {
 }
 ";
 
-/// The uniform block: three matrix rows, the offsets, and two flags, as `vec4<f32>`s.
+/// Bytes in the WGSL `Params` block: ten `vec4<f32>`s.
+const PARAMS_SIZE: u64 = 160;
+
+/// The uniform block: three matrix rows, the offsets, two flags, the primaries matrix and the tone
+/// mapping numbers, as `vec4<f32>`s.
 fn params_bytes(c: Colorimetry, srgb_target: bool) -> Vec<u8> {
     let k = YuvToRgb::new(c);
+    let t = ToneMap::new(c);
     let top = ((1u32 << c.bits) - 1) as f32;
-    let words: [f32; 20] = [
+    let words: [f32; 40] = [
         k.m[0][0],
         k.m[0][1],
         k.m[0][2],
@@ -126,6 +191,26 @@ fn params_bytes(c: Colorimetry, srgb_target: bool) -> Vec<u8> {
         0.0,
         1.0 / top,
         if srgb_target { 1.0 } else { 0.0 },
+        0.0,
+        0.0,
+        t.gamut[0][0],
+        t.gamut[0][1],
+        t.gamut[0][2],
+        0.0,
+        t.gamut[1][0],
+        t.gamut[1][1],
+        t.gamut[1][2],
+        0.0,
+        t.gamut[2][0],
+        t.gamut[2][1],
+        t.gamut[2][2],
+        0.0,
+        t.mode,
+        t.e_black,
+        t.e_range,
+        t.max_lum,
+        t.target_white,
+        0.0,
         0.0,
         0.0,
     ];
@@ -185,7 +270,7 @@ impl GpuVideo {
             entries.push(wgpu::BindGroupLayoutEntry {
                 binding: 4,
                 visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: wgpu::BufferSize::new(80) },
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: wgpu::BufferSize::new(PARAMS_SIZE) },
                 count: None,
             });
             let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some(label), entries: &entries });
@@ -214,7 +299,7 @@ impl GpuVideo {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        let params = device.create_buffer(&wgpu::BufferDescriptor { label: Some("ironav video params"), size: 80, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let params = device.create_buffer(&wgpu::BufferDescriptor { label: Some("ironav video params"), size: PARAMS_SIZE, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         Self { variants: [make("ironav yuv8", EIGHT_BIT, true), make("ironav yuv16", SIXTEEN_BIT, false)], sampler, params, srgb_target: target.is_srgb(), textures: None, shown: None, color: None }
     }
 
@@ -265,7 +350,7 @@ impl GpuVideo {
         for (i, &(pw, ph, bpp)) in layout.iter().enumerate().take(if v.pix_fmt == PixelFormat::Gray8 { 1 } else { 3 }) {
             write_plane(queue, &t.planes[i], &v.planes[i], pw, ph, bpp);
         }
-        let color = Colorimetry::of(v);
+        let color = Colorimetry::with_info(v, f.color);
         if self.color != Some(color) {
             queue.write_buffer(&self.params, 0, &params_bytes(color, self.srgb_target));
             self.color = Some(color);
@@ -328,15 +413,16 @@ impl CallbackTrait for VideoCallback {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use ironav_player::rgb_frame;
+    use ironav_core::ColorInfo;
+    use ironav_player::{rgb_frame_with, Primaries, Transfer};
     use std::future::Future;
     use std::task::{Context, Poll, Waker};
 
     #[test]
     fn what_the_shader_gets_in_its_uniform_is_the_cpu_matrix() {
-        let c = Colorimetry { matrix: ironav_player::Matrix::Bt709, full_range: false, bits: 10 };
+        let c = Colorimetry { matrix: ironav_player::Matrix::Bt709, full_range: false, bits: 10, transfer: Transfer::Sdr, primaries: Primaries::Bt709 };
         let b = params_bytes(c, true);
-        assert_eq!(b.len(), 80, "the WGSL `Params` block is five vec4<f32>");
+        assert_eq!(b.len() as u64, PARAMS_SIZE, "the WGSL `Params` block is ten vec4<f32>");
         let f = |i: usize| f32::from_ne_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
         let k = YuvToRgb::new(c);
         assert_eq!([f(0), f(1), f(2)], k.m[0]);
@@ -344,6 +430,35 @@ pub(crate) mod tests {
         assert_eq!([f(8), f(9), f(10)], k.m[2]);
         assert_eq!([f(12), f(13), f(14)], k.offset);
         assert!((f(16) - 1.0 / 1023.0).abs() < 1e-9 && f(17) == 1.0);
+        // An SDR picture leaves the tone mapping off.
+        assert_eq!(f(32), 0.0);
+    }
+
+    #[test]
+    fn what_the_shader_gets_for_hdr_is_the_cpu_tone_map() {
+        let info = ColorInfo { primaries: 9, transfer: 16, matrix: 9, full_range: false };
+        let v = VideoFrame { width: 2, height: 2, pix_fmt: PixelFormat::Yuv420p10, pts: 0, planes: vec![vec![0; 8], vec![0; 2], vec![0; 2]] };
+        let c = Colorimetry::with_info(&v, Some(info));
+        let t = ToneMap::new(c);
+        let b = params_bytes(c, false);
+        let f = |i: usize| f32::from_ne_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
+        assert_eq!([f(20), f(21), f(22)], t.gamut[0]);
+        assert_eq!([f(24), f(25), f(26)], t.gamut[1]);
+        assert_eq!([f(28), f(29), f(30)], t.gamut[2]);
+        assert_eq!([f(32), f(33), f(34), f(35), f(36)], [1.0, t.e_black, t.e_range, t.max_lum, t.target_white]);
+        assert_eq!(f(17), 0.0);
+    }
+
+    /// The WGSL must parse and validate; this needs no GPU.
+    #[test]
+    fn the_shaders_validate() {
+        for tail in [EIGHT_BIT, SIXTEEN_BIT] {
+            let src = format!("{COMMON}{tail}");
+            let module = wgpu::naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| panic!("{}", e.emit_to_string(&src)));
+            wgpu::naga::valid::Validator::new(wgpu::naga::valid::ValidationFlags::all(), wgpu::naga::valid::Capabilities::empty())
+                .validate(&module)
+                .unwrap_or_else(|e| panic!("{e:?}"));
+        }
     }
 
     #[test]
@@ -374,11 +489,11 @@ pub(crate) mod tests {
     }
 
     /// Render `f` offscreen at its own size and return RGBA bytes.
-    fn render(device: &wgpu::Device, queue: &wgpu::Queue, f: VideoFrame) -> Vec<u8> {
+    fn render(device: &wgpu::Device, queue: &wgpu::Queue, f: VideoFrame, color: Option<ColorInfo>) -> Vec<u8> {
         let (w, h) = (f.width, f.height);
         assert_eq!(w * 4 % 256, 0, "the readback needs 256-byte rows");
         let mut g = GpuVideo::new(device, wgpu::TextureFormat::Rgba8Unorm);
-        g.upload(device, queue, &Arc::new(TimedFrame { time: 0.0, frame: f }));
+        g.upload(device, queue, &Arc::new(TimedFrame { time: 0.0, frame: f, color }));
         let target = device.create_texture(&wgpu::TextureDescriptor {
             label: None,
             size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
@@ -459,10 +574,26 @@ pub(crate) mod tests {
             (PixelFormat::Yuv420p10, 64, 48, [90 << 2, 240 << 2]),
         ] {
             let f = noise_planes(fmt, w, h, chroma);
-            let gpu = render(&device, &queue, f.clone());
-            let (_, _, cpu) = rgb_frame(&f, None, None);
+            let gpu = render(&device, &queue, f.clone(), None);
+            let (_, _, cpu) = rgb_frame_with(&f, None, None, None);
             let worst = cpu.as_chunks::<3>().0.iter().zip(gpu.as_chunks::<4>().0.iter()).flat_map(|(c, g)| (0..3).map(move |i| (i32::from(c[i]) - i32::from(g[i])).abs())).max().unwrap();
             assert!(worst <= 2, "{fmt:?} {w}x{h}: the GPU and CPU differ by {worst}");
+        }
+    }
+
+    #[test]
+    fn the_shader_tone_maps_like_the_cpu_on_a_real_adapter() {
+        let Some((device, queue)) = device() else {
+            eprintln!("no GPU adapter here; the offscreen shader test is skipped");
+            return;
+        };
+        for (transfer, chroma) in [(16u8, [512u16, 512]), (18, [400, 600]), (16, [300, 700])] {
+            let info = ColorInfo { primaries: 9, transfer, matrix: 9, full_range: false };
+            let f = noise_planes(PixelFormat::Yuv420p10, 64, 48, chroma);
+            let gpu = render(&device, &queue, f.clone(), Some(info));
+            let (_, _, cpu) = rgb_frame_with(&f, Some(info), None, None);
+            let worst = cpu.as_chunks::<3>().0.iter().zip(gpu.as_chunks::<4>().0.iter()).flat_map(|(c, g)| (0..3).map(move |i| (i32::from(c[i]) - i32::from(g[i])).abs())).max().unwrap();
+            assert!(worst <= 3, "transfer {transfer}: the GPU and CPU differ by {worst}");
         }
     }
 }

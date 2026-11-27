@@ -1,8 +1,8 @@
 //! Turning a decoded picture into something a screen, a terminal or an agent can use.
 
-use crate::color::{Colorimetry, YuvToRgb};
+use crate::color::{Colorimetry, ToneMap, YuvToRgb};
 use ironav_codec::resize_frame;
-use ironav_core::{Error, ErrorCode, PixelFormat, Result, VideoFrame};
+use ironav_core::{ColorInfo, Error, ErrorCode, PixelFormat, Result, VideoFrame};
 use std::borrow::Cow;
 
 /// RGB24 pixels of `v`, resized to fit inside `max_w` x `max_h` (aspect kept) when given.
@@ -11,11 +11,26 @@ use std::borrow::Cow;
 /// The conversion is integer fixed point (Q16) over row slices, with the chroma terms worked out
 /// once per chroma sample; it matches [`rgb_frame_reference`] to within 1 per channel.
 pub fn rgb_frame(v: &VideoFrame, max_w: Option<u32>, max_h: Option<u32>) -> (u32, u32, Vec<u8>) {
+    rgb_frame_with(v, None, max_w, max_h)
+}
+
+/// [`rgb_frame`] with the decoder's colour description: the signalled matrix and range are used,
+/// and PQ or HLG pictures are tone mapped to SDR BT.709 (see [`ToneMap`]) in f32 at their full bit
+/// depth. With `None`, or SDR limited-range info, the result is exactly [`rgb_frame`]'s.
+pub fn rgb_frame_with(v: &VideoFrame, info: Option<ColorInfo>, max_w: Option<u32>, max_h: Option<u32>) -> (u32, u32, Vec<u8>) {
     let mut src: Cow<VideoFrame> = Cow::Borrowed(v);
     if let Some((w, h)) = fit(v.width, v.height, max_w, max_h) {
         let mut scaled = resize_frame(v, w, h);
         scaled.pts = v.pts;
         src = Cow::Owned(scaled);
+    }
+    let c = Colorimetry::with_info(v, info);
+    // HDR, and full-range pictures (the fixed-point path assumes studio range), take the f32 path.
+    let planar = !matches!(src.pix_fmt, PixelFormat::Rgb24 | PixelFormat::Gray8);
+    if planar && (c.is_hdr() || c.full_range) {
+        let mut out = vec![0u8; src.width as usize * src.height as usize * 3];
+        convert_f32(&src, c, &mut out);
+        return (src.width, src.height, out);
     }
     // High-bit-depth pictures are narrowed to 8 bits first; a screen shows 8 bits anyway.
     if src.pix_fmt.bit_depth() > 8 {
@@ -23,9 +38,38 @@ pub fn rgb_frame(v: &VideoFrame, max_w: Option<u32>, max_h: Option<u32>) -> (u32
     }
     let (w, h) = (src.width as usize, src.height as usize);
     let mut out = vec![0u8; w * h * 3];
-    let c = Colorimetry::of(v);
     convert_8bit(&src, &Fixed::new(Colorimetry { bits: 8, ..c }), &mut out);
     (w as u32, h as u32, out)
+}
+
+/// Float conversion at the picture's own bit depth, with tone mapping for PQ and HLG. For snapshots
+/// and the CPU fallback; the shader does the same per pixel.
+fn convert_f32(src: &VideoFrame, c: Colorimetry, out: &mut [u8]) {
+    let (w, h) = (src.width as usize, src.height as usize);
+    if w == 0 || h == 0 {
+        return;
+    }
+    let layout = src.pix_fmt.planes(w, h);
+    let (cw, ch) = (layout[1].0, layout[1].1);
+    let (sx, sy) = (if cw < w { 2 } else { 1 }, if ch < h { 2 } else { 1 });
+    let k = YuvToRgb::new(c);
+    let tone = c.is_hdr().then(|| ToneMap::new(c));
+    let top = ((1u32 << c.bits.clamp(8, 16)) - 1) as f32;
+    let sample = |plane: usize, i: usize| -> f32 {
+        let p = &src.planes[plane];
+        let s = if layout[plane].2 == 2 { u16::from_le_bytes([p[2 * i], p[2 * i + 1]]) } else { u16::from(p[i]) };
+        f32::from(s) / top
+    };
+    for (y, orow) in out.chunks_exact_mut(w * 3).enumerate() {
+        for (x, o) in orow.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+            let ci = (y / sy) * cw + x / sx;
+            let mut rgb = k.apply(sample(0, y * w + x), sample(1, ci), sample(2, ci)).map(|v| v.clamp(0.0, 1.0));
+            if let Some(t) = &tone {
+                rgb = t.apply(rgb);
+            }
+            *o = rgb.map(|v| (v * 255.0).round().clamp(0.0, 255.0) as u8);
+        }
+    }
 }
 
 /// The YUV to RGB matrix as Q16 integers over raw 8-bit sample differences.
@@ -206,6 +250,7 @@ pub fn base64(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ironav_core::ColorInfo;
 
     #[test]
     fn base64_matches_the_rfc_vectors() {
@@ -286,5 +331,58 @@ mod tests {
         let (_, _, new) = rgb_frame(&f, None, None);
         let (_, _, old) = rgb_frame_reference(&f, None, None);
         assert!(new.iter().zip(&old).all(|(a, b)| (i32::from(*a) - i32::from(*b)).abs() <= 1));
+    }
+
+    fn grey10(y: u16, c: u16) -> VideoFrame {
+        let words = |v: u16, n: usize| (0..n).flat_map(|_| v.to_le_bytes()).collect::<Vec<u8>>();
+        VideoFrame { width: 4, height: 4, pix_fmt: PixelFormat::Yuv420p10, pts: 0, planes: vec![words(y, 16), words(c, 4), words(c, 4)] }
+    }
+
+    #[test]
+    fn without_colour_info_the_output_is_what_it_always_was() {
+        for f in [grey10(500, 512), noise(33, 17, PixelFormat::Yuv420p), noise(64, 720, PixelFormat::Yuv422p)] {
+            assert_eq!(rgb_frame_with(&f, None, None, None), rgb_frame(&f, None, None));
+            // SDR limited-range info that matches the size guess changes nothing either.
+            let hd = f.height >= 720;
+            let info = ColorInfo { primaries: if hd { 1 } else { 6 }, transfer: if hd { 1 } else { 6 }, matrix: if hd { 1 } else { 6 }, full_range: false };
+            assert_eq!(rgb_frame_with(&f, Some(info), None, None), rgb_frame(&f, None, None));
+        }
+    }
+
+    #[test]
+    fn pq_and_hlg_pictures_are_tone_mapped_in_range() {
+        let pq = ColorInfo { primaries: 9, transfer: 16, matrix: 9, full_range: false };
+        let hlg = ColorInfo { primaries: 9, transfer: 18, matrix: 9, full_range: false };
+        for info in [pq, hlg] {
+            let c = Colorimetry::with_info(&grey10(500, 512), Some(info));
+            assert!(c.is_hdr());
+            // Mid grey (10-bit luma 500, neutral chroma) is a mid grey, neither black nor white.
+            let (w, h, out) = rgb_frame_with(&grey10(500, 512), Some(info), None, None);
+            assert_eq!((w, h, out.len()), (4, 4, 48));
+            let px = &out[..3];
+            assert!(px.iter().all(|&v| v > 20 && v < 250), "{px:?}");
+            assert!(px.iter().all(|&v| (i32::from(v) - i32::from(px[0])).abs() <= 1), "grey stays grey: {px:?}");
+            assert_ne!(out, rgb_frame(&grey10(500, 512), None, None).2, "HDR must not take the SDR path");
+            // Limited-range black and the nominal peak map to the ends of the range.
+            assert_eq!(&rgb_frame_with(&grey10(64, 512), Some(info), None, None).2[..3], &[0, 0, 0]);
+            let top = rgb_frame_with(&grey10(940, 512), Some(info), None, None).2;
+            assert!(top[..3].iter().all(|&v| v >= 250), "{:?}", &top[..3]);
+        }
+        // Brighter input never gives a darker output.
+        let mut last = 0;
+        for y in (64..=940).step_by(16) {
+            let v = rgb_frame_with(&grey10(y, 512), Some(pq), None, None).2[0];
+            assert!(v >= last, "luma {y}: {v} after {last}");
+            last = v;
+        }
+    }
+
+    #[test]
+    fn full_range_info_is_honoured() {
+        let f = VideoFrame { width: 2, height: 2, pix_fmt: PixelFormat::Yuv420p, pts: 0, planes: vec![vec![255; 4], vec![128], vec![128]] };
+        let full = ColorInfo { primaries: 1, transfer: 1, matrix: 1, full_range: true };
+        assert_eq!(rgb_frame_with(&f, Some(full), None, None).2, vec![255; 12]);
+        let f0 = VideoFrame { planes: vec![vec![0; 4], vec![128], vec![128]], ..f };
+        assert_eq!(rgb_frame_with(&f0, Some(full), None, None).2, vec![0; 12]);
     }
 }

@@ -4,7 +4,7 @@
 //! what an agent drives.
 
 use ironav_core::{Error, ErrorCode, Result};
-use ironav_player::{rgb_frame, to_png, OpenOptions, Player, State};
+use ironav_player::{rgb_frame_with, to_png, OpenOptions, Player, State};
 use serde_json::{json, Value};
 use std::io::{BufRead, IsTerminal, Write};
 use std::sync::Arc;
@@ -234,7 +234,7 @@ fn draw_video(f: &mut Frame, pl: &Player, ui: &mut Ui, area: Rect) {
     let (mw, mh) = (area.width as u32, area.height as u32 * 2);
     let fresh = !matches!(&ui.cache, Some((k, w, h, ..)) if *k == key && *w == mw && *h == mh);
     if fresh {
-        let (w, h, rgb) = rgb_frame(&fr.frame, Some(mw), Some(mh));
+        let (w, h, rgb) = rgb_frame_with(&fr.frame, fr.color, Some(mw), Some(mh));
         ui.cache = Some((key, mw, mh, w, h, rgb));
     }
     let Some((_, _, _, w, h, rgb)) = &ui.cache else { return };

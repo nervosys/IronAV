@@ -10,7 +10,7 @@ use eframe::egui::{self, Color32, RichText};
 use ironav_core::Error;
 use ironav_engine::desktop::{Link, CONNECTION_ENV};
 use ironav_formats::FORMATS;
-use ironav_player::{rgb_frame, to_png, AudioMode, OpenOptions, Player, SeekMode, State, TimedFrame};
+use ironav_player::{rgb_frame_with, to_png, AudioMode, OpenOptions, Player, SeekMode, State, TimedFrame};
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::sync::{Arc, Weak};
@@ -234,7 +234,7 @@ impl PlayerApp {
                 let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("frame");
                 let name = format!("{stem}-{}s.png", frame.time as u64);
                 let target = path.with_file_name(name);
-                let (w, h, rgb) = rgb_frame(&frame.frame, None, None);
+                let (w, h, rgb) = rgb_frame_with(&frame.frame, frame.color, None, None);
                 std::fs::write(&target, to_png(w, h, &rgb)?)?;
                 Ok(format!("Saved {}", target.display()))
             })();
@@ -696,7 +696,7 @@ impl PlayerApp {
 
 /// Convert a decoded frame for display, fitted into `max_w` x `max_h` device pixels.
 fn picture(f: &TimedFrame, max_w: u32, max_h: u32) -> egui::ColorImage {
-    let (w, h, rgb) = rgb_frame(&f.frame, Some(max_w), Some(max_h));
+    let (w, h, rgb) = rgb_frame_with(&f.frame, f.color, Some(max_w), Some(max_h));
     egui::ColorImage::from_rgb([w as usize, h as usize], &rgb)
 }
 

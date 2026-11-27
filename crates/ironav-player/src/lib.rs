@@ -24,8 +24,8 @@ pub use output::{AudioOutput, NullOutput};
 #[cfg(feature = "audio")]
 pub use output::{device_description, CpalOutput};
 pub use pipeline::{open_video_decoder, open_video_decoder_with};
-pub use color::{Colorimetry, Matrix, YuvToRgb};
-pub use snapshot::{base64, rgb_frame, rgb_frame_reference, to_png};
+pub use color::{Colorimetry, Matrix, Primaries, ToneMap, Transfer, YuvToRgb};
+pub use snapshot::{base64, rgb_frame, rgb_frame_reference, rgb_frame_with, to_png};
 pub use spectrum::{
     AudioAnalysis, AudioPcm, SpectralDecay, SpectrumFrame, Waveform, DECAY_FFT_SIZE, DECAY_REFRESH_HZ, DECAY_SLICES,
     DECAY_STEP, SPECTRUM_BANDS, SPECTRUM_BATCH, SPECTRUM_FFT_SIZE, SPECTRUM_HISTORY,
@@ -33,7 +33,7 @@ pub use spectrum::{
 };
 pub use subtitle::SubtitleTrack;
 
-use ironav_core::{CodecId, Error, ErrorCode, MediaType, Result, StreamInfo, StreamParams, VideoFrame};
+use ironav_core::{CodecId, ColorInfo, Error, ErrorCode, MediaType, Result, StreamInfo, StreamParams, VideoFrame};
 use ironav_formats::open_demuxer_lazy;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -112,6 +112,8 @@ pub struct MediaInfo {
 pub struct TimedFrame {
     pub time: f64,
     pub frame: VideoFrame,
+    /// The decoder's colour description for this picture, when it gave one.
+    pub color: Option<ColorInfo>,
 }
 
 /// How exactly a seek lands.

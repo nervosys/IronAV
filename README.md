@@ -713,6 +713,14 @@ GPU spectral decay refreshes up to 60 times per second during playback.
 Waterfall and **Jet** are the starting defaults. The color picker also offers Parula, Spectral, Turbo, Viridis,
 Plasma, Inferno, Magma, Cividis, and Greyscale. The player remembers the plot and colors when you close it.
 
+HDR video (PQ and HLG, as the decoder reports them with its colour description) is tone mapped to an SDR BT.709 display: the
+shader linearizes the picture (ST 2084, or BT.2100 HLG with its system gamma), maps BT.2020 primaries to BT.709, rolls the
+highlights off with the ITU-R BT.2390 curve (a 1000 nit source down to 203 nit reference white) and encodes the result for the
+screen. Snapshots and the CPU fallback use the same maths in f32 at the picture's own bit depth. The `video` object of the JSON
+status has a `color` field (`primaries`, `transfer`, `matrix`, `full_range`, `hdr`). SDR pictures are untouched. This is checked by
+unit tests only (curve values, gamut matrix, CPU against the shader formula, shader validation, and a GPU offscreen comparison
+when an adapter exists); no HDR display and no HDR file was viewed, so how it looks is unjudged.
+
 What was and was not checked, on one machine (Windows, RTX 3090 Ti):
 - Real-time pacing, pause, exact seeks, ordering, looping, end detection and the JSON commands are covered by tests on
   generated WAV and Y4M files, against the silent clock (`--audio silent`).
