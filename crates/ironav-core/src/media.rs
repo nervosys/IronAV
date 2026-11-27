@@ -390,6 +390,39 @@ pub enum FieldOrder {
     Interlaced,
 }
 
+/// Colour description of decoded pictures, as ITU-T H.273 code points (the same numbers the H.264,
+/// HEVC, AV1 and VP9 bitstreams, Matroska `Colour` and MP4 `colr nclx` use). `2` means unspecified.
+///
+/// It travels beside the frames (see `Decoder::color_info`) so that `VideoFrame` keeps its shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColorInfo {
+    /// Colour primaries: 1 BT.709, 5/6 BT.601, 9 BT.2020, 12 Display P3.
+    pub primaries: u8,
+    /// Transfer characteristics: 1/6/14/15 SDR gamma, 13 sRGB, 16 PQ (SMPTE ST 2084), 18 HLG.
+    pub transfer: u8,
+    /// Matrix coefficients: 0 identity (RGB), 1 BT.709, 5/6 BT.601, 9 BT.2020 non-constant luminance.
+    pub matrix: u8,
+    /// Full range (0..=max) instead of limited ("studio") range.
+    pub full_range: bool,
+}
+
+impl ColorInfo {
+    pub const UNSPECIFIED: ColorInfo = ColorInfo { primaries: 2, transfer: 2, matrix: 2, full_range: false };
+    pub const TRANSFER_PQ: u8 = 16;
+    pub const TRANSFER_HLG: u8 = 18;
+
+    /// PQ or HLG: the pictures need tone mapping to show on an SDR display.
+    pub fn is_hdr(&self) -> bool {
+        matches!(self.transfer, Self::TRANSFER_PQ | Self::TRANSFER_HLG)
+    }
+}
+
+impl Default for ColorInfo {
+    fn default() -> Self {
+        Self::UNSPECIFIED
+    }
+}
+
 impl FieldOrder {
     /// Whether the picture is known to hold two fields from different moments.
     pub fn is_interlaced(self) -> bool {

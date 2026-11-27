@@ -1,4 +1,4 @@
-use crate::{Attachment, Chapter, Error, ErrorCode, FieldOrder, Frame, Packet, Result, StreamInfo, StreamParams};
+use crate::{Attachment, Chapter, ColorInfo, Error, ErrorCode, FieldOrder, Frame, Packet, Result, StreamInfo, StreamParams};
 
 // All stage traits are `Send` so the engine can run each stage on its own thread and
 // move packets/frames between stages without copying.
@@ -54,6 +54,13 @@ pub trait Decoder: Send {
     /// A decoder that does not track interlacing returns an empty list (every frame is then `Unknown`).
     fn field_orders(&self) -> Vec<FieldOrder> {
         Vec::new()
+    }
+
+    /// The colour description the stream signals for its pictures (from the sequence header or
+    /// parameter set in use), or `None` if the decoder does not read it or the stream says nothing.
+    /// Valid after the first `decode` that returned a frame.
+    fn color_info(&self) -> Option<ColorInfo> {
+        None
     }
 }
 
