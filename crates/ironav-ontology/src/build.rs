@@ -18,6 +18,8 @@ fn codec_meta(c: CodecId) -> (&'static str, &'static str) {
         Ac3 => ("AC-3", "Lossy audio codec (ATSC A/52, Dolby Digital) used in DVD, broadcast and Blu-ray; decoded, not encoded."),
         Eac3 => ("E-AC-3", "Lossy audio codec (ATSC A/52 annex E, Dolby Digital Plus) of streaming services, broadcast and Blu-ray; decoded (the independent substream, up to 5.1 channels, with spectral extension and the adaptive hybrid transform), not encoded."),
         Dts => ("DTS", "Lossy audio codec (ETSI TS 102 114, DTS Coherent Acoustics, DCA) of DVD, Blu-ray and broadcast; the core substream is decoded (up to 5.1 channels; the DTS-HD extensions XCH, X96, XXCH, XBR, XLL and LBR are skipped, so DTS-HD streams give their core), not encoded."),
+        TrueHd => ("TrueHD", "Lossless audio codec (Dolby TrueHD, built on MLP) of Blu-ray and streaming; decoded bit-exactly to up to 8 channels (the 2-, 6- and 8-channel presentations; the Dolby Atmos object substream is skipped, so Atmos streams give their 7.1 bed), not encoded."),
+        Mlp => ("MLP", "Lossless audio codec (Meridian Lossless Packing) of DVD-Audio and the base of TrueHD; decoded bit-exactly (up to 6 channels, 16, 20 or 24 bits), not encoded."),
         Opus => ("Opus","Lossy low-latency audio codec (RFC 6716); best quality per bit for speech and music."),
         Vorbis => ("Vorbis", "Lossy audio codec used in Ogg and WebM."),
         Flac => ("FLAC", "Lossless audio compression."),

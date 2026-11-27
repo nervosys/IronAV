@@ -5,7 +5,7 @@ A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so 
 
 > **Status: foundation (v0.1.10).** The architecture, agent interface, ontology, hardware model, CLI, MCP server
 > and both GUIs are working and tested. Containers: **WAV, FLAC, Y4M, MP4, QuickTime MOV (read and write), Matroska/WebM (read and write), Ogg, ADTS, MP3, JPEG and MPEG transport streams (read and write); AVI (read, with OpenDML), MPEG program streams (`.mpg`, `.vob`, read) and raw MPEG-1/2 video (`.m2v`, read; MPEG-2 also written); subtitles as streams (`.srt`, `.vtt`, `.ass`/`.ssa` files and Matroska text tracks, read); `probe` also lists the entries of M3U and PLS playlists and the chapters and attachments of Matroska files; raw H.264 and HEVC (Annex B: read and written as files, and read as live sources).**
-> Audio codecs, each decoded and encoded: **PCM, FLAC, ALAC, AAC-LC (plus HE-AAC v1 and v2 decode), MP3, MP2, AC-3, Opus and Vorbis.** E-AC-3 and the DTS core are decoded only.
+> Audio codecs, each decoded and encoded: **PCM, FLAC, ALAC, AAC-LC (plus HE-AAC v1 and v2 decode), MP3, MP2, AC-3, Opus and Vorbis.** E-AC-3, the DTS core, and TrueHD and MLP (lossless) are decoded only.
 > Video: **software decoders for H.264, HEVC (including 4:2:2 and 4:4:4), VP8 and VP9; a software H.264 encoder (High profile: CABAC and the 8x8 transform), a software HEVC encoder (Main profile, 8-bit 4:2:0, merge and skip, SAO), a software VP8 encoder, and a software VP9 encoder (key and inter frames), and a software AV1 encoder (key and inter frames, profile 0, 8-bit 4:2:0); JPEG/Motion-JPEG and Apple ProRes decoded and encoded in software; MPEG-4 Part 2 (Simple and Advanced Simple profiles) decoded in software, and Simple profile I and P pictures encoded in software, with Advanced Simple B pictures as an option (MP4 and Matroska); MPEG-1 and MPEG-2 video (frame and field pictures, 4:2:0 and 4:2:2) decoded in software, and MPEG-2 video (Main profile, 4:2:0, progressive frames, optional B pictures) encoded in software.**
 > NVIDIA GPUs encode H.264 and HEVC (NVENC, preferred when usable) and decode H.264, HEVC and AV1 (NVDEC).
 > AV1 is decoded on NVIDIA GPUs (NVDEC) or in software (key, intra-only and inter frames, superres included). VP9 and AV1 copy between WebM, Matroska and MP4.
@@ -1520,6 +1520,36 @@ raw, Matroska, MP4, MPEG-TS and WAV files. FFmpeg's encoder writes only the core
 substreams the tests append. The tests are `crates/ironav-codec/tests/dts_ffmpeg.rs` and
 `crates/ironav-formats/tests/dts_containers.rs` (with a 15 KB fixture); the FFmpeg comparisons skip without `ffmpeg` on the PATH.
 The tables in `crates/ironav-codec/src/dts/tables.rs` are generated from FFmpeg's by `tools/gen_dca_tables.py`.
+
+## TrueHD and MLP
+
+Dolby TrueHD and MLP (Meridian Lossless Packing) are decoded as the `truehd` and `mlp` codecs, by `ironav_codec::mlp::MlpDecoder`, a
+translation of FFmpeg's `mlpdec.c`. Both are lossless: the output is the integers the encoder was given. It decodes the major sync
+and restart headers (with their checksums), the decoding parameters, the per-channel FIR and IIR prediction filters, Huffman and raw
+residuals, the primitive matrices with bypassed LSBs and noise, the output shift, and the access unit, substream and lossless-check
+parities. The output is float scaled by 2^23 (2^15 for 16-bit MLP), in FFmpeg's channel order, which is the order AC-3 and DTS use
+here (7.1 is L R C LFE Lb Rb Ls Rs).
+
+Substreams are decoded up to the third, as FFmpeg does by default: a TrueHD stream carries a 2-channel presentation in substream 0, a
+6-channel one in substream 1 and an 8-channel one in substream 2, so a stream with all three comes out as 8 channels. The fourth
+substream, which Dolby Atmos uses for its object data, is not decoded: an Atmos stream plays its 7.1 TrueHD bed. A failed substream
+parity, restart checksum or lossless check is counted (`MlpDecoder::check_failures`), as FFmpeg logs it, and does not stop
+decoding; a bad access unit parity or major sync checksum refuses the access unit. TrueHD and MLP are not encoded.
+
+They are read from raw `.thd`, `.truehd` and `.mlp` files (an access unit per packet, found by the length in its header; a major
+sync marks a sync sample, so seeking lands on one), Matroska (`A_TRUEHD` and `A_MLP`; written too), MP4 (`mlpa` with `dmlp`, read
+only) and MPEG-TS (stream type 0x83, Blu-ray). The AC-3 version of the audio that Blu-ray puts on the same PID travels in PES packets
+with extended stream id 0x76; those are dropped, as FFmpeg splits them into a second stream, and the TrueHD ones are kept. FFmpeg
+has no descriptor that marks TrueHD in private PES (0x06), so none is read.
+
+Measured against `ffmpeg -f s32le` (or `s16le` for 16-bit MLP) on 22 streams made with FFmpeg's `truehd` and `mlp` encoders (2
+seconds each: mono, stereo, 2.1, 4.0, quad, 5.0 and 5.1, at 44.1, 48 and 96 kHz, from 16- and 24-bit input): IronAV's samples are
+identical to FFmpeg's in all 22, and equal to the encoder's input in all 22. The same fixture decodes identically through raw,
+Matroska, MP4, MPEG-TS and M2TS files, and through a Blu-ray style transport stream that the test builds with the AC-3 packets in it.
+FFmpeg's TrueHD encoder has no 7.1 layout and writes no third substream, so 7.1 and the noise-shaped matrices Dolby's encoders write
+are covered by the unit tests only. The tests are `crates/ironav-codec/tests/truehd_ffmpeg.rs` and
+`crates/ironav-formats/tests/truehd_containers.rs` (with 21 KB and 22 KB fixtures, whose decoded samples are pinned by hash); the
+FFmpeg comparisons skip without `ffmpeg` on the PATH.
 
 ## Matroska output
 

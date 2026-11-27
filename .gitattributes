@@ -4,3 +4,5 @@
 *.m2v binary
 *.aac binary
 *.dts binary
+*.thd binary
+*.mlp binary

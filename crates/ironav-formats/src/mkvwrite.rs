@@ -279,6 +279,8 @@ impl MatroskaWriter {
                 CodecId::Mp2 => "A_MPEG/L2",
                 CodecId::Ac3 => "A_AC3",
                 CodecId::Eac3 => "A_EAC3",
+                CodecId::TrueHd => "A_TRUEHD",
+                CodecId::Mlp => "A_MLP",
                 CodecId::PcmF32Le | CodecId::PcmF64Le => "A_PCM/FLOAT/IEEE",
                 c if c.sample_format().is_some() => "A_PCM/INT/LIT",
                 _ => "A_MPEG/L3",
@@ -475,7 +477,7 @@ impl Muxer for MatroskaWriter {
                     }
                     false
                 }
-                (StreamParams::Audio { .. }, CodecId::Flac | CodecId::Mp3 | CodecId::Mp2 | CodecId::Ac3 | CodecId::Eac3) => false,
+                (StreamParams::Audio { .. }, CodecId::Flac | CodecId::Mp3 | CodecId::Mp2 | CodecId::Ac3 | CodecId::Eac3 | CodecId::TrueHd | CodecId::Mlp) => false,
                 (StreamParams::Audio { .. }, c) if c.sample_format().is_some() => false,
                 _ => {
                     return Err(Error::new(

@@ -16,6 +16,7 @@
 //! | AC-3 | `ac3::Ac3Decoder` | `ac3::Ac3Encoder` | `encoders::Ac3Encoder` |
 //! | E-AC-3 | `ac3::Ac3Decoder` (decodes both) | none | none |
 //! | DTS | `dts::DtsDecoder` (the core) | none | none |
+//! | TrueHD, MLP | `mlp::MlpDecoder` (lossless) | none | none |
 //! | ALAC | `alac::AlacDecoder` | `alac::AlacEncoder` | `encoders::AlacEncoder` |
 //! | AV1 | `av1::Av1Decoder` | `av1::Av1Encoder` | `encoders::Av1Encoder` |
 //! | FLAC | `flac::FlacDecoder` | `flac::FlacEncoder` | `encoders::FlacEncoder` |
@@ -45,6 +46,8 @@ pub mod av1;
 pub mod alac;
 #[cfg(feature = "dts")]
 pub mod dts;
+#[cfg(feature = "mlp")]
+pub mod mlp;
 #[cfg(feature = "h264")]
 pub mod change;
 #[cfg(feature = "flac")]
@@ -195,6 +198,10 @@ pub fn implemented() -> Vec<CodecImpl> {
             #[cfg(feature = "dts")]
             if c == CodecId::Dts {
                 return Some(CodecImpl { codec: c, decode: true, encode: false, implementation: "ironav-dts" });
+            }
+            #[cfg(feature = "mlp")]
+            if c == CodecId::TrueHd || c == CodecId::Mlp {
+                return Some(CodecImpl { codec: c, decode: true, encode: false, implementation: "ironav-mlp" });
             }
             #[cfg(feature = "alac")]
             if c == CodecId::Alac {
@@ -430,6 +437,10 @@ pub fn new_decoder_for(s: &ironav_core::StreamInfo) -> Result<Box<dyn Decoder>> 
         CodecId::Ac3 | CodecId::Eac3 => Ok(kept_span(s, Box::new(ac3::Ac3Decoder::new()))),
         #[cfg(feature = "dts")]
         CodecId::Dts => Ok(kept_span(s, Box::new(dts::DtsDecoder::new()))),
+        #[cfg(feature = "mlp")]
+        CodecId::TrueHd => Ok(kept_span(s, Box::new(mlp::MlpDecoder::new(true)))),
+        #[cfg(feature = "mlp")]
+        CodecId::Mlp => Ok(kept_span(s, Box::new(mlp::MlpDecoder::new(false)))),
         #[cfg(feature = "alac")]
         CodecId::Alac => Ok(Box::new(alac::AlacDecoder::new(&s.extradata, &s.params)?)),
         #[cfg(feature = "opus")]
@@ -462,7 +473,7 @@ pub fn new_decoder_for(s: &ironav_core::StreamInfo) -> Result<Box<dyn Decoder>> 
 /// priming, in samples of the stream's rate) to `lead_in` plus its duration, which the container
 /// set (an MP4 edit's segment, or a Matroska codec delay less its discard padding). A stream with no
 /// lead-in, or whose time base is not its sample rate, is left whole.
-#[cfg(any(feature = "aac", feature = "mp3", feature = "ac3", feature = "dts"))]
+#[cfg(any(feature = "aac", feature = "mp3", feature = "ac3", feature = "dts", feature = "mlp"))]
 fn kept_span(s: &ironav_core::StreamInfo, d: Box<dyn Decoder>) -> Box<dyn Decoder> {
     let in_samples = matches!(s.params, StreamParams::Audio { sample_rate, .. } if s.time_base.num == 1 && s.time_base.den == sample_rate as i64);
     if s.lead_in <= 0 || !in_samples {
@@ -517,7 +528,7 @@ impl Decoder for EndTrim {
 
 /// Drops decoded samples before `start` and from `end` on (positions in the decoder's own output),
 /// and renumbers the frames' pts from the first kept sample.
-#[cfg(any(feature = "aac", feature = "mp3", feature = "ac3", feature = "dts"))]
+#[cfg(any(feature = "aac", feature = "mp3", feature = "ac3", feature = "dts", feature = "mlp"))]
 struct Gapless {
     inner: Box<dyn Decoder>,
     start: u64,
@@ -525,7 +536,7 @@ struct Gapless {
     pos: u64,
 }
 
-#[cfg(any(feature = "aac", feature = "mp3", feature = "ac3", feature = "dts"))]
+#[cfg(any(feature = "aac", feature = "mp3", feature = "ac3", feature = "dts", feature = "mlp"))]
 impl Gapless {
     fn keep(&mut self, frames: Vec<ironav_core::Frame>) -> Vec<ironav_core::Frame> {
         let mut out = Vec::with_capacity(frames.len());
@@ -549,7 +560,7 @@ impl Gapless {
     }
 }
 
-#[cfg(any(feature = "aac", feature = "mp3", feature = "ac3", feature = "dts"))]
+#[cfg(any(feature = "aac", feature = "mp3", feature = "ac3", feature = "dts", feature = "mlp"))]
 impl Decoder for Gapless {
     fn decode(&mut self, packet: &ironav_core::Packet) -> Result<Vec<ironav_core::Frame>> {
         let frames = self.inner.decode(packet)?;

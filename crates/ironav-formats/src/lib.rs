@@ -9,6 +9,7 @@ mod dts;
 pub(crate) mod flac;
 mod mkv;
 mod mkvwrite;
+mod mlp;
 mod mp4;
 mod mp3;
 mod mp4demux;
@@ -101,7 +102,7 @@ pub static FORMATS: &[FormatSpec] = &[
     FormatSpec {
         name: "mp4",
         extensions: &["mp4", "m4a", "m4v"],
-        description: "MP4 (ISO BMFF) with H.264 or HEVC video (or VP9 or AV1 copied from another file, or MPEG-4 Part 2 or MPEG-2 `mp4v` video, copied or encoded by IronAV) and optionally AAC, MP2, AC-3, FLAC or ALAC audio (AAC copied or encoded, MP2 encoded or copied, AC-3 copied or encoded, with its dac3 box), and E-AC-3 audio (`ec-3` with `dec3`, read only) and DTS audio (`dtsc`, `dtsh`, `dtsl` with `ddts`, read only; `dtse` is not read). Read as well as written; written with the index first (fast-start), or fragmented (moov, then a moof and mdat per fragment) when a fragment length is given; fragmented files are read too",
+        description: "MP4 (ISO BMFF) with H.264 or HEVC video (or VP9 or AV1 copied from another file, or MPEG-4 Part 2 or MPEG-2 `mp4v` video, copied or encoded by IronAV) and optionally AAC, MP2, AC-3, FLAC or ALAC audio (AAC copied or encoded, MP2 encoded or copied, AC-3 copied or encoded, with its dac3 box), and E-AC-3 audio (`ec-3` with `dec3`, read only) and DTS audio (`dtsc`, `dtsh`, `dtsl` with `ddts`, read only; `dtse` is not read) and TrueHD audio (`mlpa` with `dmlp`, read only). Read as well as written; written with the index first (fast-start), or fragmented (moov, then a moof and mdat per fragment) when a fragment length is given; fragmented files are read too",
         media: MediaType::Video,
         demux: true,
         mux: true,
@@ -119,11 +120,11 @@ pub static FORMATS: &[FormatSpec] = &[
     FormatSpec {
         name: "mkv",
         extensions: &["mkv", "mka"],
-        description: "Matroska: read (also WebM, with any codec the file holds) and written with H.264, HEVC, VP8, VP9, AV1 or Motion-JPEG or MPEG-4 Part 2 or MPEG-2 video (copied; VP8, MJPEG, MPEG-4 and MPEG-2 also encoded by IronAV where it has the codec) and AAC, FLAC, MP3, MP2 (read, copied or encoded), AC-3 (copied or encoded), E-AC-3 (copied), DTS (`A_DTS`, copied), Opus, Vorbis or PCM audio copied or encoded (PCM as integer or float, little- or big-endian); any number of tracks of each kind; no SeekHead",
+        description: "Matroska: read (also WebM, with any codec the file holds) and written with H.264, HEVC, VP8, VP9, AV1 or Motion-JPEG or MPEG-4 Part 2 or MPEG-2 video (copied; VP8, MJPEG, MPEG-4 and MPEG-2 also encoded by IronAV where it has the codec) and AAC, FLAC, MP3, MP2 (read, copied or encoded), AC-3 (copied or encoded), E-AC-3 (copied), DTS (`A_DTS`, read), TrueHD and MLP (`A_TRUEHD`, `A_MLP`, copied), Opus, Vorbis or PCM audio copied or encoded (PCM as integer or float, little- or big-endian); any number of tracks of each kind; no SeekHead",
         media: MediaType::Video,
         demux: true,
         mux: true,
-        codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Vp8, CodecId::Vp9, CodecId::Av1, CodecId::Mjpeg, CodecId::Mpeg4, CodecId::Mpeg2Video, CodecId::Aac, CodecId::Mp3, CodecId::Mp2, CodecId::Ac3, CodecId::Eac3, CodecId::Dts, CodecId::Opus, CodecId::Vorbis, CodecId::Flac, CodecId::PcmU8, CodecId::PcmS16Le, CodecId::PcmS24Le, CodecId::PcmS32Le, CodecId::PcmF32Le, CodecId::PcmF64Le],
+        codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Vp8, CodecId::Vp9, CodecId::Av1, CodecId::Mjpeg, CodecId::Mpeg4, CodecId::Mpeg2Video, CodecId::Aac, CodecId::Mp3, CodecId::Mp2, CodecId::Ac3, CodecId::Eac3, CodecId::Dts, CodecId::TrueHd, CodecId::Mlp, CodecId::Opus, CodecId::Vorbis, CodecId::Flac, CodecId::PcmU8, CodecId::PcmS16Le, CodecId::PcmS24Le, CodecId::PcmS32Le, CodecId::PcmF32Le, CodecId::PcmF64Le],
     },
     FormatSpec {
         name: "avi",
@@ -207,6 +208,24 @@ pub static FORMATS: &[FormatSpec] = &[
         codecs: &[CodecId::Dts],
     },
     FormatSpec {
+        name: "truehd",
+        extensions: &["thd", "truehd"],
+        description: "Raw Dolby TrueHD access units, found by their length fields (a major sync, F8726FBA, starts the stream); read only (decoded losslessly up to the 8-channel presentation; Atmos objects are not decoded)",
+        media: MediaType::Audio,
+        demux: true,
+        mux: false,
+        codecs: &[CodecId::TrueHd],
+    },
+    FormatSpec {
+        name: "mlp",
+        extensions: &["mlp"],
+        description: "Raw MLP (Meridian Lossless Packing) access units, found by their length fields (a major sync, F8726FBB, starts the stream); read only (decoded losslessly)",
+        media: MediaType::Audio,
+        demux: true,
+        mux: false,
+        codecs: &[CodecId::Mlp],
+    },
+    FormatSpec {
         name: "eac3",
         extensions: &["eac3", "ec3"],
         description: "Raw E-AC-3 (Dolby Digital Plus) syncframes, an independent frame and the dependent frames after it as one packet; read only (the dependent substreams are not decoded); ID3 tags are skipped when reading",
@@ -263,7 +282,7 @@ pub static FORMATS: &[FormatSpec] = &[
     FormatSpec {
         name: "mpegts",
         extensions: &["ts", "m2ts", "mts"],
-        description: "MPEG transport stream (broadcast, IPTV, HLS segments); 192-byte M2TS packets are read too; MPEG-2 video is read and written (stream type 0x02); AC-3 is read (stream type 0x81, or 0x06 with the AC-3 descriptor) and written as 0x81 with the AC-3 registration descriptor; E-AC-3 is read (stream type 0x87, 0x84 or 0xA1, or 0x06 with the E-AC-3 descriptor); DTS is read (stream type 0x82, 0x85, 0x8A or 0xA2, or 0x06 with the DTS descriptor)",
+        description: "MPEG transport stream (broadcast, IPTV, HLS segments); 192-byte M2TS packets are read too; MPEG-2 video is read and written (stream type 0x02); AC-3 is read (stream type 0x81, or 0x06 with the AC-3 descriptor) and written as 0x81 with the AC-3 registration descriptor; E-AC-3 is read (stream type 0x87, 0x84 or 0xA1, or 0x06 with the E-AC-3 descriptor); DTS is read (stream type 0x82, 0x85, 0x8A or 0xA2, or 0x06 with the DTS descriptor); Blu-ray TrueHD is read (stream type 0x83; the AC-3 packets that share its PID are dropped)",
         media: MediaType::Video,
         demux: true,
         mux: true,
@@ -341,6 +360,8 @@ fn open_with(path: &Path, lazy: bool) -> Result<Box<dyn Demuxer>> {
         Ok(Box::new(ogg::open(f)?))
     } else if ac3::looks_like_ac3(magic) || behind_id3.as_ref().is_some_and(|b| ac3::looks_like_ac3(b)) {
         Ok(Box::new(ac3::open(f)?))
+    } else if mlp::looks_like_mlp(magic) {
+        Ok(Box::new(mlp::open(f)?))
     } else if dts::looks_like_dts(magic) || behind_id3.as_ref().is_some_and(|b| dts::looks_like_dts(b)) {
         Ok(Box::new(dts::open(f)?))
     } else if adts::looks_like_adts(magic) || behind_id3.as_ref().is_some_and(|b| b.len() >= 2 && b[0] == 0xFF && b[1] & 0xF6 == 0xF0) {

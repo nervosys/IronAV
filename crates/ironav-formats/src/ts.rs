@@ -29,6 +29,11 @@
 //! AC-3 is written as stream type 0x81 with the `AC-3` registration descriptor, the way FFmpeg writes
 //! it by default (the DVB descriptor 0x6A form is read, not written), in private_stream_1 PES packets.
 //!
+//! Blu-ray TrueHD (stream type 0x83) is read: its PID also carries an AC-3 version of the audio, in
+//! PES packets whose extended stream id is 0x76, as FFmpeg separates them; those are dropped, and the
+//! TrueHD access units of the others are found by their length fields, starting at a major sync. There
+//! is no TrueHD descriptor for private streams (0x06) in FFmpeg's reader, so none is read.
+//!
 //! Not handled: more than one program, and
 //! PMT changes after the first.
 
@@ -82,6 +87,30 @@ fn pes_pts(b: &[u8]) -> Option<i64> {
     (b.len() >= 14 && b[..3] == [0, 0, 1] && b[7] & 0x80 != 0).then(|| read_ts(&b[9..14]))
 }
 
+/// The extended stream id of a PES packet (13818-1's PES extension 2), if it names one; HDMV uses it
+/// to tell the TrueHD packets of a stream (0x72) from the AC-3 ones (0x76). As FFmpeg reads it.
+fn pes_extended_stream_id(pes: &[u8]) -> Option<u8> {
+    if pes.len() < 9 || pes[7] & 1 == 0 {
+        return None;
+    }
+    let end = 9 + pes[8] as usize;
+    let mut r = 9 + match pes[7] & 0xC0 {
+        0x80 => 5,
+        0xC0 => 10,
+        _ => 0,
+    };
+    let ext = *pes.get(r)?;
+    r += 1;
+    // skip the private data, the program packet sequence counter and the P-STD buffer
+    let mut skip = (ext >> 4) & 0xB;
+    skip += skip & 0x9;
+    r += skip as usize;
+    if ext & 0x41 == 0x01 && r + 2 <= end.min(pes.len()) && pes[r] & 0x7F > 0 && pes[r + 1] & 0x80 == 0 {
+        return Some(pes[r + 1]);
+    }
+    None
+}
+
 fn codec_of(stream_type: u8) -> Option<CodecId> {
     match stream_type {
         0x1B => Some(CodecId::H264),
@@ -99,6 +128,10 @@ fn codec_of(stream_type: u8) -> Option<CodecId> {
         // audio, whose core is what is decoded. 0x86, Blu-ray's DTS-HD Master Audio, is also SCTE-35's
         // stream type, so it is left alone.
         0x82 | 0x85 | 0x8A | 0xA2 => Some(CodecId::Dts),
+        // Blu-ray's Dolby TrueHD: the PID also carries an AC-3 version of the audio, in PES packets
+        // that name themselves with extended stream id 0x76 and are dropped (FFmpeg makes a second
+        // stream of them)
+        0x83 => Some(CodecId::TrueHd),
         _ => None,
     }
 }
@@ -364,6 +397,9 @@ struct Es {
     opus_head: Vec<u8>,
     opus_pre: u32,
     opus_lead: bool,
+    /// TrueHD: the substream count and samples per access unit of the last major sync, while the
+    /// access units that follow it are in step; `None` until a major sync, and after a gap.
+    mlp: Option<(usize, usize)>,
 }
 
 #[derive(Default)]
@@ -452,6 +488,7 @@ impl TsParser {
             e.next = None;
             e.rem = 0;
             e.started = false;
+            e.mlp = None;
         }
     }
 
@@ -573,6 +610,7 @@ impl TsParser {
                         opus_lead: opus.is_some(),
                         opus_head: opus.unwrap_or_default(),
                         opus_pre: 0,
+                        mlp: None,
                     });
                 }
                 i += 5 + es_len;
@@ -614,9 +652,12 @@ impl TsParser {
         if hdr > end {
             return;
         }
+        let codec = self.es[k].codec;
+        if codec == CodecId::TrueHd && pes_extended_stream_id(&pes) == Some(0x76) {
+            return; // the AC-3 version of a Blu-ray TrueHD stream
+        }
         let pts = pes_pts(&pes).map(|raw| self.unwrap(k, raw));
         let payload = pes[hdr..end].to_vec();
-        let codec = self.es[k].codec;
         if codec.media_type() == ironav_core::MediaType::Video {
             let Some(pts) = pts.or_else(|| self.es[k].next) else { return };
             let key = if is_mpeg_video(codec) { crate::keyframe::is_keyframe(codec, &payload) == Some(true) } else { is_keyframe(codec, &payload) } || self.es[k].random_access;
@@ -661,6 +702,7 @@ impl TsParser {
         // the PES's time belongs to the first frame that starts in it
         let mut synced = false;
         while i < data.len() {
+            let mut key = true;
             let (len, hdr, rate, channels, samples, asc, frame_codec) = if codec == CodecId::Aac {
                 match adts::parse(&data[i..]) {
                     Some(h) => {
@@ -692,6 +734,40 @@ impl TsParser {
                     Ok(f) => (f.frame_size, 0, f.sample_rate, f.channels, f.samples, Vec::new(), CodecId::Dts),
                     _ if data.len() - i < 64 && !last => break,
                     _ => {
+                        i += 1;
+                        continue;
+                    }
+                }
+            } else if codec == CodecId::TrueHd {
+                // an access unit: its length in words, then a major sync (the stream's parameters)
+                // or, in step with the one before, a parity nibble that checks
+                let rest = &data[i..];
+                let n = ironav_codec::mlp::access_unit_length(rest);
+                let sync = ironav_codec::mlp::major_sync_kind(rest) == Some(true);
+                let state = self.es[k].mlp;
+                match n {
+                    // the rest of it is in the next PES
+                    Some(n) if rest.len() < n && (sync || state.is_some()) && !last => break,
+                    Some(n) if rest.len() >= n && sync => match ironav_codec::mlp::major_sync_at_start(rest) {
+                        Some(mh) if mh.truehd => {
+                            self.es[k].mlp = Some((mh.num_substreams, mh.access_unit_size));
+                            (n, 0, mh.sample_rate, mh.channels() as u16, mh.access_unit_size, Vec::new(), CodecId::TrueHd)
+                        }
+                        _ => {
+                            self.es[k].mlp = None;
+                            i += 1;
+                            continue;
+                        }
+                    },
+                    Some(n) if rest.len() >= n && state.is_some_and(|(subs, _)| ironav_codec::mlp::access_unit_parity_ok(&rest[..n], subs)) => {
+                        key = false;
+                        let (_, size) = state.unwrap_or_default();
+                        let rate = self.es[k].info.as_ref().map_or(48000, |s| s.time_base.den as u32);
+                        (n, 0, rate, 0, size, Vec::new(), CodecId::TrueHd)
+                    }
+                    None if rest.len() < 4 && !last => break,
+                    _ => {
+                        self.es[k].mlp = None;
                         i += 1;
                         continue;
                     }
@@ -791,8 +867,9 @@ impl TsParser {
             e.rem = ticks % rate as i64;
             let frame = data[i + hdr..i + len].to_vec();
             // E-AC-3 frames have 1, 2, 3 or 6 blocks, and DTS frames 8 to 128 blocks of 32 samples
-            let dur = matches!(frame_codec, CodecId::Eac3 | CodecId::Dts).then_some(samples as i64);
-            self.unit(k, Unit { pts: t, data: frame, key: true, dur });
+            // and TrueHD access units 40 to 160 samples
+            let dur = matches!(frame_codec, CodecId::Eac3 | CodecId::Dts | CodecId::TrueHd).then_some(samples as i64);
+            self.unit(k, Unit { pts: t, data: frame, key, dur });
             i += len;
         }
         if !last {
@@ -1029,6 +1106,7 @@ impl<R: Read + Seek + Send> TsDemuxer<R> {
                     CodecId::Aac => 1024,
                     CodecId::Ac3 | CodecId::Eac3 => 1536,
                     CodecId::Dts => 512,
+                    CodecId::TrueHd => 40,
                     CodecId::Opus => 960,
                     _ => 1152,
                 },

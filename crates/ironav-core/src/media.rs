@@ -197,6 +197,8 @@ codecs! {
     Ac3 => "ac3", Audio;
     Eac3 => "eac3", Audio;
     Dts => "dts", Audio;
+    TrueHd => "truehd", Audio;
+    Mlp => "mlp", Audio;
     Opus => "opus", Audio;
     Vorbis => "vorbis", Audio;
     Flac => "flac", Audio;

@@ -702,6 +702,8 @@ fn parse_trak(trak: &[u8], index: usize, samples: &mut Vec<Sample>, movie_ts: u3
             // DTS with a core: core only, core and extension, and lossless with a core; `dtse` is an
             // extension substream alone (DTS Express), which has no core to decode
             (None, b"dtsc" | b"dtsh" | b"dtsl") => CodecId::Dts,
+            // TrueHD, the only codec `mlpa` is used for
+            (None, b"mlpa") => CodecId::TrueHd,
             (None, b".mp3") => CodecId::Mp3,
             _ => return Ok(None),
         };
@@ -733,6 +735,14 @@ fn parse_trak(trak: &[u8], index: usize, samples: &mut Vec<Sample>, movie_ts: u3
         if codec == CodecId::Dts {
             // the ddts box says what the core is; the entry's own count may be of the whole stream
             if let Some(c) = child(kids, b"ddts")?.and_then(ddts_channels) {
+                channels = c;
+            }
+        }
+        if codec == CodecId::TrueHd {
+            // the dmlp box has the true rate (the entry's 16.16 field cannot hold 96 kHz and up) and
+            // the channels of the presentation the decoder outputs
+            if let Some((r, c)) = child(kids, b"dmlp")?.and_then(|b| b.get(..4)).and_then(|b| ironav_codec::mlp::dmlp_params(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))) {
+                rate = r;
                 channels = c;
             }
         }
@@ -1107,7 +1117,9 @@ impl<R: Read + Seek + Send> Demuxer for Mp4Demuxer<R> {
             // No video: start on the packet that contains the requested time (a subtitle cue is not one, unless there is nothing else)
             let sub = |s: &Sample| matches!(self.tracks[s.stream as usize].stream.params, StreamParams::Subtitle);
             let timed = self.samples.iter().any(|s| !sub(s) && !self.discarded[s.stream as usize]);
-            upto.iter().rfind(|s| !self.discarded[s.stream as usize] && (!timed || !sub(s))).map_or(t, at)
+            // (a TrueHD or MLP decoder can only start at a major sync, which is a sync sample)
+            let needs_sync = |s: &Sample| matches!(self.tracks[s.stream as usize].stream.codec, CodecId::TrueHd | CodecId::Mlp) && !s.sync;
+            upto.iter().rfind(|s| !self.discarded[s.stream as usize] && (!timed || !sub(s)) && !needs_sync(s)).map_or(t, at)
         };
         self.next = self.samples.partition_point(|s| at(s) < landing - 1e-9);
         self.seen.fill(0); // the first video packet after a seek needs its parameter sets again
