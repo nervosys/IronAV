@@ -23,6 +23,18 @@ fn scratch(tag: &str) -> PathBuf {
     d
 }
 
+/// Whether FFmpeg trims a Matroska track's CodecDelay for codecs other than Opus: from 8.1 on
+/// (matroskadec commit 0880458e4c). A version it cannot parse (a git build) counts as new.
+fn ffmpeg_trims_codec_delay() -> bool {
+    let out = Command::new("ffmpeg").arg("-version").output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    let v = out.split_whitespace().nth(2).unwrap_or("").trim_start_matches('n');
+    let mut parts = v.split(|c: char| !c.is_ascii_digit());
+    match (parts.next().and_then(|s| s.parse::<u32>().ok()), parts.next().and_then(|s| s.parse::<u32>().ok())) {
+        (Some(major), minor) => (major, minor.unwrap_or(0)) >= (8, 1),
+        _ => true,
+    }
+}
+
 fn ffmpeg(args: &[&str]) {
     let status = Command::new("ffmpeg").args(["-v", "error", "-y"]).args(args).status().expect("running ffmpeg");
     assert!(status.success(), "ffmpeg {args:?} failed");
@@ -225,8 +237,8 @@ fn containers_hold_mp2() {
 }
 
 /// MPEG audio IronAV writes into Matroska carries its encoder's lead-in as CodecDelay, which FFmpeg
-/// trims: its decoding then lines up with the input at lag 0 (without the delay it is 481 or 1057
-/// samples late). IronAV reads its own file the same way.
+/// trims (from FFmpeg 8.1): its decoding then lines up with the input at lag 0 (without the delay it
+/// is 481 or 1057 samples late). IronAV reads its own file the same way.
 #[test]
 fn mpeg_audio_in_matroska_has_its_codec_delay_trimmed() {
     if !ffmpeg_available() {
@@ -237,6 +249,7 @@ fn mpeg_audio_in_matroska_has_its_codec_delay_trimmed() {
     let input = sweep(44100, 2, 0.4);
     let wav = d.join("in.wav");
     write_wav(&wav, &input, 2, 44100);
+    let trims = ffmpeg_trims_codec_delay();
     for codec in ["mp2", "mp3"] {
         let out = d.join(format!("out_{codec}.mkv"));
         let mut j = Job { input: wav.display().to_string(), output: out.display().to_string(), hwaccel: "auto".into(), ..Job::default() };
@@ -247,7 +260,10 @@ fn mpeg_audio_in_matroska_has_its_codec_delay_trimmed() {
         ffmpeg(&["-i", out.to_str().unwrap(), "-map", "0:a:0", "-f", "s16le", "-acodec", "pcm_s16le", raw.to_str().unwrap()]);
         let decoded: Vec<i16> = std::fs::read(&raw).unwrap().as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes(*b)).collect();
         let (lag, _) = best_lag(&input, &decoded, 2);
-        assert_eq!(lag, 0, "{codec}: FFmpeg's decoding of the Matroska file starts {lag} frames after the input");
+        // an FFmpeg before 8.1 trims CodecDelay only for Opus, so its decoding is late by exactly
+        // the lead-in the file declares
+        let want = if trims { 0 } else if codec == "mp2" { 481 } else { 1057 };
+        assert_eq!(lag, want, "{codec}: FFmpeg's decoding of the Matroska file starts {lag} frames after the input");
 
         let back = d.join(format!("back_{codec}.wav"));
         run(&job(&out, &back), &mut |_| {}).unwrap();
