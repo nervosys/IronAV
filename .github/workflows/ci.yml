@@ -28,6 +28,11 @@ jobs:
       - name: Linux build dependencies (sound, windowing)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev
+      # FFmpeg makes the tests that compare IronAV with FFmpeg run instead of skipping themselves;
+      # Ubuntu's FFmpeg is older than a developer's, so it also checks they hold across versions
+      - name: FFmpeg (for the comparison tests)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y ffmpeg && ffmpeg -hide_banner -version | head -1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Build
