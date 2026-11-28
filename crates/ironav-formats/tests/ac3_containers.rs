@@ -2,6 +2,8 @@
 //! with the engine's decoder for the stream to what FFmpeg's decoder makes of the same file. Skipped
 //! without `ffmpeg` on PATH.
 
+mod common;
+
 use ironav_core::{AudioFrame, CodecId, Demuxer, Encoder, Frame, Packet, Rational, StreamInfo, StreamParams};
 use ironav_formats::open_demuxer;
 use std::path::{Path, PathBuf};
@@ -72,8 +74,9 @@ fn encode_and_compare(dir: &Path, name: &str, format: &str, channels: &str) -> P
         "encoding {name}"
     );
     let want = reference(dir, name, &file);
-    let (got, _, _) = demux_and_decode(&file);
-    check(name, &got, &want);
+    let (got, _, ch) = demux_and_decode(&file);
+    let want = common::comparable(&file, format, ch as usize, got.len(), &want);
+    check(name, &got, want);
     file
 }
 

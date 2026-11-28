@@ -4,10 +4,14 @@
 //! lacks are skipped, and the whole file is skipped without `ffmpeg` on PATH. CAF has no AAC from FFmpeg
 //! (its writer leaves the cookie out), so that file is built here from the packets of an ADTS file.
 
+mod common;
+
 use ironav_core::{CodecId, Demuxer, Frame, MediaType, Packet, StreamInfo, StreamParams};
 use ironav_formats::open_demuxer;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use common::ffmpeg_at_least;
 
 fn tool_available(name: &str) -> bool {
     Command::new(name).arg("-version").output().is_ok_and(|o| o.status.success())
@@ -306,9 +310,13 @@ fn check_alac(file: &Path) {
     let got = audio_of(d.as_mut(), &packets);
     let want = ffmpeg_samples(file);
     assert!(got.len() >= want.len() && got[..want.len()] == want[..], "ALAC samples differ from FFmpeg's");
-    assert_eq!(got.len(), (44100.0 * 1.2) as usize * channels, "the valid frames");
-    assert_eq!(s.duration, Some((44100.0 * 1.2) as i64));
-    assert_eq!(packets.iter().map(|p| p.duration).sum::<i64>(), (44100.0 * 1.2) as i64, "the last packet ends at the last valid frame");
+    let valid = (44100.0 * 1.2) as i64;
+    assert_eq!(got.len(), valid as usize * channels, "the valid frames");
+    // FFmpeg's CAF writer before 8.1 (cafenc commit 8d1f247ec1) declares every packet full: its packet
+    // table has 4096 valid frames for each, with no remainder, so the file's valid frames are those
+    let declared = if ffmpeg_at_least(8, 1) { valid } else { packets.len() as i64 * 4096 };
+    assert_eq!(s.duration, Some(declared));
+    assert_eq!(packets.iter().map(|p| p.duration).sum::<i64>(), declared, "the last packet ends at the last valid frame");
     // seeking to the middle lands on a packet and decodes the same samples from there
     let landed = d.seek(0.55).unwrap();
     let rest = read_all(d.as_mut());

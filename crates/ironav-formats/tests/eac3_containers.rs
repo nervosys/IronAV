@@ -4,6 +4,8 @@
 //! raw file with dependent frames (the packets keep them, the decoder leaves them out) and a raw file
 //! copied into Matroska. Skipped without `ffmpeg` on PATH.
 
+mod common;
+
 use ironav_core::{CodecId, Demuxer, Frame, Packet, StreamParams};
 use ironav_formats::open_demuxer;
 use std::path::{Path, PathBuf};
@@ -79,7 +81,8 @@ fn encode_and_compare(dir: &Path, name: &str, format: &str, channels: &str, extr
     let want = reference(dir, name, &file);
     let (got, _, ch) = demux_and_decode(&file);
     assert_eq!(ch.to_string(), channels, "{name}: channels");
-    check(name, &got, &want);
+    let want = common::comparable(&file, format, ch as usize, got.len(), &want);
+    check(name, &got, want);
     (file, ch)
 }
 
