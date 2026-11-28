@@ -30,6 +30,7 @@
 //! | Opus | `opus::OpusDecoder` | `opus::OpusEncoder` | `encoders::OpusEncoder` |
 //! | ProRes | `prores::ProResDecoder` | `prores::ProResEncoder` | `encoders::ProResEncoder` |
 //! | Vorbis | `vorbis::VorbisDecoder` | `vorbis::VorbisEncoder` | `encoders::VorbisEncoder` |
+//! | Theora | `theora::TheoraDecoder` | none | none |
 //! | VP8 | `vp8::Vp8Decoder` | `vp8::Vp8Encoder` | `encoders::Vp8Encoder` |
 //! | VP9 | `vp9::Vp9Decoder` | `vp9::Vp9Encoder` | `encoders::Vp9Encoder` |
 //!
@@ -87,6 +88,8 @@ pub mod order;
 pub mod prores;
 #[cfg(feature = "vorbis")]
 pub mod vorbis;
+#[cfg(feature = "theora")]
+pub mod theora;
 #[cfg(feature = "vp8")]
 pub mod vp8;
 mod options;
@@ -254,6 +257,10 @@ pub fn implemented() -> Vec<CodecImpl> {
             #[cfg(feature = "av1")]
             if c == CodecId::Av1 {
                 return Some(CodecImpl { codec: c, decode: true, encode: true, implementation: "ironav-av1" });
+            }
+            #[cfg(feature = "theora")]
+            if c == CodecId::Theora {
+                return Some(CodecImpl { codec: c, decode: true, encode: false, implementation: "ironav-theora" });
             }
             #[cfg(feature = "vp8")]
             if c == CodecId::Vp8 {
@@ -457,6 +464,8 @@ pub fn new_decoder_for(s: &ironav_core::StreamInfo) -> Result<Box<dyn Decoder>> 
         CodecId::Opus => Ok(trimmed(s, opus::new_decoder(&s.extradata, &s.params)?)),
         #[cfg(feature = "vorbis")]
         CodecId::Vorbis => Ok(trimmed(s, Box::new(vorbis::VorbisDecoder::new(&s.extradata, &s.params)?))),
+        #[cfg(feature = "theora")]
+        CodecId::Theora => Ok(Box::new(theora::TheoraDecoder::new(s)?)),
         #[cfg(feature = "vp8")]
         CodecId::Vp8 => Ok(Box::new(vp8::Vp8Decoder::new())),
         #[cfg(feature = "h264")]

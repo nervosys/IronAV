@@ -210,6 +210,7 @@ codecs! {
     Hevc => "hevc", Video;
     Av1 => "av1", Video;
     Vp8 => "vp8", Video;
+    Theora => "theora", Video;
     Vp9 => "vp9", Video;
     Mpeg4 => "mpeg4", Video;
     Mpeg2Video => "mpeg2video", Video;

@@ -126,7 +126,7 @@ pub static FORMATS: &[FormatSpec] = &[
     FormatSpec {
         name: "mkv",
         extensions: &["mkv", "mka"],
-        description: "Matroska: read (also WebM, with any codec the file holds) and written with H.264, HEVC, VP8, VP9, AV1 or Motion-JPEG or MPEG-4 Part 2 or MPEG-2 video (copied; VP8, MJPEG, MPEG-4 and MPEG-2 also encoded by IronAV where it has the codec) and AAC, FLAC, MP3, MP2 (read, copied or encoded), AC-3 (copied or encoded), E-AC-3 (copied), DTS (`A_DTS`, read), TrueHD and MLP (`A_TRUEHD`, `A_MLP`, copied), Opus, Vorbis or PCM audio copied or encoded (PCM as integer or float, little- or big-endian); any number of tracks of each kind; no SeekHead",
+        description: "Matroska: read (also WebM, with any codec the file holds) and written with H.264, HEVC, VP8, VP9, AV1 or Motion-JPEG or MPEG-4 Part 2 or MPEG-2 video (copied; VP8, MJPEG, MPEG-4 and MPEG-2 also encoded by IronAV where it has the codec) and AAC, FLAC, MP3, MP2 (read, copied or encoded), AC-3 (copied or encoded), E-AC-3 (copied), DTS (`A_DTS`, read), Theora video (`V_THEORA`, read), TrueHD and MLP (`A_TRUEHD`, `A_MLP`, copied), Opus, Vorbis or PCM audio copied or encoded (PCM as integer or float, little- or big-endian); any number of tracks of each kind; no SeekHead",
         media: MediaType::Video,
         demux: true,
         mux: true,
@@ -251,8 +251,8 @@ pub static FORMATS: &[FormatSpec] = &[
     },
     FormatSpec {
         name: "ogg",
-        extensions: &["ogg", "opus", "oga"],
-        description: "Ogg: read Opus, Vorbis and FLAC audio (Speex and Theora are refused); write Opus, Vorbis and FLAC",
+        extensions: &["ogg", "opus", "oga", "ogv"],
+        description: "Ogg: read Opus, Vorbis and FLAC audio and Theora video (Speex is refused); write Opus, Vorbis and FLAC",
         media: MediaType::Audio,
         demux: true,
         mux: true,

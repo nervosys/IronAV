@@ -27,7 +27,7 @@ workspace = true
 [features]
 default = [
     "aac", "ac3", "alac", "av1", "dts", "flac", "h264", "hevc", "jpeg", "mlp", "mp3", "mpeg2", "mpeg4", "opus", "prores", "wma",
-    "vorbis", "vp8", "vp9", "voice", "resample", "filters", "order", "serde",
+    "theora", "vorbis", "vp8", "vp9", "voice", "resample", "filters", "order", "serde",
 ]
 # One feature per codec module (the decoder and, where there is one, the encoder).
 aac = []
@@ -50,6 +50,7 @@ mpeg4 = []
 # Opus needs the resampler: its encoder runs SILK on 16 kHz input.
 opus = ["resample"]
 prores = []
+theora = []
 vorbis = []
 vp8 = []
 # Needs VP8's boolean encoder.

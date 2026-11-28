@@ -22,7 +22,7 @@ pub(crate) mod lazy;
 pub(crate) mod live;
 
 use crate::mp4demux::{av1c_config, gcd, parse_avcc, parse_hvcc, unwrap_frame, Config, Mp4Demuxer, Sample, TrackInfo, Unwrap, VideoMeta};
-use ironav_core::{Attachment, Chapter, CodecId, ColorInfo, Error, ErrorCode, HdrMetadata, MasteringDisplay, Rational, Result, StreamInfo, StreamParams};
+use ironav_core::{Attachment, Chapter, CodecId, ColorInfo, Error, ErrorCode, HdrMetadata, MasteringDisplay, PixelFormat, Rational, Result, StreamInfo, StreamParams};
 use std::io::{BufReader, Read, Seek, SeekFrom};
 
 const EBML: u32 = 0x1A45_DFA3;
@@ -939,6 +939,7 @@ fn video_codec(id: &str) -> Option<CodecId> {
         "V_AV1" => CodecId::Av1,
         "V_VP9" => CodecId::Vp9,
         "V_VP8" => CodecId::Vp8,
+        "V_THEORA" => CodecId::Theora,
         "V_MPEG4/ISO/ASP" | "V_MPEG4/ISO/SP" | "V_MPEG4/ISO/AP" => CodecId::Mpeg4,
         "V_MJPEG" => CodecId::Mjpeg,
         "V_MPEG2" => CodecId::Mpeg2Video,
@@ -1074,6 +1075,16 @@ fn build_track(t: &MkTrack, index: usize, frames: &[&Frame], scale: u64, samples
             CodecId::Mpeg4 | CodecId::Mpeg2Video | CodecId::Mpeg1Video => {
                 extradata = t.private.clone();
                 Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma: crate::mpegvideo::chroma_of(codec, &t.private) }
+            }
+            CodecId::Theora => {
+                // the three headers in Xiph lacing, which also say the chroma format
+                extradata = t.private.clone();
+                let chroma = match ironav_codec::theora::TheoraInfo::from_extradata(&t.private).map(|i| i.pix_fmt) {
+                    Ok(PixelFormat::Yuv422p) => 2,
+                    Ok(PixelFormat::Yuv444p) => 3,
+                    _ => 1,
+                };
+                Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma }
             }
             CodecId::Av1 if !t.private.is_empty() => {
                 extradata = t.private.clone();

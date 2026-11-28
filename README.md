@@ -6,7 +6,7 @@ A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so 
 > **Status: foundation (v0.1.10).** The architecture, agent interface, ontology, hardware model, CLI, MCP server
 > and both GUIs are working and tested. Containers: **WAV, FLAC, Y4M, MP4, QuickTime MOV (read and write), Matroska/WebM (read and write), Ogg, ADTS, MP3, JPEG and MPEG transport streams (read and write); AVI (read, with OpenDML), FLV, AIFF and AIFF-C, CAF and IVF (read), MPEG program streams (`.mpg`, `.vob`, read) and raw MPEG-1/2 video (`.m2v`, read; MPEG-2 also written); subtitles as streams (`.srt`, `.vtt`, `.ass`/`.ssa` files and Matroska text tracks, read; Blu-ray PGS in `.sup` files and Matroska, and DVD VobSub in Matroska and in MPEG program streams, read as bitmap subtitle streams); `probe` also lists the entries of M3U and PLS playlists and the chapters and attachments of Matroska files; raw H.264 and HEVC (Annex B: read and written as files, and read as live sources).**
 > Audio codecs, each decoded and encoded: **PCM, FLAC, ALAC, AAC-LC (plus HE-AAC v1 and v2 decode), MP3, MP2, AC-3, Opus and Vorbis.** E-AC-3, the DTS core, TrueHD and MLP (lossless), and WMA 1 and 2 are decoded only.
-> Video: **software decoders for H.264, HEVC (including 4:2:2 and 4:4:4), VP8 and VP9; a software H.264 encoder (High profile: CABAC and the 8x8 transform), a software HEVC encoder (Main profile, 8-bit 4:2:0, merge and skip, SAO), a software VP8 encoder, and a software VP9 encoder (key and inter frames), and a software AV1 encoder (key and inter frames, profile 0, 8-bit 4:2:0); JPEG/Motion-JPEG and Apple ProRes decoded and encoded in software; MPEG-4 Part 2 (Simple and Advanced Simple profiles) decoded in software, and Simple profile I and P pictures encoded in software, with Advanced Simple B pictures as an option (MP4 and Matroska); MPEG-1 and MPEG-2 video (frame and field pictures, 4:2:0 and 4:2:2) decoded in software, and MPEG-2 video (Main profile, 4:2:0, progressive frames, optional B pictures) encoded in software.**
+> Video: **software decoders for H.264, HEVC (including 4:2:2 and 4:4:4), VP8, VP9 and Theora; a software H.264 encoder (High profile: CABAC and the 8x8 transform), a software HEVC encoder (Main profile, 8-bit 4:2:0, merge and skip, SAO), a software VP8 encoder, and a software VP9 encoder (key and inter frames), and a software AV1 encoder (key and inter frames, profile 0, 8-bit 4:2:0); JPEG/Motion-JPEG and Apple ProRes decoded and encoded in software; MPEG-4 Part 2 (Simple and Advanced Simple profiles) decoded in software, and Simple profile I and P pictures encoded in software, with Advanced Simple B pictures as an option (MP4 and Matroska); MPEG-1 and MPEG-2 video (frame and field pictures, 4:2:0 and 4:2:2) decoded in software, and MPEG-2 video (Main profile, 4:2:0, progressive frames, optional B pictures) encoded in software.**
 > NVIDIA GPUs encode H.264 and HEVC (NVENC, preferred when usable) and decode H.264, HEVC and AV1 (NVDEC).
 > AV1 is decoded on NVIDIA GPUs (NVDEC) or in software (key, intra-only and inter frames, superres included). VP9 and AV1 copy between WebM, Matroska and MP4.
 > Live sources: **files as they grow, pipes, TCP, UDP, SRT (with encryption), RTSP/RTSPS, HLS over HTTP(S), WebRTC ingest (WHIP, over TLS with `whips://`), YouTube, cameras and microphones (Media Foundation, Video4Linux2, AVFoundation), and screens (DXGI Desktop Duplication, X11, CoreGraphics).**
@@ -1203,6 +1203,34 @@ loses most of that). Not done: sub-8x8 partitions on by default, or above QP 20.
 
 The software HEVC and MPEG-4 encoders take `--bframes N` (or `bframes` in a job's `video`, 0 to 3) for B pictures between anchor pictures, which `with_bframes` sets (the MPEG-4 encoder also writes the Advanced Simple profile then, and its container configuration says so). The GPU encoder codes no B pictures and ignores it, as it ignores `refs`, and `--latency low` refuses it, since low latency codes none.
 
+## Theora
+
+Theora video (Theora I, bitstream 3.2 and later) is decoded in software as the `theora` codec, by `ironav_codec::theora::TheoraDecoder`
+(`ironav-codec/src/theora`, a translation of FFmpeg's `vp3.c`, `vp3data.h` and `vp3dsp.c`). Decoded: the identification, comment and setup
+headers (the quantiser tables with their ranges and base-matrix interpolation, the loop filter limits, the 80 Huffman token tables), coded
+block flags (superblock and fragment run lengths), macroblock modes (the eight schemes), motion vectors (the VLC and the fixed-length
+scheme), DCT tokens with EOB runs and zero runs, DC prediction, dequantisation with up to three quantisers per frame, the integer inverse
+DCT, intra and inter reconstruction with the half-pel average, the loop filter, the golden and previous frames, 4:2:0, 4:2:2 and 4:4:4,
+and the picture region of the identification header (frames are cropped to it and delivered as `Yuv420p`, `Yuv422p` or `Yuv444p`, top row
+first). A packet of no bytes (a dropped frame) gives no picture, and an inter frame before the first key frame is skipped. The colour
+space code 1 or 2 is reported as Rec. 470M or 470BG. Not decoded: the pre-release bitstreams older than 3.2.0 are refused, and so is a frame of
+more than 16.7 million coded pixels (so a damaged header cannot ask for a huge allocation). Damaged headers and packets are errors, not panics.
+Theora is not encoded.
+
+Theora is read from Ogg (`.ogv`, `.ogg`; the `ogg` reader, any number of logical streams beside Opus or Vorbis audio, chained links with the
+same headers as one track) and from Matroska (`V_THEORA`, the three headers in `CodecPrivate` in Xiph lacing). A frame is one time unit of the
+header's frame rate, counted from zero; the key frames come from each packet's frame type bit, which is what the granule position's key
+frame part (above KFGSHIFT) names, so seeking lands on the last key frame at or before the time (the same machinery as every other video
+in Ogg and Matroska). The stream's `extradata` is the three headers in Xiph lacing.
+
+Measured against `ffmpeg -f rawvideo` on streams made with FFmpeg's libtheora: 11 clips (176x144, 330x186 and 64x48; 4:2:0, 4:2:2 and 4:4:4;
+`-q:v` 2 to 10; `-g` 1 to 250; `testsrc2` and `mandelbrot`; 12 to 30 frames) are byte-identical in Ogg, and 4 of them copied into Matroska too,
+including the clips with dropped frames (FFmpeg gives no picture for those either). Those clips use every macroblock mode, one to three
+quantisers per frame, and the preset mode schemes 0, 1, 3, 4, 5, 6 and 7; libtheora never writes the fixed-length motion vector scheme (or scheme 2), so those
+follow FFmpeg's code without a sample. Seeks in Ogg land on key frames and the packets and pictures after them equal a full read's; truncated and
+bit-flipped headers, packets and files give errors. The tests are `crates/ironav-formats/tests/theora_ffmpeg.rs` and
+`crates/ironav-engine/tests/theora.rs`, and they skip without `ffmpeg` (with libtheora).
+
 ## VP8
 
 VP8 video is decoded in software (`ironav-codec/src/vp8`, a port of FFmpeg's `vp8.c` and `vp8dsp.c`; the probability, quantiser and
@@ -1773,7 +1801,7 @@ Build: `cargo build --release` · Test: `cargo test` · Rust 1.95 or newer for `
 Lean build for servers/agents without the graphics or sound stack: `cargo build --release --no-default-features -p ironav-cli`
 
 Codec features: `ironav-codec` puts each codec behind a cargo feature: `aac`, `ac3`, `alac`, `av1`, `flac`, `h264`,
-`hevc`, `jpeg`, `mp3`, `mpeg2`, `mpeg4`, `opus`, `prores`, `vorbis`, `vp8` and `vp9`. Three more name shared parts:
+`hevc`, `jpeg`, `mp3`, `mpeg2`, `mpeg4`, `opus`, `prores`, `theora`, `vorbis`, `vp8` and `vp9`. Three more name shared parts:
 `voice` (the voice-link DSP, which needs `resample`, the windowed-sinc resampler), `filters` (the filter registry)
 and `order` (H.264 and HEVC picture order). `serde` gives the registries and core types their serialisation. All are
 on by default, so the workspace crates are unchanged. A small build turns the defaults off and names what it needs,

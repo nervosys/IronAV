@@ -31,6 +31,7 @@ fn codec_meta(c: CodecId) -> (&'static str, &'static str) {
         Hevc => ("H.265 / HEVC", "Lossy video codec; the successor to H.264, with smaller files at equal quality."),
         Av1 => ("AV1", "Royalty-free lossy video codec from AOMedia; best compression, growing hardware support."),
         Vp8 => ("VP8", "Lossy video codec used in early WebM."),
+        Theora => ("Theora", "Lossy video codec of Xiph.Org (VP3 family) in Ogg and Matroska; decoded (version 3.2 and later: 4:2:0, 4:2:2 and 4:4:4, the picture region, golden and previous frames, the loop filter, bit-exact to FFmpeg), not encoded."),
         Vp9 => ("VP9", "Royalty-free lossy video codec from Google; WebM and YouTube."),
         Mpeg4 => ("MPEG-4 Part 2", "Legacy lossy video codec (DivX/Xvid family)."),
         Mpeg2Video => ("MPEG-2 video", "Lossy video codec (ITU-T H.262 / ISO 13818-2) of broadcast, DVD and DVB; decoded (progressive and interlaced, 4:2:0 and 4:2:2) and encoded in software (progressive, 4:2:0)."),

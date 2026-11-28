@@ -1,4 +1,4 @@
-//! Ogg reader (Opus, Vorbis and FLAC).
+//! Ogg reader (Opus, Vorbis, FLAC and Theora).
 //!
 //! The file is read whole and its pages are unwrapped into one buffer of packet bytes, so a packet
 //! that continues over a page boundary is contiguous again. The packets are then handed to the MP4
@@ -20,11 +20,18 @@
 //! FLAC in Ogg is the native-FLAC mapping: one FLAC frame per packet, durations from the frame
 //! headers, no end trim (a FLAC frame is exact).
 //!
-//! Not handled: Speex, Theora and other codecs in Ogg (refused, or passed over when they share the
+//! Theora video is one packet per frame, one time unit (the frame period, from the identification
+//! header's frame rate) each, from zero; a packet of no bytes is a dropped frame (the decoder gives no
+//! picture for it). A key frame is a packet whose frame type bit says so, which is what the granule
+//! position's key frame part (the bits above KFGSHIFT) names, so seeking lands on one. The codec data
+//! of a Theora stream is its three headers in Xiph lacing, as Matroska keeps them. Chained Theora
+//! links with the same headers are one track.
+//!
+//! Not handled: Speex and other codecs in Ogg (refused, or passed over when they share the
 //! file with a readable stream) and files too big to hold in memory (refused above 1 GiB).
 
 use crate::mp4demux::{Config, Mp4Demuxer, Sample, TrackInfo};
-use ironav_core::{CodecId, Error, ErrorCode, Rational, Result, StreamInfo, StreamParams};
+use ironav_core::{CodecId, Error, ErrorCode, PixelFormat, Rational, Result, StreamInfo, StreamParams};
 use std::collections::HashMap;
 use std::io::{Cursor, Read};
 
@@ -76,6 +83,7 @@ enum Kind {
     Opus,
     Vorbis,
     Flac,
+    Theora,
 }
 
 impl Kind {
@@ -87,6 +95,8 @@ impl Kind {
             Some(Kind::Vorbis)
         } else if first.starts_with(b"\x7fFLAC") {
             Some(Kind::Flac)
+        } else if first.starts_with(b"\x80theora") {
+            Some(Kind::Theora)
         } else {
             None
         }
@@ -96,7 +106,7 @@ impl Kind {
     fn headers(self) -> usize {
         match self {
             Kind::Opus => 2,
-            Kind::Vorbis => 3,
+            Kind::Vorbis | Kind::Theora => 3,
             Kind::Flac => 1, // more metadata packets may follow; see `is_header`
         }
     }
@@ -131,9 +141,9 @@ struct Track {
 /// Open an Ogg file for reading.
 ///
 /// Every logical stream is read: multiplexed streams (sharing the file in time) are separate tracks, and
-/// chained streams (one after another) of Vorbis or FLAC whose setup matches are joined into one track. An
+/// chained streams (one after another) of Vorbis, FLAC or Theora whose setup matches are joined into one track. An
 /// Opus stream is never joined to a chained one: the decoder removes the pre-skip once per track, so each link
-/// stays a track of its own. Streams of other codecs (Speex, Theora, ...) are passed over.
+/// stays a track of its own. Streams of other codecs (Speex, ...) are passed over.
 pub fn open<R: Read>(mut r: R) -> Result<Mp4Demuxer<Cursor<Vec<u8>>>> {
     let mut file = Vec::new();
     r.by_ref().take(MAX_FILE + 1).read_to_end(&mut file)?;
@@ -176,7 +186,7 @@ pub fn open<R: Read>(mut r: R) -> Result<Mp4Demuxer<Cursor<Vec<u8>>>> {
         page_no += 1;
 
         if flags & 0x02 != 0 {
-            // a stream begins: read it if it is Opus, Vorbis or FLAC, and pass over it otherwise
+            // a stream begins: read it if it is Opus, Vorbis, FLAC or Theora, and pass over it otherwise
             let first = &page[27 + nseg..];
             let slot = match Kind::of(first) {
                 Some(kind) => {
@@ -185,7 +195,7 @@ pub fn open<R: Read>(mut r: R) -> Result<Mp4Demuxer<Cursor<Vec<u8>>>> {
                 }
                 None => {
                     if unsupported.is_none() {
-                        let name = [(&b"Speex"[..], "Speex"), (&b"\x80theora"[..], "Theora")].iter().find(|(m, _)| first.starts_with(m)).map_or("an unrecognised codec", |(_, n)| n);
+                        let name = [(&b"Speex"[..], "Speex")].iter().find(|(m, _)| first.starts_with(m)).map_or("an unrecognised codec", |(_, n)| n);
                         unsupported = Some(name.to_string());
                     }
                     None
@@ -230,8 +240,8 @@ pub fn open<R: Read>(mut r: R) -> Result<Mp4Demuxer<Cursor<Vec<u8>>>> {
 
     if streams.is_empty() {
         return Err(match unsupported {
-            Some(n) => Error::new(ErrorCode::UnsupportedCodec, format!("Ogg: the file holds {n}; only Opus, Vorbis and FLAC in Ogg are read so far")),
-            None => bad("no Opus or Vorbis stream found"),
+            Some(n) => Error::new(ErrorCode::UnsupportedCodec, format!("Ogg: the file holds {n}; only Opus, Vorbis, FLAC and Theora in Ogg are read so far")),
+            None => bad("no Opus, Vorbis, FLAC or Theora stream found"),
         });
     }
 
@@ -243,7 +253,7 @@ pub fn open<R: Read>(mut r: R) -> Result<Mp4Demuxer<Cursor<Vec<u8>>>> {
         }
         let key = match s.kind {
             Kind::Opus => Vec::new(),
-            Kind::Vorbis => [header(&data, s, 0)?, header(&data, s, 2)?].concat(), // identification and setup
+            Kind::Vorbis | Kind::Theora => [header(&data, s, 0)?, header(&data, s, 2)?].concat(), // identification and setup
             Kind::Flac => {
                 let hd = header(&data, s, 0)?;
                 if hd.len() < 51 {
@@ -266,8 +276,8 @@ pub fn open<R: Read>(mut r: R) -> Result<Mp4Demuxer<Cursor<Vec<u8>>>> {
     }
     if tracks.is_empty() {
         return Err(match unsupported {
-            Some(n) => Error::new(ErrorCode::UnsupportedCodec, format!("Ogg: the file holds {n}; only Opus, Vorbis and FLAC in Ogg are read so far")),
-            None => bad("no Opus or Vorbis stream found"),
+            Some(n) => Error::new(ErrorCode::UnsupportedCodec, format!("Ogg: the file holds {n}; only Opus, Vorbis, FLAC and Theora in Ogg are read so far")),
+            None => bad("no Opus, Vorbis, FLAC or Theora stream found"),
         });
     }
 
@@ -301,6 +311,14 @@ pub fn open<R: Read>(mut r: R) -> Result<Mp4Demuxer<Cursor<Vec<u8>>>> {
                     }
                     trim_end(&mut samples[link_at..], &mut link, s.last_granule);
                 }
+                Kind::Theora => {
+                    // one frame period per packet; a key frame says so in its first byte
+                    for &(off, size) in &s.packets {
+                        let sync = ironav_codec::theora::is_key_frame(&data[off as usize..off as usize + size.min(1)]);
+                        samples.push(Sample { stream: ti as u16, sync, offset: off, size: size as u32, dts: pts + link, cts_offset: 0, duration: 1 });
+                        link += 1;
+                    }
+                }
                 Kind::Opus => {
                     for &(off, size) in &s.packets {
                         let h = &data[off as usize..off as usize + size.min(2)];
@@ -317,7 +335,14 @@ pub fn open<R: Read>(mut r: R) -> Result<Mp4Demuxer<Cursor<Vec<u8>>>> {
     }
     let tracks_out: Vec<TrackInfo> = infos
         .into_iter()
-        .map(|stream| TrackInfo { stream, config: Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma: 1 }, convert: false, swap: 0, unwrap: Vec::new(), meta: Default::default() })
+        .map(|stream| {
+            let chroma = match stream.params {
+                StreamParams::Video { pix_fmt: PixelFormat::Yuv422p, .. } => 2,
+                StreamParams::Video { pix_fmt: PixelFormat::Yuv444p, .. } => 3,
+                _ => 1,
+            };
+            TrackInfo { stream, config: Config { prefix: Vec::new(), nal_length: 0, bits: 8, chroma }, convert: false, swap: 0, unwrap: Vec::new(), meta: Default::default() }
+        })
         .collect();
     Ok(Mp4Demuxer::from_parts(Cursor::new(data), "ogg", tracks_out, samples))
 }
@@ -370,6 +395,24 @@ fn track_info(kind: Kind, first: &Logical, data: &[u8], index: usize) -> Result<
                 params: StreamParams::Audio { sample_rate: rate, channels },
             };
             (stream, extradata)
+        }
+        Kind::Theora => {
+            let extradata = ironav_codec::theora::join_headers([header(data, first, 0)?, header(data, first, 1)?, header(data, first, 2)?]);
+            let info = ironav_codec::theora::TheoraInfo::parse(header(data, first, 0)?)?;
+            if info.fps_num == 0 || info.fps_den == 0 {
+                return Err(bad("the Theora frame rate is zero"));
+            }
+            let stream = StreamInfo {
+                index,
+                codec: CodecId::Theora,
+                time_base: Rational::new(info.fps_den as i64, info.fps_num as i64),
+                duration: None,
+                bits: None,
+                extradata,
+                lead_in: 0,
+                params: StreamParams::Video { width: info.width, height: info.height, pix_fmt: info.pix_fmt, frame_rate: Rational::new(info.fps_num as i64, info.fps_den as i64) },
+            };
+            (stream, Vec::new())
         }
         Kind::Opus => {
             let hd = header(data, first, 0)?;
