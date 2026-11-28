@@ -896,7 +896,7 @@ fn sound_child<'a>(kids: &'a [u8], kind: &[u8; 4], within: &str) -> Result<&'a [
 }
 
 /// The AudioSpecificConfig inside an `esds` box, which must be MPEG-4 AAC (object type 0x40).
-fn aac_config(esds: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn aac_config(esds: &[u8]) -> Result<Vec<u8>> {
     match esds_config(esds)? {
         (0x40, dsi) => Ok(dsi),
         _ => Err(Error::new(ErrorCode::UnsupportedCodec, "the mp4a track is not MPEG-4 AAC (object type is not 0x40)")),

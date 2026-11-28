@@ -4,7 +4,7 @@ Audio and video conversion in Rust, built to be driven by AI agents as well as p
 A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so they cannot drift apart.
 
 > **Status: foundation (v0.1.10).** The architecture, agent interface, ontology, hardware model, CLI, MCP server
-> and both GUIs are working and tested. Containers: **WAV, FLAC, Y4M, MP4, QuickTime MOV (read and write), Matroska/WebM (read and write), Ogg, ADTS, MP3, JPEG and MPEG transport streams (read and write); AVI (read, with OpenDML), MPEG program streams (`.mpg`, `.vob`, read) and raw MPEG-1/2 video (`.m2v`, read; MPEG-2 also written); subtitles as streams (`.srt`, `.vtt`, `.ass`/`.ssa` files and Matroska text tracks, read); `probe` also lists the entries of M3U and PLS playlists and the chapters and attachments of Matroska files; raw H.264 and HEVC (Annex B: read and written as files, and read as live sources).**
+> and both GUIs are working and tested. Containers: **WAV, FLAC, Y4M, MP4, QuickTime MOV (read and write), Matroska/WebM (read and write), Ogg, ADTS, MP3, JPEG and MPEG transport streams (read and write); AVI (read, with OpenDML), FLV, AIFF and AIFF-C, CAF and IVF (read), MPEG program streams (`.mpg`, `.vob`, read) and raw MPEG-1/2 video (`.m2v`, read; MPEG-2 also written); subtitles as streams (`.srt`, `.vtt`, `.ass`/`.ssa` files and Matroska text tracks, read); `probe` also lists the entries of M3U and PLS playlists and the chapters and attachments of Matroska files; raw H.264 and HEVC (Annex B: read and written as files, and read as live sources).**
 > Audio codecs, each decoded and encoded: **PCM, FLAC, ALAC, AAC-LC (plus HE-AAC v1 and v2 decode), MP3, MP2, AC-3, Opus and Vorbis.** E-AC-3, the DTS core, and TrueHD and MLP (lossless) are decoded only.
 > Video: **software decoders for H.264, HEVC (including 4:2:2 and 4:4:4), VP8 and VP9; a software H.264 encoder (High profile: CABAC and the 8x8 transform), a software HEVC encoder (Main profile, 8-bit 4:2:0, merge and skip, SAO), a software VP8 encoder, and a software VP9 encoder (key and inter frames), and a software AV1 encoder (key and inter frames, profile 0, 8-bit 4:2:0); JPEG/Motion-JPEG and Apple ProRes decoded and encoded in software; MPEG-4 Part 2 (Simple and Advanced Simple profiles) decoded in software, and Simple profile I and P pictures encoded in software, with Advanced Simple B pictures as an option (MP4 and Matroska); MPEG-1 and MPEG-2 video (frame and field pictures, 4:2:0 and 4:2:2) decoded in software, and MPEG-2 video (Main profile, 4:2:0, progressive frames, optional B pictures) encoded in software.**
 > NVIDIA GPUs encode H.264 and HEVC (NVENC, preferred when usable) and decode H.264, HEVC and AV1 (NVDEC).
@@ -1550,6 +1550,45 @@ FFmpeg's TrueHD encoder has no 7.1 layout and writes no third substream, so 7.1 
 are covered by the unit tests only. The tests are `crates/ironav-codec/tests/truehd_ffmpeg.rs` and
 `crates/ironav-formats/tests/truehd_containers.rs` (with 21 KB and 22 KB fixtures, whose decoded samples are pinned by hash); the
 FFmpeg comparisons skip without `ffmpeg` on the PATH.
+
+## FLV, AIFF, CAF and IVF
+
+Four more containers are read (not written), by `open_demuxer`, so `probe`, `convert`, `analyze`, `chunk` and the players take them.
+
+**FLV** (`.flv`): the tag stream is walked once to build the sample table, so a file seeks to the key frame at or before any time whether
+or not its `onMetaData` has a `keyframes` object (live recordings often have none; the object is not read). Video: H.264 (codec id 7, with the
+AVCDecoderConfigurationRecord and each picture's composition time), HEVC (codec id 12, and the enhanced FLV `hvc1` form) and AV1 (enhanced FLV
+`av01`). Audio: AAC (with its AudioSpecificConfig), MP3, and PCM (format 0 read as big-endian as FFmpeg does, and format 3; 8-bit unsigned and
+16-bit signed). Times are the tags' milliseconds with the extension byte. `onMetaData` (AMF0, nesting and sizes capped, damage ignored) only
+supplies the picture size and frame rate when the sequence header lacks them. Streams of other codecs (Sorenson H.263, screen video, VP6,
+ADPCM, Nellymoser, Speex, A-law, u-law, enhanced audio, other enhanced video FourCCs including `vp09`) are listed by `unsupported_streams`
+and not played; encrypted tags are skipped; a second sequence header (a change of picture size) is ignored. Tested with FFmpeg files:
+H.264 with AAC (with and without B-frames, with and without metadata), MP3, PCM, enhanced HEVC and AV1: stream parameters, packet times
+against `ffprobe`, every picture decoded, audio against FFmpeg's decode (PCM bit for bit, AAC and MP3 over 40 dB SNR), seeks to every picture's
+time landing on `ffprobe`'s key frames, and truncated and bit-flipped files.
+
+**AIFF and AIFF-C** (`.aiff`, `.aif`, `.aifc`): big-endian integer PCM of 8, 16, 24 and 32 bits (odd widths are left-justified in their bytes,
+as the format stores them), and AIFF-C `NONE`, `twos`, `in24`, `in32`, `raw `, `sowt` (little-endian), `fl32` and `fl64`, read as the
+little-endian PCM codecs (8-bit signed samples become `pcm_u8`). The 80-bit extended sample rate is read exactly. Any other AIFF-C
+compression (u-law, A-law, IMA4, MACE) is refused with its name. It seeks to the exact sample. Tested against FFmpeg's decode, bit for bit, in
+8, 16 and 24-bit AIFF (and 24-bit stereo at 48 kHz) and AIFF-C `sowt`, `fl32` and `fl64`, including the samples read after a seek.
+
+**CAF** (`.caf`): `desc`, `kuki`, `pakt` and `data` chunks. Linear PCM (8, 16, 24 and 32-bit integer, 32 and 64-bit float, either byte order,
+as AIFF is read), ALAC (the cookie in its `frma` form or the bare 24-byte one) and AAC (an ES descriptor cookie). Compressed audio is found
+through the packet table (variable packet sizes and frame counts; the last packet lasts to the last valid frame) and seeks by packet; for AAC
+the priming frames are the stream's lead-in and the valid frames its duration, so the decoder is gapless. Other formats (IMA4, u-law, A-law,
+FLAC, Opus and so on), the channel layout chunk and lpcm that is not packed to whole bytes are not read. Tested against FFmpeg: PCM (16-bit
+both orders, 24-bit, float, stereo) bit for bit; ALAC (16 and 24-bit) bit for bit, with packet counts against `ffprobe`; FFmpeg's CAF writer
+leaves out the AAC cookie, so AAC is tested on a CAF built from the packets of an FFmpeg ADTS file (packets identical, decode against FFmpeg's
+over 60 dB SNR, with and without priming and remainder frames). FFmpeg takes the remainder frames off an ALAC file's last packet a second time
+(the packet already holds only the valid ones), so it ends a few frames before the file's valid frame count; IronAV ends at the count.
+
+**IVF** (`.ivf`): VP8, VP9 and AV1 with the header's time base; the frame rate is measured from the frame times. The file is walked once, and
+each frame's key-frame flag is read from its bitstream (VP8's frame tag, VP9's uncompressed header, AV1's sequence header and shown key frame in
+the temporal unit), so seeking lands on key frames. VP9 gets its bit depth and chroma layout from the first key frame, AV1 from its sequence
+header, and AV1's extradata is an `av1C` record built from it, so the stream can be copied into MP4 and Matroska. Other FourCCs (H.264 and
+HEVC in IVF) are refused by name. Tested with FFmpeg's libvpx (VP8), libvpx-vp9 (4:2:0 and 4:4:4) and libaom (AV1): stream parameters, packet
+times against `ffprobe`, seeks to every picture's time landing on `ffprobe`'s key frames, every picture decoded (4:2:0), and truncated files.
 
 ## Matroska output
 

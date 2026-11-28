@@ -2,10 +2,14 @@
 
 mod ac3;
 mod adts;
+mod aiff;
 mod annexb;
 mod audio_stream;
 mod avi;
+mod caf;
 mod dts;
+mod flv;
+mod ivf;
 pub(crate) mod flac;
 mod mkv;
 mod mkvwrite;
@@ -288,6 +292,42 @@ pub static FORMATS: &[FormatSpec] = &[
         mux: true,
         codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Mpeg2Video, CodecId::Aac, CodecId::Mp3, CodecId::Opus, CodecId::Mp2, CodecId::Ac3],
     },
+    FormatSpec {
+        name: "flv",
+        extensions: &["flv"],
+        description: "Flash Video: read with H.264 (codec id 7), HEVC (codec id 12 and enhanced FLV `hvc1`) or AV1 (enhanced FLV `av01`) video and AAC, MP3 or PCM audio, with times in milliseconds; seeks to key frames through an index built in one pass over the tags; streams of other codecs (Sorenson H.263, screen video, VP6, ADPCM, Nellymoser, Speex, A-law, u-law) are reported as unsupported, not played; read only",
+        media: MediaType::Video,
+        demux: true,
+        mux: false,
+        codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Av1, CodecId::Aac, CodecId::Mp3, CodecId::PcmU8, CodecId::PcmS16Le],
+    },
+    FormatSpec {
+        name: "aiff",
+        extensions: &["aiff", "aif", "aifc"],
+        description: "AIFF and AIFF-C: big-endian integer PCM of 8 to 32 bits, and AIFF-C `NONE`, `sowt` (little-endian), `fl32` and `fl64` (float), read as little-endian PCM; other AIFF-C compressions are refused by name; seeks to the sample; read only",
+        media: MediaType::Audio,
+        demux: true,
+        mux: false,
+        codecs: &[CodecId::PcmU8, CodecId::PcmS16Le, CodecId::PcmS24Le, CodecId::PcmS32Le, CodecId::PcmF32Le, CodecId::PcmF64Le],
+    },
+    FormatSpec {
+        name: "caf",
+        extensions: &["caf"],
+        description: "Core Audio Format: linear PCM (8 to 32-bit integer, 32 and 64-bit float, either byte order), ALAC and AAC with their magic cookies and packet tables (priming and remainder frames); other formats are refused by name; seeks by packet; read only",
+        media: MediaType::Audio,
+        demux: true,
+        mux: false,
+        codecs: &[CodecId::PcmU8, CodecId::PcmS16Le, CodecId::PcmS24Le, CodecId::PcmS32Le, CodecId::PcmF32Le, CodecId::PcmF64Le, CodecId::Alac, CodecId::Aac],
+    },
+    FormatSpec {
+        name: "ivf",
+        extensions: &["ivf"],
+        description: "IVF: VP8 (`VP80`), VP9 (`VP90`) and AV1 (`AV01`) video, with the header's time base; key frames are found from the bitstream in one pass, so it seeks to them; other FourCCs are refused by name; read only",
+        media: MediaType::Video,
+        demux: true,
+        mux: false,
+        codecs: &[CodecId::Vp8, CodecId::Vp9, CodecId::Av1],
+    },
 ];
 
 pub fn find_format(name: &str) -> Result<&'static FormatSpec> {
@@ -340,6 +380,14 @@ fn open_with(path: &Path, lazy: bool) -> Result<Box<dyn Demuxer>> {
     };
     if ts::packet_size(magic).is_some() {
         Ok(Box::new(ts::TsDemuxer::open(f)?))
+    } else if aiff::looks_like_aiff(magic) {
+        aiff::open(f)
+    } else if caf::looks_like_caf(magic) {
+        caf::open(f)
+    } else if flv::looks_like_flv(magic) {
+        Ok(Box::new(flv::open(f)?))
+    } else if ivf::looks_like_ivf(magic) {
+        Ok(Box::new(ivf::open(f)?))
     } else if avi::looks_like_avi(magic) {
         // Like Matroska, the AVI reader buffers for itself: it seeks over every chunk while indexing.
         Ok(Box::new(avi::open(f.into_inner())?))
