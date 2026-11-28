@@ -5,7 +5,7 @@ A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so 
 
 > **Status: foundation (v0.1.10).** The architecture, agent interface, ontology, hardware model, CLI, MCP server
 > and both GUIs are working and tested. Containers: **WAV, FLAC, Y4M, MP4, QuickTime MOV (read and write), Matroska/WebM (read and write), Ogg, ADTS, MP3, JPEG and MPEG transport streams (read and write); AVI (read, with OpenDML), FLV, AIFF and AIFF-C, CAF and IVF (read), MPEG program streams (`.mpg`, `.vob`, read) and raw MPEG-1/2 video (`.m2v`, read; MPEG-2 also written); subtitles as streams (`.srt`, `.vtt`, `.ass`/`.ssa` files and Matroska text tracks, read; Blu-ray PGS in `.sup` files and Matroska, and DVD VobSub in Matroska and in MPEG program streams, read as bitmap subtitle streams); `probe` also lists the entries of M3U and PLS playlists and the chapters and attachments of Matroska files; raw H.264 and HEVC (Annex B: read and written as files, and read as live sources).**
-> Audio codecs, each decoded and encoded: **PCM, FLAC, ALAC, AAC-LC (plus HE-AAC v1 and v2 decode), MP3, MP2, AC-3, Opus and Vorbis.** E-AC-3, the DTS core, and TrueHD and MLP (lossless) are decoded only.
+> Audio codecs, each decoded and encoded: **PCM, FLAC, ALAC, AAC-LC (plus HE-AAC v1 and v2 decode), MP3, MP2, AC-3, Opus and Vorbis.** E-AC-3, the DTS core, TrueHD and MLP (lossless), and WMA 1 and 2 are decoded only.
 > Video: **software decoders for H.264, HEVC (including 4:2:2 and 4:4:4), VP8 and VP9; a software H.264 encoder (High profile: CABAC and the 8x8 transform), a software HEVC encoder (Main profile, 8-bit 4:2:0, merge and skip, SAO), a software VP8 encoder, and a software VP9 encoder (key and inter frames), and a software AV1 encoder (key and inter frames, profile 0, 8-bit 4:2:0); JPEG/Motion-JPEG and Apple ProRes decoded and encoded in software; MPEG-4 Part 2 (Simple and Advanced Simple profiles) decoded in software, and Simple profile I and P pictures encoded in software, with Advanced Simple B pictures as an option (MP4 and Matroska); MPEG-1 and MPEG-2 video (frame and field pictures, 4:2:0 and 4:2:2) decoded in software, and MPEG-2 video (Main profile, 4:2:0, progressive frames, optional B pictures) encoded in software.**
 > NVIDIA GPUs encode H.264 and HEVC (NVENC, preferred when usable) and decode H.264, HEVC and AV1 (NVDEC).
 > AV1 is decoded on NVIDIA GPUs (NVDEC) or in software (key, intra-only and inter frames, superres included). VP9 and AV1 copy between WebM, Matroska and MP4.
@@ -1560,6 +1560,30 @@ FFmpeg's TrueHD encoder has no 7.1 layout and writes no third substream, so 7.1 
 are covered by the unit tests only. The tests are `crates/ironav-codec/tests/truehd_ffmpeg.rs` and
 `crates/ironav-formats/tests/truehd_containers.rs` (with 21 KB and 22 KB fixtures, whose decoded samples are pinned by hash); the
 FFmpeg comparisons skip without `ffmpeg` on the PATH.
+
+## ASF and WMA
+
+Windows Media Audio versions 1 and 2 are decoded as the `wmav1` and `wmav2` codecs, by `ironav_codec::wma::WmaDecoder` (a translation of
+FFmpeg's `wmadec.c`, `wma.c` and tables, see `tools/gen_wma_tables.py`), to float samples, mono or stereo up to 50 kHz. Decoded: superframes
+with and without the bit reservoir, block switching with the windows of mixed block sizes, exponents as LSP coefficients or Huffman-coded
+deltas, noise substitution, run-level coefficients with the six code tables, and mid/side stereo. WMA is not encoded. The decoder is built from
+the stream's `extradata`, which holds the WAVEFORMATEX (the bit rate and block align the tables depend on), and drops its two-frame delay at
+the start and after a reset, as FFmpeg's output does.
+
+ASF files (`.asf`, `.wma`, `.wmv`) are read by `open_demuxer` (probed by the header GUID): the File Properties (packet size, duration, preroll),
+Stream Properties, Header Extension, Stream Bitrate Properties, Codec List, and Content Description and Extended Content Description (read as
+`ironav_formats::asf::metadata`: text from the file, so untrusted, with control characters removed and cut to 512 characters). Data packets are
+parsed with their error correction, padding, single and multiple payloads, compressed payloads and replicated data; media objects are reassembled
+across fragments and packets, and audio spread streams are descrambled. Times are milliseconds less the preroll. Seeking uses the Simple Index
+when the file has one (FFmpeg's muxer writes one only with video), else a bisection of the packets by send time, and lands on the last object at or
+before the time. Video (WMV1, WMV2, WMV3, VC-1, MS MPEG-4), WMA Pro, WMA Lossless and WMA Voice streams are not decoded: they are listed by
+`unsupported_streams` (named by FourCC or format tag), and a file with nothing playable is refused with an error naming them. DRM-protected files
+are not handled. Damaged headers, packets, sizes and fragments are errors, not panics.
+
+Measured against `ffmpeg -f f32le` on 48 files made with FFmpeg's `wmav1` and `wmav2` encoders (3 seconds, mono and stereo at 22.05, 44.1 and 48 kHz,
+at 32, 64, 128 and 192 kbit/s): the SNR against FFmpeg's decode is 134.5 to 136.3 dB in all 48 (float rounding only), with the same sample count.
+Packet times and sizes equal `ffprobe -show_packets`. FFmpeg's encoders write no bit reservoir, so that path is covered by reading FFmpeg's
+code, not by a sample file. The tests are `crates/ironav-formats/tests/wma_ffmpeg.rs` and `asf_containers.rs`, and they skip without `ffmpeg`.
 
 ## FLV, AIFF, CAF and IVF
 

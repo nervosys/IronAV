@@ -17,6 +17,7 @@
 //! | E-AC-3 | `ac3::Ac3Decoder` (decodes both) | none | none |
 //! | DTS | `dts::DtsDecoder` (the core) | none | none |
 //! | TrueHD, MLP | `mlp::MlpDecoder` (lossless) | none | none |
+//! | WMA 1, WMA 2 | `wma::WmaDecoder` | none | none |
 //! | ALAC | `alac::AlacDecoder` | `alac::AlacEncoder` | `encoders::AlacEncoder` |
 //! | AV1 | `av1::Av1Decoder` | `av1::Av1Encoder` | `encoders::Av1Encoder` |
 //! | FLAC | `flac::FlacDecoder` | `flac::FlacEncoder` | `encoders::FlacEncoder` |
@@ -49,6 +50,8 @@ pub mod alac;
 pub mod dts;
 #[cfg(feature = "mlp")]
 pub mod mlp;
+#[cfg(feature = "wma")]
+pub mod wma;
 #[cfg(feature = "h264")]
 pub mod change;
 #[cfg(feature = "flac")]
@@ -97,7 +100,7 @@ pub mod resample;
 mod scale;
 #[cfg(feature = "voice")]
 pub mod voice;
-#[cfg(any(feature = "aac", feature = "ac3"))]
+#[cfg(any(feature = "aac", feature = "ac3", feature = "wma"))]
 mod imdct;
 #[cfg(any(feature = "opus", feature = "vorbis", feature = "voice"))]
 mod mdct;
@@ -203,6 +206,10 @@ pub fn implemented() -> Vec<CodecImpl> {
             #[cfg(feature = "mlp")]
             if c == CodecId::TrueHd || c == CodecId::Mlp {
                 return Some(CodecImpl { codec: c, decode: true, encode: false, implementation: "ironav-mlp" });
+            }
+            #[cfg(feature = "wma")]
+            if c == CodecId::WmaV1 || c == CodecId::WmaV2 {
+                return Some(CodecImpl { codec: c, decode: true, encode: false, implementation: "ironav-wma" });
             }
             #[cfg(feature = "alac")]
             if c == CodecId::Alac {
@@ -442,6 +449,8 @@ pub fn new_decoder_for(s: &ironav_core::StreamInfo) -> Result<Box<dyn Decoder>> 
         CodecId::TrueHd => Ok(kept_span(s, Box::new(mlp::MlpDecoder::new(true)))),
         #[cfg(feature = "mlp")]
         CodecId::Mlp => Ok(kept_span(s, Box::new(mlp::MlpDecoder::new(false)))),
+        #[cfg(feature = "wma")]
+        CodecId::WmaV1 | CodecId::WmaV2 => Ok(Box::new(wma::WmaDecoder::new(s)?)),
         #[cfg(feature = "alac")]
         CodecId::Alac => Ok(Box::new(alac::AlacDecoder::new(&s.extradata, &s.params)?)),
         #[cfg(feature = "opus")]

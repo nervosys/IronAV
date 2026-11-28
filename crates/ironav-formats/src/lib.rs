@@ -3,6 +3,7 @@
 mod ac3;
 mod adts;
 mod aiff;
+pub mod asf;
 mod annexb;
 mod audio_stream;
 mod avi;
@@ -312,6 +313,15 @@ pub static FORMATS: &[FormatSpec] = &[
         codecs: &[CodecId::H264, CodecId::Hevc, CodecId::Av1, CodecId::Aac, CodecId::Mp3, CodecId::PcmU8, CodecId::PcmS16Le],
     },
     FormatSpec {
+        name: "asf",
+        extensions: &["asf", "wma", "wmv"],
+        description: "ASF (Windows Media): WMA 1 and 2 audio (format tags 0x160 and 0x161) from the header's WAVEFORMATEX, with objects put together from fragments across data packets, compressed payloads and audio spread descrambling; times in milliseconds less the preroll; seeks by the Simple Index when there is one, else by bisecting the packets' send times; video (WMV1, WMV2, WMV3, VC-1, MS MPEG-4), WMA Pro, WMA Lossless and WMA Voice streams are reported as unsupported, not played; read only",
+        media: MediaType::Audio,
+        demux: true,
+        mux: false,
+        codecs: &[CodecId::WmaV1, CodecId::WmaV2],
+    },
+    FormatSpec {
         name: "aiff",
         extensions: &["aiff", "aif", "aifc"],
         description: "AIFF and AIFF-C: big-endian integer PCM of 8 to 32 bits, and AIFF-C `NONE`, `sowt` (little-endian), `fl32` and `fl64` (float), read as little-endian PCM; other AIFF-C compressions are refused by name; seeks to the sample; read only",
@@ -394,6 +404,8 @@ fn open_with(path: &Path, lazy: bool) -> Result<Box<dyn Demuxer>> {
         aiff::open(f)
     } else if caf::looks_like_caf(magic) {
         caf::open(f)
+    } else if asf::looks_like_asf(magic) {
+        Ok(Box::new(asf::open(f)?))
     } else if flv::looks_like_flv(magic) {
         Ok(Box::new(flv::open(f)?))
     } else if ivf::looks_like_ivf(magic) {

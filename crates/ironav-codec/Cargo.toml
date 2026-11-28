@@ -26,7 +26,7 @@ workspace = true
 # example); those are enabled with it.
 [features]
 default = [
-    "aac", "ac3", "alac", "av1", "dts", "flac", "h264", "hevc", "jpeg", "mlp", "mp3", "mpeg2", "mpeg4", "opus", "prores",
+    "aac", "ac3", "alac", "av1", "dts", "flac", "h264", "hevc", "jpeg", "mlp", "mp3", "mpeg2", "mpeg4", "opus", "prores", "wma",
     "vorbis", "vp8", "vp9", "voice", "resample", "filters", "order", "serde",
 ]
 # One feature per codec module (the decoder and, where there is one, the encoder).
@@ -41,6 +41,8 @@ h264 = []
 hevc = ["h264"]
 jpeg = []
 mlp = []
+# Needs the inverse MDCT of AAC and AC-3.
+wma = []
 mp3 = []
 # Needs MPEG-4's bit reader, IDCT and units.
 mpeg2 = ["mpeg4"]

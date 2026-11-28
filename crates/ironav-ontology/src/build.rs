@@ -20,6 +20,8 @@ fn codec_meta(c: CodecId) -> (&'static str, &'static str) {
         Dts => ("DTS", "Lossy audio codec (ETSI TS 102 114, DTS Coherent Acoustics, DCA) of DVD, Blu-ray and broadcast; the core substream is decoded (up to 5.1 channels; the DTS-HD extensions XCH, X96, XXCH, XBR, XLL and LBR are skipped, so DTS-HD streams give their core), not encoded."),
         TrueHd => ("TrueHD", "Lossless audio codec (Dolby TrueHD, built on MLP) of Blu-ray and streaming; decoded bit-exactly to up to 8 channels (the 2-, 6- and 8-channel presentations; the Dolby Atmos object substream is skipped, so Atmos streams give their 7.1 bed), not encoded."),
         Mlp => ("MLP", "Lossless audio codec (Meridian Lossless Packing) of DVD-Audio and the base of TrueHD; decoded bit-exactly (up to 6 channels, 16, 20 or 24 bits), not encoded."),
+        WmaV1 => ("WMA 1", "Lossy audio codec (Windows Media Audio version 1, ASF format tag 0x160) of early .wma files; decoded (mono and stereo, the LSP and Vorbis-style exponent coding, noise substitution, block switching and the bit reservoir), not encoded."),
+        WmaV2 => ("WMA 2", "Lossy audio codec (Windows Media Audio version 2, ASF format tag 0x161), the common .wma and ASF audio; decoded (mono and stereo, run-level coefficients, noise substitution, block switching, mid/side stereo and the bit reservoir), not encoded. WMA Pro, WMA Lossless and WMA Voice are different codecs and are not decoded."),
         Opus => ("Opus","Lossy low-latency audio codec (RFC 6716); best quality per bit for speech and music."),
         Vorbis => ("Vorbis", "Lossy audio codec used in Ogg and WebM."),
         Flac => ("FLAC", "Lossless audio compression."),

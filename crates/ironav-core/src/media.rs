@@ -199,6 +199,8 @@ codecs! {
     Dts => "dts", Audio;
     TrueHd => "truehd", Audio;
     Mlp => "mlp", Audio;
+    WmaV1 => "wmav1", Audio;
+    WmaV2 => "wmav2", Audio;
     Opus => "opus", Audio;
     Vorbis => "vorbis", Audio;
     Flac => "flac", Audio;
