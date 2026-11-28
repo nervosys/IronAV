@@ -45,7 +45,8 @@ windows = { version = "0.62", features = ["Win32_Media_MediaFoundation", "Win32_
 libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-# cameras and microphones through AVFoundation
+# cameras and microphones through AVFoundation, and the UDP receive buffer of a media socket
+libc = "0.2"
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSDictionary", "NSError", "NSObject", "NSString", "NSValue"] }
 objc2-av-foundation = { version = "0.3", default-features = false, features = ["std", "AVCaptureAudioDataOutput", "AVCaptureDevice", "AVCaptureInput", "AVCaptureOutput", "AVCaptureOutputBase", "AVCaptureSession", "AVCaptureVideoDataOutput", "AVMediaFormat", "block2", "dispatch2", "objc2-core-media"] }

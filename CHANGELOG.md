@@ -59,6 +59,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - ironav-codec: a fill element in an AAC frame whose escape count was 0 panicked in debug builds (subtract with overflow) and wrapped in release builds; the count is now 14, as the standard has it.
 - MCP: pictures in a tool result are image blocks whatever their encoding. Only `png_base64` was turned into one, so the JPEGs of `stream_keyframes` (`jpeg_base64`) reached the model as base64 text; they are now `image/jpeg` blocks, and each entry says which block is its own.
 - Player: every seek rebuilt the video decoder (NVDEC reloaded its libraries and recreated the context and parser).
+- Live: the media sockets of a UDP source, an RTSP stream's RTP port, an SRT receiver and a WHIP or WHEP endpoint ask for a 4 MiB receive buffer on macOS and other Unix systems as well (it was Windows and Linux only), falling back to smaller sizes if the system refuses. macOS's default is a few tens of KiB, so a keyframe's burst of packets was dropped on loopback; the WebRTC viewer test lost the tail of its stream and the SRT loss tests lost data to the overflow. The WebRTC test also waits for a sender report made after the last access unit.
 
 ## [0.1.10] - 2026-11-19
 

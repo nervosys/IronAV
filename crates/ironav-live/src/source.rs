@@ -145,6 +145,8 @@ fn open_once(url: &str) -> Result<Box<dyn Source>> {
                 }
                 _ => UdpSocket::bind((if host.is_empty() { "127.0.0.1" } else { host }, port)).map_err(|e| unreachable(e, "could not bind"))?,
             };
+            // a burst of a stream's packets must not overflow the system's small default buffer
+            crate::webrtc::grow_receive_buffer(&sock);
             Box::new(UdpSource { info: SourceInfo { url: shown, kind: "udp", live: true, synthetic: false }, sock })
         }
         "srt" => Box::new(crate::srt::open(&u, shown)?),

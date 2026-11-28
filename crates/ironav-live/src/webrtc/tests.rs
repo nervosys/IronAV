@@ -1080,6 +1080,9 @@ fn watch(port: u16, token: Option<&str>, profiles: &[u16]) -> Watcher {
     let ssrc: u32 = attr(&answer, "ssrc").split(' ').next().unwrap().parse().unwrap();
 
     let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    // a viewer reads in turns, and the system's default buffer (a few tens of KiB on macOS) overflows
+    // while a keyframe's burst waits: a real viewer asks for a bigger one too
+    grow_receive_buffer(&sock);
     sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let txid = [5u8; 12];
     sock.send_to(&stun::request(&txid, &format!("{ufrag}:viewU"), &pwd, true, [1, 2, 3, 4, 5, 6, 7, 8]), to).unwrap();
@@ -1291,10 +1294,13 @@ fn whep_watching(profiles: &[u16], tls: bool, with_token: bool) {
         server.send_h264_access_unit(au, 1000 + pts).unwrap();
         w.listen(&mut heard, Duration::from_millis(3));
     }
-    // sender reports come each second: wait for one that counts everything sent
-    let sr_counts = |h: &Heard| h.rtcp.iter().filter(|(t, _)| *t == 200).any(|(_, p)| u32::from_be_bytes([p[20], p[21], p[22], p[23]]) as usize == h.rtp.len());
+    // sender reports come each second: wait for one, made after the last access unit went, that
+    // counts everything sent (an earlier report, made mid-stream, would count only what had gone by
+    // then, and could end the wait while the tail still sits in the socket)
+    let sr_counts = |h: &Heard, from: usize| h.rtcp[from..].iter().filter(|(t, _)| *t == 200).any(|(_, p)| u32::from_be_bytes([p[20], p[21], p[22], p[23]]) as usize == h.rtp.len());
+    let reports_before = heard.rtcp.len();
     let end = Instant::now() + Duration::from_secs(4);
-    while !sr_counts(&heard) && Instant::now() < end {
+    while !sr_counts(&heard, reports_before) && Instant::now() < end {
         w.listen(&mut heard, Duration::from_millis(100));
     }
 
@@ -1313,7 +1319,7 @@ fn whep_watching(profiles: &[u16], tls: bool, with_token: bool) {
     }
     // a sender report, naming the stream and counting what was sent
     let sr = heard.rtcp.iter().rfind(|(t, _)| *t == 200).expect("a sender report");
-    assert!(sr_counts(&heard), "a sender report counts the packets sent");
+    assert!(sr_counts(&heard, reports_before), "a sender report counts the packets sent");
     assert_eq!(u32::from_be_bytes([sr.1[4], sr.1[5], sr.1[6], sr.1[7]]), w.ssrc);
     let count = |at: usize| u32::from_be_bytes([sr.1[at], sr.1[at + 1], sr.1[at + 2], sr.1[at + 3]]);
     assert_eq!(count(20) as usize, heard.rtp.len());

@@ -840,9 +840,10 @@ impl Endpoint {
     }
 }
 
-/// Asks for a larger receive buffer on the media socket than the system's default (64 KiB on
-/// Windows), so a keyframe's burst of packets is not dropped while the endpoint is busy. Best
-/// effort: the system may grant less, and elsewhere its default stays.
+/// Asks for a larger receive buffer on a media socket than the system's default (64 KiB on
+/// Windows, a few tens of KiB on macOS), so a keyframe's burst of packets is not dropped while the
+/// receiver is busy. Best effort: the system may grant less (macOS refuses a size above its
+/// `kern.ipc.maxsockbuf` share outright, so a smaller one is tried), and elsewhere its default stays.
 pub(crate) fn grow_receive_buffer(sock: &UdpSocket) {
     const SIZE: i32 = 4 << 20;
     #[cfg(windows)]
@@ -852,13 +853,21 @@ pub(crate) fn grow_receive_buffer(sock: &UdpSocket) {
         // SAFETY: the socket is open for the call, and SO_RCVBUF takes an int
         unsafe { setsockopt(SOCKET(sock.as_raw_socket() as usize), SOL_SOCKET, SO_RCVBUF, Some(&SIZE.to_ne_bytes())) };
     }
-    #[cfg(target_os = "linux")]
+    // libc is a dependency on Linux and macOS only
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         use std::os::fd::AsRawFd;
-        // SAFETY: the socket is open for the call, and SO_RCVBUF takes an int
-        unsafe { libc::setsockopt(sock.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVBUF, (&SIZE as *const i32).cast(), std::mem::size_of::<i32>() as libc::socklen_t) };
+        let mut size = SIZE;
+        while size >= 128 << 10 {
+            // SAFETY: the socket is open for the call, and SO_RCVBUF takes an int
+            let r = unsafe { libc::setsockopt(sock.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVBUF, (&size as *const i32).cast(), std::mem::size_of::<i32>() as libc::socklen_t) };
+            if r == 0 {
+                break;
+            }
+            size /= 2;
+        }
     }
-    #[cfg(not(any(windows, target_os = "linux")))]
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     let _ = (sock, SIZE);
 }
 

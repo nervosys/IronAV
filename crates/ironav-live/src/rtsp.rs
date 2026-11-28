@@ -161,6 +161,7 @@ fn bind_pair(ip: IpAddr) -> Result<(UdpSocket, UdpSocket)> {
             continue;
         }
         if let Ok(rtcp) = UdpSocket::bind((ip, port + 1)) {
+            crate::webrtc::grow_receive_buffer(&rtp);
             rtp.set_nonblocking(true)?;
             rtcp.set_nonblocking(true)?;
             return Ok((rtp, rtcp));
