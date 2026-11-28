@@ -9,7 +9,7 @@ pub(crate) const TRANS_LPS: [u8; 64] = [
 ];
 
 /// The next state (pStateIdx * 2 + valMPS) after an MPS (`.0`) or an LPS (`.1`), for each state.
-const NEXT: [[u8; 2]; 128] = {
+pub(crate) const NEXT: [[u8; 2]; 128] = {
     let mut t = [[0u8; 2]; 128];
     let mut s = 0;
     while s < 128 {

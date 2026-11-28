@@ -278,10 +278,10 @@ impl HevcEncoder {
         for (i, (rows, (part, _))) in bands.iter().zip(&coded).enumerate() {
             merge(&mut pic, &part.pic, rows, ctb_w, nctb, i as u16);
         }
-        filter::deblock(&mut pic, sps, pps, geo);
+        filter::deblock(&mut pic, sps, pps, geo, None);
         pic.sao = sao::decide(&pic, src, sps, lambda_for(qp));
         if pic.sao.iter().any(|s| s.kind != [0; 3]) {
-            filter::sao(&mut pic, sps, pps, geo);
+            filter::sao(&mut pic, sps, pps, geo, None);
         }
         let mut data = Vec::new();
         if idr {
@@ -516,6 +516,32 @@ mod tests {
         let mut enc = HevcEncoder::new(&params, Some(30), None).unwrap().with_bframes(3);
         let pts: Vec<i64> = encode_all(&mut enc, 64, 32, 10).iter().map(|p| p.pts).collect();
         assert_eq!(pts, [0, 4, 1, 2, 3, 8, 5, 6, 7, 9]);
+    }
+
+    /// Loop filtering on several threads gives the same pictures as on one.
+    #[test]
+    fn threaded_loop_filters_match_one_thread() {
+        let (w, h, frames) = (200u32, 300u32, 6u32);
+        let params = StreamParams::Video { width: w, height: h, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational::new(25, 1) };
+        let mut enc = HevcEncoder::new(&params, Some(27), None).unwrap().with_bframes(2);
+        let pkts = encode_all(&mut enc, w, h, frames);
+        let run = |threads: usize| -> Vec<Vec<Vec<u8>>> {
+            let mut d = HevcDecoder::with_threads(threads);
+            let mut out = Vec::new();
+            for p in &pkts {
+                out.extend(d.decode(p).unwrap());
+            }
+            out.extend(d.flush().unwrap());
+            out.into_iter()
+                .map(|f| match f {
+                    OutFrame::Video(v) => v.planes,
+                    _ => panic!("video"),
+                })
+                .collect()
+        };
+        let one = run(1);
+        assert_eq!(one.len(), frames as usize);
+        assert_eq!(one, run(4));
     }
 
     /// A bit rate steers the quantiser: the stream lands within a factor of two of its target.

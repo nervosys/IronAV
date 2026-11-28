@@ -97,6 +97,11 @@ pub struct CurPic {
 
 impl CurPic {
     pub fn new(sps: &Sps, pts: i64, poc: i32) -> Self {
+        Self::reusing(sps, pts, poc, None)
+    }
+
+    /// A new picture, reusing the buffers of `spare`, a finished picture of the same size and format.
+    pub fn reusing(sps: &Sps, pts: i64, poc: i32, spare: Option<Frame>) -> Self {
         let (w, h) = (sps.width, sps.height);
         let (cw, ch) = match sps.chroma_format_idc {
             0 => (0, 0),
@@ -108,19 +113,30 @@ impl CurPic {
         let n4 = w4 * h4;
         let nctb = sps.ctb_w * sps.ctb_h;
         let mid = |bd: u32| 1u16 << (bd - 1);
-        let frame = Frame {
-            planes: [vec![mid(sps.bit_depth_luma); w * h], vec![mid(sps.bit_depth_chroma); cw * ch], vec![mid(sps.bit_depth_chroma); cw * ch]],
-            width: w,
-            height: h,
-            cwidth: cw,
-            cheight: ch,
-            poc,
-            mv: vec![MvField::default(); n4],
-            w4,
-            pts,
-            crop: sps.crop,
-            bit_depth: sps.bit_depth_luma,
-            chroma_format: sps.chroma_format_idc,
+        let fits = |f: &Frame| f.width == w && f.height == h && f.cwidth == cw && f.cheight == ch && f.bit_depth == sps.bit_depth_luma && f.chroma_format == sps.chroma_format_idc;
+        let frame = match spare.filter(fits) {
+            // a buffer in use before is faster than a fresh allocation, which costs page faults
+            Some(mut f) => {
+                f.planes[0].fill(mid(sps.bit_depth_luma));
+                f.planes[1].fill(mid(sps.bit_depth_chroma));
+                f.planes[2].fill(mid(sps.bit_depth_chroma));
+                f.mv.fill(MvField::default());
+                Frame { poc, pts, crop: sps.crop, ..f }
+            }
+            None => Frame {
+                planes: [vec![mid(sps.bit_depth_luma); w * h], vec![mid(sps.bit_depth_chroma); cw * ch], vec![mid(sps.bit_depth_chroma); cw * ch]],
+                width: w,
+                height: h,
+                cwidth: cw,
+                cheight: ch,
+                poc,
+                mv: vec![MvField::default(); n4],
+                w4,
+                pts,
+                crop: sps.crop,
+                bit_depth: sps.bit_depth_luma,
+                chroma_format: sps.chroma_format_idc,
+            },
         };
         CurPic {
             frame,

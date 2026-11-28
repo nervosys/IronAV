@@ -11,6 +11,7 @@ mod filter;
 mod frame;
 mod inter;
 mod intra;
+mod pool;
 mod enc;
 pub use enc::HevcEncoder;
 pub(crate) mod ps;
@@ -68,6 +69,11 @@ struct Cur {
 }
 
 pub struct HevcDecoder {
+    /// Worker threads for the loop filters, started with the first picture that needs them.
+    pool: Option<pool::Pool>,
+    threads: usize,
+    /// Buffers of pictures no longer needed, for the next ones.
+    spare: Vec<Frame>,
     sps: Vec<Option<Arc<Sps>>>,
     pps: Vec<Option<Arc<Pps>>>,
     cur: Option<Cur>,
@@ -95,8 +101,18 @@ impl Default for HevcDecoder {
 }
 
 impl HevcDecoder {
+    /// A decoder that uses up to `threads` threads for the loop filters (1 stays on the calling thread).
+    pub fn with_threads(threads: usize) -> Self {
+        let mut d = Self::new();
+        d.threads = threads.max(1);
+        d
+    }
+
     pub fn new() -> Self {
         HevcDecoder {
+            threads: std::thread::available_parallelism().map_or(1, |n| n.get()),
+            spare: Vec::new(),
+            pool: None,
             sps: vec![None; 16],
             pps: vec![None; 64],
             cur: None,
@@ -122,12 +138,17 @@ impl HevcDecoder {
         let (w, h) = (f.width - cl - cr, f.height - ct - cb);
         let wide = f.bit_depth > 8;
         let put = |v: &mut Vec<u8>, src: &[u16]| {
+            let start = v.len();
             if wide {
-                for s in src {
-                    v.extend_from_slice(&s.to_le_bytes());
+                v.resize(start + src.len() * 2, 0);
+                for (d, &s) in v[start..].as_chunks_mut::<2>().0.iter_mut().zip(src) {
+                    *d = s.to_le_bytes();
                 }
             } else {
-                v.extend(src.iter().map(|&s| s as u8));
+                v.resize(start + src.len(), 0);
+                for (d, &s) in v[start..].iter_mut().zip(src) {
+                    *d = s as u8;
+                }
             }
         };
         let (sx, sy) = match f.chroma_format {
@@ -184,6 +205,21 @@ impl HevcDecoder {
         true
     }
 
+    /// Drops the pictures that are neither referenced nor waiting for output, keeping their buffers for the next picture.
+    fn prune_dpb(&mut self) {
+        let mut i = 0;
+        while i < self.dpb.len() {
+            let e = &self.dpb[i];
+            if e.marking != Marking::Unused || e.needed_for_output {
+                i += 1;
+            } else if let Ok(f) = Arc::try_unwrap(self.dpb.remove(i).frame) {
+                if self.spare.len() < 2 {
+                    self.spare.push(f);
+                }
+            }
+        }
+    }
+
     fn waiting(&self) -> usize {
         self.dpb.iter().filter(|e| e.needed_for_output).count()
     }
@@ -192,7 +228,11 @@ impl HevcDecoder {
 
     fn finish_picture(&mut self) {
         let Some(mut c) = self.cur.take() else { return };
-        filter::run(&mut c.pic, &c.sps, &c.pps, &c.geo);
+        // pictures too short to split into bands do not need the threads
+        if self.threads > 1 && self.pool.is_none() && c.sps.height >= 128 {
+            self.pool = Some(pool::Pool::new(self.threads.min(8) - 1));
+        }
+        filter::run(&mut c.pic, &c.sps, &c.pps, &c.geo, self.pool.as_ref());
         let frame = Arc::new(c.pic.frame);
         self.dpb.push(DpbEntry { frame, marking: Marking::Short, needed_for_output: c.output });
         let max_reorder = c.sps.max_num_reorder as usize;
@@ -363,12 +403,12 @@ impl HevcDecoder {
         self.after_eos = false;
         let (before, after, lt) = self.apply_rps(&sps, hdr, poc);
         // free what is neither referenced nor waiting for output, then make room by outputting
-        self.dpb.retain(|e| e.marking != Marking::Unused || e.needed_for_output);
+        self.prune_dpb();
         while self.waiting() > sps.max_num_reorder as usize || (self.dpb.len() >= sps.max_dec_pic_buffering as usize && self.waiting() > 0) {
             if !self.bump() {
                 break;
             }
-            self.dpb.retain(|e| e.marking != Marking::Unused || e.needed_for_output);
+            self.prune_dpb();
         }
         let geo = match &self.geo_cache {
             Some((s, p, g)) if *s == sps.id && *p == pps.id => g.clone(),
@@ -378,11 +418,12 @@ impl HevcDecoder {
                 g
             }
         };
+        let spare = self.spare.pop();
         let scaling = active_scaling_list(&sps, &pps).map(|l| Arc::new(ScalingFactors::new(&l)));
         let output = hdr.pic_output;
         self.color = sps.color;
         self.cur = Some(Cur {
-            pic: CurPic::new(&sps, pts, poc),
+            pic: CurPic::reusing(&sps, pts, poc, spare),
             sps,
             pps,
             geo,

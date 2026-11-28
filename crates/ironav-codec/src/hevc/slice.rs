@@ -124,6 +124,7 @@ pub struct Dec<'a> {
     ctb_x: usize,
     ctb_y: usize,
     coef: Vec<i32>,
+    pub(super) mc: super::inter::McScratch,
     pub(super) bd_y: u32,
     pub(super) bd_c: u32,
 }
@@ -194,6 +195,7 @@ impl<'a> Dec<'a> {
             ctb_x: 0,
             ctb_y: 0,
             coef: vec![0; 32 * 32],
+            mc: super::inter::McScratch::new(),
             bd_y: ctx.sps.bit_depth_luma,
             bd_c: ctx.sps.bit_depth_chroma,
         })
@@ -888,9 +890,9 @@ impl<'a> Dec<'a> {
         let maxv = (1i32 << bd) - 1;
         let p = &mut self.pic.frame.planes[plane];
         for yy in 0..n {
-            for xx in 0..n {
-                let v = p[(y + yy) * stride + x + xx] as i32 + self.coef[yy * n + xx];
-                p[(y + yy) * stride + x + xx] = v.clamp(0, maxv) as u16;
+            let row = &mut p[(y + yy) * stride + x..(y + yy) * stride + x + n];
+            for (d, &r) in row.iter_mut().zip(&self.coef[yy * n..yy * n + n]) {
+                *d = (*d as i32 + r).clamp(0, maxv) as u16;
             }
         }
         Ok(())
