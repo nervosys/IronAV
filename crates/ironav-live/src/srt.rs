@@ -79,6 +79,8 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
 const HANDSHAKE_RESEND: Duration = Duration::from_millis(250);
 /// How long a socket read waits before the timers are looked at.
 const POLL: Duration = Duration::from_millis(2);
+/// A pause between two ticks of this long is a stall of the receiving thread, in microseconds.
+const STALL: i64 = 100_000;
 const SRT_VERSION: u32 = 0x0001_0500;
 /// The extension field of a version 5 induction response.
 const MAGIC: u16 = 0x4a17;
@@ -540,6 +542,9 @@ struct Receiver {
     base: i64,
     win_min: i64,
     win_start: i64,
+    /// When `tick` last ran, and until when a gap is not given up on (see `tick`).
+    last_tick: i64,
+    grace_until: i64,
     rtt: i64,
     rttvar: i64,
     ack_no: u32,
@@ -582,6 +587,8 @@ impl Receiver {
             base: 0,
             win_min: 0,
             win_start: 0,
+            last_tick: 0,
+            grace_until: 0,
             rtt: 100_000,
             rttvar: 50_000,
             ack_no: 0,
@@ -919,7 +926,7 @@ impl Receiver {
                     // the first packet after the gap: if it is due, the gap is too late
                     let next = self.buf.iter().position(|s| matches!(s, Slot::Have { .. }));
                     match next {
-                        Some(j) if matches!(&self.buf[j], Slot::Have { ts, .. } if self.due(*ts, now)) => {
+                        Some(j) if now >= self.grace_until && matches!(&self.buf[j], Slot::Have { ts, .. } if self.due(*ts, now)) => {
                             for _ in 0..j {
                                 if let Some(Slot::Missing { .. }) = self.buf.pop_front() {
                                     self.stats.late += 1;
@@ -952,6 +959,14 @@ impl Receiver {
             self.state = State::Broken(format!("the sender sent nothing for {} s", EXPIRE / 1_000_000));
             return;
         }
+        // This thread was held up (a starved machine, a stopped process): the clock has run on
+        // while the gaps' retransmissions could not come, and every packet behind a gap would be
+        // due at once, so the gaps would be given up on before a NAK could be answered. They get
+        // a few round trips to be asked for again and filled before the too-late drop applies.
+        if self.last_tick != 0 && n - self.last_tick > STALL {
+            self.grace_until = n + 2 * self.rtt + 20_000;
+        }
+        self.last_tick = n;
         self.deliver(n);
         if n - self.last_ack_try >= ACK_PERIOD {
             self.last_ack_try = n;
@@ -1524,6 +1539,32 @@ mod tests {
         // 11 arriving now is of no use
         r.on_datagram(&data_packet(11, 10_000, 1, 0, b"b"), at(t0, 80));
         assert!(r.ready.is_empty() && r.buf.is_empty());
+    }
+
+    #[test]
+    fn a_stalled_receiver_asks_again_before_it_gives_a_gap_up() {
+        let (mut r, t0) = receiver(50, 10);
+        r.tick(at(t0, 1));
+        r.on_datagram(&data_packet(10, 0, 1, 0, b"a"), at(t0, 2));
+        r.on_datagram(&data_packet(12, 20_000, 1, 0, b"c"), at(t0, 22));
+        r.tick(at(t0, 30));
+        r.take_output();
+        // this thread is held up for a second: 12 is long due, but 11 could not come meanwhile
+        r.tick(at(t0, 1030));
+        assert_eq!(r.stats.late, 0);
+        assert_eq!(r.ready.drain(..).collect::<Vec<_>>(), vec![b"a".to_vec()]);
+        assert!(!naks(&r.take_output()).is_empty(), "the gap is asked for again");
+        r.on_datagram(&data_packet(11, 10_000, 1, 0, b"b"), at(t0, 1035));
+        r.tick(at(t0, 1040));
+        assert_eq!(r.ready.drain(..).collect::<Vec<_>>(), vec![b"b".to_vec(), b"c".to_vec()]);
+        assert_eq!(r.stats.late, 0);
+        // a gap that stays open after the grace is given up on as before
+        r.on_datagram(&data_packet(14, 40_000, 1, 0, b"e"), at(t0, 1041));
+        for ms in (1042..1500).step_by(40) {
+            r.tick(at(t0, ms));
+        }
+        assert_eq!(r.stats.late, 1);
+        assert_eq!(r.ready.drain(..).collect::<Vec<_>>(), vec![b"e".to_vec()]);
     }
 
     #[test]
