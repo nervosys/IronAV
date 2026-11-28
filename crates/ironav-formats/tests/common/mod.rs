@@ -44,9 +44,12 @@ pub fn comparable<'a>(file: &Path, format: &str, channels: usize, got_len: usize
     if format == "mp4" && !ffmpeg_at_least(9, 0) {
         let (lead_in, duration, packets) = edit(file);
         let end = lead_in.saturating_add(duration.unwrap_or(i64::MAX));
+        // whole packets: IronAV's last packet is already cut to the edit's end, so each counts at the
+        // full length (AC-3 and E-AC-3 packets are all the same length)
+        let full = packets.iter().copied().max().unwrap_or(0);
         let mut at = 0i64;
-        for d in packets {
-            at += d;
+        for _ in &packets {
+            at += full;
             if at >= end {
                 break;
             }
