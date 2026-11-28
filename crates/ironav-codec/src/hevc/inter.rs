@@ -3,6 +3,7 @@
 
 use super::frame::*;
 use super::ps::SliceType;
+use super::shared::SharedFrame;
 use super::slice::{bad, Dec, PartMode};
 use super::tables::*;
 use super::RefPic;
@@ -358,8 +359,9 @@ impl<'a> Dec<'a> {
         self.col_mv(col, (xc >> 4) << 4, (yc >> 4) << 4, ref_idx, list)
     }
 
-    fn col_mv(&self, col: &Frame, x: usize, y: usize, ref_idx: usize, list: usize) -> Option<[i16; 2]> {
-        let m = *col.mv.get((y >> 2) * col.w4 + (x >> 2))?;
+    fn col_mv(&self, col: &SharedFrame, x: usize, y: usize, ref_idx: usize, list: usize) -> Option<[i16; 2]> {
+        // waits for the collocated picture to have decoded and filtered that far
+        let m = col.mv((y >> 2) * col.w4 + (x >> 2))?;
         if m.pred & 3 == 0 {
             return None;
         }
@@ -468,13 +470,20 @@ impl<'a> Dec<'a> {
                     continue;
                 }
                 let r = refs[l].get(m.ref_idx[l] as usize).ok_or_else(|| bad("reference picture index is out of range"))?;
-                let f = &r.frame;
+                let f = &*r.frame;
                 let (pw, ph) = if c == 0 { (f.width, f.height) } else { (f.cwidth, f.cheight) };
                 let out = &mut pred[l][..bw * bh];
+                // The last row of this plane the interpolation reads (8 taps reach 3 rows above and 4 below,
+                // 4 taps 1 above and 2 below), as a number of luma rows. The reference picture may still be
+                // decoding: its rows become readable as they are final.
+                let dy = if c == 0 { (m.mv[l][1] >> 2) as i32 } else if sy == 1 { (m.mv[l][1] >> 3) as i32 } else { (m.mv[l][1] >> 2) as i32 };
+                let last = by as i32 + dy + bh as i32 + if c == 0 { 3 } else { 2 };
+                let rows = ((last + 1).max(0) as usize).min(ph) << if c == 0 { 0 } else { sy };
+                let plane = f.plane(c, rows);
                 if c == 0 {
-                    luma_mc_with(&f.planes[0], pw, ph, bx as i32, by as i32, m.mv[l], bw, bh, bd, out, pad, tmp);
+                    luma_mc_with(plane, pw, ph, bx as i32, by as i32, m.mv[l], bw, bh, bd, out, pad, tmp);
                 } else {
-                    chroma_mc_with(&f.planes[c], pw, ph, bx as i32, by as i32, m.mv[l], (sx, sy), bw, bh, bd, out, pad, tmp);
+                    chroma_mc_with(plane, pw, ph, bx as i32, by as i32, m.mv[l], (sx, sy), bw, bh, bd, out, pad, tmp);
                 }
             }
             let cw = if c == 0 { self.pic.frame.width } else { self.pic.frame.cwidth };

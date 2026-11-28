@@ -31,12 +31,13 @@ fn decode(data: &[u8], threads: usize) -> Vec<u8> {
     out
 }
 
-fn run_case(dir: &Path, name: &str, source: &str, pix_fmt: &str, x265: &str) {
+fn run_case(dir: &Path, name: &str, source: &str, pix_fmt: &str, x265: &str, frames: usize) {
     let stream = dir.join(format!("{name}.hevc"));
     let reference = dir.join(format!("{name}.yuv"));
     let (stream_s, reference_s) = (stream.to_str().unwrap(), reference.to_str().unwrap());
     let params = format!("log-level=none:{x265}");
-    let args = ["-f", "lavfi", "-i", source, "-frames:v", "10", "-pix_fmt", pix_fmt, "-c:v", "libx265", "-x265-params", &params, "-f", "hevc", stream_s];
+    let frames = frames.to_string();
+    let args = ["-f", "lavfi", "-i", source, "-frames:v", &frames, "-pix_fmt", pix_fmt, "-c:v", "libx265", "-x265-params", &params, "-f", "hevc", stream_s];
     if !ffmpeg(&args) {
         eprintln!("{name}: this FFmpeg cannot make the stream, skipped");
         return;
@@ -44,7 +45,7 @@ fn run_case(dir: &Path, name: &str, source: &str, pix_fmt: &str, x265: &str) {
     assert!(ffmpeg(&["-i", stream_s, "-pix_fmt", pix_fmt, "-f", "rawvideo", reference_s]), "{name}: FFmpeg cannot decode its own stream");
     let want = std::fs::read(&reference).unwrap();
     let data = std::fs::read(&stream).unwrap();
-    for threads in [1, 4] {
+    for threads in [1, 2, 3, 4, 8] {
         let got = decode(&data, threads);
         assert_eq!(got.len(), want.len(), "{name}, {threads} threads: the output is not the reference's size");
         if let Some(at) = got.iter().zip(&want).position(|(a, b)| a != b) {
@@ -88,9 +89,25 @@ fn matches_ffmpeg_on_streams_with_different_tools() {
         ("main10_no_loop_filters", noisy, p10, "no-deblock=1:no-sao=1:bframes=2"),
         ("main422_10", noisy, "yuv422p10le", "bframes=2"),
         ("main444", noisy, "yuv444p", "bframes=2"),
+        ("monochrome", noisy, "gray", "bframes=2"),
     ];
     for (name, source, pix_fmt, x265) in cases {
-        run_case(&dir, name, source, pix_fmt, x265);
+        run_case(&dir, name, source, pix_fmt, x265, 10);
+    }
+    // what frame threading depends on: a long GOP with B pictures in a pyramid (pictures that refer to
+    // pictures decoded just before them, and to ones further back), and vertical motion of 20 to 30 rows
+    // a picture (so a block waits for rows far below it in the reference)
+    let scrolling = "testsrc2=size=328x264:rate=30,scroll=v=0.1,noise=alls=8:allf=t";
+    let long: &[(&str, &str, &str, &str)] = &[
+        ("pyramid_bframes8", noisy, p8, "bframes=8:b-pyramid=1:ref=4:keyint=40"),
+        ("pyramid_bframes8_main10", noisy, p10, "bframes=8:b-pyramid=1:ref=3:keyint=40"),
+        ("large_vertical_motion", scrolling, p8, "bframes=3:ref=3:merange=128:keyint=40"),
+        ("large_vertical_motion_p", scrolling, p8, "bframes=0:ref=2:merange=128:keyint=40"),
+        ("slices_pyramid", noisy, p8, "slices=3:bframes=5:b-pyramid=1:keyint=40"),
+        ("temporal_mvp_off", noisy, p8, "no-temporal-mvp=1:bframes=4:keyint=40"),
+    ];
+    for (name, source, pix_fmt, x265) in long {
+        run_case(&dir, name, source, pix_fmt, x265, 36);
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

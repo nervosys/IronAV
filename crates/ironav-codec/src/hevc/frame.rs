@@ -23,9 +23,11 @@ impl MvField {
     }
 }
 
-/// A reconstructed picture, kept as a reference and for output.
+/// The samples of the picture being decoded, as they come out of reconstruction (before the loop filters).
 pub struct Frame {
     pub planes: [Vec<u16>; 3],
+    /// The planes after deblocking, before sample adaptive offset, kept while SAO needs them (empty until then).
+    pub snap: [Vec<u16>; 3],
     pub width: usize,
     pub height: usize,
     /// Chroma plane size (zero for monochrome).
@@ -125,6 +127,7 @@ impl CurPic {
             }
             None => Frame {
                 planes: [vec![mid(sps.bit_depth_luma); w * h], vec![mid(sps.bit_depth_chroma); cw * ch], vec![mid(sps.bit_depth_chroma); cw * ch]],
+                snap: [Vec::new(), Vec::new(), Vec::new()],
                 width: w,
                 height: h,
                 cwidth: cw,

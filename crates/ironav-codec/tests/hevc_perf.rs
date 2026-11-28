@@ -112,6 +112,18 @@ fn clip(profile: &str, pix_fmt: &str, n: usize) {
         assert!(first.is_none(), "{profile}, {label}: the output differs from FFmpeg's at byte {}", first.unwrap_or(0));
     }
     eprintln!("{profile}: identical to FFmpeg with one thread and with the default threads");
+    // IRONAV_HEVC_SWEEP: how the speed grows with the number of pictures decoded at once
+    if std::env::var_os("IRONAV_HEVC_SWEEP").is_some() {
+        let counts = [1usize, 2, 3, 4, 6, 8, 12, 16];
+        let mut secs = vec![Vec::new(); counts.len()];
+        for _ in 0..3 {
+            for (k, &t) in counts.iter().enumerate() {
+                secs[k].push(ironav_decode(&data, Some(t)).1);
+            }
+        }
+        let line: Vec<String> = counts.iter().zip(secs).map(|(t, s)| format!("{t}: {:.1}", got.len() as f64 / median(s))).collect();
+        eprintln!("{profile}: fps by threads (median of 3, alternating): {}", line.join(", "));
+    }
     let _ = std::fs::remove_file(&hevc);
 }
 

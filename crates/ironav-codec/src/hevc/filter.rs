@@ -1,26 +1,173 @@
 //! In-loop filters: the deblocking filter (ITU-T H.265 8.7.2) and sample adaptive offset (8.7.3).
 
 use super::frame::*;
-use super::pool::{Pool, ScopedJob};
 use super::ps::{Pps, Sps};
+use super::shared::Publisher;
 use super::tables::{BETA_TABLE, QP_C_TABLE, TC_TABLE};
 
-/// Runs the loop filters over a decoded picture, on the threads of `pool` if there is one.
-pub(super) fn run(pic: &mut CurPic, sps: &Sps, pps: &Pps, geo: &Geometry, pool: Option<&Pool>) {
+/// Runs the loop filters over a whole decoded picture, in place.
+pub(super) fn run(pic: &mut CurPic, sps: &Sps, pps: &Pps, geo: &Geometry) {
     if pic.slices.iter().any(|s| !s.deblocking_disabled) {
-        deblock(pic, sps, pps, geo, pool);
+        deblock(pic, sps, pps, geo);
     }
     if sps.sao && pic.sao.iter().any(|s| s.kind != [0; 3]) {
-        sao(pic, sps, pps, geo, pool);
+        sao(pic, sps, pps, geo);
     }
 }
 
-/// How many bands of a multiple of `unit` rows to cut `rows` rows into for the threads of `pool`, and how
-/// many rows each has.
-fn bands(rows: usize, unit: usize, pool: Option<&Pool>) -> (usize, usize) {
-    // a band is at least two units, or handing it to a thread costs more than it saves
-    let per = rows.div_ceil(pool.map_or(1, |p| p.width())).max(unit * 2).div_ceil(unit) * unit;
-    (rows.div_ceil(per), per)
+/// Whether the loop filters can follow the decoding row by row: the CTBs must be decoded in raster order
+/// (one tile column) and no sample may be exempt from the filters (those pictures are filtered whole).
+pub(super) fn can_follow(sps: &Sps, pps: &Pps) -> bool {
+    pps.num_tile_cols == 1 && !(sps.pcm && sps.pcm_loop_filter_disabled) && !pps.transquant_bypass
+}
+
+/// The loop filters run a CTB row behind the decoding, on a copy of the picture that readers of the
+/// picture see row by row as it becomes final.
+///
+/// When CTB row `r` is decoded, its samples are copied (unfiltered, so that the intra prediction in the
+/// next row still reads the originals) into the published picture's unpublished rows; its vertical edges
+/// are deblocked, then its horizontal ones, which change up to three rows of the row above. Rows more than
+/// three above the next CTB row are final after deblocking. SAO of row `r - 1` follows: it reads the
+/// deblocked rows around it, kept in `snap`, and writes its own rows in place, which are then final.
+pub(super) struct RowFilter {
+    out: Publisher,
+    /// CTB rows decoded and deblocked so far, and CTB rows that SAO has been applied to.
+    decoded: usize,
+    saoed: usize,
+    /// Rows of each plane copied into `snap`.
+    snapped: [usize; 3],
+    snap: [Vec<u16>; 3],
+}
+
+impl RowFilter {
+    pub(super) fn new(out: Publisher, snap: [Vec<u16>; 3]) -> Self {
+        RowFilter { out, decoded: 0, saoed: 0, snapped: [0; 3], snap }
+    }
+
+    pub(super) fn into_snap(self) -> [Vec<u16>; 3] {
+        self.snap
+    }
+
+    pub(super) fn out(&self) -> &Publisher {
+        &self.out
+    }
+
+    /// The first `rows` CTB rows of `pic` are decoded.
+    pub(super) fn rows_decoded(&mut self, pic: &CurPic, sps: &Sps, pps: &Pps, geo: &Geometry, rows: usize) {
+        while self.decoded < rows.min(sps.ctb_h) {
+            self.step(pic, sps, pps, geo, self.decoded);
+            self.decoded += 1;
+        }
+    }
+
+    /// All of `pic` is decoded: filters what is left and publishes it all.
+    pub(super) fn finish(&mut self, pic: &CurPic, sps: &Sps, pps: &Pps, geo: &Geometry) {
+        self.rows_decoded(pic, sps, pps, geo, sps.ctb_h);
+        let d = self.out.rows();
+        let ncomp = if sps.chroma_format_idc == 0 { 1 } else { 3 };
+        let mut tails = self.out.tails();
+        if sps.sao {
+            for c in 0..ncomp {
+                let (s, ph, pw) = plane_dims(pic, sps, c);
+                copy_snap(&mut self.snap[c], &mut self.snapped[c], tails[c], d >> s, pw, ph, ph);
+            }
+            while self.saoed < sps.ctb_h {
+                Self::sao_row(&self.snap, pic, sps, pps, geo, &mut tails, d, self.saoed);
+                self.saoed += 1;
+            }
+        }
+        self.out.advance(sps.height, &pic.frame.mv);
+    }
+
+    fn step(&mut self, pic: &CurPic, sps: &Sps, pps: &Pps, geo: &Geometry, r: usize) {
+        let c = 1usize << sps.log2_ctb;
+        let (y0, y1) = (r * c, ((r + 1) * c).min(sps.height));
+        let d = self.out.rows();
+        let (_, sy) = sps.chroma_shift();
+        let ncomp = if sps.chroma_format_idc == 0 { 1 } else { 3 };
+        let mut tails = self.out.tails();
+        // the row's samples as reconstructed
+        for k in 0..ncomp {
+            let (s, ph, pw) = plane_dims(pic, sps, k);
+            let (a, b) = (y0 >> s, if y1 == sps.height { ph } else { y1 >> s });
+            let d_k = if k == 0 { d } else { d >> sy };
+            tails[k][(a - d_k) * pw..(b - d_k) * pw].copy_from_slice(&pic.frame.planes[k][a * pw..b * pw]);
+        }
+        if pic.slices.iter().any(|s| !s.deblocking_disabled) {
+            let CurPic { frame, edges, pred_mode, nz, nofilter, qp, slices, ctb_slice_idx, ctb_slice_addr, w4, .. } = pic;
+            let db = Deblock { sps, pps, geo, edges, pred_mode, nz, nofilter, qp, mv: &frame.mv, slices, ctb_slice_idx, ctb_slice_addr, w4: *w4, width: frame.width, cwidth: frame.cwidth };
+            let [ty, tcb, tcr] = &mut tails;
+            for vertical in [true, false] {
+                db.pass(vertical, y0 / 4..y1 / 4, &mut [&mut **ty, &mut **tcb, &mut **tcr], d, d >> sy);
+            }
+        }
+        if sps.sao {
+            for k in 0..ncomp {
+                let (s, ph, pw) = plane_dims(pic, sps, k);
+                // deblocked for good up to and including the first row of this CTB row
+                copy_snap(&mut self.snap[k], &mut self.snapped[k], tails[k], d >> s, pw, ph, (y0 >> s) + 1);
+            }
+            if r >= 1 {
+                Self::sao_row(&self.snap, pic, sps, pps, geo, &mut tails, d, r - 1);
+                self.saoed = r;
+            }
+        }
+        // what is final: with SAO the rows above this CTB row; without, the rows of this one less the
+        // few that the next row's top edge may change
+        let done = if sps.sao { y0 } else { y1 - 4 };
+        self.out.advance(done, &pic.frame.mv);
+    }
+
+    /// SAO of CTB row `ry`, on the unpublished rows `tails` (which start at luma row `d`).
+    #[allow(clippy::too_many_arguments)]
+    fn sao_row(snap: &[Vec<u16>; 3], pic: &CurPic, sps: &Sps, pps: &Pps, geo: &Geometry, tails: &mut [&mut [u16]; 3], d: usize, ry: usize) {
+        let ncomp = if sps.chroma_format_idc == 0 { 1 } else { 3 };
+        let CurPic { sao, slices, ctb_slice_addr, ctb_slice_idx, .. } = pic;
+        let meta = SaoMeta { sao, slices, ctb_slice_addr, ctb_slice_idx };
+        for c in 0..ncomp {
+            let (sx, sy) = if c == 0 { (0, 0) } else { sps.chroma_shift() };
+            let (pw, ph) = if c == 0 { (pic.frame.width, pic.frame.height) } else { (pic.frame.cwidth, pic.frame.cheight) };
+            let bd = if c == 0 { sps.bit_depth_luma } else { sps.bit_depth_chroma };
+            let maxv = (1i32 << bd) - 1;
+            let ch_ctb = (1usize << sps.log2_ctb) >> sy;
+            let cw_ctb = (1usize << sps.log2_ctb) >> sx;
+            let row0 = d >> sy;
+            for rx in 0..sps.ctb_w {
+                let s = meta.sao[ry * sps.ctb_w + rx];
+                if s.kind[c] == 0 {
+                    continue;
+                }
+                let (x0, y0) = (rx * cw_ctb, ry * ch_ctb);
+                let (x1, y1) = ((x0 + cw_ctb).min(pw), (y0 + ch_ctb).min(ph));
+                // log2_sao_offset_scale is 0: the range extension that sets it is refused
+                let offs: [i32; 4] = std::array::from_fn(|i| s.offset[c][i] as i32);
+                sao_ctb(&meta, sps, pps, geo, c, rx, ry, (x0, y0, x1, y1), pw, &snap[c], tails[c], row0, offs, maxv, bd);
+            }
+        }
+    }
+}
+
+/// Copies the rows of a plane (`pw` wide, `ph` high) up to row `upto` from the unpublished rows `tail`,
+/// which start at row `tail_row`, into `snap`, of which the first `*snapped` rows are copied already.
+fn copy_snap(snap: &mut Vec<u16>, snapped: &mut usize, tail: &[u16], tail_row: usize, pw: usize, ph: usize, upto: usize) {
+    let from = *snapped;
+    if snap.len() != pw * ph {
+        snap.resize(pw * ph, 0);
+    }
+    if upto <= from {
+        return;
+    }
+    snap[from * pw..upto * pw].copy_from_slice(&tail[(from - tail_row) * pw..(upto - tail_row) * pw]);
+    *snapped = upto;
+}
+
+/// The vertical shift, height and width of component `c` of `pic`.
+fn plane_dims(pic: &CurPic, sps: &Sps, c: usize) -> (usize, usize, usize) {
+    if c == 0 {
+        (0, pic.frame.height, pic.frame.width)
+    } else {
+        (sps.chroma_shift().1, pic.frame.cheight, pic.frame.cwidth)
+    }
 }
 
 fn mv_far(a: [i16; 2], b: [i16; 2]) -> bool {
@@ -246,68 +393,21 @@ impl Deblock<'_> {
     }
 }
 
-/// Cuts a plane into consecutive chunks, chunk k starting at sample `starts[k]` (`starts[0]` is 0).
-fn split_chunks<'p>(mut plane: &'p mut [u16], starts: &[usize]) -> Vec<&'p mut [u16]> {
-    let mut out = Vec::with_capacity(starts.len());
-    let mut taken = 0;
-    for k in 0..starts.len() {
-        let end = if k + 1 < starts.len() { starts[k + 1].min(taken + plane.len()) } else { taken + plane.len() };
-        let (a, b) = std::mem::take(&mut plane).split_at_mut(end - taken);
-        taken = end;
-        plane = b;
-        out.push(a);
-    }
-    out
-}
-
-pub(super) fn deblock(pic: &mut CurPic, sps: &Sps, pps: &Pps, geo: &Geometry, pool: Option<&Pool>) {
-    let (w4, h4) = (pic.w4, pic.h4);
-    let (_, sy) = sps.chroma_shift();
+/// Deblocks a whole picture in place.
+pub(super) fn deblock(pic: &mut CurPic, sps: &Sps, pps: &Pps, geo: &Geometry) {
+    let h4 = pic.h4;
+    let w4 = pic.w4;
     let CurPic { frame, edges, pred_mode, nz, nofilter, qp, slices, ctb_slice_idx, ctb_slice_addr, .. } = pic;
     let [pl_y, pl_cb, pl_cr] = &mut frame.planes;
     let (width, cwidth) = (frame.width, frame.cwidth);
     let db = Deblock { sps, pps, geo, edges, pred_mode, nz, nofilter, qp, mv: &frame.mv, slices, ctb_slice_idx, ctb_slice_addr, w4, width, cwidth };
-    // Bands of `per` luma rows (a multiple of 16, so of 8 chroma rows). The vertical edges of a band touch
-    // only its own rows. A horizontal edge touches the 4 rows above it and the 4 below, but changes 3 at
-    // most on each side and they are 8 rows apart, so a band that starts 4 rows above its first edge
-    // does not overlap its neighbours.
-    let (nb, per) = bands(h4 * 4, 16, pool);
     for vertical in [true, false] {
-        if nb <= 1 {
-            db.pass(vertical, 0..h4, &mut [&mut pl_y[..], &mut pl_cb[..], &mut pl_cr[..]], 0, 0);
-            continue;
-        }
-        let first_row = |k: usize, shift: usize| -> usize {
-            let r = (k * per) >> shift;
-            if k == 0 || vertical {
-                r
-            } else {
-                r - 4
-            }
-        };
-        let starts = |shift: usize, stride: usize| -> Vec<usize> { (0..nb).map(|k| first_row(k, shift) * stride).collect() };
-        let (cy, ccb, ccr) = (split_chunks(pl_y, &starts(0, width)), split_chunks(pl_cb, &starts(sy, cwidth)), split_chunks(pl_cr, &starts(sy, cwidth)));
-        let db = &db;
-        let jobs: Vec<ScopedJob> = cy
-            .into_iter()
-            .zip(ccb)
-            .zip(ccr)
-            .enumerate()
-            .map(|(k, ((a, b), c))| -> ScopedJob {
-                let (row0, crow0) = (first_row(k, 0), first_row(k, sy));
-                let rows = k * per / 4..((k + 1) * per / 4).min(h4);
-                Box::new(move || db.pass(vertical, rows, &mut [a, b, c], row0, crow0))
-            })
-            .collect();
-        pool.expect("more than one band means a pool").run(jobs);
+        db.pass(vertical, 0..h4, &mut [&mut pl_y[..], &mut pl_cb[..], &mut pl_cr[..]], 0, 0);
     }
 }
 
-thread_local! {
-    static SAO_SRC: std::cell::RefCell<Vec<u16>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-pub(super) fn sao(pic: &mut CurPic, sps: &Sps, pps: &Pps, geo: &Geometry, pool: Option<&Pool>) {
+/// Sample adaptive offset over a whole picture, in place.
+pub(super) fn sao(pic: &mut CurPic, sps: &Sps, pps: &Pps, geo: &Geometry) {
     let ncomp = if sps.chroma_format_idc == 0 { 1 } else { 3 };
     let l = sps.log2_ctb;
     for c in 0..ncomp {
@@ -318,15 +418,15 @@ pub(super) fn sao(pic: &mut CurPic, sps: &Sps, pps: &Pps, geo: &Geometry, pool: 
         let (pw, ph) = if c == 0 { (pic.frame.width, pic.frame.height) } else { (pic.frame.cwidth, pic.frame.cheight) };
         let bd = if c == 0 { sps.bit_depth_luma } else { sps.bit_depth_chroma };
         // the plane before SAO, in a buffer kept between pictures (a fresh 4 MB allocation costs page faults)
-        let mut src = SAO_SRC.with(|b| std::mem::take(&mut *b.borrow_mut()));
+        let mut src = std::mem::take(&mut pic.frame.snap[c]);
         src.clear();
         src.extend_from_slice(&pic.frame.planes[c]);
         // without PCM or transquant bypass blocks no sample is exempt, and whole rows can be filtered at once
         let no_bypass = !pic.nofilter.iter().any(|&v| v != 0);
         let maxv = (1i32 << bd) - 1;
         if no_bypass {
-            sao_plane(pic, sps, pps, geo, c, &src, pool);
-            SAO_SRC.with(|b| *b.borrow_mut() = src);
+            sao_plane(pic, sps, pps, geo, c, &src);
+            pic.frame.snap[c] = src;
             continue;
         }
         // log2_sao_offset_scale: 0 unless the PPS range extension sets it, which is refused. (The first
@@ -417,7 +517,7 @@ pub(super) fn sao(pic: &mut CurPic, sps: &Sps, pps: &Pps, geo: &Geometry, pool: 
                 }
             }
         }
-        SAO_SRC.with(|b| *b.borrow_mut() = src);
+        pic.frame.snap[c] = src;
     }
 }
 
@@ -485,9 +585,8 @@ struct SaoMeta<'a> {
     ctb_slice_idx: &'a [u16],
 }
 
-/// SAO of one component for a picture with no exempt samples, with the CTB rows split over threads. `src`
-/// is the plane before SAO.
-fn sao_plane(pic: &mut CurPic, sps: &Sps, pps: &Pps, geo: &Geometry, c: usize, src: &[u16], pool: Option<&Pool>) {
+/// SAO of one component for a picture with no exempt samples. `src` is the plane before SAO.
+fn sao_plane(pic: &mut CurPic, sps: &Sps, pps: &Pps, geo: &Geometry, c: usize, src: &[u16]) {
     let (sx, sy) = if c == 0 { (0, 0) } else { sps.chroma_shift() };
     let (pw, ph) = if c == 0 { (pic.frame.width, pic.frame.height) } else { (pic.frame.cwidth, pic.frame.cheight) };
     let bd = if c == 0 { sps.bit_depth_luma } else { sps.bit_depth_chroma };
@@ -495,36 +594,21 @@ fn sao_plane(pic: &mut CurPic, sps: &Sps, pps: &Pps, geo: &Geometry, c: usize, s
     let ch_ctb = (1usize << sps.log2_ctb) >> sy;
     let CurPic { frame, sao, slices, ctb_slice_addr, ctb_slice_idx, .. } = pic;
     let meta = SaoMeta { sao, slices, ctb_slice_addr, ctb_slice_idx };
-    let (nb, per) = bands(sps.ctb_h, 1, pool);
-    let starts: Vec<usize> = (0..nb).map(|k| k * per * ch_ctb * pw).collect();
-    let chunks = split_chunks(&mut frame.planes[c], &starts);
-    let rows = |dst: &mut [u16], k: usize| {
-        let (r0, r1) = (k * per, ((k + 1) * per).min(sps.ctb_h));
-        let row0 = r0 * ch_ctb;
-        for ry in r0..r1 {
-            for rx in 0..sps.ctb_w {
-                let s = meta.sao[ry * sps.ctb_w + rx];
-                if s.kind[c] == 0 {
-                    continue;
-                }
-                let cw_ctb = (1usize << sps.log2_ctb) >> sx;
-                let (x0, y0) = (rx * cw_ctb, ry * ch_ctb);
-                let (x1, y1) = ((x0 + cw_ctb).min(pw), (y0 + ch_ctb).min(ph));
-                // log2_sao_offset_scale is 0: the range extension that sets it is refused
-                let offs: [i32; 4] = std::array::from_fn(|i| s.offset[c][i] as i32);
-                sao_ctb(&meta, sps, pps, geo, c, rx, ry, (x0, y0, x1, y1), pw, src, dst, row0, offs, maxv, bd);
+    let dst = &mut frame.planes[c][..];
+    for ry in 0..sps.ctb_h {
+        for rx in 0..sps.ctb_w {
+            let s = meta.sao[ry * sps.ctb_w + rx];
+            if s.kind[c] == 0 {
+                continue;
             }
+            let cw_ctb = (1usize << sps.log2_ctb) >> sx;
+            let (x0, y0) = (rx * cw_ctb, ry * ch_ctb);
+            let (x1, y1) = ((x0 + cw_ctb).min(pw), (y0 + ch_ctb).min(ph));
+            // log2_sao_offset_scale is 0: the range extension that sets it is refused
+            let offs: [i32; 4] = std::array::from_fn(|i| s.offset[c][i] as i32);
+            sao_ctb(&meta, sps, pps, geo, c, rx, ry, (x0, y0, x1, y1), pw, src, dst, 0, offs, maxv, bd);
         }
-    };
-    if nb <= 1 {
-        for (k, dst) in chunks.into_iter().enumerate() {
-            rows(dst, k);
-        }
-        return;
     }
-    let rows = &rows;
-    let jobs: Vec<ScopedJob> = chunks.into_iter().enumerate().map(|(k, dst)| -> ScopedJob { Box::new(move || rows(dst, k)) }).collect();
-    pool.expect("more than one band means a pool").run(jobs);
 }
 
 /// Sample adaptive offset of one CTB of component `c`, for a picture with no exempt samples. `region` is

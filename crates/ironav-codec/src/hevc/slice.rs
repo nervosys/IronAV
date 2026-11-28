@@ -102,6 +102,8 @@ pub struct Dec<'a> {
     pub(super) poc: i32,
     pub(super) cab: Cabac<'a>,
     pub(super) pic: &'a mut CurPic,
+    /// Called with the number of CTB rows decoded each time one is completed.
+    on_row: Option<&'a mut (dyn FnMut(&CurPic, usize) + 'a)>,
     scans: &'static Scans,
     init: &'static [u8; HEVC_CONTEXTS],
     slice_qp: i32,
@@ -177,6 +179,7 @@ impl<'a> Dec<'a> {
             poc: ctx.poc,
             cab,
             pic,
+            on_row: None,
             scans: Scans::get(),
             init,
             slice_qp,
@@ -199,6 +202,12 @@ impl<'a> Dec<'a> {
             bd_y: ctx.sps.bit_depth_luma,
             bd_c: ctx.sps.bit_depth_chroma,
         })
+    }
+
+    /// Has `on_row` called as each CTB row is decoded.
+    pub fn with_row_hook(mut self, on_row: &'a mut (dyn FnMut(&CurPic, usize) + 'a)) -> Self {
+        self.on_row = Some(on_row);
+        self
     }
 
     #[inline]
@@ -273,6 +282,11 @@ impl<'a> Dec<'a> {
             let (x0, y0) = (self.ctb_x << sps.log2_ctb, self.ctb_y << sps.log2_ctb);
             self.coding_quadtree(x0, y0, sps.log2_ctb, 0)?;
             self.pic.ctbs_done += 1;
+            if self.ctb_x + 1 == sps.ctb_w {
+                if let Some(h) = self.on_row.as_mut() {
+                    h(self.pic, self.ctb_y + 1);
+                }
+            }
             let end = self.cab.terminate() == 1;
             if pps.entropy_sync && (self.ctb_x == 1 || (self.ctb_x > 1 && self.geo.tile_id[self.geo.rs_to_ts[rs - 2]] != tile && self.geo.tile_id[self.geo.rs_to_ts[rs - 1]] == tile)) {
                 carry.wpp_ctx = Some(self.cab.contexts());

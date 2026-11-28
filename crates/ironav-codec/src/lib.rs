@@ -422,7 +422,9 @@ fn gcd(a: i64, b: i64) -> i64 {
 pub struct DecoderOptions {
     /// Output each picture as soon as nothing earlier can still arrive, for live sources. H.264
     /// that does not declare its reordering depth then starts with none and learns it (see
-    /// [`h264::H264Decoder::low_delay`]); HEVC always declares it, and other codecs do not reorder.
+    /// [`h264::H264Decoder::low_delay`]); HEVC always declares it, but decodes on the caller's thread so
+    /// that a picture comes out on the call that completes it ([`hevc::HevcDecoder::low_delay`]); other
+    /// codecs do not reorder.
     pub low_delay: bool,
 }
 
@@ -433,6 +435,10 @@ pub fn new_decoder_with(s: &ironav_core::StreamInfo, o: &DecoderOptions) -> Resu
     #[cfg(feature = "h264")]
     if o.low_delay && s.codec == CodecId::H264 {
         return Ok(Box::new(h264::H264Decoder::low_delay()));
+    }
+    #[cfg(feature = "hevc")]
+    if o.low_delay && s.codec == CodecId::Hevc {
+        return Ok(Box::new(hevc::HevcDecoder::low_delay()));
     }
     new_decoder_for(s)
 }

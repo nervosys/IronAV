@@ -278,10 +278,10 @@ impl HevcEncoder {
         for (i, (rows, (part, _))) in bands.iter().zip(&coded).enumerate() {
             merge(&mut pic, &part.pic, rows, ctb_w, nctb, i as u16);
         }
-        filter::deblock(&mut pic, sps, pps, geo, None);
+        filter::deblock(&mut pic, sps, pps, geo);
         pic.sao = sao::decide(&pic, src, sps, lambda_for(qp));
         if pic.sao.iter().any(|s| s.kind != [0; 3]) {
-            filter::sao(&mut pic, sps, pps, geo, None);
+            filter::sao(&mut pic, sps, pps, geo);
         }
         let mut data = Vec::new();
         if idr {
@@ -518,30 +518,137 @@ mod tests {
         assert_eq!(pts, [0, 4, 1, 2, 3, 8, 5, 6, 7, 9]);
     }
 
-    /// Loop filtering on several threads gives the same pictures as on one.
+    /// Decodes `pkts` one packet at a time, flushing at the end; every plane of every picture.
+    fn decode_planes(mut d: HevcDecoder, pkts: &[Packet]) -> Vec<Vec<Vec<u8>>> {
+        let mut out = Vec::new();
+        for p in pkts {
+            out.extend(d.decode(p).unwrap());
+        }
+        out.extend(d.flush().unwrap());
+        out.into_iter()
+            .map(|f| match f {
+                OutFrame::Video(v) => v.planes,
+                _ => panic!("video"),
+            })
+            .collect()
+    }
+
+    /// Decoding several pictures at once (frame threading, the loop filters following the decoding row by
+    /// row) gives the same pictures as one thread, for any number of threads, and the same as filtering
+    /// each picture whole.
     #[test]
-    fn threaded_loop_filters_match_one_thread() {
-        let (w, h, frames) = (200u32, 300u32, 6u32);
+    fn threaded_decoding_matches_one_thread() {
+        let (w, h, frames) = (200u32, 300u32, 14u32);
         let params = StreamParams::Video { width: w, height: h, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational::new(25, 1) };
-        let mut enc = HevcEncoder::new(&params, Some(27), None).unwrap().with_bframes(2);
+        let mut enc = HevcEncoder::new(&params, Some(27), None).unwrap().with_bframes(3);
         let pkts = encode_all(&mut enc, w, h, frames);
-        let run = |threads: usize| -> Vec<Vec<Vec<u8>>> {
-            let mut d = HevcDecoder::with_threads(threads);
-            let mut out = Vec::new();
-            for p in &pkts {
-                out.extend(d.decode(p).unwrap());
-            }
-            out.extend(d.flush().unwrap());
-            out.into_iter()
-                .map(|f| match f {
-                    OutFrame::Video(v) => v.planes,
-                    _ => panic!("video"),
-                })
-                .collect()
-        };
-        let one = run(1);
+        let one = decode_planes(HevcDecoder::with_threads(1), &pkts);
         assert_eq!(one.len(), frames as usize);
-        assert_eq!(one, run(4));
+        assert_eq!(one, decode_planes(HevcDecoder::with_threads(1).with_whole_picture_filters(), &pkts), "filters following the decoding, or not");
+        for threads in [2, 3, 4, 8] {
+            assert_eq!(one, decode_planes(HevcDecoder::with_threads(threads), &pkts), "{threads} threads");
+            assert_eq!(one, decode_planes(HevcDecoder::with_threads(threads).with_whole_picture_filters(), &pkts), "{threads} threads, whole-picture filters");
+        }
+    }
+
+    /// In low-delay mode a stream without reordering gives one picture per call, the call that completes
+    /// it, and the same pictures as the threaded decoder.
+    #[test]
+    fn low_delay_outputs_each_picture_on_its_call() {
+        let (w, h, frames) = (200u32, 300u32, 8u32);
+        let params = StreamParams::Video { width: w, height: h, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational::new(25, 1) };
+        let mut enc = HevcEncoder::new(&params, Some(27), None).unwrap();
+        let pkts = encode_all(&mut enc, w, h, frames);
+        let mut d = HevcDecoder::low_delay();
+        let mut out = Vec::new();
+        for (i, p) in pkts.iter().enumerate() {
+            let got = d.decode(p).unwrap();
+            assert_eq!(got.len(), 1, "packet {i}");
+            out.extend(got);
+        }
+        assert!(d.flush().unwrap().is_empty());
+        let planes: Vec<Vec<Vec<u8>>> = out
+            .into_iter()
+            .map(|f| match f {
+                OutFrame::Video(v) => v.planes,
+                _ => panic!("video"),
+            })
+            .collect();
+        assert_eq!(planes, decode_planes(HevcDecoder::with_threads(4), &pkts));
+    }
+
+    /// A reset (a seek) with pictures still being decoded on other threads drops them and starts clean.
+    #[test]
+    fn reset_with_threads_in_flight_starts_clean() {
+        let (w, h, frames) = (200u32, 300u32, 14u32);
+        let params = StreamParams::Video { width: w, height: h, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational::new(25, 1) };
+        let mut enc = HevcEncoder::new(&params, Some(27), None).unwrap().with_bframes(3);
+        let pkts = encode_all(&mut enc, w, h, frames);
+        let want = decode_planes(HevcDecoder::with_threads(1), &pkts);
+        let mut d = HevcDecoder::with_threads(4);
+        for p in &pkts[..7] {
+            d.decode(p).unwrap();
+        }
+        assert!(d.reset());
+        let mut out = Vec::new();
+        for p in &pkts {
+            out.extend(d.decode(p).unwrap());
+        }
+        out.extend(d.flush().unwrap());
+        let got: Vec<Vec<Vec<u8>>> = out
+            .into_iter()
+            .map(|f| match f {
+                OutFrame::Video(v) => v.planes,
+                _ => panic!("video"),
+            })
+            .collect();
+        assert_eq!(want, got);
+    }
+
+    /// Damaged data with several threads ends with an error or with pictures, never in a hang: pictures
+    /// wait for the rows of the pictures they refer to, and those are published even when decoding fails.
+    #[test]
+    fn corrupt_streams_do_not_hang_threads() {
+        let (w, h, frames) = (200u32, 300u32, 14u32);
+        let params = StreamParams::Video { width: w, height: h, pix_fmt: PixelFormat::Yuv420p, frame_rate: Rational::new(25, 1) };
+        let mut enc = HevcEncoder::new(&params, Some(27), None).unwrap().with_bframes(3);
+        let pkts = encode_all(&mut enc, w, h, frames);
+        for seed in 0..24u32 {
+            let mut pkts = pkts.clone();
+            let mut x = seed.wrapping_mul(2654435761).wrapping_add(12345);
+            let mut next = || {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x
+            };
+            // damage a few packets: flip bytes, or cut one short
+            for _ in 0..3 {
+                let i = next() as usize % pkts.len();
+                let len = pkts[i].data.len();
+                if next() % 4 == 0 {
+                    pkts[i].data.truncate(len / 2);
+                } else {
+                    for _ in 0..4 {
+                        let at = 8 + next() as usize % (len - 8);
+                        pkts[i].data[at] ^= (next() % 255 + 1) as u8;
+                    }
+                }
+            }
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut d = HevcDecoder::with_threads(4);
+                let mut n = 0;
+                for p in &pkts {
+                    // an error is fine; the decoder must go on with what follows
+                    n += d.decode(p).map_or(0, |f| f.len());
+                }
+                n += d.flush().map_or(0, |f| f.len());
+                let _ = d.reset();
+                let _ = tx.send(n);
+            });
+            assert!(rx.recv_timeout(std::time::Duration::from_secs(60)).is_ok(), "seed {seed}: decoding with threads hung or panicked");
+        }
     }
 
     /// A bit rate steers the quantiser: the stream lands within a factor of two of its target.
