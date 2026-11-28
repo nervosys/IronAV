@@ -38,7 +38,7 @@
 use crate::auth::random_bytes;
 use crate::net::{self, Allow};
 use crate::sha1::sha1;
-use crate::source::{host_port, Chunk, Source, SourceInfo, ThreadSource};
+use crate::source::{host_port, Chunk, Source, SourceInfo, SourceStats, ThreadSource};
 use crate::url::{percent_decode, SourceUrl};
 use ic_cipher::keywrap::{Aes128Kw, Aes192Kw, Aes256Kw};
 use ic_cipher::{Aes128, Aes192, Aes256};
@@ -49,7 +49,7 @@ use std::io::ErrorKind;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 mod send;
@@ -494,19 +494,6 @@ enum State {
     Broken(String),
 }
 
-#[derive(Debug, Clone, Default)]
-#[cfg_attr(not(test), allow(dead_code))]
-struct Stats {
-    received: u64,
-    /// Arrived after being reported missing.
-    recovered: u64,
-    /// Never came in time: skipped when a later packet was due.
-    late: u64,
-    duplicates: u64,
-    /// Out of the window, too big for the buffer, or encrypted in a way that could not be read.
-    discarded: u64,
-}
-
 struct RxConfig {
     my_id: u32,
     peer_id: u32,
@@ -562,7 +549,7 @@ struct Receiver {
     bps: u32,
     bad_run: u32,
     state: State,
-    stats: Stats,
+    stats: SourceStats,
 }
 
 impl Receiver {
@@ -606,7 +593,7 @@ impl Receiver {
             bps: 0,
             bad_run: 0,
             state: State::Open,
-            stats: Stats::default(),
+            stats: SourceStats::default(),
         }
     }
 
@@ -1222,8 +1209,9 @@ fn accept(sock: &UdpSocket, o: &Options, stop: &AtomicBool) -> std::io::Result<O
 // The source
 
 /// Runs a connection until it ends: datagrams in, protocol, payloads on to `tx`.
-fn pump(sock: &UdpSocket, peer: SocketAddr, mut rx: Receiver, tx: &SyncSender<std::io::Result<Vec<u8>>>, stop: &AtomicBool) {
+fn pump(sock: &UdpSocket, peer: SocketAddr, mut rx: Receiver, tx: &SyncSender<std::io::Result<Vec<u8>>>, stop: &AtomicBool, shared: &Mutex<SourceStats>) {
     let mut buf = vec![0u8; MAX_DATAGRAM];
+    let mut shown = SourceStats::default();
     loop {
         if stop.load(Ordering::Relaxed) {
             let _ = sock.send_to(&rx.shutdown_packet(Instant::now()), peer);
@@ -1240,6 +1228,10 @@ fn pump(sock: &UdpSocket, peer: SocketAddr, mut rx: Receiver, tx: &SyncSender<st
             }
         }
         rx.tick(Instant::now());
+        if rx.stats != shown {
+            shown = rx.stats;
+            *shared.lock().unwrap_or_else(|e| e.into_inner()) = shown;
+        }
         for p in rx.take_output() {
             let _ = sock.send_to(&p, peer);
         }
@@ -1281,6 +1273,7 @@ fn pump(sock: &UdpSocket, peer: SocketAddr, mut rx: Receiver, tx: &SyncSender<st
 pub(crate) struct SrtSource {
     inner: ThreadSource,
     stop: Arc<AtomicBool>,
+    stats: Arc<Mutex<SourceStats>>,
 }
 
 impl Drop for SrtSource {
@@ -1295,6 +1288,9 @@ impl Source for SrtSource {
     }
     fn read(&mut self, buf: &mut [u8], wait: Duration) -> Result<Chunk> {
         self.inner.read(buf, wait)
+    }
+    fn stats(&self) -> Option<SourceStats> {
+        Some(*self.stats.lock().unwrap_or_else(|e| e.into_inner()))
     }
 }
 
@@ -1321,6 +1317,8 @@ pub(crate) fn open(u: &SourceUrl, shown: String) -> Result<SrtSource> {
     let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = sync_channel(256);
     let flag = stop.clone();
+    let stats = Arc::new(Mutex::new(SourceStats::default()));
+    let shared = stats.clone();
     std::thread::Builder::new()
         .name("ironav-srt".into())
         .spawn(move || {
@@ -1339,10 +1337,10 @@ pub(crate) fn open(u: &SourceUrl, shown: String) -> Result<SrtSource> {
                     }
                 },
             };
-            pump(&sock, peer, receiver, &tx, &flag);
+            pump(&sock, peer, receiver, &tx, &flag, &shared);
         })
         .expect("spawning a thread");
-    Ok(SrtSource { inner: ThreadSource::from_channel(info, rx), stop })
+    Ok(SrtSource { inner: ThreadSource::from_channel(info, rx), stop, stats })
 }
 
 #[cfg(test)]

@@ -11,7 +11,7 @@ use crate::tap::{Tap, TapConfig, TapFeeder};
 use ironav_analyze::{Level, Observation};
 use ironav_core::{Error, ErrorCode, Rational, Result, StreamInfo, VideoFrame};
 use ironav_formats::stream::{stream_demuxer, StreamOptions, StreamPacket, SNIFF_BYTES};
-use ironav_live::{open_source, Chunk, Health, HealthState, Source, SourceInfo, SourceUrl};
+use ironav_live::{open_source, Chunk, Health, HealthState, Source, SourceInfo, SourceStats, SourceUrl};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -166,6 +166,8 @@ struct Shared {
     taps: Vec<TapFeeder>,
     /// How a source that is kept up is doing.
     health: Option<Health>,
+    /// What a packet-based source (SRT) has received, its too-late drops among it.
+    source_stats: Option<SourceStats>,
     /// The newest keyframe pictures, oldest first.
     keyframes: VecDeque<KeyframeJpeg>,
     /// Per stream, the Unix time of media time 0 by the sender's clock (RTCP sender reports).
@@ -433,6 +435,7 @@ pub fn open_with_taps(args: &OpenArgs, taps: Vec<TapConfig>) -> Result<(Arc<Sess
             reconfigure: VecDeque::new(),
             taps: feeders,
             health: None,
+            source_stats: None,
             keyframes: VecDeque::new(),
             clocks: BTreeMap::new(),
             requested: 0,
@@ -766,6 +769,9 @@ impl Session {
             let chunk = source.read(&mut buf, READ_WAIT);
             if let Some(h) = source.health() {
                 self.health(h);
+            }
+            if let Some(st) = source.stats() {
+                lock(&self.shared).source_stats = Some(st);
             }
             for c in source.captions() {
                 match c {
@@ -1117,6 +1123,7 @@ impl Session {
             "transcode": sh.transcode,
             "publish": sh.publish.as_ref().map(|c| c.status()),
             "source_health": sh.health,
+            "source_stats": sh.source_stats,
             "sender_clock": sh.clocks.iter().map(|(s, c)| json!({ "stream": s, "unix_at_zero": (c * 1000.0).round() / 1000.0 })).collect::<Vec<_>>(),
         })
     }

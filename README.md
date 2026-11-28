@@ -220,7 +220,8 @@ and then twice as long after each failed attempt, up to 30 s, for ever or for `?
 turns this off; a source that cannot be reached when the session opens is an error at once). The session's media time
 goes on from where it stopped plus the time the source was gone, decoders wait for the next keyframe, and a source that
 comes back with different tracks ends the session. `stream_status` has `source_health` (`connected`, `stalled`,
-`reconnecting` or `failed`, since when, how many reconnects and failed attempts, and the last error), and the log has
+`reconnecting` or `failed`, since when, how many reconnects and failed attempts, and the last error), `source_stats` for an SRT source (packets received, repaired by retransmission, given up on as too
+late, duplicated and discarded), and the log has
 `source_stalled`, `source_lost`, `source_restored` and `source_failed` as they happen.
 
 `whip://:port[/path]` is a WebRTC ingest endpoint ([WHIP](https://www.rfc-editor.org/rfc/rfc9725)): OBS, FFmpeg,

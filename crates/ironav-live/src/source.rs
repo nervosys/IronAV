@@ -36,6 +36,37 @@ pub struct SourceInfo {
     pub synthetic: bool,
 }
 
+/// What a packet-based source has received, for judging a lossy link. Counts add up across
+/// reconnections.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct SourceStats {
+    /// Packets that came, not counting repeats.
+    pub received: u64,
+    /// Of those, packets that came again after being asked for: losses the link repaired.
+    pub recovered: u64,
+    /// Packets given up on as too late: they did not come before the packets behind them were
+    /// due, so their bytes are missing from the stream. (The sender's own drops of packets it
+    /// could not send in time are in its [`crate::SinkStats::dropped`].)
+    pub late: u64,
+    /// Packets that came more than once.
+    pub duplicates: u64,
+    /// Packets thrown away: out of the window, too big, or encrypted in a way that could not be read.
+    pub discarded: u64,
+}
+
+impl SourceStats {
+    /// These counts and `other`'s together.
+    pub fn plus(&self, other: &SourceStats) -> SourceStats {
+        SourceStats {
+            received: self.received + other.received,
+            recovered: self.recovered + other.recovered,
+            late: self.late + other.late,
+            duplicates: self.duplicates + other.duplicates,
+            discarded: self.discarded + other.discarded,
+        }
+    }
+}
+
 /// A caption that came with the media: from `start` to `end` in the media's seconds.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Caption {
@@ -52,6 +83,10 @@ pub trait Source: Send {
     fn read(&mut self, buf: &mut [u8], wait: Duration) -> Result<Chunk>;
     /// How a source that is kept up is doing (see [`crate::reconnect`]); `None` for the others.
     fn health(&self) -> Option<crate::reconnect::Health> {
+        None
+    }
+    /// What a packet-based source (SRT) has received so far; `None` for the others.
+    fn stats(&self) -> Option<SourceStats> {
         None
     }
     /// The captions that came since the last call (from an HLS subtitle rendition), and why they

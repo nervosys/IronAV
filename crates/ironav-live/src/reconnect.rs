@@ -5,7 +5,7 @@
 //!
 //! The first open is not retried: a source that cannot be reached at all is an error at once.
 
-use crate::source::{Chunk, Source, SourceInfo};
+use crate::source::{Chunk, Source, SourceInfo, SourceStats};
 use ironav_core::{Error, ErrorCode, Result};
 use serde::Serialize;
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
@@ -72,6 +72,8 @@ pub struct Reconnecting {
     /// A new connection is up and the reader has not yet been told.
     restarted: bool,
     health: Health,
+    /// The statistics of the connections that were lost.
+    carry: SourceStats,
 }
 
 fn now() -> f64 {
@@ -93,6 +95,7 @@ impl Reconnecting {
             backoff: FIRST_BACKOFF,
             last_data: Instant::now(),
             restarted: false,
+            carry: SourceStats::default(),
             health: Health { state: HealthState::Connected, since: now(), reconnects: 0, attempts: 0, last_error: None },
         })
     }
@@ -105,6 +108,9 @@ impl Reconnecting {
 
     /// Drops the connection and plans the first attempt.
     fn lose(&mut self, why: String) {
+        if let Some(st) = self.inner.as_ref().and_then(|i| i.stats()) {
+            self.carry = self.carry.plus(&st);
+        }
         self.inner = None;
         self.health.last_error = Some(why);
         self.health.attempts = 0;
@@ -169,6 +175,14 @@ impl Source for Reconnecting {
 
     fn health(&self) -> Option<Health> {
         Some(self.health.clone())
+    }
+
+    fn stats(&self) -> Option<SourceStats> {
+        let now = self.inner.as_ref().and_then(|i| i.stats());
+        match now {
+            Some(st) => Some(self.carry.plus(&st)),
+            None => Some(self.carry).filter(|c| *c != SourceStats::default()),
+        }
     }
 
     fn read(&mut self, buf: &mut [u8], wait: Duration) -> Result<Chunk> {

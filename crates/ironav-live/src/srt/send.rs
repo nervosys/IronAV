@@ -1112,24 +1112,31 @@ mod tests {
             (src, sink, relay)
         };
         wait_connected(sink.as_ref());
-        let reader = std::thread::spawn(move || drain(src.as_mut(), Duration::from_secs(30)));
+        let reader = std::thread::spawn(move || {
+            let got = drain(src.as_mut(), Duration::from_secs(30));
+            (got, src.stats().expect("an SRT source has statistics"))
+        });
         write_paced(sink.as_mut(), &data);
         sink.finish().unwrap();
-        let got = reader.join().unwrap();
+        let (got, rx_stats) = reader.join().unwrap();
         let stats = sink.stats();
         let lost = relay.finish();
         // about 40 when every original reaches the relay; a busy machine overflows its socket first
         assert!(lost >= 20, "the path lost {lost}");
         assert!(stats.retransmitted >= lost, "{stats:?}, lost {lost}");
         assert_eq!(stats.bytes as usize, data.len());
-        // a machine so starved that the sender gave up on packets as too late, as a slow CI runner can
-        // be, says so: what is missing is then no more than it dropped. With no drop, every byte comes.
-        if stats.dropped > 0 {
+        // A machine so starved that a packet could not be repaired in time loses it by design, on
+        // either side: the sender gives up on a packet it could not send in the latency
+        // (`stats.dropped`), and the receiver on one that had not come when the packets behind it
+        // were due (`rx_stats.late`; libsrt's too-late packet drop). Each says so, and what is
+        // missing is then no more than the two together. With neither, every byte comes.
+        let declared = stats.dropped + rx_stats.late;
+        if declared > 0 {
             let missing = data.len().saturating_sub(got.len());
-            assert!(missing <= stats.dropped as usize * PAYLOAD, "{missing} bytes missing, {stats:?}");
+            assert!(missing <= declared as usize * PAYLOAD, "{missing} bytes missing, sender {stats:?}, receiver {rx_stats:?}");
             return;
         }
-        assert_eq!(got.len(), data.len(), "{stats:?}");
+        assert_eq!(got.len(), data.len(), "sender {stats:?}, receiver {rx_stats:?}");
         assert!(got == data, "the bytes differ");
     }
 
