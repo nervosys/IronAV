@@ -961,6 +961,7 @@ fn audio_codec(id: &str) -> Option<CodecId> {
         "A_DTS" | "A_DTS/EXPRESS" | "A_DTS/LOSSLESS" => CodecId::Dts,
         "A_TRUEHD" => CodecId::TrueHd,
         "A_MLP" => CodecId::Mlp,
+        "A_WAVPACK4" => CodecId::WavPack,
         "A_ALAC" => CodecId::Alac,
         s if s == "A_AAC" || s.starts_with("A_AAC/") => CodecId::Aac,
         _ => return None,

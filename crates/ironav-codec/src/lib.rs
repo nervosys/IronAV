@@ -18,6 +18,7 @@
 //! | DTS | `dts::DtsDecoder` (the core) | none | none |
 //! | TrueHD, MLP | `mlp::MlpDecoder` (lossless) | none | none |
 //! | WMA 1, WMA 2 | `wma::WmaDecoder` | none | none |
+//! | WavPack | `wavpack::WavPackDecoder` (lossless; the lossy part of hybrid) | none | none |
 //! | ALAC | `alac::AlacDecoder` | `alac::AlacEncoder` | `encoders::AlacEncoder` |
 //! | AV1 | `av1::Av1Decoder` | `av1::Av1Encoder` | `encoders::Av1Encoder` |
 //! | FLAC | `flac::FlacDecoder` | `flac::FlacEncoder` | `encoders::FlacEncoder` |
@@ -53,6 +54,8 @@ pub mod dts;
 pub mod mlp;
 #[cfg(feature = "wma")]
 pub mod wma;
+#[cfg(feature = "wavpack")]
+pub mod wavpack;
 #[cfg(feature = "h264")]
 pub mod change;
 #[cfg(feature = "flac")]
@@ -213,6 +216,10 @@ pub fn implemented() -> Vec<CodecImpl> {
             #[cfg(feature = "wma")]
             if c == CodecId::WmaV1 || c == CodecId::WmaV2 {
                 return Some(CodecImpl { codec: c, decode: true, encode: false, implementation: "ironav-wma" });
+            }
+            #[cfg(feature = "wavpack")]
+            if c == CodecId::WavPack {
+                return Some(CodecImpl { codec: c, decode: true, encode: false, implementation: "ironav-wavpack" });
             }
             #[cfg(feature = "alac")]
             if c == CodecId::Alac {
@@ -458,6 +465,8 @@ pub fn new_decoder_for(s: &ironav_core::StreamInfo) -> Result<Box<dyn Decoder>> 
         CodecId::Mlp => Ok(kept_span(s, Box::new(mlp::MlpDecoder::new(false)))),
         #[cfg(feature = "wma")]
         CodecId::WmaV1 | CodecId::WmaV2 => Ok(Box::new(wma::WmaDecoder::new(s)?)),
+        #[cfg(feature = "wavpack")]
+        CodecId::WavPack => Ok(Box::new(wavpack::WavPackDecoder::new(s)?)),
         #[cfg(feature = "alac")]
         CodecId::Alac => Ok(Box::new(alac::AlacDecoder::new(&s.extradata, &s.params)?)),
         #[cfg(feature = "opus")]

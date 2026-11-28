@@ -201,6 +201,7 @@ codecs! {
     Mlp => "mlp", Audio;
     WmaV1 => "wmav1", Audio;
     WmaV2 => "wmav2", Audio;
+    WavPack => "wavpack", Audio;
     Opus => "opus", Audio;
     Vorbis => "vorbis", Audio;
     Flac => "flac", Audio;

@@ -5,7 +5,7 @@ A CLI, an MCP server and a HandBrake-style GUI all sit on one tool registry, so 
 
 > **Status: foundation (v0.1.10).** The architecture, agent interface, ontology, hardware model, CLI, MCP server
 > and both GUIs are working and tested. Containers: **WAV, FLAC, Y4M, MP4, QuickTime MOV (read and write), Matroska/WebM (read and write), Ogg, ADTS, MP3, JPEG and MPEG transport streams (read and write); AVI (read, with OpenDML), FLV, AIFF and AIFF-C, CAF and IVF (read), MPEG program streams (`.mpg`, `.vob`, read) and raw MPEG-1/2 video (`.m2v`, read; MPEG-2 also written); subtitles as streams (`.srt`, `.vtt`, `.ass`/`.ssa` files and Matroska text tracks, read; Blu-ray PGS in `.sup` files and Matroska, and DVD VobSub in Matroska and in MPEG program streams, read as bitmap subtitle streams); `probe` also lists the entries of M3U and PLS playlists and the chapters and attachments of Matroska files; raw H.264 and HEVC (Annex B: read and written as files, and read as live sources).**
-> Audio codecs, each decoded and encoded: **PCM, FLAC, ALAC, AAC-LC (plus HE-AAC v1 and v2 decode), MP3, MP2, AC-3, Opus and Vorbis.** E-AC-3, the DTS core, TrueHD and MLP (lossless), and WMA 1 and 2 are decoded only.
+> Audio codecs, each decoded and encoded: **PCM, FLAC, ALAC, AAC-LC (plus HE-AAC v1 and v2 decode), MP3, MP2, AC-3, Opus and Vorbis.** E-AC-3, the DTS core, TrueHD and MLP (lossless), WMA 1 and 2, and WavPack (lossless; hybrid files give their lossy part) are decoded only.
 > Video: **software decoders for H.264, HEVC (including 4:2:2 and 4:4:4), VP8, VP9 and Theora; a software H.264 encoder (High profile: CABAC and the 8x8 transform), a software HEVC encoder (Main profile, 8-bit 4:2:0, merge and skip, SAO), a software VP8 encoder, and a software VP9 encoder (key and inter frames), and a software AV1 encoder (key and inter frames, profile 0, 8-bit 4:2:0); JPEG/Motion-JPEG and Apple ProRes decoded and encoded in software; MPEG-4 Part 2 (Simple and Advanced Simple profiles) decoded in software, and Simple profile I and P pictures encoded in software, with Advanced Simple B pictures as an option (MP4 and Matroska); MPEG-1 and MPEG-2 video (frame and field pictures, 4:2:0 and 4:2:2) decoded in software, and MPEG-2 video (Main profile, 4:2:0, progressive frames, optional B pictures) encoded in software.**
 > NVIDIA GPUs encode H.264 and HEVC (NVENC, preferred when usable) and decode H.264, HEVC and AV1 (NVDEC).
 > AV1 is decoded on NVIDIA GPUs (NVDEC) or in software (key, intra-only and inter frames, superres included). VP9 and AV1 copy between WebM, Matroska and MP4.
@@ -1612,6 +1612,42 @@ Measured against `ffmpeg -f f32le` on 48 files made with FFmpeg's `wmav1` and `w
 at 32, 64, 128 and 192 kbit/s): the SNR against FFmpeg's decode is 134.5 to 136.3 dB in all 48 (float rounding only), with the same sample count.
 Packet times and sizes equal `ffprobe -show_packets`. FFmpeg's encoders write no bit reservoir, so that path is covered by reading FFmpeg's
 code, not by a sample file. The tests are `crates/ironav-formats/tests/wma_ffmpeg.rs` and `asf_containers.rs`, and they skip without `ffmpeg`.
+
+## WavPack
+
+WavPack is decoded as the `wavpack` codec, by `ironav_codec::wavpack::WavPackDecoder` (a translation of FFmpeg's `wavpack.c`,
+`wavpack.h` and `wavpackdata.c`), to interleaved f64 scaled like the other lossless codecs here: 8 and 16-bit samples by 2^15, 24-bit by
+2^23, 32-bit by 2^31, so the integers come back exactly, and float files as their f32 samples. Decoded: the block header, the metadata
+sub-blocks (decorrelation terms, weights and samples, entropy variables, hybrid parameters, int32 and float information, extra bits,
+channel information and the custom sample rate), the adaptive entropy coder with its median tracking and its zero-run mode, all the
+decorrelation terms (history terms 1 to 8, 17 and 18, and the cross-channel terms -1 to -3), joint stereo, mono and false stereo, 8, 16,
+24 and 32-bit integers, shifted and "int32" data, 32-bit float with its extra bits, and any number of channels as several blocks in a
+frame (the first flagged initial, the last final). The CRC of each block is checked, and a block that fails it is an error for that
+frame (FFmpeg only checks it on request). A frame's blocks are independent of the frames before it, so decoding starts anywhere.
+
+Hybrid (lossy) files are decoded as FFmpeg does, without a correction file: the lossy samples come out. The CRC of a hybrid block is
+what the encoder had, which a decode without the correction file need not reproduce, so it is not enforced for a lossy block (one whose
+error limits are ever nonzero; FFmpeg checks the CRC only on request); a hybrid block whose limits are all zero is lossless and is checked
+like any other. The `.wvc` correction data is not read, so a hybrid file's lossless version cannot be rebuilt. DSD
+WavPack (WavPack 5) is refused with an unsupported-format error. FFmpeg's encoder writes lossless files only, so the hybrid path is
+checked by the unit tests alone (lossless blocks marked hybrid, with their parameters), not against a real lossy file.
+
+Raw `.wv` files are read by `open_demuxer` (the `wavpack` format, probed by a `wvpk` block header, 4.02 to 4.10, at the start of the
+file): the file is walked once, header to header, to index the frames; a frame is one packet, with the block index and sample count of
+its first block as its time, so the duration is where the last frame ends and a seek lands on the frame that holds the time. Blocks
+with no samples are left out, a damaged stretch is skipped by looking for the next valid header, and a frame cut by the end of the
+file is dropped. An APEv2 tag at the end (with an ID3v1 tag after it) ends the audio and is read by `ironav_formats::wv::metadata`
+(lower-case names, text only, control characters removed, cut to 512 characters; ID3v1 is read only when there is no APEv2). Matroska
+and WebM `A_WAVPACK4` tracks are read too (the codec private data is the 2-byte stream version); each block is rebuilt with its header
+from Matroska's shortened form, as FFmpeg does. MP4 and writing WavPack are not done.
+
+Measured against `ffmpeg -f s16le/s32le/f32le` on streams made with FFmpeg's native encoder: 66 cases, each as a `.wv` file and in
+Matroska (132 files), decode sample for sample identically to FFmpeg: 8, 16, 24 and 32-bit integers and float; mono, stereo, 3 and 5.1
+channels; 8 to 96 kHz; compression levels 0, 1, 2, 3, 5 and 8; joint stereo on, off and automatic; tones with noise, bursts between runs
+of digital silence (the zero-run mode), full-scale squares and silence; with block sizes from 2000 to 16384 samples. Seeking in 3
+seconds of 4096-sample blocks (to the start, the middle, near the end and past the end) lands on a block and the packets after it equal a
+full read. The tests are `crates/ironav-codec/src/wavpack/tests.rs` (with small FFmpeg-made files in `crates/ironav-codec/tests/data`) and
+`crates/ironav-formats/tests/wavpack_ffmpeg.rs`, which skips without `ffmpeg` on the PATH.
 
 ## FLV, AIFF, CAF and IVF
 

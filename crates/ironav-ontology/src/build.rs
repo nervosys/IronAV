@@ -22,6 +22,7 @@ fn codec_meta(c: CodecId) -> (&'static str, &'static str) {
         Mlp => ("MLP", "Lossless audio codec (Meridian Lossless Packing) of DVD-Audio and the base of TrueHD; decoded bit-exactly (up to 6 channels, 16, 20 or 24 bits), not encoded."),
         WmaV1 => ("WMA 1", "Lossy audio codec (Windows Media Audio version 1, ASF format tag 0x160) of early .wma files; decoded (mono and stereo, the LSP and Vorbis-style exponent coding, noise substitution, block switching and the bit reservoir), not encoded."),
         WmaV2 => ("WMA 2", "Lossy audio codec (Windows Media Audio version 2, ASF format tag 0x161), the common .wma and ASF audio; decoded (mono and stereo, run-level coefficients, noise substitution, block switching, mid/side stereo and the bit reservoir), not encoded. WMA Pro, WMA Lossless and WMA Voice are different codecs and are not decoded."),
+        WavPack => ("WavPack", "Lossless audio codec (WavPack 4 and 5) with an optional lossy hybrid mode; decoded bit-exactly (8, 16, 24 and 32-bit integer and 32-bit float, mono to many channels, joint stereo, shifted data), and for hybrid files the lossy part without a correction file; DSD is not decoded; not encoded."),
         Opus => ("Opus","Lossy low-latency audio codec (RFC 6716); best quality per bit for speech and music."),
         Vorbis => ("Vorbis", "Lossy audio codec used in Ogg and WebM."),
         Flac => ("FLAC", "Lossless audio compression."),

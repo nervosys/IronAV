@@ -29,6 +29,7 @@ pub mod renditions;
 pub mod rtp;
 pub mod ts;
 mod wav;
+pub mod wv;
 mod jpeg;
 mod keyframe;
 pub use keyframe::is_keyframe;
@@ -126,7 +127,7 @@ pub static FORMATS: &[FormatSpec] = &[
     FormatSpec {
         name: "mkv",
         extensions: &["mkv", "mka"],
-        description: "Matroska: read (also WebM, with any codec the file holds) and written with H.264, HEVC, VP8, VP9, AV1 or Motion-JPEG or MPEG-4 Part 2 or MPEG-2 video (copied; VP8, MJPEG, MPEG-4 and MPEG-2 also encoded by IronAV where it has the codec) and AAC, FLAC, MP3, MP2 (read, copied or encoded), AC-3 (copied or encoded), E-AC-3 (copied), DTS (`A_DTS`, read), Theora video (`V_THEORA`, read), TrueHD and MLP (`A_TRUEHD`, `A_MLP`, copied), Opus, Vorbis or PCM audio copied or encoded (PCM as integer or float, little- or big-endian); any number of tracks of each kind; no SeekHead",
+        description: "Matroska: read (also WebM, with any codec the file holds) and written with H.264, HEVC, VP8, VP9, AV1 or Motion-JPEG or MPEG-4 Part 2 or MPEG-2 video (copied; VP8, MJPEG, MPEG-4 and MPEG-2 also encoded by IronAV where it has the codec) and AAC, FLAC, MP3, MP2 (read, copied or encoded), AC-3 (copied or encoded), E-AC-3 (copied), DTS (`A_DTS`, read), Theora video (`V_THEORA`, read), TrueHD and MLP (`A_TRUEHD`, `A_MLP`, copied), WavPack (`A_WAVPACK4`, read), Opus, Vorbis or PCM audio copied or encoded (PCM as integer or float, little- or big-endian); any number of tracks of each kind; no SeekHead",
         media: MediaType::Video,
         demux: true,
         mux: true,
@@ -322,6 +323,15 @@ pub static FORMATS: &[FormatSpec] = &[
         codecs: &[CodecId::WmaV1, CodecId::WmaV2],
     },
     FormatSpec {
+        name: "wavpack",
+        extensions: &["wv"],
+        description: "Raw WavPack (`wvpk` blocks): lossless 8 to 32-bit integer and float audio, mono to many channels (a frame is the blocks of its channels), with the sample count and position of each block from its header so it seeks by frame; hybrid files give their lossy part (no `.wvc` correction file is read); APEv2 and ID3v1 tags at the end are skipped and read as metadata; DSD is refused; read only",
+        media: MediaType::Audio,
+        demux: true,
+        mux: false,
+        codecs: &[CodecId::WavPack],
+    },
+    FormatSpec {
         name: "aiff",
         extensions: &["aiff", "aif", "aifc"],
         description: "AIFF and AIFF-C: big-endian integer PCM of 8 to 32 bits, and AIFF-C `NONE`, `sowt` (little-endian), `fl32` and `fl64` (float), read as little-endian PCM; other AIFF-C compressions are refused by name; seeks to the sample; read only",
@@ -406,6 +416,8 @@ fn open_with(path: &Path, lazy: bool) -> Result<Box<dyn Demuxer>> {
         caf::open(f)
     } else if asf::looks_like_asf(magic) {
         Ok(Box::new(asf::open(f)?))
+    } else if wv::looks_like_wv(magic) {
+        Ok(Box::new(wv::open(f)?))
     } else if flv::looks_like_flv(magic) {
         Ok(Box::new(flv::open(f)?))
     } else if ivf::looks_like_ivf(magic) {
