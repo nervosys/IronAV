@@ -38,6 +38,8 @@ fn codec_meta(c: CodecId) -> (&'static str, &'static str) {
         SubRip => ("SubRip", "Timed text subtitles (.srt, and Matroska S_TEXT/UTF8); read as a subtitle stream of cues, not decoded to pictures."),
         Ass => ("ASS / SSA", "Advanced SubStation Alpha subtitles (.ass, .ssa, and Matroska S_TEXT/ASS): timed events with styling override tags; read as a subtitle stream of cues."),
         WebVtt => ("WebVTT", "Web Video Text Tracks subtitles (.vtt, and Matroska S_TEXT/WEBVTT); read as a subtitle stream of cues."),
+        HdmvPgs => ("Blu-ray PGS subtitles", "Presentation Graphic Stream bitmap subtitles of Blu-ray discs (.sup, and Matroska S_HDMV/PGS); read as a subtitle stream of display sets and decoded to bitmaps for display; no text is recovered (no OCR)."),
+        DvdSub => ("DVD VobSub subtitles", "DVD subpicture bitmap subtitles (VobSub; Matroska S_VOBSUB and DVD program streams); read as a subtitle stream of subpicture packets and decoded to bitmaps for display; no text is recovered (no OCR)."),
     }
 }
 

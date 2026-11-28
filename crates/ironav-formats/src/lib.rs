@@ -34,6 +34,7 @@ pub use keyframe::is_keyframe;
 mod y4m;
 pub mod playlist;
 pub mod subtitle;
+pub mod sup;
 pub mod webvtt;
 
 use ironav_core::{CodecId, Demuxer, Error, ErrorCode, MediaType, Muxer, Result};
@@ -167,6 +168,15 @@ pub static FORMATS: &[FormatSpec] = &[
         codecs: &[CodecId::Ass],
     },
     FormatSpec {
+        name: "sup",
+        extensions: &["sup"],
+        description: "Raw Blu-ray subtitles (PGS segments with their `PG` headers): one subtitle stream of the `hdmv_pgs_subtitle` codec, a packet per display set on a 90 kHz time base; the packets are bitmaps, decoded by `ironav_codec::bitmapsub` (no text is recovered); read only",
+        media: MediaType::Subtitle,
+        demux: true,
+        mux: false,
+        codecs: &[CodecId::HdmvPgs],
+    },
+    FormatSpec {
         name: "mp3",
         extensions: &["mp3", "mp2"],
         description: "MPEG audio files: MP3 (MPEG-1/2/2.5 Layer III) and MP2 (Layer II, read as the mp2 codec and written from MP2 or encoded by IronAV); ID3 tags are skipped and a Xing/Info frame is not played; MP3 is written with an Info frame (frame count, gapless delay and padding), MP2 without one",
@@ -277,7 +287,7 @@ pub static FORMATS: &[FormatSpec] = &[
     FormatSpec {
         name: "mpegps",
         extensions: &["mpg", "mpeg", "vob", "ps"],
-        description: "MPEG program stream (DVD VOB, MPEG-1 system streams, .mpg files): every MPEG-1 or MPEG-2 video stream, MP2/MP3 audio, AC-3 and DVD LPCM are read; DTS, subpictures and DVD-Audio are skipped",
+        description: "MPEG program stream (DVD VOB, MPEG-1 system streams, .mpg files): every MPEG-1 or MPEG-2 video stream, MP2/MP3 audio, AC-3 and DVD LPCM are read; DVD subpictures are read as `dvd_subtitle` streams (bitmaps; their palette is in the IFO file, which is not read); DTS and DVD-Audio are skipped",
         media: MediaType::Video,
         demux: true,
         mux: false,
@@ -422,6 +432,8 @@ fn open_with(path: &Path, lazy: bool) -> Result<Box<dyn Demuxer>> {
         Ok(Box::new(y4m::Y4mDemuxer::open(f)?))
     } else if mpegvideo::looks_like_es(magic) || mpegvideo::looks_like_ps(magic) {
         Ok(Box::new(mpegvideo::MpegVideoDemuxer::open(f, mpegvideo::looks_like_ps(magic))?))
+    } else if sup::looks_like_sup(magic) {
+        Ok(Box::new(sup::SupDemuxer::open(f)?))
     } else if let Some(kind) = subtitle::sniff(magic) {
         Ok(match kind {
             "webvtt" => Box::new(subtitle::SubtitleDemuxer::vtt(f)?) as Box<dyn Demuxer>,

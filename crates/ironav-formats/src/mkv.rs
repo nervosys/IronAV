@@ -899,6 +899,9 @@ fn subtitle_codec(id: &str) -> Option<CodecId> {
         "S_TEXT/ASS" | "S_TEXT/SSA" | "S_ASS" | "S_SSA" => CodecId::Ass,
         // WebM's form of WebVTT (what FFmpeg writes) holds the cue payload in the block; the settings are in a block addition
         "S_TEXT/WEBVTT" | "D_WEBVTT/SUBTITLES" | "D_WEBVTT/CAPTIONS" => CodecId::WebVtt,
+        // bitmap subtitles: a block is a PGS display set, or a DVD subpicture packet
+        "S_HDMV/PGS" => CodecId::HdmvPgs,
+        "S_VOBSUB" => CodecId::DvdSub,
         _ => return None,
     })
 }
@@ -910,10 +913,12 @@ fn build_subtitle(t: &MkTrack, codec: CodecId, index: usize, frames: &[&Frame], 
     let g = gcd(scale as i64, 1_000_000_000);
     let tick = Rational::new(scale as i64 / g, 1_000_000_000 / g);
     let default_ticks = (t.default_ns / scale.max(1)) as i64;
+    // bitmaps are far larger than cues: a block may be a few MiB, and a film's track tens of them
+    let (max_size, max_total) = if matches!(codec, CodecId::HdmvPgs | CodecId::DvdSub) { (4 << 20, usize::MAX) } else { (crate::subtitle::MAX_CUE_BYTES * 2, crate::subtitle::MAX_TOTAL_BYTES) };
     let (mut end, mut bytes, mut cues) = (0i64, 0usize, 0usize);
     for f in frames {
         let size = f.size as usize;
-        if size == 0 || size > crate::subtitle::MAX_CUE_BYTES * 2 || cues >= crate::subtitle::MAX_CUES || bytes + size > crate::subtitle::MAX_TOTAL_BYTES {
+        if size == 0 || size > max_size || cues >= crate::subtitle::MAX_CUES || bytes + size > max_total {
             continue;
         }
         let duration = f.duration.filter(|&d| d > 0).unwrap_or(default_ticks).max(0);
@@ -1525,7 +1530,7 @@ mod tests {
     fn text_tracks_are_subtitle_streams_with_their_cues() {
         let video = el(TRACK_ENTRY, &[uint(TRACK_NUMBER, 1), uint(TRACK_TYPE, 1), el(CODEC_ID, b"V_VP9"), uint(DEFAULT_DURATION, 40_000_000), el(VIDEO, &[uint(PIXEL_WIDTH, 64), uint(PIXEL_HEIGHT, 48)].concat())].concat());
         let header = b"[Script Info]\nTitle: x\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n";
-        let entries = [video, subtitle_entry(2, "S_TEXT/UTF8", b""), subtitle_entry(3, "S_TEXT/ASS", header), subtitle_entry(4, "S_TEXT/WEBVTT", b""), subtitle_entry(5, "S_VOBSUB", b"")];
+        let entries = [video, subtitle_entry(2, "S_TEXT/UTF8", b""), subtitle_entry(3, "S_TEXT/ASS", header), subtitle_entry(4, "S_TEXT/WEBVTT", b""), subtitle_entry(5, "S_KATE", b"")];
         let cluster = [
             uint(CLUSTER_TIMECODE, 1000),
             simple(1, 0, true, &[0xAA; 5]),
@@ -1553,7 +1558,26 @@ mod tests {
         assert_eq!(crate::subtitle::plain_text(CodecId::Ass, &cues[2][0].2), "Top");
         let u = d.unsupported_streams();
         assert_eq!(u.len(), 1);
-        assert!(u[0].contains("S_VOBSUB") && u[0].contains("subtitle"), "{u:?}");
+        assert!(u[0].contains("S_KATE") && u[0].contains("subtitle"), "{u:?}");
+    }
+
+    #[test]
+    fn pgs_and_vobsub_tracks_are_subtitle_streams_with_their_packets() {
+        let idx = b"# VobSub index file\nsize: 720x480\npalette: 000000, ffffff, 808080, 404040, 000000, 000000, 000000, 000000, 000000, 000000, 000000, 000000, 000000, 000000, 000000, 000000\n";
+        let entries = [subtitle_entry(1, "S_HDMV/PGS", b""), subtitle_entry(2, "S_VOBSUB", idx)];
+        let big = vec![7u8; crate::subtitle::MAX_CUE_BYTES * 8];
+        let cluster = [uint(CLUSTER_TIMECODE, 0), cue_block(1, 100, &big, 0), cue_block(2, 300, b"\x00\x08spu", 500), cue_block(1, 900, b"\x80\x00\x00", 0)].concat();
+        let mut d = open(Cursor::new(file_with(&entries, Vec::new(), cluster))).unwrap();
+        let s = d.streams().to_vec();
+        assert_eq!(s.iter().map(|s| s.codec).collect::<Vec<_>>(), vec![CodecId::HdmvPgs, CodecId::DvdSub]);
+        assert!(s.iter().all(|s| s.params == StreamParams::Subtitle && s.time_base == Rational::new(1, 1000)));
+        assert_eq!(s[1].extradata, idx.to_vec(), "the .idx text is the track's private data");
+        let mut got = Vec::new();
+        while let Some(p) = d.read_packet().unwrap() {
+            got.push((p.stream, p.pts, p.data.len()));
+        }
+        assert_eq!(got, vec![(0, 100, big.len()), (1, 300, 5), (0, 900, 3)], "blocks larger than a text cue may be are kept");
+        assert!(d.unsupported_streams().is_empty());
     }
 
     #[test]

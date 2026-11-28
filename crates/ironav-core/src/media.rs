@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 pub enum MediaType {
     Audio,
     Video,
-    /// Timed text: SubRip, WebVTT, ASS. Its streams are cues, not samples or pictures.
+    /// Timed text (SubRip, WebVTT, ASS) or bitmaps (Blu-ray PGS, DVD VobSub). Its streams are cues, not samples or pictures.
     Subtitle,
 }
 
@@ -217,6 +217,8 @@ codecs! {
     SubRip => "subrip", Subtitle;
     Ass => "ass", Subtitle;
     WebVtt => "webvtt", Subtitle;
+    HdmvPgs => "hdmv_pgs_subtitle", Subtitle;
+    DvdSub => "dvd_subtitle", Subtitle;
 }
 
 impl CodecId {

@@ -36,6 +36,7 @@
 //! `opus::MultistreamDecoder` and `opus::MultistreamEncoder`. To get a decoder or encoder for a
 //! `CodecId` without naming the type, use [`new_decoder`] and [`new_encoder`].
 
+pub mod bitmapsub;
 #[cfg(feature = "aac")]
 pub mod aac;
 #[cfg(feature = "ac3")]

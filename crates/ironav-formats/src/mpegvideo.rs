@@ -7,7 +7,11 @@
 //! A program stream is read through its PES packets, and every stream in it that can be decoded
 //! comes out: each video stream (0xE0-0xEF), MPEG audio (0xC0-0xDF, MP2 or MP3 by each frame's
 //! layer), and the private stream 1 substreams DVDs use: AC-3 (0x80-0x87) and DVD linear PCM
-//! (0xA0-0xA7, 16, 20 or 24 bits, converted to little-endian). DTS (0x88-0x8F), subpictures, DVD-Audio
+//! (0xA0-0xA7, 16, 20 or 24 bits, converted to little-endian). DVD subpictures (0x20-0x3F) come out as
+//! `dvd_subtitle` streams, a packet per subpicture (rebuilt from its PES packets by its size field) with
+//! the video's size as `size:` in the codec private data and no palette: that is in the DVD's IFO file,
+//! which IronAV does not read, so the decoder guesses white levels as FFmpeg does without one. A
+//! subpicture shows up only when one is on screen, so the first 8 MiB are scanned for them. DTS (0x88-0x8F), DVD-Audio
 //! PCM and other private streams are skipped. Times are PES presentation timestamps on the 90 kHz
 //! clock; every stream starts at the earliest of them, as FFmpeg's start time does, so audio and
 //! video stay aligned. A video stream's pictures are placed from its first timestamp by display
@@ -26,6 +30,10 @@ use std::io::Read;
 const CHUNK: usize = 1 << 20;
 /// How much of a file is read, at most, looking for the streams and their first sequence header.
 const MAX_HEAD: usize = 16 << 20;
+/// A program stream is read this far for DVD subpictures, which show up only when one is on screen.
+const SUB_SCAN: usize = 8 << 20;
+/// The largest subpicture packet taken.
+const MAX_SPU: usize = 1 << 20;
 /// The 90 kHz clock of PES timestamps.
 const CLOCK: i64 = 90_000;
 /// PES timestamps are 33 bits.
@@ -242,6 +250,8 @@ enum Kind {
     /// MPEG audio, Layer II or III by each frame.
     Mpeg,
     Ac3,
+    /// DVD subpictures (VobSub), a packet each.
+    Sub,
     /// DVD linear PCM.
     Lpcm,
 }
@@ -265,13 +275,25 @@ struct Track {
     rem: i64,
     /// LPCM: the bits, rate and channels the carried bytes are in.
     lpcm: Option<(u8, u32, usize)>,
+    /// Subpictures: the size the subpicture being rebuilt (in `carry`, from `next`) will have.
+    want: usize,
     /// The index of the stream in the demuxer's streams, once they are published.
     out: Option<usize>,
 }
 
 impl Track {
     fn new(key: u16, kind: Kind) -> Self {
-        Track { kind, key, framer: Framer::default(), start: None, origin: None, last: None, info: None, carry: Vec::new(), next: None, rem: 0, lpcm: None, out: None }
+        let info = (kind == Kind::Sub).then(|| StreamInfo {
+            index: 0,
+            codec: CodecId::DvdSub,
+            time_base: Rational::new(1, CLOCK),
+            duration: None,
+            bits: None,
+            extradata: Vec::new(),
+            lead_in: 0,
+            params: StreamParams::Subtitle,
+        });
+        Track { kind, key, framer: Framer::default(), start: None, origin: None, last: None, info, carry: Vec::new(), next: None, rem: 0, lpcm: None, want: 0, out: None }
     }
 
     fn has_info(&self) -> bool {
@@ -497,7 +519,7 @@ impl<R: Read + Send> MpegVideoDemuxer<R> {
             d.track(0, Kind::Video);
         }
         let mut read = 0usize;
-        while !d.is_ready() && !d.eof && read <= MAX_HEAD {
+        while (!d.is_ready() || (ps && read < SUB_SCAN)) && !d.eof && read <= MAX_HEAD {
             read += d.pump()?;
         }
         d.publish();
@@ -644,10 +666,47 @@ impl<R: Read + Send> MpegVideoDemuxer<R> {
                         let pts = self.stamp(t, raw);
                         self.lpcm(t, &body[3..6], &body[6..], pts);
                     }
+                    // DVD subpictures: the substream id, then the subpicture's own bytes
+                    0x20..=0x3F => {
+                        let t = self.track(0x100 | sub as u16, Kind::Sub);
+                        let pts = self.stamp(t, raw);
+                        self.subpicture(t, body, pts);
+                    }
                     _ => {}
                 }
             }
             _ => {}
+        }
+    }
+
+    /// The payload of a DVD subpicture PES. A subpicture (SPU) starts with its size and may span
+    /// several PES packets; a PES with a timestamp begins a new one. It comes out whole, at the time
+    /// of its first PES.
+    fn subpicture(&mut self, t: usize, body: &[u8], pts: Option<i64>) {
+        let tr = &mut self.tracks[t];
+        if pts.is_some() {
+            tr.carry.clear();
+        }
+        if tr.carry.is_empty() {
+            let Some(at) = pts else { return };
+            let size = match body {
+                [0, 0, a, b, c, d, ..] => u32::from_be_bytes([*a, *b, *c, *d]) as usize,
+                [a, b, ..] => u16::from_be_bytes([*a, *b]) as usize,
+                _ => return,
+            };
+            if !(6..=MAX_SPU).contains(&size) {
+                return;
+            }
+            tr.want = size;
+            tr.next = Some(at);
+        }
+        tr.carry.extend_from_slice(body);
+        if tr.carry.len() >= tr.want {
+            let mut data = std::mem::take(&mut tr.carry);
+            data.truncate(tr.want);
+            if let Some(at) = tr.next {
+                self.pending.push(Out { track: t, pts: at, dur: 0, data });
+            }
         }
     }
 
@@ -761,8 +820,13 @@ impl<R: Read + Send> MpegVideoDemuxer<R> {
             return;
         }
         self.published = true;
+        // a subpicture stream's canvas is the video's picture
+        let size = self.tracks.iter().find_map(|t| t.framer.info.as_ref()).map(|i| format!("size: {}x{}\n", i.width, i.height));
         for t in self.tracks.iter_mut() {
             let Some(mut s) = t.stream_info(self.ps) else { continue };
+            if t.kind == Kind::Sub {
+                s.extradata = size.clone().unwrap_or_default().into_bytes();
+            }
             s.index = self.streams.len();
             t.out = Some(s.index);
             self.streams.push(s);
